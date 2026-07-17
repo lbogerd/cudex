@@ -321,10 +321,11 @@ impl Inner {
         let deadline = Instant::now() + SESSION_RECOVERY_TIMEOUT;
         self.fail_all_http_body_streams(disconnect_message.clone())
             .await;
-        if timeout_at(deadline, self.wait_for_process_starts())
-            .await
-            .is_err()
-        {
+        let wait_for_process_starts = tokio::select! {
+            _ = self.recovery_cancellation.cancelled() => return,
+            result = timeout_at(deadline, self.wait_for_process_starts()) => result,
+        };
+        if wait_for_process_starts.is_err() {
             let message = format!(
                 "{disconnect_message}; failed to resume exec-server session: recovery timed out after {SESSION_RECOVERY_TIMEOUT:?}"
             );
@@ -349,7 +350,11 @@ impl Inner {
         );
         let mut registry_retry_attempt = 0;
         let last_error = loop {
-            match timeout_at(deadline, self.resume_once(&session_id)).await {
+            let resume_result = tokio::select! {
+                _ = self.recovery_cancellation.cancelled() => return,
+                result = timeout_at(deadline, self.resume_once(&session_id)) => result,
+            };
+            match resume_result {
                 Ok(Ok(candidate)) => {
                     if !candidate.is_disconnected() && self.install_recovered_client(candidate) {
                         return;
@@ -376,7 +381,10 @@ impl Inner {
             if now >= deadline {
                 break format!("recovery timed out after {SESSION_RECOVERY_TIMEOUT:?}");
             }
-            sleep(retry_delay.min(deadline - now)).await;
+            tokio::select! {
+                _ = self.recovery_cancellation.cancelled() => return,
+                _ = sleep(retry_delay.min(deadline - now)) => {}
+            }
         };
 
         let message =
@@ -503,7 +511,7 @@ impl Inner {
         Ok(())
     }
 
-    async fn fail(self: &Arc<Self>, message: String) {
+    pub(super) async fn fail(self: &Arc<Self>, message: String) {
         let (message, newly_failed) = {
             let mut connection = self
                 .connection
@@ -517,6 +525,7 @@ impl Inner {
                 }
             }
         };
+        self.recovery_cancellation.cancel();
         if newly_failed {
             self.notify_connection_changed();
             fail_all_in_flight_work(self, message.clone()).await;

@@ -18,6 +18,7 @@ use tokio::sync::OnceCell;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 
 use tokio::time::timeout;
@@ -125,6 +126,7 @@ const PROCESS_EVENT_CHANNEL_CAPACITY: usize = 256;
 const PROCESS_EVENT_RETAINED_BYTES: usize = 1024 * 1024;
 const MAX_PENDING_PROCESS_EVENTS: usize = 256;
 const MAX_PENDING_PROCESS_EVENT_BYTES: usize = 1024 * 1024;
+const ENVIRONMENT_REMOVED_MESSAGE: &str = "exec-server environment was removed";
 
 impl Default for ExecServerClientConnectOptions {
     fn default() -> Self {
@@ -219,6 +221,7 @@ struct Inner {
     http_body_stream_next_id: AtomicU64,
     session_id: OnceLock<String>,
     reconnect_strategy: Option<ExecServerReconnectStrategy>,
+    recovery_cancellation: CancellationToken,
 }
 
 struct ConnectionState {
@@ -296,6 +299,7 @@ pub(crate) struct LazyRemoteExecServerClient {
     current_client: Arc<StdMutex<Option<ExecServerClient>>>,
     reconnect: Arc<StdMutex<Option<Arc<ConnectionAttempt>>>>,
     environment_connection_state_tx: watch::Sender<EnvironmentConnectionState>,
+    terminated: Arc<AtomicBool>,
 }
 
 impl LazyRemoteExecServerClient {
@@ -310,6 +314,7 @@ impl LazyRemoteExecServerClient {
                 EnvironmentConnectionState::Disconnected,
             )
             .0,
+            terminated: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -318,6 +323,9 @@ impl LazyRemoteExecServerClient {
     }
 
     pub(crate) fn start_connecting(&self) -> Option<AbortOnDropHandle<()>> {
+        if self.is_terminated() {
+            return None;
+        }
         // Stdio starts a process, so keep it lazy until the environment is used.
         if matches!(
             self.transport_params,
@@ -338,6 +346,9 @@ impl LazyRemoteExecServerClient {
     }
 
     pub(crate) fn readiness_result(&self) -> Option<Result<(), ExecServerError>> {
+        if self.is_terminated() {
+            return Some(Err(environment_removed_error()));
+        }
         if let Some(client) = self.cached_client() {
             return client.readiness_result();
         }
@@ -348,6 +359,11 @@ impl LazyRemoteExecServerClient {
     }
 
     pub(crate) async fn status(&self) -> crate::EnvironmentObservedStatus {
+        if self.is_terminated() {
+            return crate::EnvironmentObservedStatus::Disconnected {
+                error: ENVIRONMENT_REMOVED_MESSAGE.to_string(),
+            };
+        }
         // Fail-fast lookup preserves the non-mutating contract: never start or recover a client.
         let client = match self.fail_fast().get().await {
             Ok(client) => client,
@@ -379,10 +395,16 @@ impl LazyRemoteExecServerClient {
     }
 
     pub(crate) async fn wait_until_ready(&self) -> Result<(), ExecServerError> {
+        if self.is_terminated() {
+            return Err(environment_removed_error());
+        }
         self.initial_client().await.map(drop)
     }
 
     pub(crate) async fn get(&self) -> Result<ExecServerClient, ExecServerError> {
+        if self.is_terminated() {
+            return Err(environment_removed_error());
+        }
         if matches!(self.recovery_policy, RecoveryPolicy::FailFast) {
             let client = match self.cached_client() {
                 Some(client) => client,
@@ -424,12 +446,22 @@ impl LazyRemoteExecServerClient {
         let result = self.startup.get_or_init(|| self.connect_once()).await;
         match result {
             Ok(client) => {
-                let mut current_client = self
-                    .current_client
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if current_client.is_none() {
-                    *current_client = Some(client.clone());
+                if self.is_terminated() {
+                    client.shutdown(ENVIRONMENT_REMOVED_MESSAGE).await;
+                    return Err(environment_removed_error());
+                }
+                {
+                    let mut current_client = self
+                        .current_client
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if current_client.is_none() {
+                        *current_client = Some(client.clone());
+                    }
+                }
+                if self.is_terminated() {
+                    client.shutdown(ENVIRONMENT_REMOVED_MESSAGE).await;
+                    return Err(environment_removed_error());
                 }
                 Ok(client.clone())
             }
@@ -455,10 +487,16 @@ impl LazyRemoteExecServerClient {
             .get_or_init(|| async {
                 let result = self.connect_once().await;
                 if let Ok(client) = &result {
-                    *self
-                        .current_client
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(client.clone());
+                    {
+                        *self
+                            .current_client
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            Some(client.clone());
+                    }
+                    if self.is_terminated() {
+                        client.shutdown(ENVIRONMENT_REMOVED_MESSAGE).await;
+                    }
                 }
                 result
             })
@@ -474,7 +512,11 @@ impl LazyRemoteExecServerClient {
         {
             *reconnect = None;
         }
-        result.clone().map_err(ExecServerError::ConnectionAttempt)
+        if self.is_terminated() {
+            Err(environment_removed_error())
+        } else {
+            result.clone().map_err(ExecServerError::ConnectionAttempt)
+        }
     }
 
     fn connected_client(&self) -> Option<ExecServerClient> {
@@ -499,15 +541,47 @@ impl LazyRemoteExecServerClient {
     }
 
     async fn connect_once(&self) -> ConnectionResult {
+        if self.is_terminated() {
+            return Err(Arc::new(environment_removed_error()));
+        }
         let result = ExecServerClient::connect_for_transport(self.transport_params.clone())
             .await
             .map_err(Arc::new);
+        if self.is_terminated() {
+            if let Ok(client) = &result {
+                client.shutdown(ENVIRONMENT_REMOVED_MESSAGE).await;
+            }
+            return Err(Arc::new(environment_removed_error()));
+        }
         if let Ok(client) = &result {
             client
                 .attach_environment_connection_state(self.environment_connection_state_tx.clone());
         }
         result
     }
+
+    pub(crate) async fn terminate(&self) {
+        self.terminated.store(true, Ordering::Release);
+        let _ = self
+            .environment_connection_state_tx
+            .send_replace(EnvironmentConnectionState::Disconnected);
+        let client = self
+            .current_client
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(client) = client {
+            client.shutdown(ENVIRONMENT_REMOVED_MESSAGE).await;
+        }
+    }
+
+    fn is_terminated(&self) -> bool {
+        self.terminated.load(Ordering::Acquire)
+    }
+}
+
+fn environment_removed_error() -> ExecServerError {
+    ExecServerError::Disconnected(ENVIRONMENT_REMOVED_MESSAGE.to_string())
 }
 
 impl HttpClient for LazyRemoteExecServerClient {
@@ -578,6 +652,24 @@ pub enum ExecServerError {
 }
 
 impl ExecServerClient {
+    async fn shutdown(&self, message: &str) {
+        let rpc_client = {
+            let connection = self
+                .inner
+                .connection
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match &connection.status {
+                ConnectionStatus::Connected(rpc_client) => Some(Arc::clone(rpc_client)),
+                ConnectionStatus::Recovering | ConnectionStatus::Failed(_) => None,
+            }
+        };
+        self.inner.fail(message.to_string()).await;
+        if let Some(rpc_client) = rpc_client {
+            rpc_client.close_transport().await;
+        }
+    }
+
     fn attach_environment_connection_state(
         &self,
         state_tx: watch::Sender<EnvironmentConnectionState>,
@@ -969,6 +1061,7 @@ impl ExecServerClient {
             http_body_stream_next_id: AtomicU64::new(1),
             session_id,
             reconnect_strategy,
+            recovery_cancellation: CancellationToken::new(),
         });
         let client = Self {
             inner,
@@ -2242,6 +2335,66 @@ mod tests {
         assert_eq!(stable_client.session_id().as_deref(), Some("session-1"));
         assert!(Arc::ptr_eq(&stable_client.inner, &reused_client.inner));
         finish_tx.send(()).expect("test should finish");
+        server.await.expect("server task should finish");
+    }
+
+    #[tokio::test]
+    async fn terminating_environment_cancels_active_session_recovery() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let websocket_url = format!(
+            "ws://{}",
+            listener.local_addr().expect("listener should have address")
+        );
+        let (recovery_started_tx, recovery_started_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut first = accept_websocket(&listener).await;
+            complete_websocket_initialize(
+                &mut first,
+                "session-1",
+                /*expected_resume_session_id*/ None,
+            )
+            .await;
+            first.close(None).await.expect("websocket should close");
+
+            let mut recovering = accept_websocket(&listener).await;
+            let initialize = read_jsonrpc_websocket(&mut recovering).await;
+            assert!(matches!(
+                initialize,
+                JSONRPCMessage::Request(request) if request.method == INITIALIZE_METHOD
+            ));
+            recovery_started_tx
+                .send(())
+                .expect("recovery attempt should signal");
+            let closed = timeout(Duration::from_secs(1), recovering.next())
+                .await
+                .expect("terminal failure should close the recovering transport");
+            assert!(matches!(
+                closed,
+                None | Some(Ok(Message::Close(_))) | Some(Err(_))
+            ));
+            assert!(
+                timeout(Duration::from_millis(300), listener.accept())
+                    .await
+                    .is_err(),
+                "terminal failure should prevent another recovery attempt"
+            );
+        });
+        let client = LazyRemoteExecServerClient::new(ExecServerTransportParams::WebSocketUrl {
+            websocket_url,
+            connect_timeout: Duration::from_secs(1),
+            initialize_timeout: Duration::from_secs(1),
+        });
+        let stable_client = client.get().await.expect("client should connect");
+        timeout(Duration::from_secs(1), recovery_started_rx)
+            .await
+            .expect("session recovery should start")
+            .expect("recovery attempt should signal");
+
+        client.terminate().await;
+
+        assert!(stable_client.is_disconnected());
         server.await.expect("server task should finish");
     }
 
