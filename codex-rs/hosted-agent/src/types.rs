@@ -69,7 +69,7 @@ impl HostedEnvironmentConnection {
     ) -> std::result::Result<(), ExecServerError> {
         self.validate()
             .map_err(|error| ExecServerError::Protocol(error.to_string()))?;
-        manager.upsert_environment(
+        manager.register_environment(
             environment_id.into(),
             self.exec_server_url.clone(),
             Some(timeout),
