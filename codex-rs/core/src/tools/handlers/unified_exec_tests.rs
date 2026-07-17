@@ -1,7 +1,9 @@
 use super::*;
+use crate::function_tool::FunctionCallError;
 use crate::shell::ShellType;
 use crate::shell::default_user_shell;
 use codex_exec_server::Environment;
+use codex_tools::ToolExecutor;
 use codex_tools::UnifiedExecShellMode;
 use codex_tools::ZshForkConfig;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -283,6 +285,40 @@ async fn exec_command_pre_tool_use_payload_skips_write_stdin() {
             payload,
         }),
         None
+    );
+}
+
+#[tokio::test]
+async fn exec_command_rejects_forged_escalation_when_disabled() {
+    let invocation = invocation_for_payload(
+        "exec_command",
+        "call-no-escalation",
+        ToolPayload::Function {
+            arguments: serde_json::json!({
+                "cmd": "echo should-not-run",
+                "sandbox_permissions": "require_escalated",
+                "justification": "forged escalation"
+            })
+            .to_string(),
+        },
+    )
+    .await;
+    let handler = ExecCommandHandler::new(ExecCommandHandlerOptions {
+        allow_login_shell: true,
+        exec_permission_approvals_enabled: false,
+        allow_permission_escalation: false,
+        include_environment_id: false,
+        include_shell_parameter: true,
+    });
+
+    let Err(error) = handler.handle(invocation).await else {
+        panic!("forged permission escalation must be rejected");
+    };
+    assert_eq!(
+        error,
+        FunctionCallError::RespondToModel(
+            "permission escalation is unavailable for this exec_command tool".to_string()
+        )
     );
 }
 

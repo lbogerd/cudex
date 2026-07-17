@@ -584,6 +584,17 @@ async fn hosted_policy_filters_specs_and_unregisters_unsafe_runtime_tools() {
         codex_code_mode::PUBLIC_TOOL_NAME,
         codex_code_mode::WAIT_TOOL_NAME,
     ]);
+    let exec_spec = plan.visible_spec("exec_command");
+    for parameter in ["additional_permissions", "justification", "prefix_rule"] {
+        assert!(!has_parameter(exec_spec, parameter));
+    }
+    assert_eq!(
+        serde_json::to_value(exec_spec)
+            .expect("exec_command spec should serialize")
+            .pointer("/parameters/properties/sandbox_permissions/enum")
+            .cloned(),
+        Some(serde_json::json!(["use_default"]))
+    );
 }
 
 #[tokio::test]

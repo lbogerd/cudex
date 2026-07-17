@@ -50,6 +50,7 @@ use super::shell_mode_for_environment;
 pub(crate) struct ExecCommandHandlerOptions {
     pub(crate) allow_login_shell: bool,
     pub(crate) exec_permission_approvals_enabled: bool,
+    pub(crate) allow_permission_escalation: bool,
     pub(crate) include_environment_id: bool,
     pub(crate) include_shell_parameter: bool,
 }
@@ -64,6 +65,7 @@ impl Default for ExecCommandHandler {
             options: ExecCommandHandlerOptions {
                 allow_login_shell: false,
                 exec_permission_approvals_enabled: false,
+                allow_permission_escalation: true,
                 include_environment_id: false,
                 include_shell_parameter: true,
             },
@@ -87,6 +89,7 @@ impl ToolExecutor<ToolInvocation> for ExecCommandHandler {
             CommandToolOptions {
                 allow_login_shell: self.options.allow_login_shell,
                 exec_permission_approvals_enabled: self.options.exec_permission_approvals_enabled,
+                allow_permission_escalation: self.options.allow_permission_escalation,
             },
             self.options.include_environment_id,
             self.options.include_shell_parameter,
@@ -189,6 +192,16 @@ impl ExecCommandHandler {
                 parse_arguments(&arguments)?
             }
         };
+        if !self.options.allow_permission_escalation
+            && (args.sandbox_permissions.requests_sandbox_override()
+                || args.additional_permissions.is_some()
+                || args.justification.is_some()
+                || args.prefix_rule.is_some())
+        {
+            return Err(FunctionCallError::RespondToModel(
+                "permission escalation is unavailable for this exec_command tool".to_string(),
+            ));
+        }
         let hook_command = args.cmd.clone();
         // TODO(anp) wire PathUri through implicit skills instead of skipping on foreign paths
         if let Some(native_cwd) = native_cwd.as_ref() {

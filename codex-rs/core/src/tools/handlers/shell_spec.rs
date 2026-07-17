@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 pub struct CommandToolOptions {
     pub allow_login_shell: bool,
     pub exec_permission_approvals_enabled: bool,
+    pub allow_permission_escalation: bool,
 }
 
 #[cfg(test)]
@@ -86,6 +87,7 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
     }
     properties.extend(create_approval_parameters(
         options.exec_permission_approvals_enabled,
+        options.allow_permission_escalation,
     ));
 
     ToolSpec::Function(ResponsesApiTool {
@@ -186,6 +188,7 @@ pub fn create_shell_command_tool(options: CommandToolOptions) -> ToolSpec {
     }
     properties.extend(create_approval_parameters(
         options.exec_permission_approvals_enabled,
+        options.allow_permission_escalation,
     ));
 
     let description = if cfg!(windows) {
@@ -297,39 +300,52 @@ fn unified_exec_output_schema() -> Value {
 
 fn create_approval_parameters(
     exec_permission_approvals_enabled: bool,
+    allow_permission_escalation: bool,
 ) -> BTreeMap<String, JsonSchema> {
     let mut sandbox_permission_values = vec![json!("use_default")];
     if exec_permission_approvals_enabled {
         sandbox_permission_values.push(json!("with_additional_permissions"));
     }
-    sandbox_permission_values.push(json!("require_escalated"));
-    let sandbox_permissions_description = if exec_permission_approvals_enabled {
+    if allow_permission_escalation {
+        sandbox_permission_values.push(json!("require_escalated"));
+    }
+    let sandbox_permissions_description = if exec_permission_approvals_enabled
+        && allow_permission_escalation
+    {
         "Per-command sandbox override. Defaults to `use_default`; use `with_additional_permissions` with `additional_permissions`, or `require_escalated` for unsandboxed execution."
-    } else {
+    } else if exec_permission_approvals_enabled {
+        "Per-command sandbox override. Defaults to `use_default`; use `with_additional_permissions` with `additional_permissions`."
+    } else if allow_permission_escalation {
         "Per-command sandbox override. Defaults to `use_default`; use `require_escalated` for unsandboxed execution."
+    } else {
+        "Per-command sandbox override. Only `use_default` is available."
     };
 
-    let mut properties = BTreeMap::from([
-        (
-            "sandbox_permissions".to_string(),
-            JsonSchema::string_enum(
-                sandbox_permission_values,
-                Some(sandbox_permissions_description.to_string()),
-            ),
+    let mut properties = BTreeMap::from([(
+        "sandbox_permissions".to_string(),
+        JsonSchema::string_enum(
+            sandbox_permission_values,
+            Some(sandbox_permissions_description.to_string()),
         ),
-        (
-            "justification".to_string(),
-            JsonSchema::string(Some(
-                "User-facing approval question for `require_escalated`; omit otherwise.".to_string(),
-            )),
-        ),
-        (
-            "prefix_rule".to_string(),
-            JsonSchema::array(JsonSchema::string(/*description*/ None), Some(
-                    r#"Reusable approval prefix for `cmd`, only with `sandbox_permissions: "require_escalated"`; for example ["git", "pull"]."#.to_string(),
+    )]);
+
+    if allow_permission_escalation {
+        properties.extend([
+            (
+                "justification".to_string(),
+                JsonSchema::string(Some(
+                    "User-facing approval question for `require_escalated`; omit otherwise."
+                        .to_string(),
                 )),
-        ),
-    ]);
+            ),
+            (
+                "prefix_rule".to_string(),
+                JsonSchema::array(JsonSchema::string(/*description*/ None), Some(
+                        r#"Reusable approval prefix for `cmd`, only with `sandbox_permissions: "require_escalated"`; for example ["git", "pull"]."#.to_string(),
+                    )),
+            ),
+        ]);
+    }
 
     if exec_permission_approvals_enabled {
         let mut additional_permissions = permission_profile_schema();

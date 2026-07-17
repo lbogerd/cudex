@@ -645,6 +645,7 @@ fn add_tool_sources(context: &CoreToolPlanContext<'_>, planned_tools: &mut Plann
                 ExecCommandHandler::new(ExecCommandHandlerOptions {
                     allow_login_shell: turn_context.config.permissions.allow_login_shell,
                     exec_permission_approvals_enabled: false,
+                    allow_permission_escalation: true,
                     include_environment_id,
                     include_shell_parameter: unified_exec_should_include_shell_parameter(
                         turn_context,
@@ -718,6 +719,7 @@ fn add_shell_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut Planne
             ExecCommandHandler::new(ExecCommandHandlerOptions {
                 allow_login_shell,
                 exec_permission_approvals_enabled: false,
+                allow_permission_escalation: false,
                 include_environment_id,
                 include_shell_parameter: unified_exec_should_include_shell_parameter(
                     turn_context,
@@ -736,6 +738,7 @@ fn add_shell_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut Planne
                 ExecCommandHandler::new(ExecCommandHandlerOptions {
                     allow_login_shell,
                     exec_permission_approvals_enabled,
+                    allow_permission_escalation: true,
                     include_environment_id,
                     include_shell_parameter: unified_exec_should_include_shell_parameter(
                         turn_context,

@@ -18,6 +18,7 @@ fn exec_command_tool_matches_expected_spec() {
     let tool = create_exec_command_tool(CommandToolOptions {
         allow_login_shell: true,
         exec_permission_approvals_enabled: false,
+        allow_permission_escalation: true,
     });
 
     let description = if cfg!(windows) {
@@ -78,7 +79,7 @@ fn exec_command_tool_matches_expected_spec() {
         ),
     ]);
     properties.extend(create_approval_parameters(
-        /*exec_permission_approvals_enabled*/ false,
+        /*exec_permission_approvals_enabled*/ false, /*allow_permission_escalation*/ true,
     ));
 
     assert_eq!(
@@ -104,6 +105,7 @@ fn exec_command_tool_can_hide_shell_parameter() {
         CommandToolOptions {
             allow_login_shell: true,
             exec_permission_approvals_enabled: false,
+            allow_permission_escalation: true,
         },
         /*include_environment_id*/ false,
         /*include_shell_parameter*/ false,
@@ -207,6 +209,7 @@ fn shell_command_tool_matches_expected_spec() {
     let tool = create_shell_command_tool(CommandToolOptions {
         allow_login_shell: true,
         exec_permission_approvals_enabled: false,
+        allow_permission_escalation: true,
     });
 
     let description = if cfg!(windows) {
@@ -256,7 +259,7 @@ Examples of valid command strings:
         ),
     ]);
     properties.extend(create_approval_parameters(
-        /*exec_permission_approvals_enabled*/ false,
+        /*exec_permission_approvals_enabled*/ false, /*allow_permission_escalation*/ true,
     ));
 
     assert_eq!(
