@@ -114,6 +114,104 @@ fn developer_interrupted_marker() -> ResponseItem {
         .expect("developer interrupted marker should be enabled")
 }
 
+#[tokio::test]
+async fn hosted_root_and_spawned_threads_own_distinct_provisioned_environments() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = temp_dir.path().join("workspace").abs();
+    config.workspace_roots = vec![config.cwd.clone()];
+    config.hosted_agents = crate::config::HostedAgentsConfig {
+        enabled: true,
+        service_url: Some("https://hosted.invalid".to_string()),
+        default_agent_type: "default".to_string(),
+    };
+    config.agent_roles.insert(
+        "default".to_string(),
+        crate::config::AgentRoleConfig {
+            description: Some("Hosted test agent".to_string()),
+            sandbox_template: Some("general-v1".to_string()),
+            ..Default::default()
+        },
+    );
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+    std::fs::create_dir_all(&config.cwd).expect("create workspace");
+
+    let environment_manager = Arc::new(EnvironmentManager::without_environments());
+    let mut manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::clone(&environment_manager),
+    );
+    let provisioner = Arc::new(HostedAgentProvisioner::new(
+        Arc::new(codex_hosted_agent::FakeHostedAgentService::default()),
+        Arc::clone(&environment_manager),
+    ));
+    Arc::get_mut(&mut manager.state)
+        .expect("new thread manager state must be unshared")
+        .hosted_agent_provisioner = Ok(Some(provisioner));
+
+    let new_thread = manager
+        .start_thread(config.clone())
+        .await
+        .expect("start hosted thread");
+    let snapshot = new_thread.thread.config_snapshot().await;
+    let [selection] = snapshot.environments.environments.as_slice() else {
+        panic!("hosted thread must select exactly one environment");
+    };
+    {
+        let runtimes = manager.state.hosted_agent_runtimes.read().await;
+        let runtime = runtimes
+            .get(&new_thread.thread_id)
+            .expect("thread must own a hosted runtime");
+        assert_eq!(selection.environment_id, runtime.environment_id);
+        assert_eq!(runtime.agent_type, "default");
+        assert_eq!(runtime.sandbox_template, "general-v1");
+    }
+    assert!(environment_manager.try_local_environment().is_none());
+
+    let child_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        parent_thread_id: new_thread.thread_id,
+        depth: 1,
+        agent_path: None,
+        agent_nickname: None,
+        agent_role: Some("default".to_string()),
+    });
+    let child = manager
+        .state
+        .spawn_new_thread_with_source(
+            config,
+            manager.agent_control(),
+            child_source,
+            /*history_mode*/ None,
+            /*parent_thread_id*/ Some(new_thread.thread_id),
+            /*forked_from_thread_id*/ None,
+            /*thread_source*/ Some(ThreadSource::Subagent),
+            /*metrics_service_name*/ None,
+            /*inherited_environments*/ None,
+            /*inherited_exec_policy*/ None,
+            /*environments*/ None,
+        )
+        .await
+        .expect("start hosted child thread");
+    let child_snapshot = child.thread.config_snapshot().await;
+    let [child_selection] = child_snapshot.environments.environments.as_slice() else {
+        panic!("hosted child must select exactly one environment");
+    };
+    let runtimes = manager.state.hosted_agent_runtimes.read().await;
+    let root_runtime = runtimes
+        .get(&new_thread.thread_id)
+        .expect("root hosted runtime");
+    let child_runtime = runtimes
+        .get(&child.thread_id)
+        .expect("child hosted runtime");
+
+    assert_eq!(child_selection.environment_id, child_runtime.environment_id);
+    assert_ne!(child_runtime.lease_id, root_runtime.lease_id);
+    assert_ne!(child_runtime.environment_id, root_runtime.environment_id);
+}
+
 #[test]
 fn effective_originator_prefers_thread_scoped_sources_before_env_originator() {
     for (metrics_service_name, persisted_originator, inherited_originator, expected_originator) in [

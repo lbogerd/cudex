@@ -6,6 +6,7 @@ use async_channel::Sender;
 use codex_analytics::GuardianApprovalRequestSource;
 use codex_async_utils::OrCancelExt;
 use codex_extension_api::LoadedUserInstructions;
+use codex_protocol::ThreadId;
 use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
@@ -91,6 +92,7 @@ pub(crate) async fn run_codex_thread_interactive(
         warnings: Vec::new(),
     };
     let (session, io) = Box::pin(Session::spawn(SessionSpawnArgs {
+        thread_id: ThreadId::new(),
         config,
         allow_provider_model_fallback: false,
         user_instructions,

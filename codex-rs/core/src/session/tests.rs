@@ -5149,6 +5149,7 @@ async fn session_new_fails_when_zsh_fork_enabled_without_packaged_zsh() {
     ));
     let environment_manager = Arc::new(EnvironmentManager::default_for_tests());
     let result = Session::new(
+        ThreadId::new(),
         session_configuration,
         Arc::clone(&config),
         /*user_instructions*/ None,
@@ -5534,6 +5535,7 @@ async fn make_session_with_config_and_rx(
     let environment_manager = Arc::new(EnvironmentManager::default_for_tests());
 
     let session = Session::new(
+        ThreadId::new(),
         session_configuration,
         Arc::clone(&config),
         /*user_instructions*/ None,
@@ -5639,8 +5641,15 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
         /*bundled_skills_enabled*/ true,
     ));
     let environment_manager = Arc::new(EnvironmentManager::default_for_tests());
+    let thread_id = match &initial_history {
+        InitialHistory::Resumed(resumed) => resumed.conversation_id,
+        InitialHistory::New | InitialHistory::Cleared | InitialHistory::Forked(_) => {
+            ThreadId::new()
+        }
+    };
 
     let session = Session::new(
+        thread_id,
         session_configuration,
         Arc::clone(&config),
         /*user_instructions*/ None,

@@ -31,6 +31,7 @@ pub struct FakeHostedAgentService {
 #[derive(Default)]
 struct State {
     next_id: u64,
+    next_environment_id: Option<String>,
     provisions: HashMap<String, (AgentProvisionRequest, ProvisionedAgent)>,
     leases: HashMap<String, Lease>,
     snapshots: HashMap<String, Snapshot>,
@@ -57,6 +58,18 @@ struct Snapshot {
 }
 
 impl FakeHostedAgentService {
+    /// Overrides the environment ID returned by the next new provision request.
+    pub fn set_next_environment_id(&self, environment_id: impl Into<String>) {
+        self.lock().next_environment_id = Some(environment_id.into());
+    }
+
+    pub fn provisioned_lease_id(&self, idempotency_key: &str) -> Option<String> {
+        self.lock()
+            .provisions
+            .get(idempotency_key)
+            .map(|(_, provisioned)| provisioned.lease_id.clone())
+    }
+
     pub fn set_patch_conflict(&self, artifact_id: impl Into<String>, paths: Vec<PathUri>) {
         self.lock().conflicts.insert(artifact_id.into(), paths);
     }
@@ -163,7 +176,10 @@ impl HostedAgentService for FakeHostedAgentService {
         };
 
         let lease_id = state.id("lease");
-        let environment_id = state.id("environment");
+        let environment_id = state
+            .next_environment_id
+            .take()
+            .unwrap_or_else(|| state.id("environment"));
         let base_snapshot_id = state.id("snapshot");
         state
             .snapshots

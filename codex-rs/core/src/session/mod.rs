@@ -403,6 +403,7 @@ pub(crate) struct SessionIo {
 pub(crate) type SessionLoopTermination = Shared<BoxFuture<'static, ()>>;
 
 pub(crate) struct SessionSpawnArgs {
+    pub(crate) thread_id: ThreadId,
     pub(crate) config: Config,
     pub(crate) allow_provider_model_fallback: bool,
     pub(crate) user_instructions: LoadedUserInstructions,
@@ -495,6 +496,7 @@ impl Session {
 
     async fn spawn_internal(args: SessionSpawnArgs) -> CodexResult<(Arc<Self>, SessionIo)> {
         let SessionSpawnArgs {
+            thread_id,
             mut config,
             allow_provider_model_fallback,
             user_instructions,
@@ -674,6 +676,7 @@ impl Session {
         let (agent_status_tx, agent_status_rx) = watch::channel(AgentStatus::PendingInit);
 
         let session = Box::pin(Session::new(
+            thread_id,
             session_configuration,
             config.clone(),
             user_instructions,

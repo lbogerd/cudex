@@ -474,6 +474,7 @@ impl Session {
     #[instrument(name = "session_init", level = "info", skip_all)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn new(
+        thread_id: ThreadId,
         mut session_configuration: SessionConfiguration,
         config: Arc<Config>,
         user_instructions: Option<codex_extension_api::UserInstructions>,
@@ -534,12 +535,14 @@ impl Session {
         let multi_agent_version = multi_agent_version.map(OnceLock::from).unwrap_or_default();
         let initial_multi_agent_version = multi_agent_version.get().copied();
 
-        let thread_id = match &initial_history {
-            InitialHistory::New | InitialHistory::Cleared | InitialHistory::Forked(_) => {
-                ThreadId::default()
-            }
-            InitialHistory::Resumed(resumed_history) => resumed_history.conversation_id,
-        };
+        if let InitialHistory::Resumed(resumed_history) = &initial_history
+            && thread_id != resumed_history.conversation_id
+        {
+            anyhow::bail!(
+                "preallocated thread ID {thread_id} does not match resumed thread ID {}",
+                resumed_history.conversation_id
+            );
+        }
         let resumed_session_id = match &initial_history {
             InitialHistory::Resumed(resumed) => {
                 resumed.history.iter().find_map(|item| match item {
