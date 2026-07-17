@@ -47,6 +47,18 @@ Completed:
     stale handles, cancels in-progress authenticated recovery, and prevents
     subsequent reconnect attempts;
   - local, default, and statically configured environments fail closed.
+- Hosted thread startup slice from Stages 2 and 3:
+  - added core-owned `HostedAgentRuntime` state and a provision/register
+    transaction boundary;
+  - preallocates thread IDs before session construction so provision requests and
+    Codex sessions share the same identity;
+  - centrally provisions both roots and thread-spawned agents, using the root
+    workspace or the owner's active lease as the snapshot source;
+  - binds hosted threads to exactly the service-returned environment and drops
+    inherited environment and exec-policy state;
+  - rejects environment-ID collisions without replacing existing environments;
+  - rolls back the environment registration and lease on registration or later
+    thread-startup failure.
 - Tool-domain foundation from Stage 5:
   - added `ToolExecutionDomain` and `ToolExecutionDomainKind` independently of
     `ToolExposure`.
@@ -58,6 +70,13 @@ Validated in this branch:
 - focused hosted-agent config tests in `codex-core`: 5 passed before the final
   URL-query and blank-default validation cases were appended;
 - focused active-recovery cancellation test in `codex-exec-server`: passed;
+- hosted runtime orchestration tests in `codex-core`: 3 passed;
+- hosted root/spawned thread startup test in `codex-core`: passed;
+- thread-manager tests in `codex-core`: 29 passed;
+- focused resumed root and subagent session tests in `codex-core`: 2 passed;
+- environment-focused tests in `codex-exec-server`: 61 passed;
+- scoped `just fix -p codex-core`: passed after clearing regenerable build
+  artifacts that had exhausted the development volume;
 - `just write-config-schema`, `just bazel-lock-update`, the hosted-agent Bazel
   target query, and final `just fmt`: passed.
 
@@ -68,9 +87,9 @@ container.
 
 Still pending:
 
-- the remainder of Stage 2: `HostedAgentRuntime`, per-thread ownership, and
-  provision/register/startup rollback integration;
-- Stage 3 uniform root and spawned-agent creation;
+- the remainder of Stage 2: durable ownership metadata and release integration;
+- the remainder of Stage 3: remove legacy spawn inheritance/override plumbing
+  and expose root `agentType` selection;
 - Stage 4 external-sandbox runtime enforcement;
 - the remainder of Stage 5: model-spec filtering and dispatch-time policy
   enforcement;
