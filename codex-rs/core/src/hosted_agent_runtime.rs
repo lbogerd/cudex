@@ -12,6 +12,8 @@ use codex_hosted_agent::HostedAgentError;
 use codex_hosted_agent::HostedAgentService;
 use codex_hosted_agent::ProvisionedAgent;
 use codex_protocol::protocol::TurnEnvironmentSelection;
+use codex_tools::ToolExecutionDomain;
+use codex_tools::ToolName;
 use thiserror::Error;
 
 const HOSTED_ENVIRONMENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -26,6 +28,40 @@ pub(crate) struct HostedAgentRuntime {
     pub(crate) base_snapshot_id: String,
     pub(crate) latest_snapshot_id: String,
     pub(crate) tool_policy: AgentToolPolicy,
+}
+
+/// Immutable tool authorization returned with a hosted thread's lease.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HostedToolAuthorization {
+    environment_id: String,
+    policy: AgentToolPolicy,
+}
+
+impl HostedToolAuthorization {
+    pub(crate) fn new(environment_id: String, policy: AgentToolPolicy) -> Self {
+        Self {
+            environment_id,
+            policy,
+        }
+    }
+
+    pub(crate) fn allows(&self, tool_name: &ToolName, domain: &ToolExecutionDomain) -> bool {
+        let environment_matches = match domain {
+            ToolExecutionDomain::EnvironmentBoundMcp { environment_id, .. } => {
+                environment_id == &self.environment_id
+            }
+            ToolExecutionDomain::AmbientMcp { .. } => false,
+            ToolExecutionDomain::AgentEnvironment
+            | ToolExecutionDomain::ControlPlane
+            | ToolExecutionDomain::ProviderHosted
+            | ToolExecutionDomain::ClientCallback
+            | ToolExecutionDomain::Extension
+            | ToolExecutionDomain::OrchestratorProcess => true,
+        };
+        environment_matches
+            && self.policy.allowed_domains.contains(&domain.kind())
+            && self.policy.allowed_tools.contains(tool_name)
+    }
 }
 
 type HostedServiceFuture<'a, T> =
@@ -172,6 +208,13 @@ pub(crate) struct PendingHostedAgentRuntime {
 impl PendingHostedAgentRuntime {
     pub(crate) fn environment_selection(&self) -> &TurnEnvironmentSelection {
         &self.environment_selection
+    }
+
+    pub(crate) fn tool_authorization(&self) -> HostedToolAuthorization {
+        HostedToolAuthorization::new(
+            self.runtime.environment_id.clone(),
+            self.runtime.tool_policy.clone(),
+        )
     }
 
     pub(crate) fn commit(self) -> HostedAgentRuntime {

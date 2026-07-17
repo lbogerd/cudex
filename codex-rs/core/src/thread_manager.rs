@@ -1861,6 +1861,9 @@ impl ThreadManagerState {
                 ),
                 None => (environments, inherited_environments, inherited_exec_policy),
             };
+        let hosted_tool_authorization = pending_hosted_runtime
+            .as_ref()
+            .map(PendingHostedAgentRuntime::tool_authorization);
         let session_result = Box::pin(Session::spawn(SessionSpawnArgs {
             thread_id,
             config,
@@ -1884,6 +1887,7 @@ impl ThreadManagerState {
             originator,
             agent_control,
             dynamic_tools,
+            hosted_tool_authorization,
             metrics_service_name,
             inherited_environments,
             inherited_exec_policy,

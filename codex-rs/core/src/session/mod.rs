@@ -425,6 +425,8 @@ pub(crate) struct SessionSpawnArgs {
     pub(crate) originator: String,
     pub(crate) agent_control: AgentControl,
     pub(crate) dynamic_tools: Vec<DynamicToolSpec>,
+    pub(crate) hosted_tool_authorization:
+        Option<crate::hosted_agent_runtime::HostedToolAuthorization>,
     pub(crate) metrics_service_name: Option<String>,
     pub(crate) inherited_exec_policy: Option<Arc<ExecPolicyManager>>,
     pub(crate) inherited_environments: Option<TurnEnvironmentSnapshot>,
@@ -518,6 +520,7 @@ impl Session {
             originator,
             agent_control,
             dynamic_tools,
+            hosted_tool_authorization,
             metrics_service_name,
             user_shell_override,
             inherited_exec_policy,
@@ -668,6 +671,7 @@ impl Session {
             thread_source,
             originator,
             dynamic_tools,
+            hosted_tool_authorization,
             user_shell_override,
         };
 

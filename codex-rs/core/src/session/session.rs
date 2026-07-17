@@ -4,6 +4,7 @@ use crate::agents_md_manager::AgentsMdManager;
 use crate::config::ConstraintError;
 use crate::environment_selection::ThreadEnvironments;
 use crate::environment_selection::TurnEnvironmentSnapshot;
+use crate::hosted_agent_runtime::HostedToolAuthorization;
 use crate::shell_snapshot::ShellSnapshot;
 use crate::skills::SkillError;
 use crate::state::ActiveTurn;
@@ -104,6 +105,7 @@ pub(crate) struct SessionConfiguration {
     /// Effective originator used for this thread's Responses requests and analytics events.
     pub(super) originator: String,
     pub(super) dynamic_tools: Vec<DynamicToolSpec>,
+    pub(super) hosted_tool_authorization: Option<HostedToolAuthorization>,
     pub(super) user_shell_override: Option<shell::Shell>,
 }
 
