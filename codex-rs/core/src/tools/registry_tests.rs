@@ -180,6 +180,47 @@ fn handler_looks_up_namespaced_aliases_explicitly() {
 }
 
 #[tokio::test]
+async fn hosted_policy_rechecks_authorization_before_dispatch() {
+    let (session, mut turn) = crate::session::tests::make_session_and_context().await;
+    let tool_name = codex_tools::ToolName::plain("forged_tool");
+    turn.hosted_tool_authorization =
+        Some(crate::hosted_agent_runtime::HostedToolAuthorization::new(
+            "hosted-environment".to_string(),
+            codex_hosted_agent::AgentToolPolicy {
+                allowed_domains: [codex_tools::ToolExecutionDomainKind::ControlPlane]
+                    .into_iter()
+                    .collect(),
+                allowed_tools: Default::default(),
+            },
+        ));
+    let handler: Arc<dyn CoreToolRuntime> = Arc::new(TestHandler {
+        tool_name: tool_name.clone(),
+    });
+    let handler =
+        override_tool_execution_domain(handler, codex_tools::ToolExecutionDomain::ControlPlane);
+    let registry = ToolRegistry::from_tools([handler]);
+    let invocation = test_invocation(
+        Arc::new(session),
+        Arc::new(turn),
+        "call-forged",
+        tool_name.clone(),
+    );
+
+    let err = registry
+        .dispatch_any_with_terminal_outcome(invocation, None)
+        .await
+        .err()
+        .expect("forged call should be rejected before its handler runs");
+
+    assert_eq!(
+        err,
+        FunctionCallError::RespondToModel(format!(
+            "tool {tool_name} is not authorized for this hosted agent (ControlPlane)"
+        ))
+    );
+}
+
+#[tokio::test]
 async fn function_tools_expose_default_hook_payloads_and_rewrites() -> anyhow::Result<()> {
     let (session, turn) = crate::session::tests::make_session_and_context().await;
     let tool_name = codex_tools::ToolName::namespaced("functions.", "echo");

@@ -32,6 +32,7 @@ use codex_protocol::parse_command::ParsedCommand;
 use codex_protocol::protocol::EventMsg;
 use codex_rollout::state_db;
 use codex_shell_command::parse_command::parse_shell_script;
+use codex_tools::ToolExecutionDomain;
 use codex_tools::ToolName;
 use codex_tools::ToolSearchInfo;
 use codex_tools::ToolSpec;
@@ -49,6 +50,10 @@ pub use codex_tools::ToolExposure;
 /// Implementers provide the shared `ToolExecutor` behavior plus optional
 /// core-owned metadata for hooks, telemetry, tool search, and argument diffs.
 pub(crate) trait CoreToolRuntime: ToolExecutor<ToolInvocation> {
+    fn execution_domain(&self) -> ToolExecutionDomain {
+        ToolExecutionDomain::OrchestratorProcess
+    }
+
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(
             payload,
@@ -249,6 +254,93 @@ pub(crate) fn override_tool_exposure(
     Arc::new(ExposureOverride { handler, exposure })
 }
 
+pub(crate) fn override_tool_execution_domain(
+    handler: Arc<dyn CoreToolRuntime>,
+    execution_domain: ToolExecutionDomain,
+) -> Arc<dyn CoreToolRuntime> {
+    Arc::new(ExecutionDomainOverride {
+        handler,
+        execution_domain,
+    })
+}
+
+struct ExecutionDomainOverride {
+    handler: Arc<dyn CoreToolRuntime>,
+    execution_domain: ToolExecutionDomain,
+}
+
+impl ToolExecutor<ToolInvocation> for ExecutionDomainOverride {
+    fn tool_name(&self) -> ToolName {
+        self.handler.tool_name()
+    }
+
+    fn spec(&self) -> ToolSpec {
+        self.handler.spec()
+    }
+
+    fn exposure(&self) -> ToolExposure {
+        self.handler.exposure()
+    }
+
+    fn supports_parallel_tool_calls(&self) -> bool {
+        self.handler.supports_parallel_tool_calls()
+    }
+
+    fn search_info(&self) -> Option<ToolSearchInfo> {
+        self.handler.search_info()
+    }
+
+    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+        self.handler.handle(invocation)
+    }
+}
+
+impl CoreToolRuntime for ExecutionDomainOverride {
+    fn execution_domain(&self) -> ToolExecutionDomain {
+        self.execution_domain.clone()
+    }
+
+    fn matches_kind(&self, payload: &ToolPayload) -> bool {
+        self.handler.matches_kind(payload)
+    }
+
+    fn waits_for_runtime_cancellation(&self) -> bool {
+        self.handler.waits_for_runtime_cancellation()
+    }
+
+    fn pre_tool_use_payload(&self, invocation: &ToolInvocation) -> Option<PreToolUsePayload> {
+        self.handler.pre_tool_use_payload(invocation)
+    }
+
+    fn post_tool_use_payload(
+        &self,
+        invocation: &ToolInvocation,
+        result: &dyn ToolOutput,
+    ) -> Option<PostToolUsePayload> {
+        self.handler.post_tool_use_payload(invocation, result)
+    }
+
+    fn with_updated_hook_input(
+        &self,
+        invocation: ToolInvocation,
+        updated_input: Value,
+    ) -> Result<ToolInvocation, FunctionCallError> {
+        self.handler
+            .with_updated_hook_input(invocation, updated_input)
+    }
+
+    fn telemetry_tags<'a>(
+        &'a self,
+        invocation: &'a ToolInvocation,
+    ) -> BoxFuture<'a, ToolTelemetryTags> {
+        self.handler.telemetry_tags(invocation)
+    }
+
+    fn create_diff_consumer(&self) -> Option<Box<dyn ToolArgumentDiffConsumer>> {
+        self.handler.create_diff_consumer()
+    }
+}
+
 struct ExposureOverride {
     handler: Arc<dyn CoreToolRuntime>,
     exposure: ToolExposure,
@@ -281,6 +373,10 @@ impl ToolExecutor<ToolInvocation> for ExposureOverride {
 }
 
 impl CoreToolRuntime for ExposureOverride {
+    fn execution_domain(&self) -> ToolExecutionDomain {
+        self.handler.execution_domain()
+    }
+
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         self.handler.matches_kind(payload)
     }
@@ -453,6 +549,33 @@ impl ToolRegistry {
                 return Err(err);
             }
         };
+
+        let execution_domain = tool.execution_domain();
+        if invocation
+            .turn
+            .hosted_tool_authorization
+            .as_ref()
+            .is_some_and(|authorization| !authorization.allows(&tool_name, &execution_domain))
+        {
+            let domain_kind = execution_domain.kind();
+            let message = format!(
+                "tool {tool_name} is not authorized for this hosted agent ({domain_kind:?})"
+            );
+            let log_payload = invocation.payload.log_payload();
+            otel.tool_result_with_tags(
+                tool_name_flat.as_ref(),
+                &call_id_owned,
+                log_payload.as_ref(),
+                Duration::ZERO,
+                /*success*/ false,
+                &message,
+                &base_tool_result_tags,
+                /*extra_trace_fields*/ &[],
+            );
+            let err = FunctionCallError::RespondToModel(message);
+            dispatch_trace.record_failed(&err);
+            return Err(err);
+        }
 
         let telemetry_tags = tool.telemetry_tags(&invocation).await;
         let mut tool_result_tags =
