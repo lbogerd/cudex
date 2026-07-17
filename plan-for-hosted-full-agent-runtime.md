@@ -71,6 +71,15 @@ Completed:
 - Tool-domain foundation from Stage 5:
   - added `ToolExecutionDomain` and `ToolExecutionDomainKind` independently of
     `ToolExposure`.
+- Tool-domain authorization from Stage 5:
+  - carries the service-returned policy and exact environment binding as
+    immutable thread/turn runtime state;
+  - classifies all planned runtime and hosted tools independently of exposure,
+    filters unauthorized model specifications, and rechecks policy at dispatch;
+  - rejects ambient and mismatched-environment MCP tools even if their coarse
+    domain and exact tool name are granted;
+  - completely unregisters legacy shell, code mode, and permission escalation
+    tools for hosted threads while preserving existing non-hosted registries.
 
 Validated in this branch:
 
@@ -88,6 +97,7 @@ Validated in this branch:
   approval/network, missing test-binary, and timing-sensitive integration tests,
   while the hosted lifecycle and thread-manager coverage passed;
 - focused resumed root and subagent session tests in `codex-core`: 2 passed;
+- surrounding tool-spec, registry, and MCP exposure suites: 44 passed;
 - environment-focused tests in `codex-exec-server`: 61 passed;
 - scoped `just fix -p codex-core`: passed after clearing regenerable build
   artifacts that had exhausted the development volume;
@@ -104,13 +114,8 @@ Still pending:
 - the remainder of Stage 3: remove legacy spawn inheritance/override plumbing
   and expose root `agentType` selection;
 - Stage 4 external-sandbox runtime enforcement;
-- the remainder of Stage 5: model-spec filtering and dispatch-time policy
-  enforcement;
 - Stages 6–8: persistence/restore, completion and explicit patch acceptance,
   lifecycle finalization, telemetry, app-server APIs, and end-to-end coverage.
-
-None of the success criteria below that depend on hosted thread orchestration
-should be considered complete yet.
 
 ## Success Criteria
 
