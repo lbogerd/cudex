@@ -80,6 +80,16 @@ Completed:
     domain and exact tool name are granted;
   - completely unregisters legacy shell, code mode, and permission escalation
     tools for hosted threads while preserving existing non-hosted registries.
+- External-sandbox enforcement from Stage 4:
+  - centrally forces every hosted root and spawned thread to use an external
+    sandbox with unrestricted network access and approval policy `Never`;
+  - replaces configured permission-profile constraints with trusted hosted
+    runtime permissions and disables the Codex-managed network proxy before
+    session construction;
+  - keeps the provisioned environment, external-sandbox profile, and approval
+    policy immutable across later thread-setting and turn-setting updates;
+  - retains the existing hosted tool-plan behavior that omits permission
+    requests, legacy shell, code mode, and exec-permission escalation.
 
 Validated in this branch:
 
@@ -98,6 +108,10 @@ Validated in this branch:
   while the hosted lifecycle and thread-manager coverage passed;
 - focused resumed root and subagent session tests in `codex-core`: 2 passed;
 - surrounding tool-spec, registry, and MCP exposure suites: 44 passed;
+- hosted external-sandbox root/child coverage: passed;
+- thread-manager tests after external-sandbox enforcement: 30 passed;
+- combined hosted tool-plan, unified-exec, shell-spec, and thread-manager
+  coverage after removing hosted escalation arguments: 79 passed;
 - environment-focused tests in `codex-exec-server`: 61 passed;
 - scoped `just fix -p codex-core`: passed after clearing regenerable build
   artifacts that had exhausted the development volume;
@@ -113,7 +127,9 @@ Still pending:
 
 - the remainder of Stage 3: remove legacy spawn inheritance/override plumbing
   and expose root `agentType` selection;
-- Stage 4 external-sandbox runtime enforcement;
+- the remainder of Stage 4: normalize service-denial diagnostics as explicit
+  external-sandbox denials and finish the audit of non-collaboration internal
+  thread-creation paths;
 - Stages 6–8: persistence/restore, completion and explicit patch acceptance,
   lifecycle finalization, telemetry, app-server APIs, and end-to-end coverage.
 
