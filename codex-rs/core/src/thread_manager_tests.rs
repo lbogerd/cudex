@@ -116,6 +116,23 @@ fn developer_interrupted_marker() -> ResponseItem {
         .expect("developer interrupted marker should be enabled")
 }
 
+fn start_thread_options(config: Config) -> StartThreadOptions {
+    StartThreadOptions {
+        config,
+        allow_provider_model_fallback: false,
+        initial_history: InitialHistory::New,
+        history_mode: None,
+        session_source: None,
+        thread_source: None,
+        dynamic_tools: Vec::new(),
+        metrics_service_name: None,
+        parent_trace: None,
+        environments: Vec::new(),
+        thread_extension_init: ExtensionDataInit::default(),
+        supports_openai_form_elicitation: false,
+    }
+}
+
 #[tokio::test]
 async fn hosted_root_and_spawned_threads_own_distinct_provisioned_environments() {
     let temp_dir = tempdir().expect("tempdir");
@@ -154,6 +171,14 @@ async fn hosted_root_and_spawned_threads_own_distinct_provisioned_environments()
             ..Default::default()
         },
     );
+    config.agent_roles.insert(
+        "researcher".to_string(),
+        crate::config::AgentRoleConfig {
+            description: Some("Hosted research agent".to_string()),
+            sandbox_template: Some("research-v1".to_string()),
+            ..Default::default()
+        },
+    );
     std::fs::create_dir_all(&config.codex_home).expect("create codex home");
     std::fs::create_dir_all(&config.cwd).expect("create workspace");
 
@@ -173,8 +198,39 @@ async fn hosted_root_and_spawned_threads_own_distinct_provisioned_environments()
         .expect("new thread manager state must be unshared")
         .hosted_agent_provisioner = Ok(Some(provisioner));
 
+    let blank_agent_type_error = manager
+        .start_thread_with_options_and_agent_type(
+            start_thread_options(config.clone()),
+            "  ".to_string(),
+        )
+        .await
+        .err()
+        .expect("blank root agent type must fail");
+    assert_eq!(
+        blank_agent_type_error.to_string(),
+        "agentType must not be blank"
+    );
+
+    let mut non_hosted_config = config.clone();
+    non_hosted_config.hosted_agents.enabled = false;
+    let non_hosted_agent_type_error = manager
+        .start_thread_with_options_and_agent_type(
+            start_thread_options(non_hosted_config),
+            "researcher".to_string(),
+        )
+        .await
+        .err()
+        .expect("non-hosted root agent type must fail");
+    assert_eq!(
+        non_hosted_agent_type_error.to_string(),
+        "agentType requires hosted agents to be enabled"
+    );
+
     let new_thread = manager
-        .start_thread(config.clone())
+        .start_thread_with_options_and_agent_type(
+            start_thread_options(config.clone()),
+            " researcher ".to_string(),
+        )
         .await
         .expect("start hosted thread");
     let snapshot = new_thread.thread.config_snapshot().await;
@@ -288,8 +344,8 @@ async fn hosted_root_and_spawned_threads_own_distinct_provisioned_environments()
             .get(&new_thread.thread_id)
             .expect("thread must own a hosted runtime");
         assert_eq!(selection.environment_id, runtime.environment_id);
-        assert_eq!(runtime.agent_type, "default");
-        assert_eq!(runtime.sandbox_template, "general-v1");
+        assert_eq!(runtime.agent_type, "researcher");
+        assert_eq!(runtime.sandbox_template, "research-v1");
     }
     assert!(environment_manager.try_local_environment().is_none());
 
@@ -300,6 +356,15 @@ async fn hosted_root_and_spawned_threads_own_distinct_provisioned_environments()
         agent_nickname: None,
         agent_role: Some("default".to_string()),
     });
+    let inherited_environments = new_thread
+        .thread
+        .session
+        .services
+        .turn_environments
+        .snapshot()
+        .await;
+    let inherited_exec_policy = Arc::clone(&new_thread.thread.session.services.exec_policy);
+    let inherited_environment_selections = inherited_environments.to_selections();
     let child = manager
         .state
         .spawn_new_thread_with_source(
@@ -311,9 +376,9 @@ async fn hosted_root_and_spawned_threads_own_distinct_provisioned_environments()
             /*forked_from_thread_id*/ None,
             /*thread_source*/ Some(ThreadSource::Subagent),
             /*metrics_service_name*/ None,
-            /*inherited_environments*/ None,
-            /*inherited_exec_policy*/ None,
-            /*environments*/ None,
+            /*inherited_environments*/ Some(inherited_environments),
+            /*inherited_exec_policy*/ Some(Arc::clone(&inherited_exec_policy)),
+            /*environments*/ Some(inherited_environment_selections),
         )
         .await
         .expect("start hosted child thread");
@@ -327,6 +392,10 @@ async fn hosted_root_and_spawned_threads_own_distinct_provisioned_environments()
     );
     assert_eq!(child_snapshot.active_permission_profile, None);
     assert!(child.thread.config().await.permissions.network.is_none());
+    assert!(!Arc::ptr_eq(
+        &child.thread.session.services.exec_policy,
+        &inherited_exec_policy
+    ));
     let [child_selection] = child_snapshot.environments.environments.as_slice() else {
         panic!("hosted child must select exactly one environment");
     };

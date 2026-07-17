@@ -750,14 +750,31 @@ impl ThreadManager {
         &self,
         options: StartThreadOptions,
     ) -> CodexResult<NewThread> {
-        self.start_thread_with_options_and_fork_source(options, /*forked_from_thread_id*/ None)
-            .await
+        self.start_thread_with_options_and_fork_source(
+            options, /*forked_from_thread_id*/ None, /*agent_type*/ None,
+        )
+        .await
+    }
+
+    /// Starts a root thread with an explicit hosted agent role selection.
+    pub async fn start_thread_with_options_and_agent_type(
+        &self,
+        options: StartThreadOptions,
+        agent_type: String,
+    ) -> CodexResult<NewThread> {
+        self.start_thread_with_options_and_fork_source(
+            options,
+            /*forked_from_thread_id*/ None,
+            Some(agent_type),
+        )
+        .await
     }
 
     async fn start_thread_with_options_and_fork_source(
         &self,
         options: StartThreadOptions,
         forked_from_thread_id: Option<ThreadId>,
+        agent_type: Option<String>,
     ) -> CodexResult<NewThread> {
         let agent_control = self.agent_control_for_config(&options.config);
         let (resumed_session_source, resumed_thread_source) = options
@@ -774,6 +791,7 @@ impl ThreadManager {
             Arc::clone(&self.state.auth_manager),
             agent_control,
             session_source,
+            agent_type,
             /*parent_thread_id*/ None,
             forked_from_thread_id,
             thread_source,
@@ -823,8 +841,12 @@ impl ThreadManager {
                 inherited_multi_agent_version,
             ),
         );
-        self.start_thread_with_options_and_fork_source(options, Some(forked_from_thread_id))
-            .await
+        self.start_thread_with_options_and_fork_source(
+            options,
+            Some(forked_from_thread_id),
+            /*agent_type*/ None,
+        )
+        .await
     }
 
     pub async fn resume_thread_from_rollout(
@@ -880,6 +902,7 @@ impl ThreadManager {
             auth_manager,
             agent_control,
             session_source,
+            /*agent_type*/ None,
             /*parent_thread_id*/ None,
             /*forked_from_thread_id*/ None,
             thread_source,
@@ -953,6 +976,7 @@ impl ThreadManager {
             auth_manager,
             agent_control,
             session_source,
+            /*agent_type*/ None,
             /*parent_thread_id*/ None,
             /*forked_from_thread_id*/ None,
             thread_source,
@@ -1180,9 +1204,27 @@ impl ThreadManagerState {
         config: &Config,
         initial_history: &InitialHistory,
         session_source: &SessionSource,
+        requested_agent_type: Option<String>,
         parent_thread_id: Option<ThreadId>,
     ) -> CodexResult<Option<PendingHostedAgentRuntime>> {
+        let requested_agent_type = match requested_agent_type {
+            Some(agent_type) => {
+                let agent_type = agent_type.trim();
+                if agent_type.is_empty() {
+                    return Err(CodexErr::InvalidRequest(
+                        "agentType must not be blank".to_string(),
+                    ));
+                }
+                Some(agent_type.to_string())
+            }
+            None => None,
+        };
         if !config.hosted_agents.enabled {
+            if requested_agent_type.is_some() {
+                return Err(CodexErr::InvalidRequest(
+                    "agentType requires hosted agents to be enabled".to_string(),
+                ));
+            }
             return Ok(None);
         }
         if matches!(initial_history, InitialHistory::Resumed(_)) {
@@ -1203,8 +1245,8 @@ impl ThreadManagerState {
                 )));
             }
         };
-        let agent_type = session_source
-            .get_agent_role()
+        let agent_type = requested_agent_type
+            .or_else(|| session_source.get_agent_role())
             .unwrap_or_else(|| config.hosted_agents.default_agent_type.clone());
         let sandbox_template = config
             .agent_roles
@@ -1629,6 +1671,7 @@ impl ThreadManagerState {
             Arc::clone(&self.auth_manager),
             agent_control,
             session_source,
+            /*agent_type*/ None,
             parent_thread_id,
             forked_from_thread_id,
             thread_source,
@@ -1672,6 +1715,7 @@ impl ThreadManagerState {
             Arc::clone(&self.auth_manager),
             agent_control,
             session_source,
+            /*agent_type*/ None,
             parent_thread_id,
             /*forked_from_thread_id*/ None,
             thread_source,
@@ -1719,6 +1763,7 @@ impl ThreadManagerState {
             Arc::clone(&self.auth_manager),
             agent_control,
             session_source,
+            /*agent_type*/ None,
             parent_thread_id,
             forked_from_thread_id,
             thread_source,
@@ -1762,6 +1807,7 @@ impl ThreadManagerState {
             auth_manager,
             agent_control,
             self.session_source.clone(),
+            /*agent_type*/ None,
             parent_thread_id,
             forked_from_thread_id,
             thread_source,
@@ -1788,6 +1834,7 @@ impl ThreadManagerState {
         auth_manager: Arc<AuthManager>,
         agent_control: AgentControl,
         session_source: SessionSource,
+        agent_type: Option<String>,
         parent_thread_id: Option<ThreadId>,
         forked_from_thread_id: Option<ThreadId>,
         thread_source: Option<ThreadSource>,
@@ -1870,6 +1917,7 @@ impl ThreadManagerState {
                 &config,
                 &initial_history,
                 &session_source,
+                agent_type,
                 parent_thread_id,
             )
             .await?;

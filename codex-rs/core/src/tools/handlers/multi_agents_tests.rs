@@ -4490,6 +4490,49 @@ async fn build_agent_spawn_config_uses_turn_context_values() {
 }
 
 #[tokio::test]
+async fn build_hosted_agent_spawn_config_does_not_inherit_turn_runtime_values() {
+    let (_session, mut turn) = make_session_and_context().await;
+    let base_instructions = BaseInstructions {
+        text: "base".to_string(),
+    };
+    let mut base_config = (*turn.config).clone();
+    base_config.hosted_agents.enabled = true;
+    let configured_cwd = base_config.cwd.clone();
+    let configured_approval_policy = base_config.permissions.approval_policy.value();
+    let configured_permission_profile = base_config.permissions.permission_profile().clone();
+    turn.config = Arc::new(base_config);
+
+    let turn_cwd = tempfile::tempdir().expect("turn cwd").abs();
+    #[allow(deprecated)]
+    {
+        turn.cwd = turn_cwd;
+    }
+    let turn_approval_policy = if configured_approval_policy == AskForApproval::Never {
+        AskForApproval::OnRequest
+    } else {
+        AskForApproval::Never
+    };
+    turn.approval_policy
+        .set(turn_approval_policy)
+        .expect("approval policy set");
+    turn.permission_profile = PermissionProfile::Disabled;
+    assert_ne!(turn.approval_policy.value(), configured_approval_policy);
+    assert_ne!(turn.permission_profile(), configured_permission_profile);
+
+    let config = build_agent_spawn_config(&base_instructions, &turn).expect("spawn config");
+
+    assert_eq!(config.cwd, configured_cwd);
+    assert_eq!(
+        config.permissions.approval_policy.value(),
+        configured_approval_policy
+    );
+    assert_eq!(
+        config.permissions.permission_profile(),
+        &configured_permission_profile
+    );
+}
+
+#[tokio::test]
 async fn build_agent_resume_config_clears_base_instructions() {
     let (_session, mut turn) = make_session_and_context().await;
     let mut base_config = (*turn.config).clone();
