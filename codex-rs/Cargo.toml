@@ -41,6 +41,7 @@ members = [
     "core-plugins",
     "core-skills",
     "hooks",
+    "hosted-agent",
     "http-client",
     "secrets",
     "exec",
@@ -195,6 +196,7 @@ codex-file-search = { path = "file-search" }
 codex-file-watcher = { path = "file-watcher" }
 codex-git-utils = { path = "git-utils" }
 codex-hooks = { path = "hooks" }
+codex-hosted-agent = { path = "hosted-agent" }
 codex-keyring-store = { path = "keyring-store" }
 codex-linux-sandbox = { path = "linux-sandbox" }
 codex-lmstudio = { path = "lmstudio" }

@@ -4838,6 +4838,7 @@ enabled = false
             description: None,
             config_file: Some(role_path.to_path_buf()),
             nickname_candidates: None,
+            sandbox_template: None,
         },
     );
     crate::agent::role::apply_role_to_config(&mut child_config, Some("custom"))

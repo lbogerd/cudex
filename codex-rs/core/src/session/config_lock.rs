@@ -1,6 +1,7 @@
 use anyhow::Context;
 use codex_config::config_toml::ConfigLockfileToml;
 use codex_config::config_toml::ConfigToml;
+use codex_config::config_toml::HostedAgentsToml;
 use codex_config::config_toml::OrchestratorFeatureToml;
 use codex_config::config_toml::OrchestratorToml;
 use codex_config::types::MemoriesToml;
@@ -185,6 +186,12 @@ fn save_config_resolved_fields(
         config.agent_default_subagent_reasoning_effort.clone();
     agents.job_max_runtime_seconds = config.agent_job_max_runtime_seconds;
     agents.interrupt_message = Some(config.agent_interrupt_message_enabled);
+
+    lock_config.hosted_agents = config.hosted_agents.enabled.then(|| HostedAgentsToml {
+        enabled: Some(true),
+        service_url: config.hosted_agents.service_url.clone(),
+        default_agent_type: Some(config.hosted_agents.default_agent_type.clone()),
+    });
 
     lock_config
         .skills

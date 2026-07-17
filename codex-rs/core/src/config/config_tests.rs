@@ -7404,6 +7404,7 @@ async fn load_config_rejects_missing_agent_role_config_file() -> std::io::Result
                     description: Some("Research role".to_string()),
                     config_file: Some(missing_path.abs()),
                     nickname_candidates: None,
+                    sandbox_template: None,
                 },
             )]),
         }),
@@ -7422,6 +7423,170 @@ async fn load_config_rejects_missing_agent_role_config_file() -> std::io::Result
     assert!(message.contains("agents.researcher.config_file"));
     assert!(message.contains("must point to an existing file"));
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn hosted_agents_are_disabled_by_default() -> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+    let config = Config::load_from_base_config_with_overrides(
+        ConfigToml::default(),
+        ConfigOverrides::default(),
+        codex_home.abs(),
+    )
+    .await?;
+
+    assert_eq!(config.hosted_agents, HostedAgentsConfig::default());
+    Ok(())
+}
+
+#[tokio::test]
+async fn hosted_agents_require_feature_and_runtime_gates() -> std::io::Result<()> {
+    for config_toml in [
+        r#"
+[features]
+hosted_agents = true
+"#,
+        r#"
+[hosted_agents]
+enabled = true
+"#,
+    ] {
+        let codex_home = TempDir::new()?;
+        let config = Config::load_from_base_config_with_overrides(
+            toml::from_str(config_toml).expect("hosted config should deserialize"),
+            ConfigOverrides::default(),
+            codex_home.abs(),
+        )
+        .await?;
+
+        assert!(!config.hosted_agents.enabled);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn load_config_resolves_hosted_agents_and_sandbox_templates() -> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+    let config = Config::load_from_base_config_with_overrides(
+        toml::from_str(
+            r#"
+[features]
+hosted_agents = true
+
+[hosted_agents]
+enabled = true
+service_url = " https://sandbox-service.example/v1 "
+default_agent_type = " researcher "
+
+[agents.researcher]
+description = "Research role"
+sandbox_template = " research-v1 "
+"#,
+        )
+        .expect("hosted config should deserialize"),
+        ConfigOverrides::default(),
+        codex_home.abs(),
+    )
+    .await?;
+
+    assert_eq!(
+        config.hosted_agents,
+        HostedAgentsConfig {
+            enabled: true,
+            service_url: Some("https://sandbox-service.example/v1".to_string()),
+            default_agent_type: "researcher".to_string(),
+        }
+    );
+    assert_eq!(
+        config
+            .agent_roles
+            .get("researcher")
+            .and_then(|role| role.sandbox_template.as_deref()),
+        Some("research-v1")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn enabled_hosted_agents_require_templates_for_configured_roles() -> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+    let error = Config::load_from_base_config_with_overrides(
+        toml::from_str(
+            r#"
+[features]
+hosted_agents = true
+
+[hosted_agents]
+enabled = true
+service_url = "https://sandbox-service.example"
+default_agent_type = "researcher"
+
+[agents.researcher]
+description = "Research role"
+"#,
+        )
+        .expect("hosted config should deserialize"),
+        ConfigOverrides::default(),
+        codex_home.abs(),
+    )
+    .await
+    .expect_err("hosted roles without a template should be rejected");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(error.to_string().contains(
+        "agent role `researcher` must define sandbox_template when hosted agents are enabled"
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn hosted_agent_service_url_rejects_unsafe_urls() -> std::io::Result<()> {
+    for (service_url, expected_message) in [
+        (
+            "http://sandbox-service.example",
+            "must be an absolute https URL",
+        ),
+        ("http:foo", "must be an absolute https URL"),
+        (
+            "https://token@sandbox-service.example",
+            "must not contain credentials",
+        ),
+        (
+            "https://sandbox-service.example/#token",
+            "must not contain a fragment",
+        ),
+        (
+            "https://sandbox-service.example/?region=west",
+            "must not contain a query string",
+        ),
+    ] {
+        let codex_home = TempDir::new()?;
+        let config_toml = format!(
+            r#"
+[features]
+hosted_agents = true
+
+[hosted_agents]
+enabled = true
+service_url = {service_url:?}
+
+[agents.default]
+description = "Default role"
+sandbox_template = "general-v1"
+"#
+        );
+        let error = Config::load_from_base_config_with_overrides(
+            toml::from_str(&config_toml).expect("hosted config should deserialize"),
+            ConfigOverrides::default(),
+            codex_home.abs(),
+        )
+        .await
+        .expect_err("unsafe service URL should be rejected");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains(expected_message));
+    }
     Ok(())
 }
 
@@ -8398,6 +8563,7 @@ async fn load_config_normalizes_agent_role_nickname_candidates() -> std::io::Res
                         "  Hypatia  ".to_string(),
                         "Noether".to_string(),
                     ]),
+                    sandbox_template: None,
                 },
             )]),
         }),
@@ -8441,6 +8607,7 @@ async fn load_config_rejects_empty_agent_role_nickname_candidates() -> std::io::
                     description: Some("Research role".to_string()),
                     config_file: None,
                     nickname_candidates: Some(Vec::new()),
+                    sandbox_template: None,
                 },
             )]),
         }),
@@ -8481,6 +8648,7 @@ async fn load_config_rejects_duplicate_agent_role_nickname_candidates() -> std::
                     description: Some("Research role".to_string()),
                     config_file: None,
                     nickname_candidates: Some(vec!["Hypatia".to_string(), " Hypatia ".to_string()]),
+                    sandbox_template: None,
                 },
             )]),
         }),
@@ -8521,6 +8689,7 @@ async fn load_config_rejects_unsafe_agent_role_nickname_candidates() -> std::io:
                     description: Some("Research role".to_string()),
                     config_file: None,
                     nickname_candidates: Some(vec!["Agent <One>".to_string()]),
+                    sandbox_template: None,
                 },
             )]),
         }),

@@ -150,6 +150,8 @@ pub enum Feature {
     Collab,
     /// Enable task-path-based multi-agent routing.
     MultiAgentV2,
+    /// Provision full agents through the experimental hosted-agent runtime.
+    HostedAgents,
     /// Removed compatibility flag retained as a no-op.
     MultiAgentMode,
     /// Enable CSV-backed agent job tools.
@@ -1049,6 +1051,12 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::MultiAgentV2,
         key: "multi_agent_v2",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::HostedAgents,
+        key: "hosted_agents",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },

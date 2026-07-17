@@ -74,6 +74,7 @@ pub enum EnvironmentConnectionState {
 pub struct EnvironmentManager {
     default_environment: Option<String>,
     pub(super) environments: RwLock<HashMap<String, Arc<Environment>>>,
+    dynamic_environment_ids: RwLock<HashSet<String>>,
     local_environment: Option<Arc<Environment>>,
     local_runtime_paths: Option<ExecServerRuntimePaths>,
 }
@@ -132,6 +133,7 @@ impl EnvironmentManager {
                 LOCAL_ENVIRONMENT_ID.to_string(),
                 Arc::new(Environment::default_for_tests()),
             )])),
+            dynamic_environment_ids: RwLock::new(HashSet::new()),
             local_environment: Some(Arc::new(Environment::default_for_tests())),
             local_runtime_paths: None,
         }
@@ -142,6 +144,7 @@ impl EnvironmentManager {
         Self {
             default_environment: None,
             environments: RwLock::new(HashMap::new()),
+            dynamic_environment_ids: RwLock::new(HashSet::new()),
             local_environment: None,
             local_runtime_paths: None,
         }
@@ -202,6 +205,7 @@ impl EnvironmentManager {
         let manager = Self {
             default_environment: Some(REMOTE_ENVIRONMENT_ID.to_string()),
             environments: RwLock::new(HashMap::new()),
+            dynamic_environment_ids: RwLock::new(HashSet::new()),
             local_environment: None,
             local_runtime_paths,
         };
@@ -290,6 +294,7 @@ impl EnvironmentManager {
         Ok(Self {
             default_environment,
             environments: RwLock::new(environment_map),
+            dynamic_environment_ids: RwLock::new(HashSet::new()),
             local_environment,
             local_runtime_paths,
         })
@@ -354,6 +359,46 @@ impl EnvironmentManager {
     ) -> Option<EnvironmentObservedStatus> {
         let environment = self.get_environment(environment_id)?;
         Some(environment.status().await)
+    }
+
+    /// Removes a dynamically registered remote environment and terminates its connection.
+    ///
+    /// Existing handles to the removed environment become permanently disconnected. Local and
+    /// statically configured environments are manager-owned and cannot be removed through this
+    /// lifecycle API.
+    pub async fn remove_environment(&self, environment_id: &str) -> Result<bool, ExecServerError> {
+        if environment_id == LOCAL_ENVIRONMENT_ID {
+            return Err(ExecServerError::Protocol(format!(
+                "environment id `{LOCAL_ENVIRONMENT_ID}` is reserved for EnvironmentManager"
+            )));
+        }
+        if self.default_environment_id() == Some(environment_id) {
+            return Err(ExecServerError::Protocol(format!(
+                "default environment `{environment_id}` cannot be removed"
+            )));
+        }
+        let environment = {
+            let mut environments = self
+                .environments
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(environment) = environments.get(environment_id).cloned() else {
+                return Ok(false);
+            };
+            let mut dynamic_environment_ids = self
+                .dynamic_environment_ids
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !dynamic_environment_ids.remove(environment_id) {
+                return Err(ExecServerError::Protocol(format!(
+                    "environment `{environment_id}` is not dynamically registered"
+                )));
+            }
+            environments.remove(environment_id);
+            environment
+        };
+        environment.terminate_connection().await;
+        Ok(true)
     }
 
     /// Adds or replaces a named remote environment without changing the
@@ -426,10 +471,18 @@ impl EnvironmentManager {
     }
 
     fn insert_environment(&self, environment_id: String, environment: Arc<Environment>) {
-        self.environments
+        let mut environments = self
+            .environments
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(environment_id, Arc::clone(&environment));
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut dynamic_environment_ids = self
+            .dynamic_environment_ids
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        environments.insert(environment_id.clone(), Arc::clone(&environment));
+        dynamic_environment_ids.insert(environment_id);
+        drop(dynamic_environment_ids);
+        drop(environments);
         environment.start_connecting();
     }
 }
@@ -817,6 +870,16 @@ impl Environment {
             None => Arc::clone(&self.filesystem),
         }
     }
+
+    async fn terminate_connection(&self) {
+        self.startup_task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(client) = &self.remote_client {
+            client.terminate().await;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -838,9 +901,20 @@ mod tests {
     use crate::environment_provider::EnvironmentDefault;
     use crate::environment_provider::EnvironmentProviderSnapshot;
     use codex_utils_path_uri::PathUri;
+    use futures::SinkExt;
+    use futures::StreamExt;
     use pretty_assertions::assert_eq;
     use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
     use tokio::time::timeout;
+    use tokio_tungstenite::accept_async;
+    use tokio_tungstenite::tungstenite::Message;
+
+    use crate::protocol::INITIALIZE_METHOD;
+    use crate::protocol::INITIALIZED_METHOD;
+    use crate::protocol::InitializeResponse;
+    use codex_exec_server_protocol::JSONRPCMessage;
+    use codex_exec_server_protocol::JSONRPCResponse;
 
     fn test_runtime_paths() -> ExecServerRuntimePaths {
         ExecServerRuntimePaths::new(
@@ -852,6 +926,73 @@ mod tests {
 
     fn assert_local_environment_unavailable(manager: &EnvironmentManager) {
         assert!(manager.try_local_environment().is_none());
+    }
+
+    fn spawn_test_environment_server(
+        listener: TcpListener,
+        session_id: &'static str,
+    ) -> (oneshot::Receiver<()>, oneshot::Receiver<()>) {
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (closed_tx, closed_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept test connection");
+            let mut websocket = accept_async(stream).await.expect("accept test websocket");
+            let initialize = websocket
+                .next()
+                .await
+                .expect("initialize frame")
+                .expect("read initialize frame");
+            let initialize: JSONRPCMessage = match initialize {
+                Message::Text(text) => serde_json::from_str(text.as_ref()),
+                Message::Binary(bytes) => serde_json::from_slice(bytes.as_ref()),
+                other => panic!("expected initialize data frame, got {other:?}"),
+            }
+            .expect("parse initialize frame");
+            let initialize = match initialize {
+                JSONRPCMessage::Request(request) if request.method == INITIALIZE_METHOD => request,
+                other => panic!("expected initialize request, got {other:?}"),
+            };
+            let response = JSONRPCMessage::Response(JSONRPCResponse {
+                id: initialize.id,
+                result: serde_json::to_value(InitializeResponse {
+                    session_id: session_id.to_string(),
+                })
+                .expect("serialize initialize response"),
+            });
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&response)
+                        .expect("serialize JSON-RPC response")
+                        .into(),
+                ))
+                .await
+                .expect("send initialize response");
+            let initialized = websocket
+                .next()
+                .await
+                .expect("initialized frame")
+                .expect("read initialized frame");
+            let initialized: JSONRPCMessage = match initialized {
+                Message::Text(text) => serde_json::from_str(text.as_ref()),
+                Message::Binary(bytes) => serde_json::from_slice(bytes.as_ref()),
+                other => panic!("expected initialized data frame, got {other:?}"),
+            }
+            .expect("parse initialized frame");
+            assert!(matches!(
+                initialized,
+                JSONRPCMessage::Notification(notification)
+                    if notification.method == INITIALIZED_METHOD
+            ));
+            let _ = ready_tx.send(());
+            while let Some(frame) = websocket.next().await {
+                match frame {
+                    Ok(Message::Close(_)) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+            let _ = closed_tx.send(());
+        });
+        (ready_rx, closed_rx)
     }
 
     #[test]
@@ -1246,6 +1387,148 @@ mod tests {
             .await
             .expect("environment should start connecting when registered")
             .expect("accept connection");
+    }
+
+    #[tokio::test]
+    async fn removing_environment_terminates_only_its_connection() {
+        let first_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind first websocket listener");
+        let first_address = first_listener.local_addr().expect("first listener address");
+        let second_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind second websocket listener");
+        let second_address = second_listener
+            .local_addr()
+            .expect("second listener address");
+        let (first_ready, first_closed) =
+            spawn_test_environment_server(first_listener, "first-session");
+        let (second_ready, mut second_closed) =
+            spawn_test_environment_server(second_listener, "second-session");
+        let manager = EnvironmentManager::without_environments();
+        manager
+            .upsert_environment(
+                "first".to_string(),
+                format!("ws://{first_address}"),
+                /*connect_timeout*/ None,
+            )
+            .expect("register first environment");
+        manager
+            .upsert_environment(
+                "second".to_string(),
+                format!("ws://{second_address}"),
+                /*connect_timeout*/ None,
+            )
+            .expect("register second environment");
+        let first = manager.get_environment("first").expect("first environment");
+        let second = manager
+            .get_environment("second")
+            .expect("second environment");
+        first
+            .wait_until_ready()
+            .await
+            .expect("connect first environment");
+        second
+            .wait_until_ready()
+            .await
+            .expect("connect second environment");
+        first_ready.await.expect("first server ready");
+        second_ready.await.expect("second server ready");
+
+        assert!(
+            manager
+                .remove_environment("first")
+                .await
+                .expect("remove first")
+        );
+
+        timeout(Duration::from_secs(1), first_closed)
+            .await
+            .expect("first connection should close")
+            .expect("first close signal");
+        assert!(manager.get_environment("first").is_none());
+        assert!(Arc::ptr_eq(
+            &second,
+            &manager
+                .get_environment("second")
+                .expect("second environment remains registered")
+        ));
+        assert_eq!(
+            first
+                .info()
+                .await
+                .expect_err("removed handle should fail")
+                .to_string(),
+            "exec-server environment was removed"
+        );
+        assert_eq!(
+            *second
+                .subscribe_connection_state()
+                .expect("second connection state")
+                .borrow(),
+            super::EnvironmentConnectionState::Connected
+        );
+        assert!(
+            timeout(Duration::from_millis(100), &mut second_closed)
+                .await
+                .is_err()
+        );
+        assert!(
+            !manager
+                .remove_environment("missing")
+                .await
+                .expect("remove missing")
+        );
+
+        assert!(
+            manager
+                .remove_environment("second")
+                .await
+                .expect("remove second")
+        );
+        timeout(Duration::from_secs(1), second_closed)
+            .await
+            .expect("second connection should close")
+            .expect("second close signal");
+    }
+
+    #[tokio::test]
+    async fn removing_manager_owned_environments_is_rejected() {
+        let manager = EnvironmentManager::default_for_tests();
+
+        let error = manager
+            .remove_environment(LOCAL_ENVIRONMENT_ID)
+            .await
+            .expect_err("local environment is manager-owned");
+
+        assert_eq!(
+            error.to_string(),
+            "exec-server protocol error: environment id `local` is reserved for EnvironmentManager"
+        );
+        assert!(manager.get_environment(LOCAL_ENVIRONMENT_ID).is_some());
+
+        let manager = EnvironmentManager::from_snapshot(
+            EnvironmentProviderSnapshot {
+                environments: vec![(
+                    "configured".to_string(),
+                    Environment::create_for_tests(Some("ws://127.0.0.1:8765".to_string()))
+                        .expect("configured environment"),
+                )],
+                default: EnvironmentDefault::Disabled,
+                include_local: false,
+            },
+            /*local_runtime_paths*/ None,
+        )
+        .expect("configured environment manager");
+        let error = manager
+            .remove_environment("configured")
+            .await
+            .expect_err("configured environment is manager-owned");
+        assert_eq!(
+            error.to_string(),
+            "exec-server protocol error: environment `configured` is not dynamically registered"
+        );
+        assert!(manager.get_environment("configured").is_some());
     }
 
     #[tokio::test]

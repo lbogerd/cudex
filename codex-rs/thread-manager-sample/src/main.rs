@@ -29,6 +29,7 @@ use codex_core_api::ExtensionRegistryBuilder;
 use codex_core_api::Features;
 use codex_core_api::GhostSnapshotConfig;
 use codex_core_api::History;
+use codex_core_api::HostedAgentsConfig;
 use codex_core_api::MemoriesConfig;
 use codex_core_api::ModelAvailabilityNuxConfig;
 use codex_core_api::MultiAgentV2Config;
@@ -248,6 +249,7 @@ fn new_config(model: Option<String>, arg0_paths: Arg0DispatchPaths) -> anyhow::R
         agent_interrupt_message_enabled: false,
         agent_max_depth: 1,
         agent_roles: BTreeMap::new(),
+        hosted_agents: HostedAgentsConfig::default(),
         memories: MemoriesConfig::default(),
         sqlite_home: codex_home.to_path_buf(),
         log_dir: codex_home.join("log").to_path_buf(),
