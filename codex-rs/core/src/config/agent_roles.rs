@@ -157,6 +157,7 @@ async fn read_declared_role(
         role_name = parsed_file.role_name;
         role.description = parsed_file.description.or(role.description);
         role.nickname_candidates = parsed_file.nickname_candidates.or(role.nickname_candidates);
+        role.sandbox_template = parsed_file.sandbox_template.or(role.sandbox_template);
     }
 
     Ok((role_name, role))
@@ -169,6 +170,10 @@ fn merge_missing_role_fields(role: &mut AgentRoleConfig, fallback: &AgentRoleCon
         .nickname_candidates
         .clone()
         .or(fallback.nickname_candidates.clone());
+    role.sandbox_template = role
+        .sandbox_template
+        .clone()
+        .or(fallback.sandbox_template.clone());
 }
 
 fn agents_toml_from_layer(
@@ -207,11 +212,16 @@ async fn agent_role_config_from_toml(
         &format!("agents.{role_name}.nickname_candidates"),
         role.nickname_candidates.as_deref(),
     )?;
+    let sandbox_template = normalize_agent_role_sandbox_template(
+        &format!("agents.{role_name}.sandbox_template"),
+        role.sandbox_template.as_deref(),
+    )?;
 
     Ok(AgentRoleConfig {
         description,
         config_file: config_file.map(AbsolutePathBuf::into_path_buf),
         nickname_candidates,
+        sandbox_template,
     })
 }
 
@@ -221,6 +231,7 @@ struct RawAgentRoleFileToml {
     name: Option<String>,
     description: Option<String>,
     nickname_candidates: Option<Vec<String>>,
+    sandbox_template: Option<String>,
     #[serde(flatten)]
     config: ConfigToml,
 }
@@ -230,6 +241,7 @@ pub(crate) struct ResolvedAgentRoleFile {
     pub(crate) role_name: String,
     pub(crate) description: Option<String>,
     pub(crate) nickname_candidates: Option<Vec<String>>,
+    pub(crate) sandbox_template: Option<String>,
     pub(crate) config: TomlValue,
 }
 
@@ -292,6 +304,13 @@ pub(crate) fn parse_agent_role_file_contents(
         ),
         parsed.nickname_candidates.as_deref(),
     )?;
+    let sandbox_template = normalize_agent_role_sandbox_template(
+        &format!(
+            "agent role file {}.sandbox_template",
+            role_file_label.display()
+        ),
+        parsed.sandbox_template.as_deref(),
+    )?;
 
     let mut config = role_file_toml;
     let Some(config_table) = config.as_table_mut() else {
@@ -306,11 +325,13 @@ pub(crate) fn parse_agent_role_file_contents(
     config_table.remove("name");
     config_table.remove("description");
     config_table.remove("nickname_candidates");
+    config_table.remove("sandbox_template");
 
     Ok(ResolvedAgentRoleFile {
         role_name,
         description,
         nickname_candidates,
+        sandbox_template,
         config,
     })
 }
@@ -341,6 +362,20 @@ fn normalize_agent_role_description(
             format!("{field_label} cannot be blank"),
         )),
         Some(description) => Ok(Some(description.to_string())),
+        None => Ok(None),
+    }
+}
+
+fn normalize_agent_role_sandbox_template(
+    field_label: &str,
+    sandbox_template: Option<&str>,
+) -> std::io::Result<Option<String>> {
+    match sandbox_template.map(str::trim) {
+        Some("") => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{field_label} cannot be blank"),
+        )),
+        Some(sandbox_template) => Ok(Some(sandbox_template.to_string())),
         None => Ok(None),
     }
 }
@@ -511,6 +546,7 @@ async fn discover_agent_roles_in_dir(
                 description: parsed_file.description,
                 config_file: Some(agent_file.to_path_buf()),
                 nickname_candidates: parsed_file.nickname_candidates,
+                sandbox_template: parsed_file.sandbox_template,
             },
         );
     }

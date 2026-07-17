@@ -147,6 +147,7 @@ use toml_edit::DocumentMut;
 pub(crate) mod agent_roles;
 mod auth_keyring;
 pub mod edit;
+mod hosted_agents;
 mod managed_features;
 mod network_proxy_spec;
 mod otel;
@@ -164,6 +165,7 @@ pub use codex_config::LoaderOverrides;
 pub use codex_network_proxy::NetworkProxyAuditMetadata;
 use codex_sandboxing::compatibility_sandbox_policy_for_permission_profile;
 pub use codex_sandboxing::system_bwrap_warning;
+pub use hosted_agents::HostedAgentsConfig;
 pub use managed_features::ManagedFeatures;
 pub use network_proxy_spec::NetworkProxySpec;
 pub use network_proxy_spec::StartedNetworkProxy;
@@ -880,6 +882,9 @@ pub struct Config {
 
     /// User-defined role declarations keyed by role name.
     pub agent_roles: BTreeMap<String, AgentRoleConfig>,
+
+    /// Settings for the experimental hosted full-agent runtime.
+    pub hosted_agents: HostedAgentsConfig,
 
     /// Memories subsystem settings.
     pub memories: MemoriesConfig,
@@ -2202,6 +2207,8 @@ pub struct AgentRoleConfig {
     pub config_file: Option<PathBuf>,
     /// Candidate nicknames for agents spawned with this role.
     pub nickname_candidates: Option<Vec<String>>,
+    /// Opaque hosting-service template used to provision this role.
+    pub sandbox_template: Option<String>,
 }
 
 fn resolve_tool_suggest_config(
@@ -3516,6 +3523,7 @@ impl Config {
         let agent_roles =
             agent_roles::load_agent_roles(fs, &cfg, &config_layer_stack, &mut startup_warnings)
                 .await?;
+        let hosted_agents = hosted_agents::resolve(&cfg, &features, &agent_roles)?;
 
         let openai_base_url = cfg
             .openai_base_url
@@ -3967,6 +3975,7 @@ impl Config {
             agent_default_subagent_reasoning_effort,
             agent_max_depth,
             agent_roles,
+            hosted_agents,
             memories: memories_config,
             agent_job_max_runtime_seconds,
             agent_interrupt_message_enabled,

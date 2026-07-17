@@ -27,6 +27,10 @@
             "type": "string"
           },
           "type": "array"
+        },
+        "sandbox_template": {
+          "description": "Opaque hosting-service template used to provision this role.",
+          "type": "string"
         }
       },
       "type": "object"
@@ -543,6 +547,9 @@
               "type": "boolean"
             },
             "hooks": {
+              "type": "boolean"
+            },
+            "hosted_agents": {
               "type": "boolean"
             },
             "image_detail_original": {
@@ -1350,6 +1357,25 @@
             "$ref": "#/definitions/HookStateToml"
           },
           "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "HostedAgentsToml": {
+      "additionalProperties": false,
+      "description": "Experimental settings for provisioning full agents through a hosting service.",
+      "properties": {
+        "default_agent_type": {
+          "description": "Agent role selected when a caller omits an agent type. Defaults to `default`.",
+          "type": "string"
+        },
+        "enabled": {
+          "description": "Whether the hosted full-agent runtime is enabled. Defaults to false.",
+          "type": "boolean"
+        },
+        "service_url": {
+          "description": "Base URL of the hosted-agent service.",
+          "type": "string"
         }
       },
       "type": "object"
@@ -4942,6 +4968,9 @@
         "hooks": {
           "type": "boolean"
         },
+        "hosted_agents": {
+          "type": "boolean"
+        },
         "image_detail_original": {
           "type": "boolean"
         },
@@ -5213,6 +5242,14 @@
         }
       ],
       "description": "Lifecycle hooks configured inline in TOML plus user-level overrides."
+    },
+    "hosted_agents": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/HostedAgentsToml"
+        }
+      ],
+      "description": "Experimental hosted full-agent runtime settings."
     },
     "include_apps_instructions": {
       "description": "Whether to inject the `<apps_instructions>` developer block.",

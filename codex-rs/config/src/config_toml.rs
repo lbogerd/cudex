@@ -436,6 +436,9 @@ pub struct ConfigToml {
     /// Agent-related settings (thread limits, etc.).
     pub agents: Option<AgentsToml>,
 
+    /// Experimental hosted full-agent runtime settings.
+    pub hosted_agents: Option<HostedAgentsToml>,
+
     /// Memories subsystem settings.
     pub memories: Option<MemoriesToml>,
 
@@ -725,6 +728,23 @@ pub struct AgentRoleToml {
 
     /// Candidate nicknames for agents spawned with this role.
     pub nickname_candidates: Option<Vec<String>>,
+
+    /// Opaque hosting-service template used to provision this role.
+    pub sandbox_template: Option<String>,
+}
+
+/// Experimental settings for provisioning full agents through a hosting service.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct HostedAgentsToml {
+    /// Whether the hosted full-agent runtime is enabled. Defaults to false.
+    pub enabled: Option<bool>,
+
+    /// Base URL of the hosted-agent service.
+    pub service_url: Option<String>,
+
+    /// Agent role selected when a caller omits an agent type. Defaults to `default`.
+    pub default_agent_type: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
