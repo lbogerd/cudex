@@ -9,6 +9,7 @@ use crate::session::tests::make_session_and_context;
 use crate::tasks::InterruptedTurnHistoryMarker;
 use crate::tasks::interrupted_turn_history_marker;
 use codex_extension_api::empty_extension_registry;
+use codex_hosted_agent::HostedAgentService;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_protocol::ResponseItemId;
 use codex_protocol::capabilities::CapabilityRootLocation;
@@ -144,8 +145,9 @@ async fn hosted_root_and_spawned_threads_own_distinct_provisioned_environments()
         config.codex_home.to_path_buf(),
         Arc::clone(&environment_manager),
     );
+    let hosted_service = Arc::new(codex_hosted_agent::FakeHostedAgentService::default());
     let provisioner = Arc::new(HostedAgentProvisioner::new(
-        Arc::new(codex_hosted_agent::FakeHostedAgentService::default()),
+        Arc::clone(&hosted_service),
         Arc::clone(&environment_manager),
     ));
     Arc::get_mut(&mut manager.state)
@@ -199,17 +201,99 @@ async fn hosted_root_and_spawned_threads_own_distinct_provisioned_environments()
     let [child_selection] = child_snapshot.environments.environments.as_slice() else {
         panic!("hosted child must select exactly one environment");
     };
-    let runtimes = manager.state.hosted_agent_runtimes.read().await;
-    let root_runtime = runtimes
-        .get(&new_thread.thread_id)
-        .expect("root hosted runtime");
-    let child_runtime = runtimes
-        .get(&child.thread_id)
-        .expect("child hosted runtime");
+    let (root_environment_id, root_lease_id, child_environment_id, child_lease_id) = {
+        let runtimes = manager.state.hosted_agent_runtimes.read().await;
+        let root_runtime = runtimes
+            .get(&new_thread.thread_id)
+            .expect("root hosted runtime");
+        let child_runtime = runtimes
+            .get(&child.thread_id)
+            .expect("child hosted runtime");
 
-    assert_eq!(child_selection.environment_id, child_runtime.environment_id);
-    assert_ne!(child_runtime.lease_id, root_runtime.lease_id);
-    assert_ne!(child_runtime.environment_id, root_runtime.environment_id);
+        assert_eq!(child_selection.environment_id, child_runtime.environment_id);
+        assert_ne!(child_runtime.lease_id, root_runtime.lease_id);
+        assert_ne!(child_runtime.environment_id, root_runtime.environment_id);
+        (
+            root_runtime.environment_id.clone(),
+            root_runtime.lease_id.clone(),
+            child_runtime.environment_id.clone(),
+            child_runtime.lease_id.clone(),
+        )
+    };
+
+    child
+        .thread
+        .shutdown_and_wait()
+        .await
+        .expect("shut down hosted child");
+    assert!(manager.remove_thread(&child.thread_id).await.is_some());
+
+    assert!(
+        manager
+            .state
+            .hosted_agent_runtimes
+            .read()
+            .await
+            .get(&child.thread_id)
+            .is_none()
+    );
+    assert!(
+        manager
+            .state
+            .hosted_agent_runtimes
+            .read()
+            .await
+            .get(&new_thread.thread_id)
+            .is_some()
+    );
+    assert!(
+        environment_manager
+            .get_environment(&child_environment_id)
+            .is_none()
+    );
+    assert!(
+        environment_manager
+            .get_environment(&root_environment_id)
+            .is_some()
+    );
+    hosted_service
+        .reconnect(codex_hosted_agent::AgentReconnectRequest {
+            lease_id: child_lease_id,
+            idempotency_key: format!("hosted-agent:{}:removed-child-reconnect", child.thread_id),
+        })
+        .await
+        .expect_err("removed child lease must be released");
+    hosted_service
+        .reconnect(codex_hosted_agent::AgentReconnectRequest {
+            lease_id: root_lease_id.clone(),
+            idempotency_key: format!(
+                "hosted-agent:{}:remaining-root-reconnect",
+                new_thread.thread_id
+            ),
+        })
+        .await
+        .expect("removing a child must not release its root lease");
+
+    let shutdown_report = manager
+        .shutdown_all_threads_bounded(Duration::from_secs(10))
+        .await;
+    assert_eq!(shutdown_report.completed, vec![new_thread.thread_id]);
+    assert!(manager.state.hosted_agent_runtimes.read().await.is_empty());
+    assert!(
+        environment_manager
+            .get_environment(&root_environment_id)
+            .is_none()
+    );
+    hosted_service
+        .reconnect(codex_hosted_agent::AgentReconnectRequest {
+            lease_id: root_lease_id,
+            idempotency_key: format!(
+                "hosted-agent:{}:shutdown-root-reconnect",
+                new_thread.thread_id
+            ),
+        })
+        .await
+        .expect_err("manager shutdown must release the root lease");
 }
 
 #[test]

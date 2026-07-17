@@ -119,7 +119,7 @@ impl HostedAgentProvisioner {
                 .service
                 .release(AgentReleaseRequest {
                     lease_id: runtime.lease_id.clone(),
-                    idempotency_key: release_idempotency_key(agent_id),
+                    idempotency_key: release_idempotency_key(agent_id, &runtime.lease_id),
                 })
                 .await;
             if let Err(release_error) = release_result {
@@ -142,6 +142,21 @@ impl HostedAgentProvisioner {
             service: Arc::clone(&self.service),
             environment_manager: Arc::clone(&self.environment_manager),
         })
+    }
+
+    /// Unregisters and releases a runtime committed to a thread.
+    pub(crate) async fn release(
+        &self,
+        agent_id: codex_protocol::ThreadId,
+        runtime: HostedAgentRuntime,
+    ) -> Result<(), HostedAgentRuntimeError> {
+        cleanup_runtime(
+            agent_id,
+            runtime,
+            self.environment_manager.as_ref(),
+            self.service.as_ref(),
+        )
+        .await
     }
 }
 
@@ -200,13 +215,14 @@ async fn cleanup_runtime(
     environment_manager: &EnvironmentManager,
     service: &dyn ErasedHostedAgentService,
 ) -> Result<(), HostedAgentRuntimeError> {
+    let release_idempotency_key = release_idempotency_key(agent_id, &runtime.lease_id);
     let unregister_result = environment_manager
         .remove_environment(&runtime.environment_id)
         .await;
     let release_result = service
         .release(AgentReleaseRequest {
             lease_id: runtime.lease_id,
-            idempotency_key: release_idempotency_key(agent_id),
+            idempotency_key: release_idempotency_key,
         })
         .await;
 
@@ -220,8 +236,8 @@ async fn cleanup_runtime(
     }
 }
 
-fn release_idempotency_key(agent_id: codex_protocol::ThreadId) -> String {
-    format!("hosted-agent:{agent_id}:startup-release")
+fn release_idempotency_key(agent_id: codex_protocol::ThreadId, lease_id: &str) -> String {
+    format!("hosted-agent:{agent_id}:lease:{lease_id}:release")
 }
 
 #[cfg(test)]

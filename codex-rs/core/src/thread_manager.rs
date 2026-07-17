@@ -87,6 +87,7 @@ use codex_thread_store::UpdateThreadMetadataParams;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use futures::StreamExt;
+use futures::future::join_all;
 use futures::stream::FuturesUnordered;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -965,9 +966,10 @@ impl ThreadManager {
 
     /// Removes the thread from the manager's internal map, though the thread is stored
     /// as `Arc<CodexThread>`, it is possible that other references to it exist elsewhere.
+    /// Any hosted runtime owned by the thread is also unregistered and released.
     /// Returns the thread if the thread was found and removed.
     pub async fn remove_thread(&self, thread_id: &ThreadId) -> Option<Arc<CodexThread>> {
-        self.state.threads.write().await.remove(thread_id)
+        self.state.remove_thread(thread_id).await
     }
 
     /// Tries to shut down all tracked threads concurrently within the provided timeout.
@@ -1004,10 +1006,13 @@ impl ThreadManager {
             }
         }
 
-        let mut tracked_threads = self.state.threads.write().await;
-        for thread_id in &report.completed {
-            tracked_threads.remove(thread_id);
-        }
+        join_all(
+            report
+                .completed
+                .iter()
+                .map(|thread_id| self.state.remove_thread(thread_id)),
+        )
+        .await;
 
         report
             .completed
@@ -1369,7 +1374,45 @@ impl ThreadManagerState {
 
     /// Remove a thread from the manager by ID, returning it when present.
     pub(crate) async fn remove_thread(&self, thread_id: &ThreadId) -> Option<Arc<CodexThread>> {
-        self.threads.write().await.remove(thread_id)
+        let (thread, hosted_runtime) = {
+            let (mut threads, mut hosted_agent_runtimes) =
+                tokio::join!(self.threads.write(), self.hosted_agent_runtimes.write());
+            (
+                threads.remove(thread_id),
+                hosted_agent_runtimes.remove(thread_id),
+            )
+        };
+
+        if let Some(runtime) = hosted_runtime {
+            let cleanup_result = match &self.hosted_agent_provisioner {
+                Ok(Some(provisioner)) => provisioner.release(*thread_id, runtime.clone()).await,
+                Ok(None) => Err(
+                    crate::hosted_agent_runtime::HostedAgentRuntimeError::Release(
+                        HostedAgentError::new(
+                            HostedAgentErrorCategory::Unavailable,
+                            "hosted-agent provisioner is unavailable during thread removal",
+                        ),
+                    ),
+                ),
+                Err(error) => Err(
+                    crate::hosted_agent_runtime::HostedAgentRuntimeError::Release(error.clone()),
+                ),
+            };
+            if let Err(error) = cleanup_result {
+                warn!(
+                    %error,
+                    %thread_id,
+                    "failed to release hosted runtime during thread removal"
+                );
+                self.hosted_agent_runtimes
+                    .write()
+                    .await
+                    .entry(*thread_id)
+                    .or_insert(runtime);
+            }
+        }
+
+        thread
     }
 
     pub(crate) async fn effective_multi_agent_version_for_spawn(
