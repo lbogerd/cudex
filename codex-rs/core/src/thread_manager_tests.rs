@@ -1,4 +1,5 @@
 use super::*;
+use crate::codex_thread::CodexThreadSettingsOverrides;
 use crate::config::test_config;
 use crate::init_state_db;
 use crate::installation_id::INSTALLATION_ID_FILENAME;
@@ -122,6 +123,24 @@ async fn hosted_root_and_spawned_threads_own_distinct_provisioned_environments()
     config.codex_home = temp_dir.path().join("codex-home").abs();
     config.cwd = temp_dir.path().join("workspace").abs();
     config.workspace_roots = vec![config.cwd.clone()];
+    config.permissions.approval_policy =
+        crate::config::Constrained::allow_any(AskForApproval::OnRequest);
+    config
+        .set_legacy_sandbox_policy(codex_protocol::protocol::SandboxPolicy::ReadOnly {
+            network_access: false,
+        })
+        .expect("set restrictive local sandbox policy");
+    config.permissions.network = Some(
+        crate::config::NetworkProxySpec::from_config_and_constraints(
+            codex_network_proxy::NetworkProxyConfig::default(),
+            Some(codex_config::NetworkConstraints {
+                enabled: Some(true),
+                ..Default::default()
+            }),
+            config.permissions.permission_profile(),
+        )
+        .expect("create managed network proxy spec"),
+    );
     config.hosted_agents = crate::config::HostedAgentsConfig {
         enabled: true,
         service_url: Some("https://hosted.invalid".to_string()),
@@ -159,6 +178,107 @@ async fn hosted_root_and_spawned_threads_own_distinct_provisioned_environments()
         .await
         .expect("start hosted thread");
     let snapshot = new_thread.thread.config_snapshot().await;
+    assert_eq!(snapshot.approval_policy, AskForApproval::Never);
+    assert_eq!(
+        snapshot.permission_profile,
+        PermissionProfile::External {
+            network: NetworkSandboxPolicy::Enabled,
+        }
+    );
+    assert_eq!(snapshot.active_permission_profile, None);
+    assert!(
+        new_thread
+            .thread
+            .config()
+            .await
+            .permissions
+            .network
+            .is_none()
+    );
+    let approval_override_error = new_thread
+        .thread
+        .preview_thread_settings_overrides(CodexThreadSettingsOverrides {
+            approval_policy: Some(AskForApproval::OnRequest),
+            ..Default::default()
+        })
+        .await
+        .expect_err("hosted approval policy must be immutable");
+    assert!(
+        approval_override_error
+            .to_string()
+            .contains("approval_policy")
+    );
+    let sandbox_override_error = new_thread
+        .thread
+        .preview_thread_settings_overrides(CodexThreadSettingsOverrides {
+            sandbox_policy: Some(codex_protocol::protocol::SandboxPolicy::ReadOnly {
+                network_access: false,
+            }),
+            ..Default::default()
+        })
+        .await
+        .expect_err("hosted sandbox policy must be immutable");
+    assert!(
+        sandbox_override_error
+            .to_string()
+            .contains("sandbox_policy")
+    );
+    let mut mismatched_environments = snapshot.environments.clone();
+    mismatched_environments.environments[0].environment_id = "other-environment".to_string();
+    let environment_override_error = new_thread
+        .thread
+        .preview_thread_settings_overrides(CodexThreadSettingsOverrides {
+            environments: Some(mismatched_environments),
+            ..Default::default()
+        })
+        .await
+        .expect_err("hosted environment selection must be immutable");
+    assert!(
+        environment_override_error
+            .to_string()
+            .contains("environments")
+    );
+    let permission_profile_override_error = new_thread
+        .thread
+        .preview_thread_settings_overrides(CodexThreadSettingsOverrides {
+            permission_profile: Some(PermissionProfile::Disabled),
+            ..Default::default()
+        })
+        .await
+        .expect_err("hosted permission profile must be immutable");
+    assert!(
+        permission_profile_override_error
+            .to_string()
+            .contains("permission_profile")
+    );
+    let active_profile_override_error = new_thread
+        .thread
+        .preview_thread_settings_overrides(CodexThreadSettingsOverrides {
+            active_permission_profile: Some(
+                codex_protocol::models::ActivePermissionProfile::read_only(),
+            ),
+            ..Default::default()
+        })
+        .await
+        .expect_err("hosted active permission profile must remain unset");
+    assert!(
+        active_profile_override_error
+            .to_string()
+            .contains("active_permission_profile")
+    );
+    let profile_roots_override_error = new_thread
+        .thread
+        .preview_thread_settings_overrides(CodexThreadSettingsOverrides {
+            profile_workspace_roots: Some(snapshot.workspace_roots.clone()),
+            ..Default::default()
+        })
+        .await
+        .expect_err("hosted profile workspace roots must remain unset");
+    assert!(
+        profile_roots_override_error
+            .to_string()
+            .contains("profile_workspace_roots")
+    );
     let [selection] = snapshot.environments.environments.as_slice() else {
         panic!("hosted thread must select exactly one environment");
     };
@@ -198,6 +318,15 @@ async fn hosted_root_and_spawned_threads_own_distinct_provisioned_environments()
         .await
         .expect("start hosted child thread");
     let child_snapshot = child.thread.config_snapshot().await;
+    assert_eq!(child_snapshot.approval_policy, AskForApproval::Never);
+    assert_eq!(
+        child_snapshot.permission_profile,
+        PermissionProfile::External {
+            network: NetworkSandboxPolicy::Enabled,
+        }
+    );
+    assert_eq!(child_snapshot.active_permission_profile, None);
+    assert!(child.thread.config().await.permissions.network.is_none());
     let [child_selection] = child_snapshot.environments.environments.as_slice() else {
         panic!("hosted child must select exactly one environment");
     };

@@ -4,6 +4,8 @@ use crate::agent::AgentControl;
 use crate::attestation::AttestationProvider;
 use crate::codex_thread::CodexThread;
 use crate::config::Config;
+use crate::config::Constrained;
+use crate::config::PermissionProfileSnapshot;
 use crate::config::ThreadStoreConfig;
 use crate::current_time::TimeProvider;
 use crate::environment_selection::TurnEnvironmentSnapshot;
@@ -54,7 +56,10 @@ use codex_protocol::ThreadId;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ModelPreset;
+use codex_protocol::permissions::NetworkSandboxPolicy;
+use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InitialHistory;
@@ -1776,7 +1781,7 @@ impl ThreadManagerState {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn spawn_thread_with_source(
         &self,
-        config: Config,
+        mut config: Config,
         initial_history: InitialHistory,
         history_mode: Option<ThreadHistoryMode>,
         allow_provider_model_fallback: bool,
@@ -1843,6 +1848,22 @@ impl ThreadManagerState {
                 forked_from_thread_id,
             )
             .await;
+        if config.hosted_agents.enabled {
+            config.permissions.approval_policy = Constrained::allow_only(AskForApproval::Never);
+            config
+                .permissions
+                .replace_permission_profile_from_session_snapshot(
+                    PermissionProfileSnapshot::legacy(PermissionProfile::External {
+                        network: NetworkSandboxPolicy::Enabled,
+                    }),
+                )
+                .map_err(|error| {
+                    CodexErr::Fatal(format!(
+                        "failed to apply hosted-agent runtime permissions: {error}"
+                    ))
+                })?;
+            config.permissions.network = None;
+        }
         let mut pending_hosted_runtime = self
             .provision_hosted_runtime(
                 thread_id,

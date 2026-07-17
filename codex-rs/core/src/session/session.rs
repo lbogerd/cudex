@@ -17,6 +17,7 @@ use codex_protocol::config_types::ServiceTier;
 use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::protocol::MultiAgentVersion;
+use codex_protocol::protocol::NetworkAccess;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TurnEnvironmentSelections;
@@ -219,6 +220,81 @@ impl SessionConfiguration {
     }
 
     pub(crate) fn apply(&self, updates: &SessionSettingsUpdate) -> ConstraintResult<Self> {
+        if self.hosted_tool_authorization.is_some() {
+            if updates
+                .environments
+                .as_ref()
+                .is_some_and(|environments| environments != &self.environments)
+            {
+                return Err(ConstraintError::InvalidValue {
+                    field_name: "environments",
+                    candidate: "hosted environment override".to_string(),
+                    allowed: "the environment provisioned for this hosted thread".to_string(),
+                    requirement_source: codex_config::RequirementSource::Unknown,
+                });
+            }
+            if updates
+                .approval_policy
+                .is_some_and(|policy| policy != AskForApproval::Never)
+            {
+                return Err(ConstraintError::InvalidValue {
+                    field_name: "approval_policy",
+                    candidate: format!("{:?}", updates.approval_policy),
+                    allowed: format!("[{:?}]", AskForApproval::Never),
+                    requirement_source: codex_config::RequirementSource::Unknown,
+                });
+            }
+            let hosted_permission_profile = PermissionProfile::External {
+                network: NetworkSandboxPolicy::Enabled,
+            };
+            if updates
+                .permission_profile
+                .as_ref()
+                .is_some_and(|profile| profile != &hosted_permission_profile)
+            {
+                return Err(ConstraintError::InvalidValue {
+                    field_name: "permission_profile",
+                    candidate: format!("{:?}", updates.permission_profile),
+                    allowed: format!("[{hosted_permission_profile:?}]"),
+                    requirement_source: codex_config::RequirementSource::Unknown,
+                });
+            }
+            let hosted_sandbox_policy = SandboxPolicy::ExternalSandbox {
+                network_access: NetworkAccess::Enabled,
+            };
+            if updates
+                .sandbox_policy
+                .as_ref()
+                .is_some_and(|policy| policy != &hosted_sandbox_policy)
+            {
+                return Err(ConstraintError::InvalidValue {
+                    field_name: "sandbox_policy",
+                    candidate: format!("{:?}", updates.sandbox_policy),
+                    allowed: format!("[{hosted_sandbox_policy:?}]"),
+                    requirement_source: codex_config::RequirementSource::Unknown,
+                });
+            }
+            if updates.active_permission_profile.is_some() {
+                return Err(ConstraintError::InvalidValue {
+                    field_name: "active_permission_profile",
+                    candidate: format!("{:?}", updates.active_permission_profile),
+                    allowed: "[None]".to_string(),
+                    requirement_source: codex_config::RequirementSource::Unknown,
+                });
+            }
+            if updates
+                .profile_workspace_roots
+                .as_ref()
+                .is_some_and(|roots| !roots.is_empty())
+            {
+                return Err(ConstraintError::InvalidValue {
+                    field_name: "profile_workspace_roots",
+                    candidate: format!("{:?}", updates.profile_workspace_roots),
+                    allowed: "[]".to_string(),
+                    requirement_source: codex_config::RequirementSource::Unknown,
+                });
+            }
+        }
         let mut next_configuration = self.clone();
         let current_sandbox_policy = self.sandbox_policy();
         let current_file_system_sandbox_policy = self.file_system_sandbox_policy();
