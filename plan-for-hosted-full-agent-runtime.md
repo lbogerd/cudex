@@ -90,6 +90,21 @@ Completed:
     policy immutable across later thread-setting and turn-setting updates;
   - retains the existing hosted tool-plan behavior that omits permission
     requests, legacy shell, code mode, and exec-permission escalation.
+- Root agent-role selection from Stage 3 and the app-server API foundation:
+  - added the experimental nullable `thread/start.agentType` field, with
+    omission selecting `hosted_agents.default_agent_type`;
+  - trims explicit selections, rejects blank values and hosted-disabled use,
+    and resolves the trusted role to its opaque sandbox template only inside
+    the centralized core provisioning boundary;
+  - keeps stable generated API fixtures free of the experimental field while
+    validating both stable and experimental schema generation.
+- Spawn runtime-isolation cleanup from Stage 3:
+  - hosted spawn and resume paths no longer inherit owner environment
+    snapshots, environment selections, or exec-policy instances;
+  - hosted spawn configuration no longer copies the live owner turn's cwd,
+    approval policy, or permission profile, including role reloads and agent
+    jobs;
+  - preserves the existing inheritance behavior for non-hosted agents.
 
 Validated in this branch:
 
@@ -112,6 +127,17 @@ Validated in this branch:
 - thread-manager tests after external-sandbox enforcement: 30 passed;
 - combined hosted tool-plan, unified-exec, shell-spec, and thread-manager
   coverage after removing hosted escalation arguments: 79 passed;
+- hosted root role selection and root/child runtime-isolation coverage: 2
+  focused `codex-core` tests passed;
+- `thread/start.agentType` capability gating and hosted-runtime forwarding: 2
+  focused `codex-app-server` integration tests passed;
+- `codex-app-server-protocol`: 266 passed, including stable fixture parity and
+  the experimental field round trip;
+- normal and experimental `just write-app-server-schema` generation passed,
+  with the checked-in tree restored to the stable fixture set;
+- scoped `just fix` passed for `codex-core`, `codex-app-server-protocol`, and
+  `codex-app-server` after clearing the regenerable Rust incremental cache that
+  had filled the development volume;
 - environment-focused tests in `codex-exec-server`: 61 passed;
 - scoped `just fix -p codex-core`: passed after clearing regenerable build
   artifacts that had exhausted the development volume;
@@ -125,11 +151,12 @@ container.
 
 Still pending:
 
-- the remainder of Stage 3: remove legacy spawn inheritance/override plumbing
-  and expose root `agentType` selection;
-- the remainder of Stage 4: normalize service-denial diagnostics as explicit
-  external-sandbox denials and finish the audit of non-collaboration internal
-  thread-creation paths;
+- the remainder of Stage 4: normalize typed executor and remote-filesystem
+  denials as explicit external-sandbox failures without retry or escalation;
+- route direct `codex_delegate` review/guardian session creation through the
+  manager-owned hosted provisioning path;
+- separate ownership lineage from the active thread whose lease supplies a
+  fork or detached subagent's project snapshot;
 - Stages 6–8: persistence/restore, completion and explicit patch acceptance,
   lifecycle finalization, telemetry, app-server APIs, and end-to-end coverage.
 
