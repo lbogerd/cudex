@@ -3191,6 +3191,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-hosted-agent"
+version = "0.0.0"
+dependencies = [
+ "codex-exec-server",
+ "codex-protocol",
+ "codex-tools",
+ "codex-utils-path-uri",
+ "pretty_assertions",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "url",
+ "wiremock",
+]
+
+[[package]]
 name = "codex-http-client"
 version = "0.0.0"
 dependencies = [
