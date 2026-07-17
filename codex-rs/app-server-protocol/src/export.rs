@@ -2171,6 +2171,7 @@ mod tests {
                 .get(Path::new("v2/ThreadStartParams.ts"))
                 .ok_or_else(|| anyhow::anyhow!("missing v2/ThreadStartParams.ts fixture"))?,
         )?;
+        assert_eq!(thread_start_ts.contains("agentType"), false);
         assert_eq!(thread_start_ts.contains("mockExperimentalField"), false);
         assert_eq!(
             fixture_tree.contains_key(Path::new("v2/MockExperimentalMethodParams.ts")),

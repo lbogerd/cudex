@@ -939,6 +939,7 @@ impl ThreadRequestProcessor {
         request_context: RequestContext,
     ) -> Result<(), JSONRPCErrorError> {
         let ThreadStartParams {
+            agent_type,
             model,
             model_provider,
             allow_provider_model_fallback,
@@ -1028,6 +1029,7 @@ impl ThreadRequestProcessor {
                 history_mode.map(Into::into),
                 session_start_source,
                 thread_source.map(Into::into),
+                agent_type,
                 environments,
                 service_name,
                 allow_provider_model_fallback,
@@ -1105,6 +1107,7 @@ impl ThreadRequestProcessor {
         history_mode: Option<ThreadHistoryMode>,
         session_start_source: Option<codex_app_server_protocol::ThreadStartSource>,
         thread_source: Option<codex_protocol::protocol::ThreadSource>,
+        agent_type: Option<String>,
         environment_selections: Option<Vec<TurnEnvironmentSelection>>,
         service_name: Option<String>,
         allow_provider_model_fallback: bool,
@@ -1220,43 +1223,57 @@ impl ThreadRequestProcessor {
             thread_extension_init.insert(selected_capability_roots);
         }
         let create_thread_started_at = std::time::Instant::now();
+        let start_options = StartThreadOptions {
+            config,
+            allow_provider_model_fallback,
+            initial_history: match session_start_source
+                .unwrap_or(codex_app_server_protocol::ThreadStartSource::Startup)
+            {
+                codex_app_server_protocol::ThreadStartSource::Startup => InitialHistory::New,
+                codex_app_server_protocol::ThreadStartSource::Clear => InitialHistory::Cleared,
+            },
+            history_mode,
+            session_source: None,
+            thread_source,
+            dynamic_tools,
+            metrics_service_name: service_name,
+            parent_trace: request_trace,
+            environments,
+            thread_extension_init,
+            supports_openai_form_elicitation,
+        };
+        let start_thread = async {
+            match agent_type {
+                Some(agent_type) => {
+                    listener_task_context
+                        .thread_manager
+                        .start_thread_with_options_and_agent_type(start_options, agent_type)
+                        .await
+                }
+                None => {
+                    listener_task_context
+                        .thread_manager
+                        .start_thread_with_options(start_options)
+                        .await
+                }
+            }
+        }
+        .instrument(tracing::info_span!(
+            "app_server.thread_start.create_thread",
+            otel.name = "app_server.thread_start.create_thread",
+            thread_start.dynamic_tool_count = dynamic_tool_count,
+        ))
+        .await;
         let NewThread {
             thread_id,
             thread,
             session_configured,
             ..
-        } = listener_task_context
-            .thread_manager
-            .start_thread_with_options(StartThreadOptions {
-                config,
-                allow_provider_model_fallback,
-                initial_history: match session_start_source
-                    .unwrap_or(codex_app_server_protocol::ThreadStartSource::Startup)
-                {
-                    codex_app_server_protocol::ThreadStartSource::Startup => InitialHistory::New,
-                    codex_app_server_protocol::ThreadStartSource::Clear => InitialHistory::Cleared,
-                },
-                history_mode,
-                session_source: None,
-                thread_source,
-                dynamic_tools,
-                metrics_service_name: service_name,
-                parent_trace: request_trace,
-                environments,
-                thread_extension_init,
-                supports_openai_form_elicitation,
-            })
-            .instrument(tracing::info_span!(
-                "app_server.thread_start.create_thread",
-                otel.name = "app_server.thread_start.create_thread",
-                thread_start.dynamic_tool_count = dynamic_tool_count,
-            ))
-            .await
-            .map_err(|err| match err {
-                CodexErr::InvalidRequest(message) => invalid_request(message),
-                CodexErr::UnsupportedOperation(message) => method_not_found(message),
-                err => internal_error(format!("error creating thread: {err}")),
-            })?;
+        } = start_thread.map_err(|err| match err {
+            CodexErr::InvalidRequest(message) => invalid_request(message),
+            CodexErr::UnsupportedOperation(message) => method_not_found(message),
+            err => internal_error(format!("error creating thread: {err}")),
+        })?;
         let session_telemetry = thread.session_telemetry();
         session_telemetry.record_startup_phase(
             "thread_start_create_thread",

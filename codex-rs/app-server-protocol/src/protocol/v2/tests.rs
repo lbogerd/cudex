@@ -3969,6 +3969,28 @@ fn thread_start_params_preserve_explicit_null_service_tier() {
 }
 
 #[test]
+fn thread_start_params_round_trip_experimental_agent_type() {
+    let params: ThreadStartParams = serde_json::from_value(json!({
+        "agentType": "researcher"
+    }))
+    .expect("params should deserialize");
+
+    assert_eq!(params.agent_type.as_deref(), Some("researcher"));
+    assert_eq!(
+        crate::experimental_api::ExperimentalApi::experimental_reason(&params),
+        Some("thread/start.agentType")
+    );
+    assert_eq!(
+        serde_json::to_value(params).expect("params should serialize")["agentType"],
+        "researcher"
+    );
+
+    let nullable: ThreadStartParams =
+        serde_json::from_value(json!({ "agentType": null })).expect("null should deserialize");
+    assert_eq!(nullable.agent_type, None);
+}
+
+#[test]
 fn thread_lifecycle_responses_default_missing_optional_fields() {
     let response = json!({
         "thread": {
