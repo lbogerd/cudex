@@ -59,6 +59,15 @@ Completed:
   - rejects environment-ID collisions without replacing existing environments;
   - rolls back the environment registration and lease on registration or later
     thread-startup failure.
+- Hosted runtime teardown slice from Stages 2 and 8:
+  - atomically removes committed runtime ownership alongside thread removal;
+  - unregisters and releases only the removed thread's environment and lease;
+  - releases successfully shut down threads during bounded manager-wide
+    shutdown without touching timed-out or submit-failed threads;
+  - retains opaque runtime metadata when cleanup fails so a later removal can
+    retry instead of forgetting the lease;
+  - scopes release idempotency keys to the lease generation so a future restored
+    lease for the same thread cannot collide with an earlier release.
 - Tool-domain foundation from Stage 5:
   - added `ToolExecutionDomain` and `ToolExecutionDomainKind` independently of
     `ToolExposure`.
@@ -72,7 +81,12 @@ Validated in this branch:
 - focused active-recovery cancellation test in `codex-exec-server`: passed;
 - hosted runtime orchestration tests in `codex-core`: 3 passed;
 - hosted root/spawned thread startup test in `codex-core`: passed;
-- thread-manager tests in `codex-core`: 29 passed;
+- thread-manager tests after release integration in `codex-core`: 30 passed;
+- hosted runtime transaction tests after release integration in `codex-core`: 3 passed;
+- full `codex-core` run after release integration: 2,880 passed, 97 failed,
+  12 skipped; failures were in existing environment-sensitive sandbox,
+  approval/network, missing test-binary, and timing-sensitive integration tests,
+  while the hosted lifecycle and thread-manager coverage passed;
 - focused resumed root and subagent session tests in `codex-core`: 2 passed;
 - environment-focused tests in `codex-exec-server`: 61 passed;
 - scoped `just fix -p codex-core`: passed after clearing regenerable build
@@ -87,7 +101,6 @@ container.
 
 Still pending:
 
-- the remainder of Stage 2: durable ownership metadata and release integration;
 - the remainder of Stage 3: remove legacy spawn inheritance/override plumbing
   and expose root `agentType` selection;
 - Stage 4 external-sandbox runtime enforcement;
