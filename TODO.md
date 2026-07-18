@@ -9,9 +9,13 @@ production backend. Stable decisions, evidence, and wire schemas are in
 - [x] Add PostgreSQL migrations for leases, snapshots, artifacts, operations,
   and connection-ticket hashes.
 - [x] Enforce unique operation/idempotency keys, lease IDs, and environment IDs.
+- [x] Add atomic PostgreSQL operation claims, sanitized logical replay, worker/
+  generation fencing, allocation ledgers, stale takeover, and sorted lease-lock
+  primitives.
 - [ ] Persist canonical request hashes, operation state, logical responses, and
   all partial provider allocations.
-- [ ] Add transactional per-lease locks and deterministic multi-lease lock order.
+- [ ] Apply transactional per-lease locks and deterministic multi-lease lock
+  order to every lifecycle mutation.
 - [x] Replace local blobs with authenticated object storage for workspace
   archives, manifests, content blobs, and patch artifacts.
 - [ ] Add reference retention so snapshots/artifacts outlive lease release while

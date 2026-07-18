@@ -285,6 +285,28 @@ targets, 300-conflict truncation, malformed inputs, and every quota dimension.
 Manifest capture/persistence and live workspace mutation remain subsequent
 lifecycle work.
 
+### Multi-replica operation journal primitives
+
+The PostgreSQL layer now exposes atomic operation admission over the unique
+`(operation, idempotency_key)` identity. It compares tenant and canonical request
+hash before any caller mutation, returns one winner under concurrent claims,
+lets identical observers await/replay terminal state, and sanitizes and bounds
+logical responses so connection/ticket/provider credentials cannot be stored.
+Every mutation is fenced by worker ID plus generation, with heartbeats and
+`FOR UPDATE SKIP LOCKED` stale takeover preventing a dead worker from later
+changing reconciler-owned state.
+
+Partial sandboxes, capture sandboxes, provider snapshots, tickets, and objects
+can be recorded immediately in a deduplicated allocation ledger and moved
+through adopted/reclaim states. Transaction-scoped advisory locks hash
+tenant/lease identities only after sorting and deduplicating lease IDs, then lock
+the corresponding rows. Docker-backed PostgreSQL 17 tests use independent pools
+to prove one concurrent claim, changed-request rejection, terminal replay and
+redaction, uniqueness, allocation fencing, one stale reconciler, and reversed
+multi-lease acquisition without deadlock. The existing control-plane methods
+still need to be refactored onto this API before the production persistence
+checklist and provider-mutation exit criterion are satisfied.
+
 CubeSandbox was verified on 2026-07-18 through stock E2B TypeScript SDK 2.35.0.
 Provider code lives in the external TypeScript control plane under `e2b/src`, not
 in `codex-core`.
