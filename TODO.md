@@ -34,7 +34,9 @@ connection material or allocation is leaked.
 
 ## 2. Production workspace ingress
 
-- [ ] Define an authenticated immutable source-snapshot lifecycle and opaque ID.
+- [x] Define an authenticated immutable source-snapshot lifecycle and opaque ID.
+- [x] Validate tenant ownership, trusted checksum, expiry, canonical roots/cwd,
+  archive layout/types/links, and all archive quotas before durable publication.
 - [ ] Extend trusted deployment metadata or the provision contract so a remote
   control plane resolves that ID without client-host `file:` access.
 - [ ] Authorize tenant/checksum/expiry before sandbox allocation.

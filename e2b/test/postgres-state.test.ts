@@ -53,10 +53,18 @@ live('source snapshots and object references deny cross-tenant access and preser
     checksum: sourceObject.checksum, cwdUri: 'file:///source/root', workspaceRootUris: ['file:///source/root'],
     state: 'available' as const, expiresAt: new Date(Date.now() + 60_000) }
   await context.first.registerSourceSnapshot(source)
+  const replay = await context.second.registerSourceSnapshot({ ...source, sourceSnapshotId: 'source-replay' })
+  assert.equal(replay.sourceSnapshotId, source.sourceSnapshotId)
   assert.equal((await context.second.findAuthorizedSourceSnapshot('tenant-1', 'source-1'))?.sourceSnapshotId, 'source-1')
+  assert.equal((await context.second.findAuthorizedSourceSnapshotByChecksum('tenant-1', source.checksum))?.sourceSnapshotId, 'source-1')
   assert.equal(await context.second.findAuthorizedSourceSnapshot('tenant-2', 'source-1'), null)
   await assert.rejects(context.second.registerSourceSnapshot({ ...source, tenantId: 'tenant-2' }), DurableStateConflictError)
   await assert.rejects(context.second.registerSourceSnapshot({ ...source, sourceSnapshotId: 'source-cross-tenant', tenantId: 'tenant-2' }))
+  const sharedPhysicalObject = { ...sourceObject, objectId: 'source-object-tenant-2', tenantId: 'tenant-2' }
+  await context.second.registerObject(sharedPhysicalObject)
+  const secondTenantSource = await context.second.registerSourceSnapshot({ ...source, sourceSnapshotId: 'source-tenant-2',
+    tenantId: 'tenant-2', archiveObjectId: sharedPhysicalObject.objectId })
+  assert.equal(secondTenantSource.tenantId, 'tenant-2')
   await assert.rejects(context.firstPool.query(`UPDATE hosted_agent_source_snapshots SET checksum = $1 WHERE source_snapshot_id = 'source-1'`, [digest('f')]))
   await assert.rejects(context.first.registerSourceSnapshot({ ...source, sourceSnapshotId: 'source-invalid',
     cwdUri: 'file:///source/other', workspaceRootUris: ['file:///source/root'] }))

@@ -280,18 +280,27 @@ export class PostgresDurableState {
             (source_snapshot_id, tenant_id, archive_object_id, checksum, cwd_uri,
              workspace_root_uris, state, expires_at)
           VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8)
-          ON CONFLICT (source_snapshot_id) DO NOTHING
+          ON CONFLICT DO NOTHING
         `, [input.sourceSnapshotId, input.tenantId, input.archiveObjectId, input.checksum,
           input.cwdUri, JSON.stringify(input.workspaceRootUris), input.state, input.expiresAt])
-        const result = await client.query<SourceRow>(`
+        let result = await client.query<SourceRow>(`
           SELECT source_snapshot_id, tenant_id, archive_object_id, checksum, cwd_uri,
                  workspace_root_uris, state, expires_at
           FROM hosted_agent_source_snapshots WHERE source_snapshot_id = $1 FOR UPDATE
         `, [input.sourceSnapshotId])
+        if (!result.rows[0]) {
+          result = await client.query<SourceRow>(`
+            SELECT source_snapshot_id, tenant_id, archive_object_id, checksum, cwd_uri,
+                   workspace_root_uris, state, expires_at
+            FROM hosted_agent_source_snapshots
+            WHERE tenant_id = $1 AND checksum = $2 FOR UPDATE
+          `, [input.tenantId, input.checksum])
+        }
         const row = result.rows[0]
         if (!row || row.tenant_id !== input.tenantId || row.archive_object_id !== input.archiveObjectId ||
           row.checksum !== input.checksum || row.cwd_uri !== input.cwdUri ||
-          JSON.stringify(row.workspace_root_uris) !== JSON.stringify(input.workspaceRootUris)) {
+          JSON.stringify(row.workspace_root_uris) !== JSON.stringify(input.workspaceRootUris) ||
+          row.state !== input.state || row.expires_at.getTime() !== input.expiresAt.getTime()) {
           throw new DurableStateConflictError('source snapshot identity does not match its existing registration')
         }
         await this.addObjectReferenceWithClient(client, input.tenantId, input.archiveObjectId,
@@ -310,6 +319,17 @@ export class PostgresDurableState {
       WHERE source_snapshot_id = $1 AND tenant_id = $2
         AND state = 'available' AND expires_at > $3
     `, [sourceSnapshotId, tenantId, at])
+    return result.rows[0] ? sourceFromRow(result.rows[0]) : null
+  }
+
+  async findAuthorizedSourceSnapshotByChecksum(tenantId: string, checksum: string, at = new Date()): Promise<SourceSnapshot | null> {
+    validateId('tenant ID', tenantId); validateChecksum(checksum); validateDate('source snapshot lookup time', at)
+    const result = await this.pool.query<SourceRow>(`
+      SELECT source_snapshot_id, tenant_id, archive_object_id, checksum, cwd_uri,
+             workspace_root_uris, state, expires_at
+      FROM hosted_agent_source_snapshots
+      WHERE tenant_id = $1 AND checksum = $2 AND state = 'available' AND expires_at > $3
+    `, [tenantId, checksum, at])
     return result.rows[0] ? sourceFromRow(result.rows[0]) : null
   }
 

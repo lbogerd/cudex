@@ -258,6 +258,36 @@ per-file bytes, path depth, archive bytes, and extraction ratio before provider
 allocation. Focused tests inspect the extracted archive and exercise overlap,
 link, FIFO, and quota rejection.
 
+### Immutable source-snapshot lifecycle
+
+The production ingress foundation accepts an authenticated tenant principal plus
+an archive, trusted SHA-256, canonical remote cwd/roots, and bounded expiry. It
+fully parses the archive into a staging manifest before the first durable write,
+enforcing the archive/type/path/link/mode quotas and requiring every declared
+`/workspace/roots/<index>/...` root and cwd while rejecting undeclared content.
+Creation publishes content-addressed bytes, registers an immutable available
+source object/snapshot/reference, and returns only an opaque `source_...` ID,
+checksums, expiry, and size. Same-tenant replay returns the existing immutable
+identity; conflicting metadata is rejected.
+
+Resolution authorizes tenant, state, expiry, and the trusted expected checksum
+before reading object storage. It then verifies physical content identity and
+bytes, reparses the archive, and returns defensive copies. Stable client errors
+do not expose storage/database details. A required ref-aware reclaimer is invoked
+after every partial publication failure and must surface cleanup-pending rather
+than claiming success.
+
+Tenant-owned durable object IDs are derived separately from the shared physical
+content identity. A migration permits identical immutable storage locations for
+different tenants while retaining tenant-specific database ownership; cleanup
+must prove no durable object points at the physical content before deletion.
+Seven lifecycle tests cover creation/resolution, cross-tenant denial, replay,
+multi-tenant identical bytes, all pre-publication validation, cleanup failures,
+and stored corruption. PostgreSQL 17 tests additionally prove transactional
+migration, tenant-isolated shared content, immutable replay, and lookup by
+checksum. HTTP upload/auth wiring, service resolution before provider allocation,
+and successful-expiry garbage collection remain open.
+
 ### Connection-ticket lifecycle
 
 Gateway tickets now carry an explicit persisted purpose and issuance time, have
