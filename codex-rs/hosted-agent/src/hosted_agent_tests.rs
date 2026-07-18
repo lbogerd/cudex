@@ -122,6 +122,88 @@ async fn fake_lifecycle_is_idempotent_and_restorable() {
 }
 
 #[tokio::test]
+async fn fake_reports_missing_and_released_leases() {
+    let service = FakeHostedAgentService::default();
+    let unknown_lease_id = "unknown-lease".to_string();
+    assert_lease_missing(
+        service
+            .reconnect(AgentReconnectRequest {
+                lease_id: unknown_lease_id.clone(),
+                idempotency_key: "reconnect-unknown".to_string(),
+            })
+            .await,
+    );
+    assert_lease_missing(
+        service
+            .checkpoint(AgentCheckpointRequest {
+                lease_id: unknown_lease_id.clone(),
+                idempotency_key: "checkpoint-unknown".to_string(),
+            })
+            .await,
+    );
+    assert_lease_missing(
+        service
+            .export_patch(AgentPatchExportRequest {
+                lease_id: unknown_lease_id.clone(),
+                agent_id: ThreadId::new(),
+                base_snapshot_id: "snapshot-unknown".to_string(),
+                idempotency_key: "export-unknown".to_string(),
+            })
+            .await,
+    );
+    assert_lease_missing(
+        service
+            .apply_patch(AgentPatchApplyRequest {
+                target_lease_id: unknown_lease_id.clone(),
+                artifact_id: "artifact-unknown".to_string(),
+                idempotency_key: "apply-unknown".to_string(),
+            })
+            .await,
+    );
+    assert_lease_missing(
+        service
+            .release(AgentReleaseRequest {
+                lease_id: unknown_lease_id,
+                idempotency_key: "release-unknown".to_string(),
+            })
+            .await,
+    );
+
+    let provisioned = service
+        .provision(root_request("released"))
+        .await
+        .expect("provision succeeds");
+    service
+        .release(AgentReleaseRequest {
+            lease_id: provisioned.lease_id.clone(),
+            idempotency_key: "release".to_string(),
+        })
+        .await
+        .expect("release succeeds");
+    assert_lease_missing(
+        service
+            .reconnect(AgentReconnectRequest {
+                lease_id: provisioned.lease_id.clone(),
+                idempotency_key: "reconnect-released".to_string(),
+            })
+            .await,
+    );
+    assert_lease_missing(
+        service
+            .checkpoint(AgentCheckpointRequest {
+                lease_id: provisioned.lease_id,
+                idempotency_key: "checkpoint-released".to_string(),
+            })
+            .await,
+    );
+}
+
+fn assert_lease_missing<T: std::fmt::Debug>(result: crate::types::Result<T>) {
+    let error = result.expect_err("lease lookup must fail");
+    assert_eq!(error.category, HostedAgentErrorCategory::LeaseMissing);
+}
+
+#[tokio::test]
 async fn fake_patch_conflict_is_atomic_and_clean_apply_can_be_checkpointed() {
     let service = FakeHostedAgentService::default();
     let source = service
@@ -368,6 +450,41 @@ async fn http_client_rejects_duplicate_lease_or_environment_ids() {
         .await
         .expect_err("duplicate lease must fail");
     assert_eq!(error.category, HostedAgentErrorCategory::InvalidResponse);
+}
+
+#[tokio::test]
+async fn http_client_distinguishes_missing_leases_and_snapshots() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/agents/reconnect"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/agents/provision"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    let client = HttpHostedAgentService::for_test(&server.uri(), "secret").unwrap();
+
+    assert_lease_missing(
+        client
+            .reconnect(AgentReconnectRequest {
+                lease_id: "lease-missing".to_string(),
+                idempotency_key: "reconnect".to_string(),
+            })
+            .await,
+    );
+
+    let mut restore = root_request("restore");
+    restore.source = ProjectSnapshotSource::DurableSnapshot {
+        snapshot_id: "snapshot-missing".to_string(),
+    };
+    let error = client
+        .provision(restore)
+        .await
+        .expect_err("missing snapshot must fail");
+    assert_eq!(error.category, HostedAgentErrorCategory::SnapshotMissing);
 }
 
 #[tokio::test]

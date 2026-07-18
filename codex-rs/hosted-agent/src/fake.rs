@@ -112,7 +112,7 @@ impl State {
             .filter(|lease| !lease.released)
             .ok_or_else(|| {
                 HostedAgentError::new(
-                    HostedAgentErrorCategory::ConnectionFailed,
+                    HostedAgentErrorCategory::LeaseMissing,
                     "lease is not active",
                 )
             })
@@ -124,7 +124,7 @@ impl State {
             .filter(|lease| !lease.released)
             .ok_or_else(|| {
                 HostedAgentError::new(
-                    HostedAgentErrorCategory::ConnectionFailed,
+                    HostedAgentErrorCategory::LeaseMissing,
                     "lease is not active",
                 )
             })
@@ -380,10 +380,7 @@ impl HostedAgentService for FakeHostedAgentService {
             };
         }
         let lease = state.leases.get_mut(&request.lease_id).ok_or_else(|| {
-            HostedAgentError::new(
-                HostedAgentErrorCategory::ConnectionFailed,
-                "lease is missing",
-            )
+            HostedAgentError::new(HostedAgentErrorCategory::LeaseMissing, "lease is missing")
         })?;
         lease.released = true;
         state

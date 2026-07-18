@@ -164,6 +164,19 @@ impl HttpHostedAgentService {
     where
         Request: Serialize + ?Sized,
     {
+        self.send_with_not_found_category(path, request, HostedAgentErrorCategory::SnapshotMissing)
+            .await
+    }
+
+    async fn send_with_not_found_category<Request>(
+        &self,
+        path: &str,
+        request: &Request,
+        not_found_category: HostedAgentErrorCategory,
+    ) -> Result<reqwest::Response>
+    where
+        Request: Serialize + ?Sized,
+    {
         let endpoint = self.service_url.join(path).map_err(|_| {
             HostedAgentError::new(
                 HostedAgentErrorCategory::ConnectionFailed,
@@ -186,7 +199,7 @@ impl HttpHostedAgentService {
         if response.status().is_success() {
             Ok(response)
         } else {
-            Err(error_for_status(response.status()))
+            Err(error_for_status(response.status(), not_found_category))
         }
     }
 
@@ -281,7 +294,14 @@ impl HostedAgentService for HttpHostedAgentService {
     }
 
     async fn reconnect(&self, request: AgentReconnectRequest) -> Result<ProvisionedAgent> {
-        let provisioned: ProvisionedAgent = self.post("v1/agents/reconnect", &request).await?;
+        let response = self
+            .send_with_not_found_category(
+                "v1/agents/reconnect",
+                &request,
+                HostedAgentErrorCategory::LeaseMissing,
+            )
+            .await?;
+        let provisioned: ProvisionedAgent = decode_response(response).await?;
         self.validate_provisioned(&provisioned, None)?;
         Ok(provisioned)
     }
@@ -370,10 +390,13 @@ fn validate_opaque_id(value: &str, kind: &str) -> Result<()> {
     }
 }
 
-fn error_for_status(status: StatusCode) -> HostedAgentError {
+fn error_for_status(
+    status: StatusCode,
+    not_found_category: HostedAgentErrorCategory,
+) -> HostedAgentError {
     let category = match status {
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => HostedAgentErrorCategory::Unauthorized,
-        StatusCode::NOT_FOUND => HostedAgentErrorCategory::SnapshotMissing,
+        StatusCode::NOT_FOUND => not_found_category,
         StatusCode::CONFLICT => HostedAgentErrorCategory::PatchConflict,
         StatusCode::UNPROCESSABLE_ENTITY => HostedAgentErrorCategory::InvalidTemplate,
         StatusCode::TOO_MANY_REQUESTS => HostedAgentErrorCategory::QuotaExceeded,

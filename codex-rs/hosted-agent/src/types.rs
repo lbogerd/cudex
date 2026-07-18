@@ -216,6 +216,7 @@ pub enum HostedAgentErrorCategory {
     Unavailable,
     Unauthorized,
     InvalidTemplate,
+    LeaseMissing,
     SnapshotMissing,
     QuotaExceeded,
     ConnectionFailed,
