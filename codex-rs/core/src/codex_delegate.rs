@@ -187,6 +187,25 @@ pub(crate) async fn run_codex_thread_interactive(
         }
     };
     if let Some(pending) = pending_hosted_runtime.take() {
+        if let Err(error) = session.try_ensure_rollout_materialized().await {
+            if let Err(shutdown_error) = io.shutdown_and_wait().await {
+                tracing::warn!(
+                    error = %shutdown_error,
+                    %thread_id,
+                    "failed to shut down hosted delegate after persistence failed"
+                );
+            }
+            if let Err(cleanup_error) = pending.rollback().await {
+                tracing::warn!(
+                    error = %cleanup_error,
+                    %thread_id,
+                    "failed to roll back hosted delegate runtime after persistence failed"
+                );
+            }
+            return Err(CodexErr::Fatal(format!(
+                "failed to materialize hosted delegate {thread_id}: {error}"
+            )));
+        }
         parent_session
             .services
             .agent_control

@@ -5,10 +5,14 @@ use std::time::Duration;
 
 use codex_exec_server::EnvironmentManager;
 use codex_exec_server::ExecServerError;
+use codex_hosted_agent::AgentCheckpoint;
+use codex_hosted_agent::AgentCheckpointRequest;
 use codex_hosted_agent::AgentProvisionRequest;
 use codex_hosted_agent::AgentReleaseRequest;
 use codex_hosted_agent::AgentToolPolicy;
 use codex_hosted_agent::HostedAgentError;
+use codex_hosted_agent::HostedAgentLifecycleState;
+use codex_hosted_agent::HostedAgentRuntimeRecord;
 use codex_hosted_agent::HostedAgentService;
 use codex_hosted_agent::ProvisionedAgent;
 use codex_protocol::protocol::TurnEnvironmentSelection;
@@ -68,6 +72,21 @@ impl HostedToolAuthorization {
     }
 }
 
+impl HostedAgentRuntime {
+    pub(crate) fn durable_record(&self) -> HostedAgentRuntimeRecord {
+        HostedAgentRuntimeRecord {
+            agent_type: self.agent_type.clone(),
+            sandbox_template: self.sandbox_template.clone(),
+            lease_id: self.lease_id.clone(),
+            environment_id: self.environment_id.clone(),
+            base_snapshot_id: self.base_snapshot_id.clone(),
+            latest_snapshot_id: Some(self.latest_snapshot_id.clone()),
+            last_exported_patch: None,
+            lifecycle_state: HostedAgentLifecycleState::Active,
+        }
+    }
+}
+
 type HostedServiceFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, HostedAgentError>> + Send + 'a>>;
 
@@ -81,6 +100,11 @@ trait ErasedHostedAgentService: Send + Sync {
         request: AgentProvisionRequest,
     ) -> HostedServiceFuture<'_, ProvisionedAgent>;
 
+    fn checkpoint(
+        &self,
+        request: AgentCheckpointRequest,
+    ) -> HostedServiceFuture<'_, AgentCheckpoint>;
+
     fn release(&self, request: AgentReleaseRequest) -> HostedServiceFuture<'_, ()>;
 }
 
@@ -93,6 +117,13 @@ where
         request: AgentProvisionRequest,
     ) -> HostedServiceFuture<'_, ProvisionedAgent> {
         Box::pin(HostedAgentService::provision(self, request))
+    }
+
+    fn checkpoint(
+        &self,
+        request: AgentCheckpointRequest,
+    ) -> HostedServiceFuture<'_, AgentCheckpoint> {
+        Box::pin(HostedAgentService::checkpoint(self, request))
     }
 
     fn release(&self, request: AgentReleaseRequest) -> HostedServiceFuture<'_, ()> {
@@ -198,6 +229,22 @@ impl HostedAgentProvisioner {
         )
         .await
     }
+
+    /// Creates a durable snapshot for one successfully completed turn.
+    pub(crate) async fn checkpoint(
+        &self,
+        agent_id: codex_protocol::ThreadId,
+        turn_id: &str,
+        runtime: &HostedAgentRuntime,
+    ) -> Result<AgentCheckpoint, HostedAgentRuntimeError> {
+        self.service
+            .checkpoint(AgentCheckpointRequest {
+                lease_id: runtime.lease_id.clone(),
+                idempotency_key: format!("hosted-agent:{agent_id}:turn:{turn_id}:checkpoint"),
+            })
+            .await
+            .map_err(HostedAgentRuntimeError::Checkpoint)
+    }
 }
 
 /// A registered lease that has not yet been committed to a successfully started thread.
@@ -225,6 +272,10 @@ impl PendingHostedAgentRuntime {
         self.runtime
     }
 
+    pub(crate) fn durable_record(&self) -> HostedAgentRuntimeRecord {
+        self.runtime.durable_record()
+    }
+
     pub(crate) async fn rollback(self) -> Result<(), HostedAgentRuntimeError> {
         cleanup_runtime(
             self.agent_id,
@@ -246,6 +297,8 @@ pub(crate) enum HostedAgentRuntimeError {
         #[source]
         source: ExecServerError,
     },
+    #[error("failed to checkpoint hosted-agent lease: {0}")]
+    Checkpoint(HostedAgentError),
     #[error("failed to unregister hosted environment `{environment_id}`: {source}")]
     Unregister {
         environment_id: String,

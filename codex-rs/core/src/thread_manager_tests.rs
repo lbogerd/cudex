@@ -27,6 +27,9 @@ use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadSource;
+use codex_protocol::protocol::TurnAbortReason;
+use codex_protocol::protocol::TurnAbortedEvent;
+use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::UserMessageEvent;
 use codex_utils_path_uri::PathUri;
@@ -140,6 +143,17 @@ async fn hosted_thread_manager_for_tests() -> (
     ThreadManager,
     Arc<codex_hosted_agent::FakeHostedAgentService>,
 ) {
+    hosted_thread_manager_with_durable_store_for_tests(/*durable_store*/ true).await
+}
+
+async fn hosted_thread_manager_with_durable_store_for_tests(
+    durable_store: bool,
+) -> (
+    tempfile::TempDir,
+    Config,
+    ThreadManager,
+    Arc<codex_hosted_agent::FakeHostedAgentService>,
+) {
     let temp_dir = tempdir().expect("tempdir");
     let mut config = test_config().await;
     config.codex_home = temp_dir.path().join("codex-home").abs();
@@ -173,9 +187,21 @@ async fn hosted_thread_manager_for_tests() -> (
         Arc::clone(&hosted_service),
         environment_manager,
     ));
-    Arc::get_mut(&mut manager.state)
-        .expect("new thread manager state must be unshared")
-        .hosted_agent_provisioner = Ok(Some(provisioner));
+    let manager_state =
+        Arc::get_mut(&mut manager.state).expect("new thread manager state must be unshared");
+    manager_state.hosted_agent_provisioner = Ok(Some(provisioner));
+    if durable_store {
+        let state_db = codex_state::StateRuntime::init(
+            config.sqlite_home.clone(),
+            config.model_provider_id.clone(),
+        )
+        .await
+        .expect("state db should initialize");
+        manager_state.thread_store = Arc::new(LocalThreadStore::new(
+            LocalThreadStoreConfig::from_config(&config),
+            Some(state_db),
+        ));
+    }
 
     (temp_dir, config, manager, hosted_service)
 }
@@ -187,6 +213,169 @@ fn hosted_provision_request(
     service
         .provision_request(&format!("hosted-agent:{thread_id}:provision"))
         .expect("hosted provision request")
+}
+
+#[tokio::test]
+async fn hosted_runtime_is_durable_and_checkpoints_only_successful_turns() {
+    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
+    let root = manager
+        .start_thread_with_options(start_thread_options(config))
+        .await
+        .expect("start hosted root");
+    let request = hosted_provision_request(&hosted_service, root.thread_id);
+    let lease_id = hosted_service
+        .provisioned_lease_id(&request.idempotency_key)
+        .expect("hosted lease");
+    let initial_record = manager
+        .state
+        .thread_store
+        .get_hosted_agent_runtime(root.thread_id)
+        .await
+        .expect("read initial hosted runtime")
+        .expect("initial hosted runtime record");
+    assert_eq!(
+        initial_record,
+        codex_hosted_agent::HostedAgentRuntimeRecord {
+            agent_type: request.agent_type,
+            sandbox_template: request.sandbox_template,
+            lease_id: lease_id.clone(),
+            environment_id: hosted_service.provisioned_environment_ids()[0].clone(),
+            base_snapshot_id: initial_record.base_snapshot_id.clone(),
+            latest_snapshot_id: Some(initial_record.base_snapshot_id.clone()),
+            last_exported_patch: None,
+            lifecycle_state: codex_hosted_agent::HostedAgentLifecycleState::Active,
+        }
+    );
+
+    hosted_service.set_checkpoint_failure(Some(codex_hosted_agent::HostedAgentError::new(
+        codex_hosted_agent::HostedAgentErrorCategory::Unavailable,
+        "checkpoint unavailable",
+    )));
+    let failed_turn = root
+        .thread
+        .session
+        .new_default_turn_with_sub_id("failed-checkpoint-turn".to_string())
+        .await;
+    root.thread
+        .session
+        .send_event(
+            &failed_turn,
+            EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: failed_turn.sub_id.clone(),
+                last_agent_message: Some("done".to_string()),
+                error: None,
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            }),
+        )
+        .await;
+    assert_eq!(
+        manager
+            .state
+            .thread_store
+            .get_hosted_agent_runtime(root.thread_id)
+            .await
+            .expect("read hosted runtime after failed checkpoint"),
+        Some(initial_record.clone())
+    );
+
+    hosted_service.set_checkpoint_failure(None);
+    let completed_turn = root
+        .thread
+        .session
+        .new_default_turn_with_sub_id("completed-turn".to_string())
+        .await;
+    root.thread
+        .session
+        .send_event(
+            &completed_turn,
+            EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: completed_turn.sub_id.clone(),
+                last_agent_message: Some("done".to_string()),
+                error: None,
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            }),
+        )
+        .await;
+    let checkpointed_record = manager
+        .state
+        .thread_store
+        .get_hosted_agent_runtime(root.thread_id)
+        .await
+        .expect("read checkpointed hosted runtime")
+        .expect("checkpointed hosted runtime record");
+    assert_eq!(
+        checkpointed_record.latest_snapshot_id,
+        hosted_service.latest_snapshot_id(&lease_id)
+    );
+    assert_ne!(checkpointed_record, initial_record);
+
+    let aborted_turn = root
+        .thread
+        .session
+        .new_default_turn_with_sub_id("aborted-turn".to_string())
+        .await;
+    root.thread
+        .session
+        .send_event(
+            &aborted_turn,
+            EventMsg::TurnAborted(TurnAbortedEvent {
+                turn_id: Some(aborted_turn.sub_id.clone()),
+                reason: TurnAbortReason::Interrupted,
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
+            }),
+        )
+        .await;
+    assert_eq!(
+        manager
+            .state
+            .thread_store
+            .get_hosted_agent_runtime(root.thread_id)
+            .await
+            .expect("read hosted runtime after aborted turn"),
+        Some(checkpointed_record)
+    );
+
+    let report = manager
+        .shutdown_all_threads_bounded(Duration::from_secs(10))
+        .await;
+    assert_eq!(report.completed, vec![root.thread_id]);
+}
+
+#[tokio::test]
+async fn hosted_startup_rolls_back_when_runtime_metadata_cannot_be_stored() {
+    let (_temp_dir, config, manager, hosted_service) =
+        hosted_thread_manager_with_durable_store_for_tests(/*durable_store*/ false).await;
+    let error = match manager
+        .start_thread_with_options(start_thread_options(config))
+        .await
+    {
+        Ok(_) => panic!("hosted startup must require durable runtime storage"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("failed to persist hosted-agent runtime")
+    );
+    assert_eq!(hosted_service.active_lease_count(), 0);
+    for environment_id in hosted_service.provisioned_environment_ids() {
+        assert!(
+            manager
+                .state
+                .environment_manager
+                .get_environment(&environment_id)
+                .is_none()
+        );
+    }
+    assert!(manager.state.hosted_agent_runtimes.read().await.is_empty());
 }
 
 #[tokio::test]
@@ -463,9 +652,13 @@ async fn hosted_root_and_spawned_threads_own_distinct_provisioned_environments()
         Arc::clone(&hosted_service),
         Arc::clone(&environment_manager),
     ));
-    Arc::get_mut(&mut manager.state)
-        .expect("new thread manager state must be unshared")
-        .hosted_agent_provisioner = Ok(Some(provisioner));
+    let manager_state =
+        Arc::get_mut(&mut manager.state).expect("new thread manager state must be unshared");
+    manager_state.hosted_agent_provisioner = Ok(Some(provisioner));
+    manager_state.thread_store = InMemoryThreadStore::for_id(format!(
+        "hosted-role-selection-test-{}",
+        uuid::Uuid::new_v4()
+    ));
 
     let blank_agent_type_error = manager
         .start_thread_with_options_and_agent_type(
@@ -608,10 +801,15 @@ async fn hosted_root_and_spawned_threads_own_distinct_provisioned_environments()
         panic!("hosted thread must select exactly one environment");
     };
     {
-        let runtimes = manager.state.hosted_agent_runtimes.read().await;
-        let runtime = runtimes
+        let runtime = manager
+            .state
+            .hosted_agent_runtimes
+            .read()
+            .await
             .get(&new_thread.thread_id)
+            .cloned()
             .expect("thread must own a hosted runtime");
+        let runtime = runtime.snapshot();
         assert_eq!(selection.environment_id, runtime.environment_id);
         assert_eq!(runtime.agent_type, "researcher");
         assert_eq!(runtime.sandbox_template, "research-v1");
@@ -672,19 +870,24 @@ async fn hosted_root_and_spawned_threads_own_distinct_provisioned_environments()
         let runtimes = manager.state.hosted_agent_runtimes.read().await;
         let root_runtime = runtimes
             .get(&new_thread.thread_id)
+            .cloned()
             .expect("root hosted runtime");
         let child_runtime = runtimes
             .get(&child.thread_id)
+            .cloned()
             .expect("child hosted runtime");
+        drop(runtimes);
+        let root_runtime = root_runtime.snapshot();
+        let child_runtime = child_runtime.snapshot();
 
         assert_eq!(child_selection.environment_id, child_runtime.environment_id);
         assert_ne!(child_runtime.lease_id, root_runtime.lease_id);
         assert_ne!(child_runtime.environment_id, root_runtime.environment_id);
         (
             root_runtime.environment_id.clone(),
-            root_runtime.lease_id.clone(),
+            root_runtime.lease_id,
             child_runtime.environment_id.clone(),
-            child_runtime.lease_id.clone(),
+            child_runtime.lease_id,
         )
     };
 

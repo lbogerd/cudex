@@ -37,6 +37,7 @@ struct State {
     snapshots: HashMap<String, Snapshot>,
     reconnects: HashMap<String, (AgentReconnectRequest, ProvisionedAgent)>,
     checkpoints: HashMap<String, (AgentCheckpointRequest, AgentCheckpoint)>,
+    checkpoint_failure: Option<HostedAgentError>,
     exports: HashMap<String, (AgentPatchExportRequest, AgentPatchArtifact)>,
     artifacts: HashMap<String, AgentPatchArtifact>,
     applies: HashMap<String, (AgentPatchApplyRequest, PatchApplyResult)>,
@@ -91,6 +92,27 @@ impl FakeHostedAgentService {
             .leases
             .get(lease_id)
             .map(|lease| lease.latest_snapshot_id.clone())
+    }
+
+    pub fn active_lease_count(&self) -> usize {
+        self.lock()
+            .leases
+            .values()
+            .filter(|lease| !lease.released)
+            .count()
+    }
+
+    pub fn provisioned_environment_ids(&self) -> Vec<String> {
+        self.lock()
+            .provisions
+            .values()
+            .map(|(_, provisioned)| provisioned.environment_id.clone())
+            .collect()
+    }
+
+    /// Configures a service error returned before any checkpoint mutation.
+    pub fn set_checkpoint_failure(&self, error: Option<HostedAgentError>) {
+        self.lock().checkpoint_failure = error;
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -249,6 +271,9 @@ impl HostedAgentService for FakeHostedAgentService {
 
     async fn checkpoint(&self, request: AgentCheckpointRequest) -> Result<AgentCheckpoint> {
         let mut state = self.lock();
+        if let Some(error) = &state.checkpoint_failure {
+            return Err(error.clone());
+        }
         if let Some((previous_request, checkpoint)) =
             state.checkpoints.get(&request.idempotency_key)
         {

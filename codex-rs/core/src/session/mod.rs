@@ -1737,6 +1737,10 @@ impl Session {
     /// Persist the event to rollout and send it to clients.
     pub(crate) async fn send_event(&self, turn_context: &TurnContext, msg: EventMsg) {
         let legacy_source = msg.clone();
+        let completed_turn_id = match &legacy_source {
+            EventMsg::TurnComplete(event) if event.error.is_none() => Some(event.turn_id.as_str()),
+            _ => None,
+        };
         if let EventMsg::Error(error) = &legacy_source
             && error
                 .codex_error_info
@@ -1760,6 +1764,20 @@ impl Session {
             msg,
         };
         self.send_event_raw(event).await;
+        if let Some(turn_id) = completed_turn_id
+            && let Err(error) = self
+                .services
+                .agent_control
+                .checkpoint_hosted_runtime(self.thread_id, turn_id)
+                .await
+        {
+            warn!(
+                %error,
+                thread_id = %self.thread_id,
+                %turn_id,
+                "failed to checkpoint hosted runtime after completed turn"
+            );
+        }
         self.maybe_notify_parent_of_terminal_turn(turn_context, &legacy_source)
             .await;
         self.maybe_mirror_event_text_to_realtime(&legacy_source)

@@ -180,8 +180,18 @@ impl AgentControl {
                 return Err(error);
             }
         };
-        state.commit_hosted_runtime(thread_id, pending).await;
-        Ok(())
+        state.commit_hosted_runtime(thread_id, pending).await
+    }
+
+    pub(crate) async fn checkpoint_hosted_runtime(
+        &self,
+        thread_id: ThreadId,
+        turn_id: &str,
+    ) -> CodexResult<()> {
+        let Some(state) = self.manager.upgrade() else {
+            return Ok(());
+        };
+        state.checkpoint_hosted_runtime(thread_id, turn_id).await
     }
 
     pub(crate) async fn release_hosted_delegate_runtime(&self, thread_id: ThreadId) {
