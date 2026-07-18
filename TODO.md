@@ -36,6 +36,9 @@ production backend. Stable decisions, evidence, and wire schemas are in
   and result leases, schema-enforced source lease/snapshot pairing, terminal/
   latest/tenant/agent/owner/template authorization, atomic lost-source retirement,
   source-snapshot retention, and result-lease allocation adoption.
+- [x] Bind restore lineage into the durable workspace-preparation intent, add an
+  atomic restore commit path, and load only the authorized content-addressed
+  archive after exact locator/digest/size verification.
 - [x] Apply transactional per-lease locking to durable checkpoint capture and
   commit across service replicas.
 - [x] Apply transactional lease/provider locking to durable release across

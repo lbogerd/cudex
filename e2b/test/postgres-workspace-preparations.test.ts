@@ -23,7 +23,8 @@ function intent(overrides: Partial<WorkspacePreparationIntent> = {}): WorkspaceP
   return {
     tenantId: 'tenant-1', leaseId: 'lease-1', environmentId: 'environment-1', agentId: 'agent-1',
     ownerAgentId: null, ownerLeaseId: null, sourceSnapshotId: null, expectedSourceChecksum: null,
-    expectedLatestSnapshotId: null,
+    restoreSourceLeaseId: null, restoreSourceSnapshotId: null,
+    expectedLatestSnapshotId: 'snapshot-before',
     providerSandboxId: 'sandbox-1', sandboxTemplate: 'general-v1', cwdUri: 'file:///workspace/root',
     workspaceRootUris: ['file:///workspace/root'], toolPolicy: {
       allowedDomains: ['controlPlane'], allowedTools: [{ namespace: 'workspace', name: 'read' }],
@@ -44,8 +45,19 @@ test('workspace preparation intents are canonical and require complete source id
   assert.equal(first.canonicalJson, second.canonicalJson)
   assert.throws(() => canonicalWorkspacePreparationIntent(intent({ sourceSnapshotId: 'source-1' })), /paired/)
   assert.throws(() => canonicalWorkspacePreparationIntent(intent({
-    sourceSnapshotId: 'source-1', expectedSourceChecksum: 'not-a-checksum',
+    sourceSnapshotId: 'source-1', expectedSourceChecksum: 'not-a-checksum', expectedLatestSnapshotId: null,
   })), /source checksum/)
+  assert.throws(() => canonicalWorkspacePreparationIntent(intent({
+    restoreSourceLeaseId: 'lease-source', restoreSourceSnapshotId: null,
+  })), /paired/)
+  assert.throws(() => canonicalWorkspacePreparationIntent(intent({
+    restoreSourceLeaseId: 'lease-source', restoreSourceSnapshotId: 'snapshot-source',
+  })), /exactly one source mode/)
+  const restore = canonicalWorkspacePreparationIntent(intent({
+    restoreSourceLeaseId: 'lease-source', restoreSourceSnapshotId: 'snapshot-source',
+    expectedLatestSnapshotId: null,
+  }))
+  assert.equal(restore.intent.restoreSourceSnapshotId, 'snapshot-source')
   assert.throws(() => canonicalWorkspacePreparationIntent({ ...intent(), accessToken: 'secret' } as WorkspacePreparationIntent),
     /invalid workspace preparation intent/)
   assert.throws(() => canonicalWorkspacePreparationIntent(intent({ toolPolicy: {

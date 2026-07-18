@@ -7,7 +7,8 @@ const checksumPattern = /^sha256:[0-9a-f]{64}$/u
 const purposes = new Set<WorkspacePreparationObjectPurpose>(['workspace_archive', 'manifest', 'content_blob'])
 const intentKeys = [
   'tenantId', 'leaseId', 'environmentId', 'agentId', 'ownerAgentId', 'ownerLeaseId',
-  'sourceSnapshotId', 'expectedSourceChecksum', 'expectedLatestSnapshotId', 'providerSandboxId', 'sandboxTemplate',
+  'sourceSnapshotId', 'expectedSourceChecksum', 'restoreSourceLeaseId', 'restoreSourceSnapshotId',
+  'expectedLatestSnapshotId', 'providerSandboxId', 'sandboxTemplate',
   'cwdUri', 'workspaceRootUris', 'toolPolicy', 'policyVersion', 'snapshotId',
   'providerSnapshotId', 'snapshotExpiresAt', 'archiveChecksum', 'manifestChecksum',
 ] as const
@@ -30,6 +31,8 @@ export interface WorkspacePreparationIntent {
   ownerLeaseId: string | null
   sourceSnapshotId: string | null
   expectedSourceChecksum: string | null
+  restoreSourceLeaseId: string | null
+  restoreSourceSnapshotId: string | null
   expectedLatestSnapshotId: string | null
   providerSandboxId: string
   sandboxTemplate: string
@@ -196,6 +199,8 @@ function validateIntent(value: WorkspacePreparationIntent): WorkspacePreparation
   id('tenant ID', value.tenantId); id('lease ID', value.leaseId); id('environment ID', value.environmentId)
   id('agent ID', value.agentId); nullableId('owner agent ID', value.ownerAgentId)
   nullableId('owner lease ID', value.ownerLeaseId); nullableId('source snapshot ID', value.sourceSnapshotId)
+  nullableId('restore source lease ID', value.restoreSourceLeaseId)
+  nullableId('restore source snapshot ID', value.restoreSourceSnapshotId)
   nullableId('expected latest snapshot ID', value.expectedLatestSnapshotId)
   id('provider sandbox ID', value.providerSandboxId); id('sandbox template', value.sandboxTemplate)
   id('cwd URI', value.cwdUri, 2048); id('snapshot ID', value.snapshotId)
@@ -205,6 +210,12 @@ function validateIntent(value: WorkspacePreparationIntent): WorkspacePreparation
   if ((value.sourceSnapshotId === null) !== (value.expectedSourceChecksum === null)) {
     throw new Error('source snapshot and checksum must be paired')
   }
+  if ((value.restoreSourceLeaseId === null) !== (value.restoreSourceSnapshotId === null)) {
+    throw new Error('restore source lease and snapshot must be paired')
+  }
+  const modes = Number(value.sourceSnapshotId !== null)
+    + Number(value.restoreSourceLeaseId !== null) + Number(value.expectedLatestSnapshotId !== null)
+  if (modes !== 1) throw new Error('workspace preparation requires exactly one source mode')
   if (value.expectedSourceChecksum !== null) checksum('source checksum', value.expectedSourceChecksum)
   checksum('archive checksum', value.archiveChecksum)
   if (!Array.isArray(value.workspaceRootUris) || value.workspaceRootUris.length < 1 || value.workspaceRootUris.length > 64) {

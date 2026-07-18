@@ -913,6 +913,18 @@ source/result identities through stale operation takeover. This is a prerequisit
 not the restore coordinator: clean-template creation, verified archive loading,
 allocation cleanup, and ambiguous-commit reconciliation remain in the queue.
 
+The next prerequisite binds the same source lease/snapshot pair into the
+canonical workspace-preparation intent. Immutable ingress, durable restore, and
+checkpoint are mutually exclusive, fully paired source modes; mixed or partial
+identity fails before object publication. `commitDurableRestore` locks the exact
+prepared intent and objects, invokes the atomic restored-lease state transition
+on the caller's transaction, verifies the new snapshot, and only then marks the
+preparation committed. A restore resolver independently checks that the logical
+archive's registered bucket/key matches the configured object store and verifies
+its content-addressed digest and size before exposing bytes. Focused PostgreSQL
+coverage proves restore preparation/commit and the full suite remains green; the
+provider coordinator and restore-specific stale cleanup remain outstanding.
+
 ### Bounded PostgreSQL reconciliation foundation
 
 An intentionally unwired `PostgresReconciler` now claims stale operations only

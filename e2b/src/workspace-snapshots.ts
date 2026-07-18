@@ -117,7 +117,8 @@ export interface WorkspaceSnapshotPublisherOptions {
 
 type DurableWorkspaceState = Pick<PostgresDurableState,
   'withObjectLocationLock' | 'registerObject' | 'createLeaseWithBaseSnapshot' | 'appendCheckpoint'>
-  & Partial<Pick<PostgresDurableState, 'getLease' | 'lockAuthorizedSourceSnapshot'>>
+  & Partial<Pick<PostgresDurableState,
+    'getLease' | 'lockAuthorizedSourceSnapshot' | 'createRestoredLeaseWithBaseSnapshot'>>
 
 interface PlannedObject {
   bytes: Uint8Array
@@ -265,10 +266,15 @@ export class WorkspaceSnapshotPublisher {
     if (input.fence.operation !== 'provision' && input.fence.operation !== 'checkpoint') {
       throw new ServiceError(400, 'invalid workspace preparation operation')
     }
-    if (input.fence.operation === 'checkpoint'
-      && (input.sourceSnapshotId != null || input.expectedSourceChecksum !== null)) {
-      throw new ServiceError(400, 'checkpoint preparation must not rebind source identity')
-    }
+    const immutableSource = input.sourceSnapshotId != null || input.expectedSourceChecksum !== null
+    const restoreSource = input.restoreSourceLeaseId != null || input.restoreSourceSnapshotId != null
+    const checkpointSource = input.expectedLatestSnapshotId != null
+    const immutablePaired = input.sourceSnapshotId != null && input.expectedSourceChecksum !== null
+    const restorePaired = input.restoreSourceLeaseId != null && input.restoreSourceSnapshotId != null
+    const validSourceMode = input.fence.operation === 'checkpoint'
+      ? checkpointSource && !immutableSource && !restoreSource
+      : !checkpointSource && ((immutablePaired && !restoreSource) || (restorePaired && !immutableSource))
+    if (!validSourceMode) throw new ServiceError(400, 'invalid workspace preparation source mode')
     const tenantId = opaque('tenant ID', input.tenantId)
     if (tenantId !== input.fence.tenantId) throw new ServiceError(400, 'workspace preparation tenant mismatch')
     const preparationId = workspacePreparationId(input.fence)
@@ -280,6 +286,8 @@ export class WorkspaceSnapshotPublisher {
         tenantId, leaseId: input.leaseId, environmentId: input.environmentId, agentId: input.agentId,
         ownerAgentId: input.ownerAgentId ?? null, ownerLeaseId: input.ownerLeaseId ?? null,
         sourceSnapshotId: input.sourceSnapshotId ?? null, expectedSourceChecksum: input.expectedSourceChecksum,
+        restoreSourceLeaseId: input.restoreSourceLeaseId ?? null,
+        restoreSourceSnapshotId: input.restoreSourceSnapshotId ?? null,
         expectedLatestSnapshotId: input.fence.operation === 'checkpoint'
           ? input.expectedLatestSnapshotId ?? null : null,
         providerSandboxId: input.providerSandboxId, sandboxTemplate: input.sandboxTemplate,
@@ -347,11 +355,12 @@ export class WorkspaceSnapshotPublisher {
       const locked = await coordinator.preparations.lockForCommit(
         fence, prepared.preparation.preparationId, prepared.intent, executor)
       const intent = locked.preparation.intent
-      if (intent.sourceSnapshotId !== null && intent.expectedSourceChecksum !== null) {
-        if (!this.state.lockAuthorizedSourceSnapshot) throw new Error('source authorization is unavailable')
-        await this.state.lockAuthorizedSourceSnapshot(intent.tenantId, intent.sourceSnapshotId,
-          intent.expectedSourceChecksum, new Date(), executor)
-      }
+      if (intent.sourceSnapshotId === null || intent.expectedSourceChecksum === null
+        || intent.restoreSourceLeaseId !== null || intent.restoreSourceSnapshotId !== null
+        || intent.expectedLatestSnapshotId !== null) throw new Error('invalid immutable source preparation')
+      if (!this.state.lockAuthorizedSourceSnapshot) throw new Error('source authorization is unavailable')
+      await this.state.lockAuthorizedSourceSnapshot(intent.tenantId, intent.sourceSnapshotId,
+        intent.expectedSourceChecksum, new Date(), executor)
       const archive = locked.objects.find(object => object.purpose === 'workspace_archive')
       const manifest = locked.objects.find(object => object.purpose === 'manifest')
       if (!archive || !manifest) throw new Error('prepared workspace object set is incomplete')
@@ -382,6 +391,54 @@ export class WorkspaceSnapshotPublisher {
     }
   }
 
+  async commitDurableRestore(fence: PreparationFence,
+    prepared: PreparedDurableBaseWorkspaceSnapshot,
+    executor: PoolClient): Promise<CommittedDurableBaseWorkspaceSnapshot> {
+    const coordinator = this.options.durablePreparation
+    if (!coordinator) throw new ServiceError(503, 'durable workspace preparation is unavailable')
+    if (fence.operation !== 'provision') throw new ServiceError(400, 'invalid workspace preparation operation')
+    try {
+      const locked = await coordinator.preparations.lockForCommit(
+        fence, prepared.preparation.preparationId, prepared.intent, executor)
+      const intent = locked.preparation.intent
+      if (intent.sourceSnapshotId !== null || intent.expectedSourceChecksum !== null
+        || intent.restoreSourceLeaseId === null || intent.restoreSourceSnapshotId === null
+        || intent.expectedLatestSnapshotId !== null) throw new Error('invalid restore source preparation')
+      if (!this.state.createRestoredLeaseWithBaseSnapshot) {
+        throw new Error('durable restore commit is unavailable')
+      }
+      const archive = locked.objects.find(object => object.purpose === 'workspace_archive')
+      const manifest = locked.objects.find(object => object.purpose === 'manifest')
+      if (!archive || !manifest) throw new Error('prepared workspace object set is incomplete')
+      const snapshotInput: SnapshotInput = {
+        snapshotId: intent.snapshotId, providerSnapshotId: intent.providerSnapshotId,
+        workspaceArchiveObjectId: archive.objectId, manifestObjectId: manifest.objectId,
+        manifestChecksum: intent.manifestChecksum,
+        contentObjectIds: locked.objects.filter(object => object.purpose === 'content_blob')
+          .map(object => object.objectId).sort(),
+        expiresAt: intent.snapshotExpiresAt === null ? null : new Date(intent.snapshotExpiresAt),
+      }
+      const created = await this.state.createRestoredLeaseWithBaseSnapshot({
+        leaseId: intent.leaseId, environmentId: intent.environmentId, tenantId: intent.tenantId,
+        agentId: intent.agentId, ownerAgentId: intent.ownerAgentId, ownerLeaseId: intent.ownerLeaseId,
+        sourceSnapshotId: null, restoreSourceLeaseId: intent.restoreSourceLeaseId,
+        restoreSourceSnapshotId: intent.restoreSourceSnapshotId,
+        providerSandboxId: intent.providerSandboxId, sandboxTemplate: intent.sandboxTemplate,
+        cwdUri: intent.cwdUri, workspaceRootUris: [...intent.workspaceRootUris],
+        toolPolicy: structuredClone(intent.toolPolicy), policyVersion: intent.policyVersion,
+        baseSnapshot: snapshotInput,
+      }, executor)
+      verifySnapshot(created.snapshot, intent.tenantId, intent.leaseId, snapshotInput)
+      await coordinator.preparations.markCommitted(
+        fence, prepared.preparation.preparationId, prepared.intent, executor)
+      return { lease: created.lease, snapshot: created.snapshot,
+        objectAllocationIds: locked.objects.map(object => object.allocationId) }
+    } catch (error) {
+      if (error instanceof ServiceError) throw error
+      throw new ServiceError(503, 'workspace snapshot service unavailable')
+    }
+  }
+
   async commitDurableCheckpoint(fence: PreparationFence,
     prepared: PreparedDurableBaseWorkspaceSnapshot, executor: PoolClient): Promise<{
       snapshot: Snapshot
@@ -394,6 +451,9 @@ export class WorkspaceSnapshotPublisher {
       const locked = await coordinator.preparations.lockForCommit(
         fence, prepared.preparation.preparationId, prepared.intent, executor)
       const intent = locked.preparation.intent
+      if (intent.sourceSnapshotId !== null || intent.expectedSourceChecksum !== null
+        || intent.restoreSourceLeaseId !== null || intent.restoreSourceSnapshotId !== null
+        || intent.expectedLatestSnapshotId === null) throw new Error('invalid checkpoint source preparation')
       if (!this.state.getLease) throw new Error('checkpoint lease authorization is unavailable')
       const lease = await this.state.getLease(intent.tenantId, intent.leaseId, executor)
       if (!lease || !['active', 'paused'].includes(lease.state)
