@@ -144,13 +144,13 @@ pub struct NewThread {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct HostedAgentProvisioningLineage {
+pub(crate) struct HostedAgentProvisioningLineage {
     owner_agent_id: Option<ThreadId>,
     snapshot_source_thread_id: Option<ThreadId>,
 }
 
 impl HostedAgentProvisioningLineage {
-    fn owned_by(owner_agent_id: ThreadId) -> Self {
+    pub(crate) fn owned_by(owner_agent_id: ThreadId) -> Self {
         Self {
             owner_agent_id: Some(owner_agent_id),
             snapshot_source_thread_id: Some(owner_agent_id),
@@ -1248,10 +1248,10 @@ impl ThreadManager {
 }
 
 impl ThreadManagerState {
-    async fn provision_hosted_runtime(
+    pub(crate) async fn prepare_hosted_runtime(
         &self,
         thread_id: ThreadId,
-        config: &Config,
+        config: &mut Config,
         initial_history: &InitialHistory,
         session_source: &SessionSource,
         requested_agent_type: Option<String>,
@@ -1277,6 +1277,20 @@ impl ThreadManagerState {
             }
             return Ok(None);
         }
+        config.permissions.approval_policy = Constrained::allow_only(AskForApproval::Never);
+        config
+            .permissions
+            .replace_permission_profile_from_session_snapshot(PermissionProfileSnapshot::legacy(
+                PermissionProfile::External {
+                    network: NetworkSandboxPolicy::Enabled,
+                },
+            ))
+            .map_err(|error| {
+                CodexErr::Fatal(format!(
+                    "failed to apply hosted-agent runtime permissions: {error}"
+                ))
+            })?;
+        config.permissions.network = None;
         if matches!(initial_history, InitialHistory::Resumed(_)) {
             return Err(CodexErr::InvalidRequest(
                 "hosted-agent resume requires persisted runtime metadata".to_string(),
@@ -1346,6 +1360,17 @@ impl ThreadManagerState {
             .await
             .map(Some)
             .map_err(|error| CodexErr::Fatal(error.to_string()))
+    }
+
+    pub(crate) async fn commit_hosted_runtime(
+        &self,
+        thread_id: ThreadId,
+        pending: PendingHostedAgentRuntime,
+    ) {
+        self.hosted_agent_runtimes
+            .write()
+            .await
+            .insert(thread_id, pending.commit());
     }
 
     async fn rollback_pending_hosted_runtime(
@@ -1473,10 +1498,26 @@ impl ThreadManagerState {
                 hosted_agent_runtimes.remove(thread_id),
             )
         };
+        self.release_removed_hosted_runtime(*thread_id, hosted_runtime)
+            .await;
 
+        thread
+    }
+
+    pub(crate) async fn release_hosted_runtime(&self, thread_id: ThreadId) {
+        let hosted_runtime = self.hosted_agent_runtimes.write().await.remove(&thread_id);
+        self.release_removed_hosted_runtime(thread_id, hosted_runtime)
+            .await;
+    }
+
+    async fn release_removed_hosted_runtime(
+        &self,
+        thread_id: ThreadId,
+        hosted_runtime: Option<HostedAgentRuntime>,
+    ) {
         if let Some(runtime) = hosted_runtime {
             let cleanup_result = match &self.hosted_agent_provisioner {
-                Ok(Some(provisioner)) => provisioner.release(*thread_id, runtime.clone()).await,
+                Ok(Some(provisioner)) => provisioner.release(thread_id, runtime.clone()).await,
                 Ok(None) => Err(
                     crate::hosted_agent_runtime::HostedAgentRuntimeError::Release(
                         HostedAgentError::new(
@@ -1498,12 +1539,10 @@ impl ThreadManagerState {
                 self.hosted_agent_runtimes
                     .write()
                     .await
-                    .entry(*thread_id)
+                    .entry(thread_id)
                     .or_insert(runtime);
             }
         }
-
-        thread
     }
 
     pub(crate) async fn effective_multi_agent_version_for_spawn(
@@ -1960,26 +1999,10 @@ impl ThreadManagerState {
                 forked_from_thread_id,
             )
             .await;
-        if config.hosted_agents.enabled {
-            config.permissions.approval_policy = Constrained::allow_only(AskForApproval::Never);
-            config
-                .permissions
-                .replace_permission_profile_from_session_snapshot(
-                    PermissionProfileSnapshot::legacy(PermissionProfile::External {
-                        network: NetworkSandboxPolicy::Enabled,
-                    }),
-                )
-                .map_err(|error| {
-                    CodexErr::Fatal(format!(
-                        "failed to apply hosted-agent runtime permissions: {error}"
-                    ))
-                })?;
-            config.permissions.network = None;
-        }
         let mut pending_hosted_runtime = self
-            .provision_hosted_runtime(
+            .prepare_hosted_runtime(
                 thread_id,
-                &config,
+                &mut config,
                 &initial_history,
                 &session_source,
                 agent_type,

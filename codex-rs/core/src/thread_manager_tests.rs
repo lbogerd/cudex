@@ -36,6 +36,7 @@ use core_test_support::responses::mount_models_once;
 use pretty_assertions::assert_eq;
 use std::time::Duration;
 use tempfile::tempdir;
+use tokio_util::sync::CancellationToken;
 use wiremock::MockServer;
 
 const TEST_INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
@@ -270,6 +271,135 @@ async fn hosted_provisioning_separates_ownership_from_snapshot_lineage() {
         .shutdown_all_threads_bounded(Duration::from_secs(10))
         .await;
     assert_eq!(report.completed.len(), 4);
+}
+
+#[tokio::test]
+async fn hosted_codex_delegate_owns_and_releases_an_isolated_runtime() {
+    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
+    let root = manager
+        .start_thread_with_options(start_thread_options(config.clone()))
+        .await
+        .expect("start hosted root");
+    let root_request = hosted_provision_request(&hosted_service, root.thread_id);
+    let root_lease_id = hosted_service
+        .provisioned_lease_id(&root_request.idempotency_key)
+        .expect("root lease");
+    let parent_turn = root.thread.session.new_default_turn().await;
+    let (delegate, delegate_io) = crate::codex_delegate::run_codex_thread_interactive(
+        config,
+        Arc::clone(&root.thread.session.services.auth_manager),
+        Arc::clone(&root.thread.session.services.models_manager),
+        Arc::clone(&root.thread.session),
+        Arc::clone(&parent_turn),
+        CancellationToken::new(),
+        SubAgentSource::Review,
+        /*initial_history*/ None,
+    )
+    .await
+    .expect("start hosted delegate");
+    let delegate_id = delegate.thread_id();
+    let delegate_request = hosted_provision_request(&hosted_service, delegate_id);
+    assert_eq!(delegate_request.owner_agent_id, Some(root.thread_id));
+    assert_eq!(
+        delegate_request.source,
+        ProjectSnapshotSource::AgentEnvironment {
+            owner_lease_id: root_lease_id,
+        }
+    );
+    assert_eq!(manager.list_thread_ids().await, vec![root.thread_id]);
+    assert!(matches!(
+        manager.get_thread(delegate_id).await,
+        Err(CodexErr::ThreadNotFound(thread_id)) if thread_id == delegate_id
+    ));
+
+    let delegate_snapshot = delegate.thread_config_snapshot().await;
+    assert_eq!(delegate_snapshot.approval_policy, AskForApproval::Never);
+    assert!(matches!(
+        delegate_snapshot.permission_profile,
+        PermissionProfile::External { .. }
+    ));
+    assert_ne!(
+        delegate_snapshot.environments.environments,
+        parent_turn.environments.to_selections()
+    );
+    assert!(!Arc::ptr_eq(
+        &delegate.services.exec_policy,
+        &root.thread.session.services.exec_policy
+    ));
+    let delegate_lease_id = hosted_service
+        .provisioned_lease_id(&delegate_request.idempotency_key)
+        .expect("delegate lease");
+
+    delegate_io
+        .shutdown_and_wait()
+        .await
+        .expect("shut down hosted delegate");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while manager
+            .state
+            .hosted_agent_runtimes
+            .read()
+            .await
+            .contains_key(&delegate_id)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("delegate runtime release timed out");
+    hosted_service
+        .reconnect(codex_hosted_agent::AgentReconnectRequest {
+            lease_id: delegate_lease_id,
+            idempotency_key: format!("hosted-agent:{delegate_id}:delegate-release-check"),
+        })
+        .await
+        .expect_err("delegate lease must be released after shutdown");
+}
+
+#[tokio::test]
+async fn non_hosted_codex_delegate_preserves_parent_runtime_inheritance() {
+    let (_temp_dir, mut config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
+    config.hosted_agents.enabled = false;
+    let root = manager
+        .start_thread_with_options(start_thread_options(config.clone()))
+        .await
+        .expect("start non-hosted root");
+    let parent_turn = root.thread.session.new_default_turn().await;
+    let parent_environments = parent_turn.environments.to_selections();
+    let (delegate, delegate_io) = crate::codex_delegate::run_codex_thread_interactive(
+        config,
+        Arc::clone(&root.thread.session.services.auth_manager),
+        Arc::clone(&root.thread.session.services.models_manager),
+        Arc::clone(&root.thread.session),
+        Arc::clone(&parent_turn),
+        CancellationToken::new(),
+        SubAgentSource::Review,
+        /*initial_history*/ None,
+    )
+    .await
+    .expect("start non-hosted delegate");
+
+    assert_eq!(
+        delegate
+            .thread_config_snapshot()
+            .await
+            .environments
+            .environments,
+        parent_environments
+    );
+    assert!(Arc::ptr_eq(
+        &delegate.services.exec_policy,
+        &root.thread.session.services.exec_policy
+    ));
+    assert!(
+        hosted_service
+            .provision_request(&format!("hosted-agent:{}:provision", delegate.thread_id()))
+            .is_none()
+    );
+    delegate_io
+        .shutdown_and_wait()
+        .await
+        .expect("shut down non-hosted delegate");
 }
 
 #[tokio::test]
