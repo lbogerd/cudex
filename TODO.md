@@ -32,6 +32,9 @@ production backend. Stable decisions, evidence, and wire schemas are in
 - [x] Add bounded preparation-scoped object reclamation that preserves unrelated
   operation allocations, durable references, shared locators, and deletion audit
   state while recovering partial publication and retry failures.
+- [x] Bind preparation and logical-object IDs deterministically to operation and
+  content identity, and exact-verify every associated object's purpose,
+  checksum, size, expiry, and locator on publication and terminal replay.
 - [x] Replace local blobs with authenticated object storage for workspace
   archives, manifests, content blobs, and patch artifacts.
 - [x] Make object stores report their exact durable bucket/key locator so

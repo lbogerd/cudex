@@ -9,8 +9,12 @@ import {
   canonicalWorkspacePreparationIntent,
   PostgresWorkspacePreparations,
   WorkspacePreparationConflictError,
+  workspacePreparationId,
+  workspacePreparationObjectId,
   type PreparationFence,
   type WorkspacePreparationIntent,
+  type WorkspacePreparationObjectDescriptor,
+  type WorkspacePreparationObjectPurpose,
 } from '../src/postgres-workspace-preparations.js'
 
 const databaseUrl = process.env.HOSTED_AGENT_TEST_DATABASE_URL
@@ -51,6 +55,18 @@ test('workspace preparation intents are canonical and require complete source id
       name: `${index}-${'x'.repeat(400)}`, namespace: null,
     })),
   } })), /too large/)
+})
+
+test('workspace preparation IDs are deterministic and domain-separated', () => {
+  const identity = { operation: 'provision', idempotencyKey: 'request-1', tenantId: 'tenant-1' }
+  const preparationId = workspacePreparationId(identity)
+  assert.equal(workspacePreparationId({ ...identity }), preparationId)
+  assert.notEqual(workspacePreparationId({ ...identity, tenantId: 'tenant-2' }), preparationId)
+  const objectChecksum = `sha256:${'c'.repeat(64)}`
+  const objectId = workspacePreparationObjectId(preparationId, 'content_blob', objectChecksum)
+  assert.equal(workspacePreparationObjectId(preparationId, 'content_blob', objectChecksum), objectId)
+  assert.notEqual(workspacePreparationObjectId(preparationId, 'manifest', objectChecksum), objectId)
+  assert.notEqual(objectId.replace('workspace_object_', ''), preparationId.replace('workspace_preparation_', ''))
 })
 
 interface Fixture {
@@ -106,8 +122,18 @@ function object(objectId: string, kind: StoredObject['kind'], character: string)
   }
 }
 
+function descriptor(stored: StoredObject): WorkspacePreparationObjectDescriptor {
+  return {
+    objectId: stored.objectId, purpose: stored.kind as WorkspacePreparationObjectPurpose, checksum: stored.checksum,
+    sizeBytes: stored.sizeBytes, expiresAt: stored.expiresAt,
+    storageBucket: stored.storageBucket, storageKey: stored.storageKey,
+  }
+}
+
 async function prepared(context: Fixture, fence: PreparationFence, preparationId: string,
-  preparationIntent = intent()): Promise<{ allocationIds: string[] }> {
+  preparationIntent = intent()): Promise<{
+    allocationIds: string[]; descriptors: WorkspacePreparationObjectDescriptor[]
+  }> {
   await context.preparations.createOrReplay({ ...fence, preparationId, intent: preparationIntent, expectedObjectCount: 2 })
   const objects = [object(`${preparationId}-archive`, 'workspace_archive', 'a'),
     object(`${preparationId}-manifest`, 'manifest', 'b')]
@@ -121,8 +147,9 @@ async function prepared(context: Fixture, fence: PreparationFence, preparationId
       allocationId: allocation.allocationId, objectId: stored.objectId,
       purpose: index === 0 ? 'workspace_archive' : 'manifest' })
   }
-  await context.preparations.markPrepared(fence, preparationId)
-  return { allocationIds }
+  const descriptors = objects.map(descriptor)
+  await context.preparations.markPrepared(fence, preparationId, preparationIntent, descriptors)
+  return { allocationIds, descriptors }
 }
 
 live('create/replay is exact and generation-worker fenced', async context => {
@@ -166,7 +193,8 @@ live('object associations are tenant-safe, exact, idempotent, and counted before
     await context.preparations.associateObject(association))
   await assert.rejects(context.preparations.associateObject({ ...association, purpose: 'manifest' }),
     WorkspacePreparationConflictError)
-  await assert.rejects(context.preparations.markPrepared(fence, preparationId), /incomplete/)
+  await assert.rejects(context.preparations.markPrepared(
+    fence, preparationId, intent(), [descriptor(archive)]), /incomplete/)
   await assert.rejects(context.preparations.associateObject({ ...fence, preparationId,
     allocationId: manifestAllocation.allocationId, objectId: manifest.objectId, purpose: 'content_blob' }),
   WorkspacePreparationConflictError)
@@ -182,11 +210,100 @@ live('object associations are tenant-safe, exact, idempotent, and counted before
     allocationId: manifestAllocation.allocationId, objectId: manifest.objectId, purpose: 'manifest' })
   await context.firstPool.query(`UPDATE hosted_agent_operation_allocations SET state = 'reclaim_pending'
     WHERE allocation_id = $1::bigint`, [archiveAllocation.allocationId])
-  await assert.rejects(context.preparations.markPrepared(fence, preparationId), /incomplete/)
+  const descriptors = [descriptor(archive), descriptor(manifest)]
+  await assert.rejects(context.preparations.markPrepared(
+    fence, preparationId, intent(), descriptors), WorkspacePreparationConflictError)
   await context.firstPool.query(`UPDATE hosted_agent_operation_allocations SET state = 'allocated'
     WHERE allocation_id = $1::bigint`, [archiveAllocation.allocationId])
-  const marked = await context.preparations.markPrepared(fence, preparationId)
+  await assert.rejects(context.preparations.markPrepared(fence, preparationId, intent(), [
+    { ...descriptor(archive), storageKey: 'sha256/wrong-but-same-count' }, descriptor(manifest),
+  ]), /object set mismatch/)
+  const marked = await context.preparations.markPrepared(fence, preparationId, intent(), descriptors)
   assert.equal(marked.state, 'prepared'); assert.equal(marked.associatedObjectCount, 2)
+})
+
+live('publication replay locks and verifies the exact existing object', async context => {
+  const fence = await claim(context, 'publication-replay')
+  const preparationId = 'preparation-publication-replay'
+  const preparationIntent = intent()
+  await context.preparations.createOrReplay({
+    ...fence, preparationId, intent: preparationIntent, expectedObjectCount: 2,
+  })
+  const archive = object('publication-replay-archive', 'workspace_archive', 'a')
+  await context.state.registerObject(archive)
+  const allocation = await context.journal.recordAllocation(fence, fence.generation, fence.workerId,
+    { kind: 'object', resourceId: archive.objectId })
+  await context.preparations.associateObject({ ...fence, preparationId,
+    allocationId: allocation.allocationId, objectId: archive.objectId, purpose: 'workspace_archive' })
+  const client = await context.firstPool.connect()
+  try {
+    await client.query('BEGIN')
+    const replay = await context.preparations.lockObjectForPublication(
+      fence, preparationId, preparationIntent, descriptor(archive), client)
+    assert.equal(replay?.allocationId, allocation.allocationId)
+    assert.equal(await context.preparations.lockObjectForPublication(fence, preparationId, preparationIntent,
+      { ...descriptor(archive), objectId: 'publication-replay-missing' }, client), null)
+    await assert.rejects(context.preparations.lockObjectForPublication(fence, preparationId, preparationIntent,
+      { ...descriptor(archive), storageKey: 'sha256/mismatch' }, client), WorkspacePreparationConflictError)
+    await client.query('COMMIT')
+  } finally { await client.query('ROLLBACK').catch(() => undefined); client.release() }
+
+  await context.firstPool.query(`UPDATE hosted_agent_operation_allocations SET state = 'reclaim_pending'
+    WHERE allocation_id = $1::bigint`, [allocation.allocationId])
+  const unavailableAllocationClient = await context.firstPool.connect()
+  try {
+    await unavailableAllocationClient.query('BEGIN')
+    await assert.rejects(context.preparations.lockObjectForPublication(
+      fence, preparationId, preparationIntent, descriptor(archive), unavailableAllocationClient),
+    WorkspacePreparationConflictError)
+    await unavailableAllocationClient.query('ROLLBACK')
+  } finally { unavailableAllocationClient.release() }
+  await context.firstPool.query(`UPDATE hosted_agent_operation_allocations SET state = 'allocated'
+    WHERE allocation_id = $1::bigint`, [allocation.allocationId])
+  await context.firstPool.query(`UPDATE hosted_agent_objects SET state = 'deleting' WHERE object_id = $1`,
+    [archive.objectId])
+  const unavailableObjectClient = await context.firstPool.connect()
+  try {
+    await unavailableObjectClient.query('BEGIN')
+    await assert.rejects(context.preparations.lockObjectForPublication(
+      fence, preparationId, preparationIntent, descriptor(archive), unavailableObjectClient),
+    WorkspacePreparationConflictError)
+    await unavailableObjectClient.query('ROLLBACK')
+  } finally { unavailableObjectClient.release() }
+})
+
+live('prepared and committed markPrepared calls are exact verification-only replays', async context => {
+  const fence = await claim(context, 'prepared-committed-replay')
+  const preparationId = 'preparation-prepared-committed-replay'
+  const result = await prepared(context, fence, preparationId)
+  const preparedReplay = await context.preparations.markPrepared(fence, preparationId, intent(), result.descriptors)
+  assert.equal(preparedReplay.state, 'prepared')
+  await assert.rejects(context.preparations.markPrepared(fence, preparationId, intent(), [
+    result.descriptors[0]!, { ...result.descriptors[1]!, sizeBytes: 11 },
+  ]), WorkspacePreparationConflictError)
+
+  const commitClient = await context.firstPool.connect()
+  try {
+    await commitClient.query('BEGIN')
+    await context.preparations.markCommitted(fence, preparationId, intent(), commitClient)
+    await commitClient.query('COMMIT')
+  } finally { await commitClient.query('ROLLBACK').catch(() => undefined); commitClient.release() }
+  await context.firstPool.query(`UPDATE hosted_agent_operation_allocations SET state = 'adopted'
+    WHERE allocation_id = ANY($1::bigint[])`, [result.allocationIds])
+  assert.equal((await context.preparations.markPrepared(
+    fence, preparationId, intent(), result.descriptors)).state, 'committed')
+  assert.equal((await context.preparations.beginAbort(fence, preparationId)).state, 'committed')
+
+  const singlePool = new Pool({ connectionString: databaseUrl,
+    options: `-c search_path=${context.schema}`, max: 1 })
+  const singleRepository = new PostgresWorkspacePreparations(singlePool)
+  const singleClient = await singlePool.connect()
+  try {
+    await singleClient.query('BEGIN')
+    assert.equal((await singleRepository.markPrepared(
+      fence, preparationId, intent(), result.descriptors, singleClient)).state, 'committed')
+    await singleClient.query('ROLLBACK')
+  } finally { singleClient.release(); await singlePool.end() }
 })
 
 live('commit and abort linearize on the preparation row and rollback hands ownership to abort', async context => {

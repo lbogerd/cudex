@@ -563,6 +563,17 @@ bounded progress, terminal replay, partial publication, unrelated allocations,
 retained references, injected post-delete failure, wrong fences, and refusal to
 reclaim a committed preparation.
 
+Preparation IDs now derive deterministically from tenant plus operation and
+idempotency identity; logical workspace object IDs are separately domain-bound
+to preparation, purpose, and checksum. Publication replay first locks the owned
+operation and preparation and can distinguish an exact existing association
+from a missing object without another put. The `prepared` gate and prepared or
+committed replay compare the complete expected object set—ID, purpose, checksum,
+size, expiry, bucket, and key—under sorted allocation/object locks. Same-count
+substitution, unavailable objects, changed locators, nonallocated rows, and
+intent drift fail closed. The abort transition also has a transaction-owning
+convenience path, while caller-supplied executors remain max-one-connection safe.
+
 ### Bounded PostgreSQL reconciliation foundation
 
 An intentionally unwired `PostgresReconciler` now claims stale operations only

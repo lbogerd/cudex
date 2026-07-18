@@ -12,6 +12,9 @@ const intentKeys = [
   'providerSnapshotId', 'snapshotExpiresAt', 'archiveChecksum', 'manifestChecksum',
 ] as const
 const maximumIntentBytes = 64 * 1024
+const descriptorKeys = [
+  'objectId', 'purpose', 'checksum', 'sizeBytes', 'expiresAt', 'storageBucket', 'storageKey',
+] as const
 
 export type WorkspacePreparationState =
   'publishing' | 'prepared' | 'committed' | 'reclaim_pending' | 'reclaimed'
@@ -60,12 +63,20 @@ export interface WorkspacePreparation {
   reclaimedAt: Date | null
 }
 
-export interface WorkspacePreparationObject {
+export interface WorkspacePreparationObjectDescriptor {
+  objectId: string
+  purpose: WorkspacePreparationObjectPurpose
+  checksum: string
+  sizeBytes: number
+  expiresAt: Date | null
+  storageBucket: string
+  storageKey: string
+}
+
+export interface WorkspacePreparationObject extends WorkspacePreparationObjectDescriptor {
   preparationId: string
   tenantId: string
   allocationId: string
-  objectId: string
-  purpose: WorkspacePreparationObjectPurpose
 }
 
 export class WorkspacePreparationConflictError extends Error {}
@@ -97,6 +108,13 @@ interface ObjectRow {
   object_id: string
   purpose: WorkspacePreparationObjectPurpose
   object_checksum: string
+  object_size_bytes: string
+  object_expires_at: Date | null
+  storage_bucket: string
+  storage_key: string
+  object_kind: WorkspacePreparationObjectPurpose
+  object_state: string
+  allocation_state: string
 }
 
 export interface PreparationFence extends OperationIdentity {
@@ -121,6 +139,13 @@ function nullableId(label: string, value: string | null): string | null {
 
 function checksum(label: string, value: string): string {
   if (!checksumPattern.test(value)) throw new Error(`invalid ${label}`)
+  return value
+}
+
+function allocationId(value: string): string {
+  if (!/^[1-9][0-9]{0,18}$/u.test(value) || BigInt(value) > 9_223_372_036_854_775_807n) {
+    throw new Error('invalid allocation ID')
+  }
   return value
 }
 
@@ -213,6 +238,46 @@ export function canonicalWorkspacePreparationIntent(intent: WorkspacePreparation
   }
 }
 
+function deterministicId(domain: string, values: string[]): string {
+  const hash = createHash('sha256').update(domain)
+  for (const value of values) hash.update('\0').update(value)
+  return hash.digest('hex')
+}
+
+export function workspacePreparationId(identity: OperationIdentity): string {
+  id('operation', identity.operation, 128)
+  id('idempotency key', identity.idempotencyKey)
+  id('tenant ID', identity.tenantId)
+  return `workspace_preparation_${deterministicId('cudex:workspace-preparation:v1', [
+    identity.operation, identity.idempotencyKey, identity.tenantId,
+  ])}`
+}
+
+export function workspacePreparationObjectId(preparationId: string,
+  purpose: WorkspacePreparationObjectPurpose, objectChecksum: string): string {
+  id('preparation ID', preparationId)
+  if (!purposes.has(purpose)) throw new Error('invalid workspace object purpose')
+  checksum('object checksum', objectChecksum)
+  return `workspace_object_${deterministicId('cudex:workspace-preparation-object:v1', [
+    preparationId, purpose, objectChecksum,
+  ])}`
+}
+
+function validateDescriptor(value: WorkspacePreparationObjectDescriptor): WorkspacePreparationObjectDescriptor {
+  exactRecord('workspace preparation object descriptor', value, descriptorKeys)
+  id('object ID', value.objectId)
+  if (!purposes.has(value.purpose)) throw new Error('invalid workspace object purpose')
+  checksum('object checksum', value.checksum)
+  if (!Number.isSafeInteger(value.sizeBytes) || value.sizeBytes < 0) throw new Error('invalid object size')
+  if (value.expiresAt !== null
+    && (!(value.expiresAt instanceof Date) || !Number.isFinite(value.expiresAt.getTime()))) {
+    throw new Error('invalid object expiry')
+  }
+  id('storage bucket', value.storageBucket)
+  id('storage key', value.storageKey, 2048)
+  return { ...value, expiresAt: value.expiresAt === null ? null : new Date(value.expiresAt) }
+}
+
 function preparationFromRow(row: PreparationRow): WorkspacePreparation {
   return {
     preparationId: row.preparation_id, operation: row.operation, idempotencyKey: row.idempotency_key,
@@ -227,7 +292,9 @@ function preparationFromRow(row: PreparationRow): WorkspacePreparation {
 
 function objectFromRow(row: ObjectRow): WorkspacePreparationObject {
   return { preparationId: row.preparation_id, tenantId: row.tenant_id,
-    allocationId: row.allocation_id, objectId: row.object_id, purpose: row.purpose }
+    allocationId: row.allocation_id, objectId: row.object_id, purpose: row.purpose,
+    checksum: row.object_checksum, sizeBytes: Number(row.object_size_bytes),
+    expiresAt: row.object_expires_at, storageBucket: row.storage_bucket, storageKey: row.storage_key }
 }
 
 const preparationColumns = `
@@ -278,8 +345,7 @@ export class PostgresWorkspacePreparations {
     preparationId: string; allocationId: string; objectId: string; purpose: WorkspacePreparationObjectPurpose
   }, executor?: PoolClient): Promise<WorkspacePreparationObject> {
     validateFence(input); id('preparation ID', input.preparationId); id('object ID', input.objectId)
-    if (!/^[1-9][0-9]{0,18}$/u.test(input.allocationId)
-      || BigInt(input.allocationId) > 9_223_372_036_854_775_807n) throw new Error('invalid allocation ID')
+    allocationId(input.allocationId)
     if (!purposes.has(input.purpose)) throw new Error('invalid workspace object purpose')
     const associate = async (client: PoolClient) => {
       await this.requireOwnership(client, input)
@@ -304,9 +370,19 @@ export class PostgresWorkspacePreparations {
       `, [input.preparationId, input.tenantId, input.allocationId, input.objectId, input.purpose,
         input.operation, input.idempotencyKey])
       const result = await client.query<ObjectRow>(`
-        SELECT preparation_id, tenant_id, allocation_id::text, object_id, purpose
-        FROM hosted_agent_workspace_preparation_objects
-        WHERE preparation_id = $1 AND allocation_id = $2::bigint
+        SELECT prepared_object.preparation_id, prepared_object.tenant_id,
+               prepared_object.allocation_id::text, prepared_object.object_id, prepared_object.purpose,
+               object_row.checksum AS object_checksum, object_row.size_bytes::text AS object_size_bytes,
+               object_row.expires_at AS object_expires_at, object_row.storage_bucket, object_row.storage_key,
+               object_row.kind AS object_kind, object_row.state AS object_state,
+               allocation.state AS allocation_state
+        FROM hosted_agent_workspace_preparation_objects AS prepared_object
+        JOIN hosted_agent_operation_allocations AS allocation
+          ON allocation.allocation_id = prepared_object.allocation_id
+        JOIN hosted_agent_objects AS object_row
+          ON object_row.object_id = prepared_object.object_id
+         AND object_row.tenant_id = prepared_object.tenant_id
+        WHERE prepared_object.preparation_id = $1 AND prepared_object.allocation_id = $2::bigint
       `, [input.preparationId, input.allocationId])
       const row = result.rows[0]
       if (!row || row.tenant_id !== input.tenantId || row.object_id !== input.objectId || row.purpose !== input.purpose) {
@@ -317,22 +393,58 @@ export class PostgresWorkspacePreparations {
     return executor ? associate(executor) : this.transaction(associate)
   }
 
-  async markPrepared(fence: PreparationFence, preparationId: string,
-    executor?: PoolClient): Promise<WorkspacePreparation> {
+  async lockObjectForPublication(fence: PreparationFence, preparationId: string,
+    intent: WorkspacePreparationIntent, descriptor: WorkspacePreparationObjectDescriptor,
+    executor: PoolClient): Promise<WorkspacePreparationObject | null> {
     validateFence(fence); id('preparation ID', preparationId)
+    const canonical = canonicalWorkspacePreparationIntent(intent)
+    const expected = validateDescriptor(descriptor)
+    await this.requireOwnership(executor, fence)
+    const preparation = await this.selectPreparation(executor, preparationId, true)
+    this.assertExact(preparation, fence, canonical.hash, canonical.canonicalJson, 'publishing')
+    const result = await executor.query<ObjectRow>(`
+      SELECT prepared_object.preparation_id, prepared_object.tenant_id,
+             prepared_object.allocation_id::text, prepared_object.object_id, prepared_object.purpose,
+             object_row.checksum AS object_checksum, object_row.size_bytes::text AS object_size_bytes,
+             object_row.expires_at AS object_expires_at, object_row.storage_bucket, object_row.storage_key,
+             object_row.kind AS object_kind, object_row.state AS object_state,
+             allocation.state AS allocation_state
+      FROM hosted_agent_workspace_preparation_objects AS prepared_object
+      JOIN hosted_agent_operation_allocations AS allocation
+        ON allocation.allocation_id = prepared_object.allocation_id
+       AND allocation.tenant_id = prepared_object.tenant_id
+      JOIN hosted_agent_objects AS object_row
+        ON object_row.object_id = prepared_object.object_id
+       AND object_row.tenant_id = prepared_object.tenant_id
+      WHERE prepared_object.preparation_id = $1 AND prepared_object.object_id = $2
+      FOR UPDATE OF prepared_object, allocation, object_row
+    `, [preparationId, expected.objectId])
+    const row = result.rows[0]
+    if (!row) return null
+    this.assertObjectRow(row, expected, new Set(['allocated']))
+    return objectFromRow(row)
+  }
+
+  async markPrepared(fence: PreparationFence, preparationId: string, intent: WorkspacePreparationIntent,
+    descriptors: WorkspacePreparationObjectDescriptor[], executor?: PoolClient): Promise<WorkspacePreparation> {
+    validateFence(fence); id('preparation ID', preparationId)
+    const canonical = canonicalWorkspacePreparationIntent(intent)
+    if (!Array.isArray(descriptors)) throw new Error('invalid workspace preparation object descriptors')
+    const expected = descriptors.map(validateDescriptor)
+    if (new Set(expected.map(descriptor => descriptor.objectId)).size !== expected.length) {
+      throw new Error('duplicate workspace preparation object descriptor')
+    }
     const mark = async (client: PoolClient) => {
       await this.requireOwnership(client, fence)
       const preparation = await this.selectPreparation(client, preparationId, true)
-      if (!preparation || preparation.operation !== fence.operation || preparation.idempotencyKey !== fence.idempotencyKey
-        || preparation.tenantId !== fence.tenantId || !['publishing', 'prepared'].includes(preparation.state)) {
+      if (!preparation || !['publishing', 'prepared', 'committed'].includes(preparation.state)) {
         throw new WorkspacePreparationConflictError('workspace preparation cannot become prepared')
       }
-      const objects = await this.lockObjects(client, preparationId)
-      if (objects.length !== preparation.expectedObjectCount
-        || objects.filter(object => object.purpose === 'workspace_archive').length !== 1
-        || objects.filter(object => object.purpose === 'manifest').length !== 1) {
-        throw new WorkspacePreparationConflictError('workspace preparation object set is incomplete')
-      }
+      this.assertExactIdentity(preparation, fence, canonical.hash, canonical.canonicalJson)
+      const allocationStates = preparation.state === 'committed'
+        ? new Set(['allocated', 'adopted']) : new Set(['allocated'])
+      const objects = await this.lockObjects(client, preparationId, allocationStates)
+      this.assertExactObjects(preparation, objects, expected)
       if (preparation.state === 'publishing') {
         await client.query(`UPDATE hosted_agent_workspace_preparations SET state = 'prepared' WHERE preparation_id = $1`,
           [preparationId])
@@ -349,7 +461,7 @@ export class PostgresWorkspacePreparations {
     await this.requireOwnership(executor, fence)
     const preparation = await this.selectPreparation(executor, preparationId, true)
     this.assertExact(preparation, fence, canonical.hash, canonical.canonicalJson, 'prepared')
-    const objects = await this.lockObjects(executor, preparationId)
+    const objects = await this.lockObjects(executor, preparationId, new Set(['allocated']))
     this.assertCompleteObjects(preparation!, objects)
     return { preparation: preparation!, objects }
   }
@@ -365,7 +477,7 @@ export class PostgresWorkspacePreparations {
       return preparation
     }
     this.assertExact(preparation, fence, canonical.hash, canonical.canonicalJson, 'prepared')
-    const objects = await this.lockObjects(executor, preparationId)
+    const objects = await this.lockObjects(executor, preparationId, new Set(['allocated']))
     this.assertCompleteObjects(preparation!, objects)
     const result = await executor.query(`
       UPDATE hosted_agent_workspace_preparations
@@ -377,21 +489,24 @@ export class PostgresWorkspacePreparations {
   }
 
   async beginAbort(fence: PreparationFence, preparationId: string,
-    executor: PoolClient): Promise<WorkspacePreparation> {
+    executor?: PoolClient): Promise<WorkspacePreparation> {
     validateFence(fence); id('preparation ID', preparationId)
-    await this.requireOwnership(executor, fence)
-    const preparation = await this.selectPreparation(executor, preparationId, true)
-    if (!preparation || preparation.operation !== fence.operation || preparation.idempotencyKey !== fence.idempotencyKey
-      || preparation.tenantId !== fence.tenantId) throw new WorkspacePreparationConflictError('workspace preparation mismatch')
-    if (preparation.state === 'committed' || preparation.state === 'reclaimed') return preparation
-    if (!['publishing', 'prepared', 'reclaim_pending'].includes(preparation.state)) {
-      throw new WorkspacePreparationConflictError('workspace preparation cannot be aborted')
+    const abort = async (client: PoolClient) => {
+      await this.requireOwnership(client, fence)
+      const preparation = await this.selectPreparation(client, preparationId, true)
+      if (!preparation || preparation.operation !== fence.operation || preparation.idempotencyKey !== fence.idempotencyKey
+        || preparation.tenantId !== fence.tenantId) throw new WorkspacePreparationConflictError('workspace preparation mismatch')
+      if (preparation.state === 'committed' || preparation.state === 'reclaimed') return preparation
+      if (!['publishing', 'prepared', 'reclaim_pending'].includes(preparation.state)) {
+        throw new WorkspacePreparationConflictError('workspace preparation cannot be aborted')
+      }
+      if (preparation.state !== 'reclaim_pending') {
+        await client.query(`UPDATE hosted_agent_workspace_preparations SET state = 'reclaim_pending'
+          WHERE preparation_id = $1`, [preparationId])
+      }
+      return (await this.selectPreparation(client, preparationId, false))!
     }
-    if (preparation.state !== 'reclaim_pending') {
-      await executor.query(`UPDATE hosted_agent_workspace_preparations SET state = 'reclaim_pending'
-        WHERE preparation_id = $1`, [preparationId])
-    }
-    return (await this.selectPreparation(executor, preparationId, false))!
+    return executor ? abort(executor) : this.transaction(abort)
   }
 
   async markReclaimed(fence: PreparationFence, preparationId: string,
@@ -468,11 +583,53 @@ export class PostgresWorkspacePreparations {
     }
   }
 
-  private async lockObjects(client: PoolClient, preparationId: string): Promise<WorkspacePreparationObject[]> {
+  private assertObjectRow(row: ObjectRow, expected: WorkspacePreparationObjectDescriptor,
+    allocationStates: ReadonlySet<string>): void {
+    const expiresAt = row.object_expires_at?.getTime() ?? null
+    const expectedExpiresAt = expected.expiresAt?.getTime() ?? null
+    if (row.object_id !== expected.objectId || row.purpose !== expected.purpose
+      || row.object_kind !== expected.purpose || row.object_checksum !== expected.checksum
+      || Number(row.object_size_bytes) !== expected.sizeBytes || expiresAt !== expectedExpiresAt
+      || row.storage_bucket !== expected.storageBucket || row.storage_key !== expected.storageKey
+      || row.object_state !== 'available' || !allocationStates.has(row.allocation_state)) {
+      throw new WorkspacePreparationConflictError('workspace preparation object mismatch')
+    }
+  }
+
+  private assertExactObjects(preparation: WorkspacePreparation, objects: WorkspacePreparationObject[],
+    expected: WorkspacePreparationObjectDescriptor[]): void {
+    if (expected.length !== preparation.expectedObjectCount || objects.length !== expected.length
+      || expected.filter(object => object.purpose === 'workspace_archive').length !== 1
+      || expected.filter(object => object.purpose === 'manifest').length !== 1) {
+      throw new WorkspacePreparationConflictError('workspace preparation object set is incomplete')
+    }
+    const actualById = new Map(objects.map(object => [object.objectId, object]))
+    for (const descriptor of expected) {
+      const actual = actualById.get(descriptor.objectId)
+      if (!actual || actual.purpose !== descriptor.purpose || actual.checksum !== descriptor.checksum
+        || actual.sizeBytes !== descriptor.sizeBytes
+        || (actual.expiresAt?.getTime() ?? null) !== (descriptor.expiresAt?.getTime() ?? null)
+        || actual.storageBucket !== descriptor.storageBucket || actual.storageKey !== descriptor.storageKey) {
+        throw new WorkspacePreparationConflictError('workspace preparation object set mismatch')
+      }
+    }
+    const archive = expected.find(object => object.purpose === 'workspace_archive')!
+    const manifest = expected.find(object => object.purpose === 'manifest')!
+    if (archive.checksum !== preparation.intent.archiveChecksum
+      || manifest.checksum !== preparation.intent.manifestChecksum) {
+      throw new WorkspacePreparationConflictError('workspace preparation object checksum mismatch')
+    }
+  }
+
+  private async lockObjects(client: PoolClient, preparationId: string,
+    allocationStates: ReadonlySet<string>): Promise<WorkspacePreparationObject[]> {
     const result = await client.query<ObjectRow>(`
       SELECT prepared_object.preparation_id, prepared_object.tenant_id,
              prepared_object.allocation_id::text, prepared_object.object_id, prepared_object.purpose,
-             object_row.checksum AS object_checksum
+             object_row.checksum AS object_checksum, object_row.size_bytes::text AS object_size_bytes,
+             object_row.expires_at AS object_expires_at, object_row.storage_bucket, object_row.storage_key,
+             object_row.kind AS object_kind, object_row.state AS object_state,
+             allocation.state AS allocation_state
       FROM hosted_agent_workspace_preparation_objects AS prepared_object
       JOIN hosted_agent_operation_allocations AS allocation
         ON allocation.allocation_id = prepared_object.allocation_id
@@ -480,12 +637,18 @@ export class PostgresWorkspacePreparations {
       JOIN hosted_agent_objects AS object_row
         ON object_row.object_id = prepared_object.object_id
        AND object_row.tenant_id = prepared_object.tenant_id
-       AND object_row.state = 'available' AND object_row.kind = prepared_object.purpose
       WHERE prepared_object.preparation_id = $1
-        AND allocation.allocation_kind = 'object' AND allocation.state = 'allocated'
-      ORDER BY prepared_object.allocation_id
-      FOR UPDATE OF allocation, object_row
+        AND allocation.allocation_kind = 'object'
+      ORDER BY prepared_object.allocation_id, prepared_object.object_id
+      FOR UPDATE OF prepared_object, allocation, object_row
     `, [preparationId])
+    for (const row of result.rows) {
+      this.assertObjectRow(row, {
+        objectId: row.object_id, purpose: row.purpose, checksum: row.object_checksum,
+        sizeBytes: Number(row.object_size_bytes), expiresAt: row.object_expires_at,
+        storageBucket: row.storage_bucket, storageKey: row.storage_key,
+      }, allocationStates)
+    }
     const objects = result.rows.map(objectFromRow)
     const archive = result.rows.find(row => row.purpose === 'workspace_archive')
     const manifest = result.rows.find(row => row.purpose === 'manifest')

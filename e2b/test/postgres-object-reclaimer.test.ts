@@ -12,6 +12,8 @@ import {
   WorkspacePreparationConflictError,
   type PreparationFence,
   type WorkspacePreparationIntent,
+  type WorkspacePreparationObjectDescriptor,
+  type WorkspacePreparationObjectPurpose,
 } from '../src/postgres-workspace-preparations.js'
 
 const databaseUrl = process.env.HOSTED_AGENT_TEST_DATABASE_URL
@@ -131,6 +133,14 @@ function preparationIntent(archiveChecksum: string, manifestChecksum: string,
   }
 }
 
+function preparationDescriptor(stored: StoredObject): WorkspacePreparationObjectDescriptor {
+  return {
+    objectId: stored.objectId, purpose: stored.kind as WorkspacePreparationObjectPurpose, checksum: stored.checksum,
+    sizeBytes: stored.sizeBytes, expiresAt: stored.expiresAt,
+    storageBucket: stored.storageBucket, storageKey: stored.storageKey,
+  }
+}
+
 async function pendingPreparation(context: Fixture, owner: Awaited<ReturnType<typeof operation>>,
   preparationId: string): Promise<{
     fence: PreparationFence
@@ -152,7 +162,8 @@ async function pendingPreparation(context: Fixture, owner: Awaited<ReturnType<ty
     allocationId: archive.allocationId, objectId: archive.object.objectId, purpose: 'workspace_archive' })
   await context.preparations.associateObject({ ...fence, preparationId,
     allocationId: manifest.allocationId, objectId: manifest.object.objectId, purpose: 'manifest' })
-  await context.preparations.markPrepared(fence, preparationId)
+  await context.preparations.markPrepared(
+    fence, preparationId, intent, [preparationDescriptor(archive.object), preparationDescriptor(manifest.object)])
   const client = await context.pool.connect()
   try {
     await client.query('BEGIN')
@@ -456,7 +467,8 @@ live('preparation reclaim retains references, retries failures, and enforces fen
     allocationId: archive.allocationId, objectId: archive.object.objectId, purpose: 'workspace_archive' })
   await context.preparations.associateObject({ ...fence, preparationId: 'committed',
     allocationId: manifest.allocationId, objectId: manifest.object.objectId, purpose: 'manifest' })
-  await context.preparations.markPrepared(fence, 'committed')
+  await context.preparations.markPrepared(fence, 'committed', committedIntent,
+    [preparationDescriptor(archive.object), preparationDescriptor(manifest.object)])
   const client = await context.pool.connect()
   try {
     await client.query('BEGIN')
