@@ -331,6 +331,22 @@ export class PostgresDurableState {
     return result.rows[0] ? sourceFromRow(result.rows[0]) : null
   }
 
+  async lockAuthorizedSourceSnapshot(tenantId: string, sourceSnapshotId: string, expectedChecksum: string,
+    at: Date, executor: Pick<PoolClient, 'query'>): Promise<SourceSnapshot> {
+    validateId('tenant ID', tenantId); validateId('source snapshot ID', sourceSnapshotId)
+    validateChecksum(expectedChecksum); validateDate('source snapshot authorization time', at)
+    const result = await executor.query<SourceRow>(`
+      SELECT source_snapshot_id, tenant_id, archive_object_id, checksum, cwd_uri,
+             workspace_root_uris, state, expires_at
+      FROM hosted_agent_source_snapshots
+      WHERE source_snapshot_id = $1 AND tenant_id = $2 AND checksum = $3
+        AND state = 'available' AND expires_at > $4
+      FOR UPDATE
+    `, [sourceSnapshotId, tenantId, expectedChecksum, at])
+    if (result.rowCount !== 1) throw new DurableStateNotFoundError('authorized source snapshot was not found')
+    return sourceFromRow(result.rows[0]!)
+  }
+
   async findAuthorizedSourceSnapshotByChecksum(tenantId: string, checksum: string, at = new Date()): Promise<SourceSnapshot | null> {
     validateId('tenant ID', tenantId); validateChecksum(checksum); validateDate('source snapshot lookup time', at)
     const result = await this.pool.query<SourceRow>(`

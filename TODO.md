@@ -58,6 +58,8 @@ connection material or allocation is leaked.
   create/resolve API adapter without accepting tenant identity or host paths from
   JSON; keep provision fail-closed until the durable backend owns the route.
 - [ ] Authorize tenant/checksum/expiry before sandbox allocation.
+- [x] Add a same-transaction final authorization lock for the exact source
+  tenant, ID, checksum, available state, and expiry; provision remains unwired.
 - [ ] Preserve roots, cwd, dirty/untracked and binary files, modes, and symlinks
   under `/workspace/roots/<index>/...`.
 - [ ] Reject traversal, escaping links, devices, sockets, FIFOs, special files,

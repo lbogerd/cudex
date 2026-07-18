@@ -372,6 +372,14 @@ integrity. Seven API tests plus provision/validation coverage pass. Provisioning
 intentionally returns 503 before provider allocation because no mixed JSON/PG
 backend is permitted.
 
+`PostgresDurableState` now also exposes a final, transaction-composable source
+authorization primitive. It locks the exact source row only when tenant, opaque
+ID, trusted checksum, `available` state, and unexpired lifetime all still match,
+using the caller's PostgreSQL client so authorization can be repeated in the
+same transaction that eventually attaches the lease. Mismatch is deliberately
+reported as not found. This closes the persistence-level time-of-check gap, but
+does not yet authorize before allocation or wire production provision.
+
 The current Rust Codex `ProjectSnapshotSource` has only root-workspace,
 agent-environment, and durable-snapshot variants, so it cannot yet emit or parse
 this source. Adding the client variant and an actual authenticated upload route

@@ -3,7 +3,7 @@ import { randomBytes, randomUUID } from 'node:crypto'
 import test from 'node:test'
 import { Pool } from 'pg'
 import { runMigrations } from '../src/migrate.js'
-import { DurableStateConflictError, PostgresDurableState, type CreateLeaseInput, type StoredObject } from '../src/postgres-state.js'
+import { DurableStateConflictError, DurableStateNotFoundError, PostgresDurableState, type CreateLeaseInput, type StoredObject } from '../src/postgres-state.js'
 import { canonicalRequestHash, PostgresJournal } from '../src/postgres-store.js'
 import { PostgresTicketIssuer } from '../src/postgres-tickets.js'
 
@@ -73,6 +73,31 @@ live('source snapshots and object references deny cross-tenant access and preser
     workspaceRootUris: ['file:///source/root', 'file:///source/root/nested'] }))
   await assert.rejects(context.second.addObjectReference({ tenantId: 'tenant-2', objectId: sourceObject.objectId,
     referenceKind: 'codex_thread', referenceId: 'thread-1', purpose: 'source' }))
+})
+
+live('final source authorization locks the exact tenant, checksum, state, and unexpired row', async context => {
+  const sourceObject = object('tenant-1', 'source-final-auth', 'source_archive', 'a')
+  await context.first.registerObject(sourceObject)
+  const expiresAt = new Date(Date.now() + 60_000)
+  await context.first.registerSourceSnapshot({
+    sourceSnapshotId: 'source-final-auth', tenantId: 'tenant-1', archiveObjectId: sourceObject.objectId,
+    checksum: sourceObject.checksum, cwdUri: 'file:///source/root', workspaceRootUris: ['file:///source/root'],
+    state: 'available', expiresAt,
+  })
+  const client = await context.firstPool.connect()
+  try {
+    await client.query('BEGIN')
+    const authorized = await context.first.lockAuthorizedSourceSnapshot(
+      'tenant-1', 'source-final-auth', sourceObject.checksum, new Date(), client)
+    assert.equal(authorized.archiveObjectId, sourceObject.objectId)
+    await assert.rejects(context.first.lockAuthorizedSourceSnapshot(
+      'tenant-2', 'source-final-auth', sourceObject.checksum, new Date(), client), DurableStateNotFoundError)
+    await assert.rejects(context.first.lockAuthorizedSourceSnapshot(
+      'tenant-1', 'source-final-auth', digest('f'), new Date(), client), DurableStateNotFoundError)
+    await assert.rejects(context.first.lockAuthorizedSourceSnapshot(
+      'tenant-1', 'source-final-auth', sourceObject.checksum, expiresAt, client), DurableStateNotFoundError)
+    await client.query('ROLLBACK')
+  } finally { client.release() }
 })
 
 live('lease and base snapshot creation is atomic and unique across two pools', async context => {
