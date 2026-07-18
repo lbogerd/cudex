@@ -850,6 +850,76 @@ async fn hosted_finalization_release_failure_is_durable_and_cleanup_retries() {
 }
 
 #[tokio::test]
+async fn removing_pending_finalization_retries_before_releasing_the_runtime() {
+    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
+    let (owner, agent) = start_hosted_owned_agent(&manager, &config).await;
+    hosted_service.set_checkpoint_failure(Some(codex_hosted_agent::HostedAgentError::new(
+        codex_hosted_agent::HostedAgentErrorCategory::Unavailable,
+        "checkpoint unavailable",
+    )));
+    manager
+        .state
+        .finalize_hosted_runtime(agent.thread_id, owner.thread_id)
+        .await
+        .expect_err("initial finalization must remain pending");
+    agent
+        .thread
+        .shutdown_and_wait()
+        .await
+        .expect("stop pending hosted agent");
+    let mut patch_available = manager.subscribe_hosted_agent_patch_available();
+
+    assert!(manager.remove_thread(&agent.thread_id).await.is_some());
+    let still_pending_record = manager
+        .state
+        .thread_store
+        .get_hosted_agent_runtime(agent.thread_id)
+        .await
+        .expect("read still-pending runtime")
+        .expect("still-pending runtime record");
+    assert_eq!(
+        still_pending_record.lifecycle_state,
+        codex_hosted_agent::HostedAgentLifecycleState::PendingFinalization
+    );
+    assert_eq!(hosted_service.active_lease_count(), 2);
+    assert!(matches!(
+        patch_available.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+
+    hosted_service.set_checkpoint_failure(None);
+    assert!(manager.remove_thread(&agent.thread_id).await.is_none());
+    let released_record = manager
+        .state
+        .thread_store
+        .get_hosted_agent_runtime(agent.thread_id)
+        .await
+        .expect("read finalized runtime")
+        .expect("finalized runtime record");
+    let notification = patch_available.recv().await.expect("patch notification");
+
+    assert_eq!(notification.owner_thread_id, owner.thread_id);
+    assert_eq!(
+        released_record.last_exported_patch,
+        Some(notification.artifact)
+    );
+    assert_eq!(
+        released_record.lifecycle_state,
+        codex_hosted_agent::HostedAgentLifecycleState::Released
+    );
+    assert!(
+        manager
+            .state
+            .hosted_agent_runtimes
+            .read()
+            .await
+            .get(&agent.thread_id)
+            .is_none()
+    );
+    assert_eq!(hosted_service.active_lease_count(), 1);
+}
+
+#[tokio::test]
 async fn hosted_startup_rolls_back_when_runtime_metadata_cannot_be_stored() {
     let (_temp_dir, config, manager, hosted_service) =
         hosted_thread_manager_with_durable_store_for_tests(/*durable_store*/ false).await;
@@ -876,6 +946,34 @@ async fn hosted_startup_rolls_back_when_runtime_metadata_cannot_be_stored() {
         );
     }
     assert!(manager.state.hosted_agent_runtimes.read().await.is_empty());
+}
+
+#[tokio::test]
+async fn hosted_provision_failure_leaves_no_thread_runtime_environment_or_lease() {
+    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
+    hosted_service.set_provision_failure(Some(codex_hosted_agent::HostedAgentError::new(
+        codex_hosted_agent::HostedAgentErrorCategory::QuotaExceeded,
+        "test quota exhausted",
+    )));
+    let initial_thread_ids = manager.list_thread_ids().await;
+
+    let error = match manager
+        .start_thread_with_options(start_thread_options(config))
+        .await
+    {
+        Ok(_) => panic!("hosted provision failure must prevent thread startup"),
+        Err(error) => error,
+    };
+
+    assert!(error.to_string().contains("test quota exhausted"));
+    assert_eq!(manager.list_thread_ids().await, initial_thread_ids);
+    assert!(manager.state.hosted_agent_runtimes.read().await.is_empty());
+    assert_eq!(
+        manager.state.environment_manager.default_environment_ids(),
+        Vec::<String>::new()
+    );
+    assert_eq!(hosted_service.active_lease_count(), 0);
+    assert!(hosted_service.provisioned_environment_ids().is_empty());
 }
 
 #[tokio::test]
@@ -932,63 +1030,80 @@ async fn stopped_hosted_thread_reconnects_without_releasing_its_lease() {
 }
 
 #[tokio::test]
-async fn pending_finalization_hosted_thread_reconnects_for_recovery() {
+async fn pending_finalization_resume_finishes_without_starting_a_new_turn() {
     let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
-    let root = manager
-        .start_thread_with_options(start_thread_options(config.clone()))
-        .await
-        .expect("start hosted root");
-    let mut record = manager
-        .state
-        .thread_store
-        .get_hosted_agent_runtime(root.thread_id)
-        .await
-        .expect("read hosted runtime")
-        .expect("hosted runtime record");
-    record.lifecycle_state = codex_hosted_agent::HostedAgentLifecycleState::PendingFinalization;
+    let (owner, agent) = start_hosted_owned_agent(&manager, &config).await;
+    hosted_service.set_export_failure(Some(codex_hosted_agent::HostedAgentError::new(
+        codex_hosted_agent::HostedAgentErrorCategory::Unavailable,
+        "export unavailable",
+    )));
     manager
         .state
-        .thread_store
-        .set_hosted_agent_runtime(root.thread_id, record.clone())
+        .finalize_hosted_runtime(agent.thread_id, owner.thread_id)
         .await
-        .expect("persist pending finalization");
-    root.thread
+        .expect_err("initial finalization must remain pending");
+    let pending_record = manager
+        .state
+        .thread_store
+        .get_hosted_agent_runtime(agent.thread_id)
+        .await
+        .expect("read pending runtime")
+        .expect("pending runtime record");
+    assert_eq!(
+        pending_record.lifecycle_state,
+        codex_hosted_agent::HostedAgentLifecycleState::PendingFinalization
+    );
+    agent
+        .thread
         .shutdown_and_wait()
         .await
-        .expect("stop hosted thread");
+        .expect("stop pending hosted agent");
+    hosted_service.set_export_failure(None);
+    let mut patch_available = manager.subscribe_hosted_agent_patch_available();
 
-    let resumed = manager
+    let error = match manager
         .resume_thread_with_history(
             config,
             InitialHistory::Resumed(ResumedHistory {
-                conversation_id: root.thread_id,
+                conversation_id: agent.thread_id,
                 history: Arc::new(Vec::new()),
-                rollout_path: root.session_configured.rollout_path.clone(),
+                rollout_path: agent.session_configured.rollout_path.clone(),
             }),
             manager.auth_manager(),
             /*parent_trace*/ None,
             /*supports_openai_form_elicitation*/ false,
         )
         .await
-        .expect("reconnect pending finalization");
-    let resumed_record = manager
+    {
+        Ok(_) => panic!("finalized hosted agent must not start another turn"),
+        Err(error) => error,
+    };
+    let released_record = manager
         .state
         .thread_store
-        .get_hosted_agent_runtime(root.thread_id)
+        .get_hosted_agent_runtime(agent.thread_id)
         .await
-        .expect("read resumed hosted runtime")
-        .expect("resumed hosted runtime record");
+        .expect("read recovered runtime")
+        .expect("recovered runtime record");
+    let notification = patch_available.recv().await.expect("patch notification");
 
-    assert_eq!(resumed_record, record);
+    assert!(
+        error
+            .to_string()
+            .contains("is finalized and cannot be resumed")
+    );
+    assert_eq!(
+        released_record.lifecycle_state,
+        codex_hosted_agent::HostedAgentLifecycleState::Released
+    );
+    assert_eq!(notification.owner_thread_id, owner.thread_id);
+    assert_eq!(
+        released_record.last_exported_patch,
+        Some(notification.artifact)
+    );
+    assert!(manager.get_thread(agent.thread_id).await.is_err());
     assert_eq!(hosted_service.active_lease_count(), 1);
-    assert_eq!(hosted_service.provisioned_environment_ids().len(), 1);
-
-    resumed
-        .thread
-        .shutdown_and_wait()
-        .await
-        .expect("stop resumed thread");
-    manager.remove_thread(&resumed.thread_id).await;
+    assert_eq!(hosted_service.provisioned_environment_ids().len(), 2);
 }
 
 #[tokio::test]

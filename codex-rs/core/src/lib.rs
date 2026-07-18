@@ -51,6 +51,7 @@ mod git_info_tests;
 mod guardian;
 mod hook_runtime;
 mod hosted_agent_runtime;
+mod hosted_agent_telemetry;
 mod image_preparation;
 mod installation_id;
 pub(crate) mod landlock;

@@ -100,6 +100,11 @@ pub(crate) async fn run_codex_thread_interactive(
             parent_session.thread_id,
         )
         .await?;
+    if config.hosted_agents.enabled && pending_hosted_runtime.is_none() {
+        crate::hosted_agent_telemetry::record_local_fallback_attempt(
+            crate::hosted_agent_telemetry::LocalFallbackPath::Delegate,
+        );
+    }
     let (environment_selections, inherited_environments, inherited_exec_policy) =
         match pending_hosted_runtime.as_ref() {
             Some(pending) => (

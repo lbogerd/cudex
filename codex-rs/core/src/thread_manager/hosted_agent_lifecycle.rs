@@ -17,6 +17,36 @@ pub struct HostedAgentPatchAvailable {
 }
 
 impl ThreadManagerState {
+    /// Retries an interrupted finalization from the runtime's durable owner and state.
+    pub(crate) async fn retry_pending_hosted_finalization(
+        &self,
+        agent_id: ThreadId,
+    ) -> CodexResult<HostedAgentLifecycleState> {
+        let runtime = self
+            .hosted_agent_runtimes
+            .read()
+            .await
+            .get(&agent_id)
+            .cloned()
+            .ok_or_else(|| {
+                CodexErr::Fatal(format!(
+                    "pending hosted runtime {agent_id} is not registered"
+                ))
+            })?;
+        let value = runtime.snapshot();
+        if value.lifecycle_state != HostedAgentLifecycleState::PendingFinalization {
+            return Ok(value.lifecycle_state);
+        }
+        let owner_thread_id = value.owner_agent_id.ok_or_else(|| {
+            CodexErr::Fatal(format!(
+                "pending hosted runtime {agent_id} has no durable owner"
+            ))
+        })?;
+        self.finalize_hosted_runtime(agent_id, owner_thread_id)
+            .await?;
+        Ok(runtime.snapshot().lifecycle_state)
+    }
+
     /// Finalizes an owned hosted agent without applying its patch to the owner.
     ///
     /// An `Ok(Some(_))` result means the artifact was durably persisted. Cleanup failures leave
@@ -99,6 +129,7 @@ impl ThreadManagerState {
         };
 
         if value.lifecycle_state == HostedAgentLifecycleState::Released {
+            self.record_active_hosted_lease_count().await;
             return Ok(Some(artifact));
         }
         let _ = self.patch_available_tx.send(HostedAgentPatchAvailable {
@@ -133,6 +164,7 @@ impl ThreadManagerState {
                 warn!(%error, %agent_id, "hosted agent completed with cleanup pending");
             }
         }
+        self.record_active_hosted_lease_count().await;
         Ok(Some(artifact))
     }
 

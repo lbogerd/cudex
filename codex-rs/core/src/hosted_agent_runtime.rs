@@ -2,6 +2,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
 use codex_exec_server::EnvironmentManager;
 use codex_exec_server::ExecServerError;
@@ -24,6 +25,10 @@ use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_tools::ToolExecutionDomain;
 use codex_tools::ToolName;
 use thiserror::Error;
+
+use crate::hosted_agent_telemetry;
+use crate::hosted_agent_telemetry::CheckpointKind;
+use crate::hosted_agent_telemetry::ProvisionKind;
 
 const HOSTED_ENVIRONMENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -207,11 +212,14 @@ impl HostedAgentProvisioner {
         let sandbox_template = request.sandbox_template.clone();
         let agent_id = request.agent_id;
         let owner_agent_id = request.owner_agent_id;
-        let provisioned = self
-            .service
-            .provision(request)
-            .await
-            .map_err(HostedAgentRuntimeError::Provision)?;
+        let started_at = Instant::now();
+        let provision_result = self.service.provision(request).await;
+        hosted_agent_telemetry::record_provision_duration(
+            ProvisionKind::Fresh,
+            started_at.elapsed(),
+            provision_result.is_ok(),
+        );
+        let provisioned = provision_result.map_err(HostedAgentRuntimeError::Provision)?;
         let runtime = HostedAgentRuntime {
             owner_agent_id,
             lease_id: provisioned.lease_id,
@@ -313,11 +321,16 @@ impl HostedAgentProvisioner {
                         "hosted-agent:{agent_id}:snapshot:{latest_snapshot_id}:restore"
                     ),
                 };
+                let started_at = Instant::now();
+                let restore_result = self.service.provision(request).await;
+                hosted_agent_telemetry::record_provision_duration(
+                    ProvisionKind::Restore,
+                    started_at.elapsed(),
+                    restore_result.is_ok(),
+                );
+                hosted_agent_telemetry::record_restore(restore_result.is_ok());
                 (
-                    self.service
-                        .provision(request)
-                        .await
-                        .map_err(HostedAgentRuntimeError::Provision)?,
+                    restore_result.map_err(HostedAgentRuntimeError::Provision)?,
                     PendingRuntimeRollback::ReleaseLease,
                 )
             }
@@ -375,13 +388,18 @@ impl HostedAgentProvisioner {
         agent_id: codex_protocol::ThreadId,
         runtime: HostedAgentRuntime,
     ) -> Result<(), HostedAgentRuntimeError> {
-        cleanup_runtime(
+        let is_cleanup_retry = runtime.lifecycle_state == HostedAgentLifecycleState::ReleasePending;
+        let cleanup_result = cleanup_runtime(
             agent_id,
             runtime,
             self.environment_manager.as_ref(),
             self.service.as_ref(),
         )
-        .await
+        .await;
+        if is_cleanup_retry {
+            hosted_agent_telemetry::record_cleanup_retry(cleanup_result.is_ok());
+        }
+        cleanup_result
     }
 
     /// Retries cleanup from durable metadata without reconnecting or restoring a terminal lease.
@@ -390,7 +408,7 @@ impl HostedAgentProvisioner {
         agent_id: codex_protocol::ThreadId,
         record: HostedAgentRuntimeRecord,
     ) -> Result<(), HostedAgentRuntimeError> {
-        cleanup_runtime(
+        let cleanup_result = cleanup_runtime(
             agent_id,
             HostedAgentRuntime {
                 owner_agent_id: record.owner_agent_id,
@@ -407,7 +425,9 @@ impl HostedAgentProvisioner {
             self.environment_manager.as_ref(),
             self.service.as_ref(),
         )
-        .await
+        .await;
+        hosted_agent_telemetry::record_cleanup_retry(cleanup_result.is_ok());
+        cleanup_result
     }
 
     /// Creates a durable snapshot for one successfully completed turn.
@@ -417,13 +437,20 @@ impl HostedAgentProvisioner {
         turn_id: &str,
         runtime: &HostedAgentRuntime,
     ) -> Result<AgentCheckpoint, HostedAgentRuntimeError> {
-        self.service
+        let started_at = Instant::now();
+        let checkpoint_result = self
+            .service
             .checkpoint(AgentCheckpointRequest {
                 lease_id: runtime.lease_id.clone(),
                 idempotency_key: format!("hosted-agent:{agent_id}:turn:{turn_id}:checkpoint"),
             })
-            .await
-            .map_err(HostedAgentRuntimeError::Checkpoint)
+            .await;
+        hosted_agent_telemetry::record_checkpoint_duration(
+            CheckpointKind::Turn,
+            started_at.elapsed(),
+            checkpoint_result.is_ok(),
+        );
+        checkpoint_result.map_err(HostedAgentRuntimeError::Checkpoint)
     }
 
     /// Creates the final durable snapshot for an owned agent's lease generation.
@@ -432,7 +459,9 @@ impl HostedAgentProvisioner {
         agent_id: codex_protocol::ThreadId,
         runtime: &HostedAgentRuntime,
     ) -> Result<AgentCheckpoint, HostedAgentRuntimeError> {
-        self.service
+        let started_at = Instant::now();
+        let checkpoint_result = self
+            .service
             .checkpoint(AgentCheckpointRequest {
                 lease_id: runtime.lease_id.clone(),
                 idempotency_key: format!(
@@ -440,8 +469,13 @@ impl HostedAgentProvisioner {
                     runtime.lease_id
                 ),
             })
-            .await
-            .map_err(HostedAgentRuntimeError::Checkpoint)
+            .await;
+        hosted_agent_telemetry::record_checkpoint_duration(
+            CheckpointKind::Completion,
+            started_at.elapsed(),
+            checkpoint_result.is_ok(),
+        );
+        checkpoint_result.map_err(HostedAgentRuntimeError::Checkpoint)
     }
 
     /// Exports the agent's final patch after its completion snapshot is durable.
@@ -473,6 +507,7 @@ impl HostedAgentProvisioner {
                 "patch artifact does not match the finalized agent",
             )));
         }
+        hosted_agent_telemetry::record_patch_size(artifact.size_bytes);
         Ok(artifact)
     }
 

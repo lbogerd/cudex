@@ -558,6 +558,7 @@ impl ToolRegistry {
             .as_ref()
             .is_some_and(|authorization| !authorization.allows(&tool_name, &execution_domain))
         {
+            crate::hosted_agent_telemetry::record_denied_tool_domain(&execution_domain);
             let message = HOSTED_EXTERNAL_SANDBOX_DENIAL_MESSAGE.to_string();
             let log_payload = invocation.payload.log_payload();
             otel.tool_result_with_tags(

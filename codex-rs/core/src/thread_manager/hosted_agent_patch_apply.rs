@@ -5,6 +5,7 @@ use codex_hosted_agent::PatchApplyResult;
 use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
+use codex_thread_store::ThreadStoreError;
 use codex_tools::ToolExecutionDomain;
 use codex_tools::ToolName;
 use codex_utils_path_uri::PathUri;
@@ -77,16 +78,19 @@ impl ThreadManagerState {
     ) -> CodexResult<bool> {
         let mut seen = std::collections::HashSet::new();
         while seen.insert(source_agent_id) {
-            let durable_owner_agent_id = self
+            let durable_owner_agent_id = match self
                 .thread_store
                 .get_hosted_agent_runtime(source_agent_id)
                 .await
-                .map_err(|error| {
-                    CodexErr::Fatal(format!(
+            {
+                Ok(record) => record.and_then(|record| record.owner_agent_id),
+                Err(ThreadStoreError::ThreadNotFound { .. }) => None,
+                Err(error) => {
+                    return Err(CodexErr::Fatal(format!(
                         "failed to load hosted-agent ownership for thread {source_agent_id}: {error}"
-                    ))
-                })?
-                .and_then(|record| record.owner_agent_id);
+                    )));
+                }
+            };
             let owner_agent_id = match durable_owner_agent_id {
                 Some(owner_agent_id) => Some(owner_agent_id),
                 None => self
@@ -219,6 +223,7 @@ impl ThreadManagerState {
                 Ok(HostedAgentPatchApplyResult::Applied)
             }
             PatchApplyResult::Conflict { paths } if paths.len() <= MAX_PATCH_CONFLICT_PATHS => {
+                crate::hosted_agent_telemetry::record_patch_conflict(paths.len());
                 Ok(HostedAgentPatchApplyResult::Conflict { paths })
             }
             PatchApplyResult::Conflict { .. } => Err(CodexErr::Fatal(

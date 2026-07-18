@@ -1383,13 +1383,37 @@ impl ThreadManagerState {
                     ))
                 })?;
             match record.lifecycle_state {
-                codex_hosted_agent::HostedAgentLifecycleState::Active
-                | codex_hosted_agent::HostedAgentLifecycleState::PendingFinalization => {
+                codex_hosted_agent::HostedAgentLifecycleState::Active => {
                     return provisioner
                         .reconnect_or_restore(thread_id, record)
                         .await
                         .map(Some)
                         .map_err(|error| CodexErr::Fatal(error.to_string()));
+                }
+                codex_hosted_agent::HostedAgentLifecycleState::PendingFinalization => {
+                    if !self
+                        .hosted_agent_runtimes
+                        .read()
+                        .await
+                        .contains_key(&thread_id)
+                    {
+                        let pending = provisioner
+                            .reconnect_or_restore(thread_id, record)
+                            .await
+                            .map_err(|error| CodexErr::Fatal(error.to_string()))?;
+                        let runtime = self
+                            .persist_pending_hosted_runtime(thread_id, pending)
+                            .await?;
+                        self.hosted_agent_runtimes
+                            .write()
+                            .await
+                            .insert(thread_id, Arc::new(HostedAgentRuntimeEntry::new(runtime)));
+                        self.record_active_hosted_lease_count().await;
+                    }
+                    let recovered_state = self.retry_pending_hosted_finalization(thread_id).await?;
+                    if recovered_state == codex_hosted_agent::HostedAgentLifecycleState::Released {
+                        self.hosted_agent_runtimes.write().await.remove(&thread_id);
+                    }
                 }
                 codex_hosted_agent::HostedAgentLifecycleState::Completed
                 | codex_hosted_agent::HostedAgentLifecycleState::ReleasePending => {
@@ -1495,7 +1519,27 @@ impl ThreadManagerState {
             .write()
             .await
             .insert(thread_id, Arc::new(HostedAgentRuntimeEntry::new(runtime)));
+        self.record_active_hosted_lease_count().await;
         Ok(())
+    }
+
+    async fn record_active_hosted_lease_count(&self) {
+        let active_lease_count = self
+            .hosted_agent_runtimes
+            .read()
+            .await
+            .values()
+            .filter(|runtime| {
+                matches!(
+                    runtime.snapshot().lifecycle_state,
+                    codex_hosted_agent::HostedAgentLifecycleState::Active
+                        | codex_hosted_agent::HostedAgentLifecycleState::PendingFinalization
+                        | codex_hosted_agent::HostedAgentLifecycleState::Completed
+                        | codex_hosted_agent::HostedAgentLifecycleState::ReleasePending
+                )
+            })
+            .count();
+        crate::hosted_agent_telemetry::record_active_leases(active_lease_count);
     }
 
     async fn persist_pending_hosted_runtime(
@@ -1751,6 +1795,32 @@ impl ThreadManagerState {
         hosted_runtime: Option<SharedHostedAgentRuntime>,
     ) {
         if let Some(runtime) = hosted_runtime {
+            if runtime.snapshot().lifecycle_state
+                == codex_hosted_agent::HostedAgentLifecycleState::PendingFinalization
+            {
+                self.hosted_agent_runtimes
+                    .write()
+                    .await
+                    .insert(thread_id, Arc::clone(&runtime));
+                match self.retry_pending_hosted_finalization(thread_id).await {
+                    Ok(codex_hosted_agent::HostedAgentLifecycleState::Released) => {
+                        self.hosted_agent_runtimes.write().await.remove(&thread_id);
+                    }
+                    Ok(
+                        codex_hosted_agent::HostedAgentLifecycleState::PendingFinalization
+                        | codex_hosted_agent::HostedAgentLifecycleState::Completed
+                        | codex_hosted_agent::HostedAgentLifecycleState::ReleasePending,
+                    ) => {}
+                    Ok(codex_hosted_agent::HostedAgentLifecycleState::Active) => {
+                        warn!(%thread_id, "pending hosted finalization unexpectedly became active");
+                    }
+                    Err(error) => {
+                        warn!(%error, %thread_id, "failed to retry pending hosted finalization during release");
+                    }
+                }
+                self.record_active_hosted_lease_count().await;
+                return;
+            }
             let Ok(_operation_permit) = Arc::clone(&runtime.operation_lock).acquire_owned().await
             else {
                 warn!(%thread_id, "hosted runtime operation coordination closed during release");
@@ -1759,6 +1829,7 @@ impl ThreadManagerState {
                     .await
                     .entry(thread_id)
                     .or_insert(runtime);
+                self.record_active_hosted_lease_count().await;
                 return;
             };
             let mut runtime_value = runtime.snapshot();
@@ -1769,9 +1840,13 @@ impl ThreadManagerState {
                         .await
                         .entry(thread_id)
                         .or_insert(runtime);
+                    self.record_active_hosted_lease_count().await;
                     return;
                 }
-                codex_hosted_agent::HostedAgentLifecycleState::Released => return,
+                codex_hosted_agent::HostedAgentLifecycleState::Released => {
+                    self.record_active_hosted_lease_count().await;
+                    return;
+                }
                 codex_hosted_agent::HostedAgentLifecycleState::Active
                 | codex_hosted_agent::HostedAgentLifecycleState::Completed
                 | codex_hosted_agent::HostedAgentLifecycleState::ReleasePending => {}
@@ -1832,6 +1907,7 @@ impl ThreadManagerState {
                     );
                 }
             }
+            self.record_active_hosted_lease_count().await;
         }
     }
 
@@ -2313,6 +2389,11 @@ impl ThreadManagerState {
                 hosted_lineage,
             )
             .await?;
+        if config.hosted_agents.enabled && pending_hosted_runtime.is_none() {
+            crate::hosted_agent_telemetry::record_local_fallback_attempt(
+                crate::hosted_agent_telemetry::LocalFallbackPath::ThreadStart,
+            );
+        }
         let (environments, inherited_environments, inherited_exec_policy) =
             match pending_hosted_runtime.as_ref() {
                 Some(pending) => (
