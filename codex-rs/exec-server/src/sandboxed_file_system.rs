@@ -403,6 +403,9 @@ fn require_platform_sandbox(
 fn map_sandbox_error(error: JSONRPCErrorError) -> io::Error {
     match error.code {
         -32004 => io::Error::new(io::ErrorKind::NotFound, error.message),
+        codex_exec_server_protocol::FILE_SYSTEM_PERMISSION_DENIED_ERROR_CODE => {
+            io::Error::new(io::ErrorKind::PermissionDenied, error.message)
+        }
         -32600 => io::Error::new(io::ErrorKind::InvalidInput, error.message),
         _ => io::Error::other(error.message),
     }

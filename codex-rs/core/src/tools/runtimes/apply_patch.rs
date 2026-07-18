@@ -104,6 +104,13 @@ impl ApplyPatchRuntime {
     }
 }
 
+fn is_hosted_file_system_denial(
+    turn: &crate::session::turn_context::TurnContext,
+    error: &codex_apply_patch::ApplyPatchError,
+) -> bool {
+    turn.hosted_tool_authorization.is_some() && error.is_permission_denied()
+}
+
 impl Sandboxable for ApplyPatchRuntime {
     fn sandbox_preference(&self) -> SandboxablePreference {
         SandboxablePreference::Auto
@@ -222,7 +229,7 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
         &mut self,
         req: &ApplyPatchRequest,
         attempt: &SandboxAttempt<'_>,
-        _ctx: &ToolCtx,
+        ctx: &ToolCtx,
     ) -> Result<ApplyPatchRuntimeOutput, ToolError> {
         let started_at = Instant::now();
         let fs = req.turn_environment.environment.get_filesystem();
@@ -241,11 +248,16 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
         let stdout = String::from_utf8_lossy(&stdout).into_owned();
         let stderr = String::from_utf8_lossy(&stderr).into_owned();
         let failed = result.is_err();
-        let exit_code = if failed { 1 } else { 0 };
-        let delta = match result {
-            Ok(delta) => delta,
-            Err(failure) => failure.into_parts().1,
+        let (delta, hosted_external_sandbox_denial) = match result {
+            Ok(delta) => (delta, false),
+            Err(failure) => {
+                let (error, delta) = failure.into_parts();
+                let hosted_external_sandbox_denial =
+                    is_hosted_file_system_denial(ctx.turn.as_ref(), &error);
+                (delta, hosted_external_sandbox_denial)
+            }
         };
+        let exit_code = if failed { 1 } else { 0 };
         self.committed_delta.append(delta);
         let output = ExecToolCallOutput {
             exit_code,
@@ -255,7 +267,9 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
             duration: started_at.elapsed(),
             timed_out: false,
         };
-        if failed && is_likely_sandbox_denied(attempt.sandbox, &output) {
+        if hosted_external_sandbox_denial
+            || (failed && is_likely_sandbox_denied(attempt.sandbox, &output))
+        {
             return Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied {
                 output: Box::new(output),
                 network_policy_decision: None,

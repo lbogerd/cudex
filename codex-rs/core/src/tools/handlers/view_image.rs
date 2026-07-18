@@ -11,7 +11,9 @@ use codex_utils_image::data_url_from_bytes;
 use serde::Deserialize;
 
 use crate::function_tool::FunctionCallError;
+use crate::hosted_agent_runtime::HOSTED_EXTERNAL_SANDBOX_DENIAL_MESSAGE;
 use crate::original_image_detail::can_request_original_image_detail;
+use crate::session::turn_context::TurnContext;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
@@ -61,6 +63,20 @@ struct ViewImageArgs {
 enum ViewImageDetail {
     High,
     Original,
+}
+
+fn view_image_file_system_error(
+    turn: &TurnContext,
+    error: std::io::Error,
+    message: impl FnOnce(&std::io::Error) -> String,
+) -> FunctionCallError {
+    if turn.hosted_tool_authorization.is_some()
+        && error.kind() == std::io::ErrorKind::PermissionDenied
+    {
+        FunctionCallError::RespondToModel(HOSTED_EXTERNAL_SANDBOX_DENIAL_MESSAGE.to_string())
+    } else {
+        FunctionCallError::RespondToModel(message(&error))
+    }
 }
 
 impl ToolExecutor<ToolInvocation> for ViewImageHandler {
@@ -155,9 +171,9 @@ impl ViewImageHandler {
             .get_metadata(&path_uri, Some(&sandbox))
             .await
             .map_err(|error| {
-                FunctionCallError::RespondToModel(format!(
-                    "unable to locate image at `{model_visible_path}`: {error}"
-                ))
+                view_image_file_system_error(turn.as_ref(), error, |error| {
+                    format!("unable to locate image at `{model_visible_path}`: {error}")
+                })
             })?;
 
         if !metadata.is_file {
@@ -169,9 +185,9 @@ impl ViewImageHandler {
             .read_file(&path_uri, Some(&sandbox))
             .await
             .map_err(|error| {
-                FunctionCallError::RespondToModel(format!(
-                    "unable to read image at `{model_visible_path}`: {error}"
-                ))
+                view_image_file_system_error(turn.as_ref(), error, |error| {
+                    format!("unable to read image at `{model_visible_path}`: {error}")
+                })
             })?;
 
         let can_request_original_detail = can_request_original_image_detail(&turn.model_info);
@@ -370,6 +386,51 @@ mod tests {
         assert_eq!(
             message,
             "view_image.detail only supports `high` or `original`; omit `detail` for default high resized behavior, got `low`"
+        );
+    }
+
+    #[tokio::test]
+    async fn hosted_permission_denials_use_the_stable_external_sandbox_diagnostic() {
+        let (_, mut turn) = make_session_and_context().await;
+        turn.hosted_tool_authorization =
+            Some(crate::hosted_agent_runtime::HostedToolAuthorization::new(
+                "hosted-environment".to_string(),
+                codex_hosted_agent::AgentToolPolicy::default(),
+            ));
+
+        let error = view_image_file_system_error(
+            &turn,
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "service-specific denial details",
+            ),
+            |error| format!("unable to locate image: {error}"),
+        );
+
+        assert_eq!(
+            error,
+            FunctionCallError::RespondToModel(HOSTED_EXTERNAL_SANDBOX_DENIAL_MESSAGE.to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn non_hosted_permission_denials_keep_the_existing_view_image_context() {
+        let (_, turn) = make_session_and_context().await;
+
+        let error = view_image_file_system_error(
+            &turn,
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "filesystem denial details",
+            ),
+            |error| format!("unable to locate image: {error}"),
+        );
+
+        assert_eq!(
+            error,
+            FunctionCallError::RespondToModel(
+                "unable to locate image: filesystem denial details".to_string()
+            )
         );
     }
 

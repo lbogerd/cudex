@@ -10,6 +10,7 @@ use crate::apply_patch;
 use crate::apply_patch::InternalApplyPatchInvocation;
 use crate::apply_patch::convert_apply_patch_to_protocol;
 use crate::function_tool::FunctionCallError;
+use crate::hosted_agent_runtime::HOSTED_EXTERNAL_SANDBOX_DENIAL_MESSAGE;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::session::turn_context::TurnEnvironment;
@@ -35,12 +36,16 @@ use crate::tools::registry::ToolExecutor;
 use crate::tools::runtimes::apply_patch::ApplyPatchRequest;
 use crate::tools::runtimes::apply_patch::ApplyPatchRuntime;
 use crate::tools::sandboxing::ToolCtx;
+use crate::tools::sandboxing::ToolError;
 use codex_apply_patch::ApplyPatchAction;
 use codex_apply_patch::ApplyPatchFileChange;
 use codex_apply_patch::Hunk;
 use codex_apply_patch::StreamingPatchParser;
 use codex_exec_server::ExecutorFileSystem;
 use codex_features::Feature;
+use codex_protocol::error::CodexErr;
+use codex_protocol::error::SandboxErr;
+use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::models::FileSystemPermissions;
 use codex_protocol::protocol::EventMsg;
@@ -258,6 +263,30 @@ fn apply_patch_payload_command(payload: &ToolPayload) -> Option<String> {
     }
 }
 
+fn apply_patch_verification_error(
+    turn: &TurnContext,
+    error: codex_apply_patch::ApplyPatchError,
+) -> FunctionCallError {
+    if turn.hosted_tool_authorization.is_some() && error.is_permission_denied() {
+        FunctionCallError::RespondToModel(HOSTED_EXTERNAL_SANDBOX_DENIAL_MESSAGE.to_string())
+    } else {
+        FunctionCallError::RespondToModel(format!("apply_patch verification failed: {error}"))
+    }
+}
+
+fn is_hosted_apply_patch_denial(
+    turn: &TurnContext,
+    out: &Result<ExecToolCallOutput, ToolError>,
+) -> bool {
+    turn.hosted_tool_authorization.is_some()
+        && matches!(
+            out,
+            Err(ToolError::Codex(CodexErr::Sandbox(
+                SandboxErr::Denied { .. }
+            )))
+        )
+}
+
 async fn effective_patch_permissions(
     session: &Session,
     turn: &TurnContext,
@@ -460,21 +489,27 @@ impl ApplyPatchHandler {
                             Ok(output) => (Ok(output.exec_output), Some(output.delta)),
                             Err(error) => (Err(error), Some(runtime.committed_delta().clone())),
                         };
+                        let hosted_external_sandbox_denial =
+                            is_hosted_apply_patch_denial(turn.as_ref(), &out);
                         let event_ctx = ToolEventCtx::new(
                             session.as_ref(),
                             turn.as_ref(),
                             &call_id,
                             Some(&tracker),
                         );
-                        let content = emitter.finish(event_ctx, out, delta.as_ref()).await?;
+                        let content = emitter.finish(event_ctx, out, delta.as_ref()).await;
+                        if hosted_external_sandbox_denial {
+                            return Err(FunctionCallError::RespondToModel(
+                                HOSTED_EXTERNAL_SANDBOX_DENIAL_MESSAGE.to_string(),
+                            ));
+                        }
+                        let content = content?;
                         Ok(boxed_tool_output(ApplyPatchToolOutput::from_text(content)))
                     }
                 }
             }
             codex_apply_patch::MaybeApplyPatchVerified::CorrectnessError(parse_error) => {
-                Err(FunctionCallError::RespondToModel(format!(
-                    "apply_patch verification failed: {parse_error}"
-                )))
+                Err(apply_patch_verification_error(turn.as_ref(), parse_error))
             }
             codex_apply_patch::MaybeApplyPatchVerified::ShellParseError(error) => {
                 tracing::trace!("Failed to parse apply_patch input, {error:?}");
@@ -624,21 +659,27 @@ pub(crate) async fn intercept_apply_patch(
                         Ok(output) => (Ok(output.exec_output), Some(output.delta)),
                         Err(error) => (Err(error), Some(runtime.committed_delta().clone())),
                     };
+                    let hosted_external_sandbox_denial =
+                        is_hosted_apply_patch_denial(turn.as_ref(), &out);
                     let event_ctx = ToolEventCtx::new(
                         session.as_ref(),
                         turn.as_ref(),
                         call_id,
                         tracker.as_ref().copied(),
                     );
-                    let content = emitter.finish(event_ctx, out, delta.as_ref()).await?;
+                    let content = emitter.finish(event_ctx, out, delta.as_ref()).await;
+                    if hosted_external_sandbox_denial {
+                        return Err(FunctionCallError::RespondToModel(
+                            HOSTED_EXTERNAL_SANDBOX_DENIAL_MESSAGE.to_string(),
+                        ));
+                    }
+                    let content = content?;
                     Ok(Some(FunctionToolOutput::from_text(content, Some(true))))
                 }
             }
         }
         codex_apply_patch::MaybeApplyPatchVerified::CorrectnessError(parse_error) => {
-            Err(FunctionCallError::RespondToModel(format!(
-                "apply_patch verification failed: {parse_error}"
-            )))
+            Err(apply_patch_verification_error(turn.as_ref(), parse_error))
         }
         codex_apply_patch::MaybeApplyPatchVerified::ShellParseError(error) => {
             tracing::trace!("Failed to parse apply_patch input, {error:?}");

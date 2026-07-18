@@ -369,6 +369,11 @@ fn map_remote_error(error: ExecServerError) -> io::Error {
         ExecServerError::Server { code, message } if code == NOT_FOUND_ERROR_CODE => {
             io::Error::new(io::ErrorKind::NotFound, message)
         }
+        ExecServerError::Server { code, message }
+            if code == codex_exec_server_protocol::FILE_SYSTEM_PERMISSION_DENIED_ERROR_CODE =>
+        {
+            io::Error::new(io::ErrorKind::PermissionDenied, message)
+        }
         ExecServerError::Server { code, message } if code == INVALID_REQUEST_ERROR_CODE => {
             io::Error::new(io::ErrorKind::InvalidInput, message)
         }
@@ -467,6 +472,22 @@ mod tests {
                     "exec-server transport closed".to_string()
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn permission_denied_wire_errors_map_to_permission_denied() {
+        let error = map_remote_error(ExecServerError::Server {
+            code: codex_exec_server_protocol::FILE_SYSTEM_PERMISSION_DENIED_ERROR_CODE,
+            message: "hosted sandbox rejected the operation".to_string(),
+        });
+
+        assert_eq!(
+            (error.kind(), error.to_string()),
+            (
+                io::ErrorKind::PermissionDenied,
+                "hosted sandbox rejected the operation".to_string(),
+            )
         );
     }
 
