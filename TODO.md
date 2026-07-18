@@ -110,7 +110,7 @@ failed upload/extraction allocations without Git or shared host paths.
 - [x] On reconnect, rotate every lease ticket, close active gateway connections
   on both first execution and idempotent replay, revoke access on confirmed
   sandbox loss, and preserve viable access across transient provider outages.
-- [ ] Restore only into a clean trusted template, overlay verified workspace
+- [x] Restore only into a clean trusted template, overlay verified workspace
   state, and reject inherited snapshot sessions/secrets before issuing rekeyed
   transport credentials.
 - [ ] Keep provider credentials out of URLs, metadata, commands, persistence,
@@ -154,8 +154,11 @@ tickets always fail, and secrets never enter durable or observable state.
 - [x] Attach an exact durable preparation to its base lease inside the caller's
   transaction, repeating source authorization there and marking the preparation
   committed before allocation adoption.
-- [ ] On restore, verify and overlay workspace state, remove inherited runtime
-  identity, restart exec, and rekey transport credentials.
+- [x] In the provider lifecycle, authorize the same agent/owner/template and
+  latest terminal snapshot, overlay its verified workspace into a clean trusted
+  template, restart exec, and rekey transport credentials.
+- [ ] Move clean restore authorization, old-lease terminalization, and new-lease
+  creation into the PostgreSQL lifecycle transaction and cross-replica locks.
 - [x] Reclaim child-capture sandboxes and provider snapshots after successful
   workspace-only capture and ordinary restore/export failure paths.
 - [ ] Make child creation atomically snapshot the owner, create only a clean

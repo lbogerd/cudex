@@ -17,7 +17,7 @@ async function fixture(provider = new FakeProvider()) {
   const state = join(directory, 'state.json'); const store = new JsonStore(state); await store.open()
   const tickets = new TicketIssuer(store, 'wss://gateway.example', 60_000)
   const blobs = new BlobStore(join(directory, 'blobs'))
-  const service = new ControlPlane(store, provider, tickets, blobs, { templates: { 'general-v1': 'tpl-1' }, allowedRoots: [directory], ingress: { maxBytes: 10_000_000, maxRoots: 4 } })
+  const service = new ControlPlane(store, provider, tickets, blobs, { templates: { 'general-v1': 'tpl-1', 'review-v1': 'tpl-2' }, allowedRoots: [directory], ingress: { maxBytes: 10_000_000, maxRoots: 4 } })
   const request = { agentId: 'agent-1', ownerAgentId: null, agentType: 'default', sandboxTemplate: 'general-v1',
     source: { type: 'rootWorkspace' as const, cwd: pathToFileURL(root).href, workspaceRoots: [pathToFileURL(root).href] }, idempotencyKey: 'provision-1' }
   return { directory, root, state, store, tickets, blobs, service, provider, request }
@@ -42,10 +42,69 @@ test('checkpoint survives restart, reconnect uses persisted provider id, and dur
   const context = await fixture(); const provisioned = await context.service.provision(context.request)
   const checkpoint = await context.service.checkpoint({ leaseId: provisioned.leaseId, idempotencyKey: 'checkpoint-1' })
   const restartedStore = new JsonStore(context.state); await restartedStore.open(); const restartedTickets = new TicketIssuer(restartedStore, 'wss://gateway.example')
-  const restarted = new ControlPlane(restartedStore, context.provider, restartedTickets, context.blobs, { templates: { 'general-v1': 'tpl-1' }, allowedRoots: [context.directory], ingress: { maxBytes: 10_000_000, maxRoots: 4 } })
+  const restarted = new ControlPlane(restartedStore, context.provider, restartedTickets, context.blobs, { templates: { 'general-v1': 'tpl-1', 'review-v1': 'tpl-2' }, allowedRoots: [context.directory], ingress: { maxBytes: 10_000_000, maxRoots: 4 } })
   const reconnected = await restarted.reconnect({ leaseId: provisioned.leaseId, idempotencyKey: 'reconnect-1' }); assert.equal(reconnected.environmentId, provisioned.environmentId)
-  const restored = await restarted.provision({ ...context.request, agentId: 'agent-restored', source: { type: 'durableSnapshot', snapshotId: checkpoint.snapshotId }, idempotencyKey: 'restore-1' })
+  await restarted.release({ leaseId: provisioned.leaseId, idempotencyKey: 'release-before-restore' })
+  const restored = await restarted.provision({ ...context.request, source: { type: 'durableSnapshot', snapshotId: checkpoint.snapshotId }, idempotencyKey: 'restore-1' })
   assert.notEqual(restored.leaseId, provisioned.leaseId); assert.notEqual(restored.environmentId, provisioned.environmentId)
+  assert.equal(context.provider.restores, 0)
+})
+
+test('durable recovery uses a clean template, overlays only the latest workspace, and replays without allocation', async () => {
+  const context = await fixture(); const agent = await context.service.provision(context.request)
+  const sourceLease = await context.store.read(database => database.leases[agent.leaseId]!)
+  const sourceSandbox = context.provider.sandboxes.get(sourceLease.sandboxId)!
+  sourceSandbox.runtimeIdentity = 'inherited-session-secret'
+  sourceSandbox.bytes = Uint8Array.from([0, 255, 17, 33])
+  const checkpoint = await context.service.checkpoint({ leaseId: agent.leaseId, idempotencyKey: 'clean-restore-checkpoint' })
+  const oldTicket = new URL(agent.connection.execServerUrl).searchParams.get('ticket')!
+  await context.provider.kill(sourceLease.sandboxId)
+  await assert.rejects(context.service.reconnect({ leaseId: agent.leaseId, idempotencyKey: 'clean-restore-missing' }),
+    (error: unknown) => error instanceof ServiceError && error.status === 404)
+  assert.equal((await context.store.read(database => database.leases[agent.leaseId]!.state)), 'lost')
+  assert.equal(await context.tickets.validate(agent.leaseId, oldTicket), false)
+
+  const request = { ...context.request, source: { type: 'durableSnapshot' as const, snapshotId: checkpoint.snapshotId }, idempotencyKey: 'clean-restore' }
+  const restored = await context.service.provision(request)
+  const replay = await context.service.provision(request)
+  const restoredLease = await context.store.read(database => database.leases[restored.leaseId]!)
+  const restoredSandbox = context.provider.sandboxes.get(restoredLease.sandboxId)!
+  assert.deepEqual(restoredSandbox.bytes, sourceSandbox.bytes)
+  assert.equal(restoredSandbox.runtimeIdentity, undefined)
+  assert.equal(context.provider.restores, 0)
+  assert.equal(context.provider.creates, 2)
+  assert.equal(replay.leaseId, restored.leaseId)
+  assert.equal((await context.store.read(database => database.leases[agent.leaseId]!.state)), 'released')
+})
+
+test('durable restore rejects active, cross-lineage, cross-template, and stale snapshot sources before allocation', async () => {
+  const context = await fixture(); const agent = await context.service.provision(context.request)
+  await assert.rejects(context.service.provision({ ...context.request, source: { type: 'durableSnapshot', snapshotId: agent.baseSnapshotId },
+    idempotencyKey: 'restore-active' }), (error: unknown) => error instanceof ServiceError && error.status === 409)
+  assert.equal(context.provider.creates, 1)
+  const checkpoint = await context.service.checkpoint({ leaseId: agent.leaseId, idempotencyKey: 'restore-lineage-checkpoint' })
+  await context.service.release({ leaseId: agent.leaseId, idempotencyKey: 'restore-lineage-release' })
+  const attempts = [
+    { ...context.request, agentId: 'other-agent', source: { type: 'durableSnapshot' as const, snapshotId: checkpoint.snapshotId }, idempotencyKey: 'restore-other-agent' },
+    { ...context.request, ownerAgentId: 'other-owner', source: { type: 'durableSnapshot' as const, snapshotId: checkpoint.snapshotId }, idempotencyKey: 'restore-other-owner' },
+    { ...context.request, sandboxTemplate: 'review-v1', source: { type: 'durableSnapshot' as const, snapshotId: checkpoint.snapshotId }, idempotencyKey: 'restore-other-template' },
+    { ...context.request, source: { type: 'durableSnapshot' as const, snapshotId: agent.baseSnapshotId }, idempotencyKey: 'restore-stale-snapshot' },
+  ]
+  for (const attempt of attempts) {
+    await assert.rejects(context.service.provision(attempt), (error: unknown) => error instanceof ServiceError && error.status === 404)
+  }
+  assert.equal(context.provider.creates, 1)
+})
+
+for (const point of ['upload', 'start', 'probe', 'snapshot']) test(`durable restore failure at ${point} cleans its fresh allocation`, async () => {
+  const context = await fixture(); const agent = await context.service.provision(context.request)
+  const checkpoint = await context.service.checkpoint({ leaseId: agent.leaseId, idempotencyKey: `restore-${point}-checkpoint` })
+  await context.service.release({ leaseId: agent.leaseId, idempotencyKey: `restore-${point}-release` })
+  context.provider.failAt = point
+  await assert.rejects(context.service.provision({ ...context.request, source: { type: 'durableSnapshot', snapshotId: checkpoint.snapshotId },
+    idempotencyKey: `restore-${point}-failure` }), new RegExp(`injected ${point}`))
+  assert.deepEqual(context.provider.live(), [])
+  assert.equal(context.provider.restores, 0)
 })
 
 test('child gets an isolated spawn-time workspace capture', async () => {

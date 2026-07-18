@@ -45,7 +45,7 @@ export interface ProvisionedAgent {
 export interface LeaseRecord {
   leaseId: string; environmentId: string; sandboxId: string; agentId: string
   ownerAgentId: string | null; template: string; cwd: string; workspaceRoots: string[]
-  baseSnapshotId: string; latestSnapshotId: string; state: 'provisioning' | 'active' | 'released'
+  baseSnapshotId: string; latestSnapshotId: string; state: 'provisioning' | 'active' | 'lost' | 'released'
   toolPolicy: ToolPolicy
 }
 export interface SnapshotRecord {

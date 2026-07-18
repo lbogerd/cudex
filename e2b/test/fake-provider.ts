@@ -1,11 +1,11 @@
 import { ProviderCapabilityError, ProviderSandboxMissingError, type CreatedSandbox, type ExecUpstream, type ManagedSandbox, type ManagedSandboxQuery,
   type ManagedSnapshot, type ProviderAdapter, type ProviderSnapshotOptions, type ProviderSnapshotQuery } from '../src/provider.js'
 
-interface FakeSandbox { bytes: Uint8Array; alive: boolean; execReady: boolean; metadata: Record<string, string>; templateId: string; startedAt: Date; endAt: Date }
-interface FakeSnapshot { bytes: Uint8Array; sandboxId: string; names: string[] }
+interface FakeSandbox { bytes: Uint8Array; alive: boolean; execReady: boolean; runtimeIdentity: string | undefined; metadata: Record<string, string>; templateId: string; startedAt: Date; endAt: Date }
+interface FakeSnapshot { bytes: Uint8Array; runtimeIdentity: string | undefined; sandboxId: string; names: string[] }
 export class FakeProvider implements ProviderAdapter {
   readonly sandboxes = new Map<string, FakeSandbox>(); readonly snapshots = new Map<string, FakeSnapshot>()
-  creates = 0; kills = 0; connects = 0; failAt: string | undefined
+  creates = 0; restores = 0; kills = 0; connects = 0; failAt: string | undefined
   rawExecUpstream: unknown
   private id = 0
   async create(templateId = 'fake-template', metadata: Record<string, string> = {}): Promise<CreatedSandbox> { this.failure('create'); this.creates++; return this.allocate(templateId, metadata) }
@@ -22,8 +22,9 @@ export class FakeProvider implements ProviderAdapter {
     }) as ExecUpstream
   }
   async restore(snapshotId: string, metadata: Record<string, string> = {}): Promise<CreatedSandbox> {
-    this.failure('restore'); const snapshot = this.snapshots.get(snapshotId); if (!snapshot) throw new Error('missing snapshot')
-    const created = this.allocate('restored-snapshot', metadata); this.sandboxes.get(created.sandboxId)!.bytes = Uint8Array.from(snapshot.bytes); return created
+    this.failure('restore'); this.restores++; const snapshot = this.snapshots.get(snapshotId); if (!snapshot) throw new Error('missing snapshot')
+    const created = this.allocate('restored-snapshot', metadata); const sandbox = this.sandboxes.get(created.sandboxId)!
+    sandbox.bytes = Uint8Array.from(snapshot.bytes); sandbox.runtimeIdentity = snapshot.runtimeIdentity; return created
   }
   async uploadArchive(sandboxId: string, archive: Uint8Array): Promise<void> { this.failure('upload'); this.sandboxes.get(sandboxId)!.bytes = Uint8Array.from(archive) }
   async exportWorkspace(sandboxId: string): Promise<Uint8Array> { this.failure('export'); return Uint8Array.from(this.sandboxes.get(sandboxId)!.bytes) }
@@ -35,7 +36,8 @@ export class FakeProvider implements ProviderAdapter {
   async snapshot(sandboxId: string, options: ProviderSnapshotOptions = {}): Promise<string> {
     this.failure('snapshot'); const sandbox = this.sandboxes.get(sandboxId); if (!sandbox?.alive) throw new Error('missing')
     const id = `provider-snapshot-${++this.id}`
-    this.snapshots.set(id, { bytes: Uint8Array.from(sandbox.bytes), sandboxId, names: options.name ? [options.name] : [] }); return id
+    this.snapshots.set(id, { bytes: Uint8Array.from(sandbox.bytes), runtimeIdentity: sandbox.runtimeIdentity,
+      sandboxId, names: options.name ? [options.name] : [] }); return id
   }
   async listManagedSandboxes(query: ManagedSandboxQuery): Promise<ManagedSandbox[]> {
     this.failure('list')
@@ -58,7 +60,8 @@ export class FakeProvider implements ProviderAdapter {
   live(): string[] { return [...this.sandboxes].filter(([, sandbox]) => sandbox.alive).map(([id]) => id) }
   private allocate(templateId: string, metadata: Record<string, string>): CreatedSandbox {
     const sandboxId = `sandbox-${++this.id}`
-    this.sandboxes.set(sandboxId, { bytes: new Uint8Array(), alive: true, execReady: false, metadata: { ...metadata }, templateId,
+    this.sandboxes.set(sandboxId, { bytes: new Uint8Array(), alive: true, execReady: false, runtimeIdentity: undefined,
+      metadata: { ...metadata }, templateId,
       startedAt: new Date(), endAt: new Date(Date.now() + 60_000) })
     return { sandboxId }
   }

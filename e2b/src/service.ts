@@ -68,6 +68,7 @@ export class ControlPlane {
         throw new ServiceError(400, 'local workspace ingress is disabled')
       }
       let immutableSource: ResolvedSourceSnapshot | undefined
+      let durableSource: { lease: LeaseRecord; archive: Uint8Array } | undefined
       if (request.source.type === 'sourceSnapshot') {
         const configured = this.options.sourceSnapshots
         if (!configured) throw new ServiceError(503, 'immutable source snapshot provisioning is not configured')
@@ -79,18 +80,28 @@ export class ControlPlane {
           throw new ServiceError(503, 'immutable source snapshot resolution mismatch')
         }
       }
+      if (request.source.type === 'durableSnapshot') {
+        const snapshot = await this.store.read(database => database.snapshots[request.source.type === 'durableSnapshot' ? request.source.snapshotId : ''])
+        if (!snapshot) throw new ServiceError(404, 'snapshot missing')
+        const original = await this.store.read(database => database.leases[snapshot.leaseId])
+        if (!original || original.agentId !== request.agentId || original.ownerAgentId !== request.ownerAgentId
+          || original.template !== request.sandboxTemplate || original.latestSnapshotId !== snapshot.snapshotId) {
+          throw new ServiceError(404, 'snapshot missing')
+        }
+        if (original.state !== 'lost' && original.state !== 'released') {
+          throw new ServiceError(409, 'snapshot source lease is still active')
+        }
+        durableSource = { lease: original, archive: await this.blobs.get(snapshot.workspaceArchiveId) }
+        await this.revokeLeaseAccess(original.leaseId)
+      }
       const leaseId = opaque('lease'); const environmentId = opaque('env')
       let sandboxId: string | undefined; let cwd: string; let roots: string[]; let created
       try {
-        if (request.source.type === 'durableSnapshot') {
-          const snapshot = await this.store.read(database => database.snapshots[request.source.type === 'durableSnapshot' ? request.source.snapshotId : ''])
-          if (!snapshot) throw new ServiceError(404, 'snapshot missing')
-          created = await this.provider.restore(snapshot.providerSnapshotId, { leaseId, agentId: request.agentId, template: request.sandboxTemplate })
+        if (durableSource) {
+          created = await this.provider.create(templateId, { leaseId, agentId: request.agentId, template: request.sandboxTemplate })
           sandboxId = created.sandboxId; operation.allocatedSandboxId = sandboxId; await this.persistOperation(operation)
-          await this.provider.uploadArchive(sandboxId, await this.blobs.get(snapshot.workspaceArchiveId))
-          const original = await this.store.read(database => database.leases[snapshot.leaseId])
-          if (!original) throw new ServiceError(404, 'snapshot lease metadata missing')
-          cwd = original.cwd; roots = original.workspaceRoots
+          await this.provider.uploadArchive(sandboxId, durableSource.archive)
+          cwd = durableSource.lease.cwd; roots = durableSource.lease.workspaceRoots
         } else {
           created = await this.provider.create(templateId, { leaseId, agentId: request.agentId, template: request.sandboxTemplate })
           sandboxId = created.sandboxId; operation.allocatedSandboxId = sandboxId; await this.persistOperation(operation)
@@ -122,7 +133,11 @@ export class ControlPlane {
         const workspaceArchiveId = await this.blobs.put(await this.provider.exportWorkspace(sandboxId)); const providerSnapshotId = await this.provider.snapshot(sandboxId); const snapshotId = opaque('snapshot')
         const lease: LeaseRecord = { leaseId, environmentId, sandboxId, agentId: request.agentId, ownerAgentId: request.ownerAgentId,
           template: request.sandboxTemplate, cwd, workspaceRoots: roots, baseSnapshotId: snapshotId, latestSnapshotId: snapshotId, state: 'active', toolPolicy: defaultPolicy }
-        await this.store.transaction(database => { database.leases[leaseId] = lease; database.snapshots[snapshotId] = { snapshotId, providerSnapshotId, workspaceArchiveId, leaseId, createdAt: Date.now() } })
+        await this.store.transaction(database => {
+          if (durableSource) database.leases[durableSource.lease.leaseId]!.state = 'released'
+          database.leases[leaseId] = lease
+          database.snapshots[snapshotId] = { snapshotId, providerSnapshotId, workspaceArchiveId, leaseId, createdAt: Date.now() }
+        })
         return this.response(lease)
       } catch (error) { if (sandboxId) await this.provider.kill(sandboxId).catch(() => undefined); throw error }
     })
@@ -135,7 +150,13 @@ export class ControlPlane {
         await this.provider.connect(lease.sandboxId)
       }
       catch (error) {
-        if (error instanceof ProviderSandboxMissingError) await this.revokeLeaseAccess(request.leaseId)
+        if (error instanceof ProviderSandboxMissingError) {
+          await this.store.transaction(database => {
+            const current = database.leases[lease.leaseId]
+            if (current?.state === 'active' && current.sandboxId === lease.sandboxId) current.state = 'lost'
+          })
+          await this.revokeLeaseAccess(request.leaseId)
+        }
         throw this.reconnectError(error)
       }
       await this.revokeLeaseAccess(request.leaseId)

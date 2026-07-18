@@ -778,7 +778,7 @@ storage primitive; the control-plane lifecycle still needs to replace its JSON
 state paths with these transactions and the operation journal before production
 multi-replica persistence is complete.
 
-### Reconnect fencing and child-capture cleanup
+### Reconnect fencing, clean recovery, and child-capture cleanup
 
 The Linux control-plane spike now distinguishes confirmed provider sandbox loss
 from transient connect, start, and health-probe failures. The E2B adapter maps
@@ -793,6 +793,21 @@ before restarting exec and issuing new access. Replaying the same successful
 operation performs the revocation again before rotating the ticket, preventing a
 previous reconnect response from leaving a live stale session.
 
+Confirmed sandbox loss now moves the old lease out of the active directory
+before Codex selects durable recovery. Durable snapshots are same-agent recovery,
+not a cloning mechanism: the request must match the source lease's agent, owner,
+trusted template, and latest snapshot, and the source lease must already be lost
+or released. All checks occur before provider allocation; active, stale, and
+cross-lineage sources fail closed.
+
+Recovery no longer creates a sandbox from the provider snapshot. It creates the
+trusted clean template, uploads the checksummed service workspace archive,
+starts and probes a fresh exec server, and issues a new lease ticket. Provider
+snapshot process, filesystem, session, and transport identity therefore cannot
+be inherited. The source lease is retired when the replacement lease/snapshot
+commit. Moving that transition and authorization into PostgreSQL locks remains
+part of the production lifecycle cutover.
+
 Child workspace capture now deletes its temporary owner snapshot as well as
 killing the temporary restored sandbox. Nested cleanup guarantees snapshot
 deletion is attempted even when capture-sandbox termination fails; restore and
@@ -801,11 +816,14 @@ cleanup outages still require the planned PostgreSQL allocation ledger and
 reconciler before the broader every-path child/provision cleanup invariant can be
 claimed.
 
-The provider-independent suite has 163 tests: 125 passed and 38 live-database
+The provider-independent suite has 169 tests: 131 passed and 38 live-database
 tests were skipped without `HOSTED_AGENT_TEST_DATABASE_URL`. New coverage proves
 ticket/socket rotation on reconnect and replay, transient-versus-missing error
 classification, missing-sandbox revocation, and child temporary-resource cleanup
-on success plus restore/export failures.
+on success plus restore/export failures. Recovery coverage additionally proves
+clean-template creation without provider restore, removal of a fake inherited
+runtime secret, exact workspace restoration, latest-snapshot/lineage checks,
+idempotent replay, and cleanup after each post-allocation failure stage.
 
 CubeSandbox was verified on 2026-07-18 through stock E2B TypeScript SDK 2.35.0.
 Provider code lives in the external TypeScript control plane under `e2b/src`, not
