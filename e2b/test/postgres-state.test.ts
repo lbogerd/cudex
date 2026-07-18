@@ -3,7 +3,8 @@ import { randomBytes, randomUUID } from 'node:crypto'
 import test from 'node:test'
 import { Pool } from 'pg'
 import { runMigrations } from '../src/migrate.js'
-import { DurableStateConflictError, DurableStateNotFoundError, PostgresDurableState, type CreateLeaseInput, type StoredObject } from '../src/postgres-state.js'
+import { DurableStateConflictError, DurableStateNotFoundError, PostgresDurableState,
+  type CreateLeaseInput, type CreateRestoredLeaseInput, type StoredObject } from '../src/postgres-state.js'
 import { canonicalRequestHash, PostgresJournal } from '../src/postgres-store.js'
 import { PostgresTicketIssuer } from '../src/postgres-tickets.js'
 
@@ -335,4 +336,50 @@ live('reconnect and loss transitions rotate durable connection generations acros
     throw error
   } finally { lossClient.release() }
   assert.equal(await context.second.activeLeaseTarget(created.lease.leaseId), undefined)
+})
+
+live('restore commit atomically validates terminal lineage, creates its replacement, and retires loss', async context => {
+  const sourceObjects = await objects(context)
+  const source = await context.first.createLeaseWithBaseSnapshot(leaseInput(sourceObjects))
+  const lossClient = await context.firstPool.connect()
+  try {
+    await lossClient.query('BEGIN')
+    await context.first.markLeaseLost('tenant-1', source.lease.leaseId, 'sandbox-1', lossClient)
+    await lossClient.query('COMMIT')
+  } catch (error) {
+    await lossClient.query('ROLLBACK')
+    throw error
+  } finally { lossClient.release() }
+
+  const authorized = await context.second.lockAuthorizedRestoreSource({
+    tenantId: 'tenant-1', sourceLeaseId: source.lease.leaseId,
+    sourceSnapshotId: source.snapshot.snapshotId, agentId: source.lease.agentId,
+    ownerAgentId: source.lease.ownerAgentId, ownerLeaseId: source.lease.ownerLeaseId,
+    sandboxTemplate: source.lease.sandboxTemplate,
+  })
+  assert.equal(authorized.archiveObject.objectId, source.snapshot.workspaceArchiveObjectId)
+
+  const replacementObjects = await objects(context, 'tenant-1', '-restored')
+  const replacementInput: CreateRestoredLeaseInput = { ...leaseInput(replacementObjects, {
+    leaseId: 'lease-restored', environmentId: 'env-restored', providerSandboxId: 'sandbox-restored',
+    baseSnapshot: { ...leaseInput(replacementObjects).baseSnapshot,
+      snapshotId: 'snapshot-restored', providerSnapshotId: 'provider-restored' },
+  }), restoreSourceLeaseId: source.lease.leaseId, restoreSourceSnapshotId: source.snapshot.snapshotId }
+  const restored = await context.second.createRestoredLeaseWithBaseSnapshot(replacementInput)
+  assert.equal(restored.lease.restoreSourceLeaseId, source.lease.leaseId)
+  assert.equal(restored.lease.restoreSourceSnapshotId, source.snapshot.snapshotId)
+  assert.equal((await context.first.getLease('tenant-1', source.lease.leaseId))?.state, 'released')
+  const reference = await context.firstPool.query<{ count: string }>(`
+    SELECT count(*)::text AS count FROM hosted_agent_snapshot_references
+    WHERE snapshot_id = $1 AND reference_kind = 'lease_restore_source' AND reference_id = $2
+  `, [source.snapshot.snapshotId, restored.lease.leaseId])
+  assert.equal(reference.rows[0]!.count, '1')
+
+  await assert.rejects(context.first.createRestoredLeaseWithBaseSnapshot({
+    ...replacementInput, leaseId: 'lease-invalid-restore', environmentId: 'env-invalid-restore',
+    providerSandboxId: 'sandbox-invalid-restore',
+    baseSnapshot: { ...replacementInput.baseSnapshot, snapshotId: 'snapshot-invalid-restore',
+      providerSnapshotId: 'provider-invalid-restore' },
+  }), DurableStateConflictError)
+  assert.equal(await context.first.getLease('tenant-1', 'lease-invalid-restore'), null)
 })

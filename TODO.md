@@ -32,6 +32,10 @@ production backend. Stable decisions, evidence, and wire schemas are in
   resource allocations.
 - [ ] Extend the same journal/allocation protocol through restore, child capture,
   and patch.
+- [x] Add the durable clean-restore lineage foundation: distinct operation source
+  and result leases, schema-enforced source lease/snapshot pairing, terminal/
+  latest/tenant/agent/owner/template authorization, atomic lost-source retirement,
+  source-snapshot retention, and result-lease allocation adoption.
 - [x] Apply transactional per-lease locking to durable checkpoint capture and
   commit across service replicas.
 - [x] Apply transactional lease/provider locking to durable release across

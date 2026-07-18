@@ -882,6 +882,37 @@ coverage, the full Docker-backed PostgreSQL 17 suite passed 190 of 190 tests wit
 zero skips on x86_64 Linux. Production startup remains on the legacy lifecycle
 until restore and child capture can move to the same authority together.
 
+### Durable clean-restore lineage foundation
+
+Restore is still the `provision` wire operation, but its durable identities differ
+from ordinary provision: the operation's primary lease is the terminal source,
+while its result is a new replacement lease. Migration 0008 records a separate
+`result_lease_id` on operations and immutable `restore_source_lease_id` plus
+`restore_source_snapshot_id` on replacement leases. Composite foreign keys prove
+that the retained snapshot belongs to the recorded source lease and tenant; a
+unique source index permits only one replacement. A dedicated
+`lease_restore_source` snapshot reference keeps the recovery point retained.
+
+The journal can now fence and bind a result lease while adopting selected
+sandbox, provider-snapshot, and object allocations to that result without
+rewriting the source `primary_lease_id`. Stale takeover returns both identities,
+so later restore reconciliation can distinguish cleanup from a committed result.
+
+The PostgreSQL state layer now exposes one exact restore authorization lock. It
+requires a terminal (`lost` or `released`) source, its available unexpired latest
+snapshot and workspace archive, matching tenant/agent/owner/owner-lease/template
+lineage, and no prior replacement. Final restore commit repeats that authorization,
+creates the new active lease/base snapshot with immutable lineage, adds the
+retention reference, revokes old tickets, and changes `lost` to `released` in the
+same transaction. Cross-tenant, stale-snapshot, active-source, or second-restore
+attempts fail before state mutation.
+
+Docker-backed PostgreSQL 17 tests prove atomic lineage commit/rollback, retained
+source references, one-replacement enforcement, and preservation of separate
+source/result identities through stale operation takeover. This is a prerequisite,
+not the restore coordinator: clean-template creation, verified archive loading,
+allocation cleanup, and ambiguous-commit reconciliation remain in the queue.
+
 ### Bounded PostgreSQL reconciliation foundation
 
 An intentionally unwired `PostgresReconciler` now claims stale operations only

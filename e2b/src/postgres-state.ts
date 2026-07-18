@@ -41,6 +41,8 @@ export interface Lease {
   ownerAgentId: string | null
   ownerLeaseId: string | null
   sourceSnapshotId: string | null
+  restoreSourceLeaseId: string | null
+  restoreSourceSnapshotId: string | null
   providerSandboxId: string | null
   sandboxTemplate: string
   cwdUri: string
@@ -85,6 +87,8 @@ export interface CreateLeaseInput {
   ownerAgentId?: string | null
   ownerLeaseId?: string | null
   sourceSnapshotId?: string | null
+  restoreSourceLeaseId?: string | null
+  restoreSourceSnapshotId?: string | null
   providerSandboxId: string
   sandboxTemplate: string
   cwdUri: string
@@ -92,6 +96,27 @@ export interface CreateLeaseInput {
   toolPolicy: Record<string, unknown>
   policyVersion: number
   baseSnapshot: SnapshotInput
+}
+
+export interface CreateRestoredLeaseInput extends CreateLeaseInput {
+  restoreSourceLeaseId: string
+  restoreSourceSnapshotId: string
+}
+
+export interface RestoreSourceAuthorization {
+  tenantId: string
+  sourceLeaseId: string
+  sourceSnapshotId: string
+  agentId: string
+  ownerAgentId: string | null
+  ownerLeaseId: string | null
+  sandboxTemplate: string
+}
+
+export interface AuthorizedRestoreSource {
+  lease: Lease
+  snapshot: Snapshot
+  archiveObject: StoredObject
 }
 
 type LeaseState = Lease['state']
@@ -107,6 +132,7 @@ interface SourceRow {
 interface LeaseRow {
   lease_id: string; environment_id: string; tenant_id: string; agent_id: string
   owner_agent_id: string | null; owner_lease_id: string | null; source_snapshot_id: string | null
+  restore_source_lease_id: string | null; restore_source_snapshot_id: string | null
   provider_sandbox_id: string | null; sandbox_template: string; cwd_uri: string
   workspace_root_uris: string[]; base_snapshot_id: string | null; latest_snapshot_id: string | null
   state: LeaseState; tool_policy: Record<string, unknown>; policy_version: string
@@ -173,7 +199,8 @@ function postgresError(error: unknown): never {
 }
 
 const leaseColumns = `lease_id, environment_id, tenant_id, agent_id, owner_agent_id,
-  owner_lease_id, source_snapshot_id, provider_sandbox_id, sandbox_template, cwd_uri,
+  owner_lease_id, source_snapshot_id, restore_source_lease_id, restore_source_snapshot_id,
+  provider_sandbox_id, sandbox_template, cwd_uri,
   workspace_root_uris, base_snapshot_id, latest_snapshot_id, state, tool_policy,
   policy_version::text, connection_generation::text, released_at`
 const snapshotColumns = `snapshot_id, tenant_id, lease_id, provider_snapshot_id,
@@ -192,7 +219,8 @@ function sourceFromRow(row: SourceRow): SourceSnapshot {
 function leaseFromRow(row: LeaseRow): Lease {
   return { leaseId: row.lease_id, environmentId: row.environment_id, tenantId: row.tenant_id,
     agentId: row.agent_id, ownerAgentId: row.owner_agent_id, ownerLeaseId: row.owner_lease_id,
-    sourceSnapshotId: row.source_snapshot_id, providerSandboxId: row.provider_sandbox_id,
+    sourceSnapshotId: row.source_snapshot_id, restoreSourceLeaseId: row.restore_source_lease_id,
+    restoreSourceSnapshotId: row.restore_source_snapshot_id, providerSandboxId: row.provider_sandbox_id,
     sandboxTemplate: row.sandbox_template, cwdUri: row.cwd_uri, workspaceRootUris: row.workspace_root_uris,
     baseSnapshotId: row.base_snapshot_id, latestSnapshotId: row.latest_snapshot_id, state: row.state,
     toolPolicy: row.tool_policy, policyVersion: Number(row.policy_version),
@@ -368,12 +396,14 @@ export class PostgresDurableState {
         await client.query(`
           INSERT INTO hosted_agent_leases
             (lease_id, environment_id, tenant_id, agent_id, owner_agent_id, owner_lease_id,
-             source_snapshot_id, provider_sandbox_id, sandbox_template, cwd_uri,
+             source_snapshot_id, restore_source_lease_id, restore_source_snapshot_id,
+             provider_sandbox_id, sandbox_template, cwd_uri,
              workspace_root_uris, state, tool_policy, policy_version)
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb,
-                  'provisioning', $12::jsonb, $13)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                  $13::jsonb, 'provisioning', $14::jsonb, $15)
         `, [input.leaseId, input.environmentId, input.tenantId, input.agentId,
           input.ownerAgentId ?? null, input.ownerLeaseId ?? null, input.sourceSnapshotId ?? null,
+          input.restoreSourceLeaseId ?? null, input.restoreSourceSnapshotId ?? null,
           input.providerSandboxId, input.sandboxTemplate, input.cwdUri,
           JSON.stringify(input.workspaceRootUris), JSON.stringify(input.toolPolicy), input.policyVersion])
         await this.referenceSnapshotObjects(client, input.tenantId, input.leaseId, input.baseSnapshot)
@@ -382,6 +412,12 @@ export class PostgresDurableState {
           INSERT INTO hosted_agent_snapshot_references (snapshot_id, reference_kind, reference_id)
           VALUES ($1, 'lease_base', $2), ($1, 'lease_latest', $2)
         `, [input.baseSnapshot.snapshotId, input.leaseId])
+        if (input.restoreSourceSnapshotId) {
+          await client.query(`
+            INSERT INTO hosted_agent_snapshot_references (snapshot_id, reference_kind, reference_id)
+            VALUES ($1, 'lease_restore_source', $2)
+          `, [input.restoreSourceSnapshotId, input.leaseId])
+        }
         const leaseResult = await client.query<LeaseRow>(`
           UPDATE hosted_agent_leases
           SET base_snapshot_id = $2, latest_snapshot_id = $2, state = 'active'
@@ -392,6 +428,84 @@ export class PostgresDurableState {
         return { lease: leaseFromRow(leaseResult.rows[0]!), snapshot }
       }
       return executor ? await create(executor) : await this.transaction(create)
+    } catch (error) { return postgresError(error) }
+  }
+
+  async createRestoredLeaseWithBaseSnapshot(input: CreateRestoredLeaseInput,
+    executor?: PoolClient): Promise<{ lease: Lease; snapshot: Snapshot }> {
+    validateLeaseInput(input); validateSnapshotInput(input.baseSnapshot)
+    try {
+      const create = async (client: PoolClient) => {
+        const authorized = await this.lockAuthorizedRestoreSource({
+          tenantId: input.tenantId, sourceLeaseId: input.restoreSourceLeaseId,
+          sourceSnapshotId: input.restoreSourceSnapshotId, agentId: input.agentId,
+          ownerAgentId: input.ownerAgentId ?? null, ownerLeaseId: input.ownerLeaseId ?? null,
+          sandboxTemplate: input.sandboxTemplate,
+        }, client)
+        const source = authorized.lease
+        const created = await this.createLeaseWithBaseSnapshot(input, client)
+        await client.query(`UPDATE hosted_agent_tickets
+          SET revoked_at = COALESCE(revoked_at, now()) WHERE lease_id = $1`, [source.leaseId])
+        if (source.state === 'lost') {
+          await client.query(`
+            UPDATE hosted_agent_leases SET state = 'released', released_at = now()
+            WHERE lease_id = $1 AND tenant_id = $2 AND state = 'lost'
+          `, [source.leaseId, input.tenantId])
+        }
+        return created
+      }
+      return executor ? await create(executor) : await this.transaction(create)
+    } catch (error) { return postgresError(error) }
+  }
+
+  async lockAuthorizedRestoreSource(input: RestoreSourceAuthorization,
+    executor?: PoolClient): Promise<AuthorizedRestoreSource> {
+    validateId('tenant ID', input.tenantId); validateId('restore source lease ID', input.sourceLeaseId)
+    validateId('restore source snapshot ID', input.sourceSnapshotId); validateId('agent ID', input.agentId)
+    validateId('sandbox template', input.sandboxTemplate)
+    if (input.ownerAgentId) validateId('owner agent ID', input.ownerAgentId)
+    if (input.ownerLeaseId) validateId('owner lease ID', input.ownerLeaseId)
+    try {
+      const authorize = async (client: PoolClient) => {
+        const lease = await this.lockLease(client, input.tenantId, input.sourceLeaseId)
+        if (!['lost', 'released'].includes(lease.state)) {
+          throw new DurableStateConflictError('restore source lease is not terminal')
+        }
+        if (lease.latestSnapshotId !== input.sourceSnapshotId || lease.agentId !== input.agentId
+          || lease.ownerAgentId !== input.ownerAgentId || lease.ownerLeaseId !== input.ownerLeaseId
+          || lease.sandboxTemplate !== input.sandboxTemplate) {
+          throw new DurableStateNotFoundError('authorized restore source was not found')
+        }
+        const replacement = await client.query(`
+          SELECT lease_id FROM hosted_agent_leases
+          WHERE restore_source_lease_id = $1 AND tenant_id = $2 FOR UPDATE
+        `, [lease.leaseId, input.tenantId])
+        if (replacement.rowCount !== 0) {
+          throw new DurableStateConflictError('restore source already has a replacement')
+        }
+        const snapshotResult = await client.query<SnapshotRow>(`
+          SELECT ${snapshotColumns} FROM hosted_agent_snapshots
+          WHERE snapshot_id = $1 AND tenant_id = $2 FOR UPDATE
+        `, [input.sourceSnapshotId, input.tenantId])
+        const snapshot = snapshotResult.rows[0] ? snapshotFromRow(snapshotResult.rows[0]) : null
+        if (!snapshot || snapshot.leaseId !== lease.leaseId || snapshot.state !== 'available'
+          || (snapshot.expiresAt !== null && snapshot.expiresAt <= new Date())) {
+          throw new DurableStateNotFoundError('authorized restore source was not found')
+        }
+        const objectResult = await client.query<ObjectRow>(`
+          SELECT object_id, tenant_id, kind, storage_bucket, storage_key, checksum,
+                 size_bytes::text, state, expires_at
+          FROM hosted_agent_objects
+          WHERE object_id = $1 AND tenant_id = $2 FOR UPDATE
+        `, [snapshot.workspaceArchiveObjectId, input.tenantId])
+        const archiveObject = objectResult.rows[0] ? objectFromRow(objectResult.rows[0]) : null
+        if (!archiveObject || archiveObject.kind !== 'workspace_archive' || archiveObject.state !== 'available'
+          || (archiveObject.expiresAt !== null && archiveObject.expiresAt <= new Date())) {
+          throw new DurableStateNotFoundError('authorized restore source was not found')
+        }
+        return { lease, snapshot, archiveObject }
+      }
+      return executor ? await authorize(executor) : await this.transaction(authorize)
     } catch (error) { return postgresError(error) }
   }
 
@@ -768,6 +882,12 @@ function validateLeaseInput(input: CreateLeaseInput): void {
   if (input.ownerAgentId) validateId('owner agent ID', input.ownerAgentId)
   if (input.ownerLeaseId) validateId('owner lease ID', input.ownerLeaseId)
   if (input.sourceSnapshotId) validateId('source snapshot ID', input.sourceSnapshotId)
+  if (input.restoreSourceLeaseId) validateId('restore source lease ID', input.restoreSourceLeaseId)
+  if (input.restoreSourceSnapshotId) validateId('restore source snapshot ID', input.restoreSourceSnapshotId)
+  if ((input.restoreSourceLeaseId == null) !== (input.restoreSourceSnapshotId == null)) {
+    throw new Error('restore source lease and snapshot must be paired')
+  }
+  if (input.sourceSnapshotId && input.restoreSourceSnapshotId) throw new Error('lease cannot have two source kinds')
   validateRoots(input.cwdUri, input.workspaceRootUris)
   if (!Number.isSafeInteger(input.policyVersion) || input.policyVersion < 1) throw new Error('invalid policy version')
 }

@@ -12,6 +12,7 @@ const operation: StaleOperation = {
   operation: 'provision', idempotencyKey: 'stale', tenantId: 'tenant-1',
   requestHash: canonicalRequestHash({ operation: 'provision' }), generation: 1,
   previousWorkerId: 'dead', workerId: 'reconciler', primaryLeaseId: null,
+  resultLeaseId: null,
 }
 
 const withoutProviderContention = async <T>(_kind: 'sandbox' | 'provider_snapshot', _resourceId: string,
@@ -30,6 +31,7 @@ test('known cleanup is fenced, active durable sandboxes are adopted, and failure
   const lease = {
     leaseId: 'lease-active', environmentId: 'env-active', tenantId: 'tenant-1', agentId: 'agent',
     ownerAgentId: null, ownerLeaseId: null, sourceSnapshotId: null,
+    restoreSourceLeaseId: null, restoreSourceSnapshotId: null,
     providerSandboxId: protectedSandbox.sandboxId, sandboxTemplate: 'template',
     cwdUri: 'file:///workspace/root', workspaceRootUris: ['file:///workspace/root'],
     baseSnapshotId: 'snapshot-base', latestSnapshotId: 'snapshot-base', state: 'active',

@@ -152,6 +152,30 @@ live('allocation ledger and stale claiming use generation fencing across replica
   assert.equal(reclaimed.state, 'reclaimed'); assert.ok(reclaimed.reclaimedAt)
 })
 
+live('restore operations keep distinct source and result lease identities through stale takeover', async context => {
+  for (const [leaseId, environmentId] of [['restore-source', 'restore-source-env'], ['restore-result', 'restore-result-env']]) {
+    await context.firstPool.query(`
+      INSERT INTO hosted_agent_leases
+        (lease_id, environment_id, tenant_id, agent_id, sandbox_template, cwd_uri,
+         workspace_root_uris, state, tool_policy, policy_version)
+      VALUES ($1, $2, 'tenant-1', 'agent-1', 'general-v1', 'file:///workspace/root',
+        '["file:///workspace/root"]'::jsonb, 'provisioning', '{}'::jsonb, 1)
+    `, [leaseId, environmentId])
+  }
+  const identity = { operation: 'provision', idempotencyKey: 'restore-result-binding', tenantId: 'tenant-1' }
+  const claim = await context.first.claimOperation({ ...identity, requestHash: canonicalRequestHash(identity),
+    workerId: 'restore-worker', primaryLeaseId: 'restore-source' })
+  assert.equal(claim.kind, 'claimed')
+  if (claim.kind !== 'claimed') return
+  await context.first.bindResultLeaseAndAdoptAllocations(
+    identity, claim.generation, 'restore-worker', 'restore-result', [])
+  await context.firstPool.query(`UPDATE hosted_agent_operations SET heartbeat_at = now() - interval '1 hour'
+    WHERE operation = 'provision' AND idempotency_key = 'restore-result-binding'`)
+  const stale = await context.second.claimStaleOperations(new Date(), 1, 'restore-reconciler', 'tenant-1')
+  assert.equal(stale[0]?.primaryLeaseId, 'restore-source')
+  assert.equal(stale[0]?.resultLeaseId, 'restore-result')
+})
+
 live('stale operation takeover is restricted to the configured tenant', async context => {
   for (const tenantId of ['tenant-1', 'tenant-2']) {
     const identity = { operation: 'provision', idempotencyKey: `stale-${tenantId}`, tenantId }

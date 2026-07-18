@@ -45,6 +45,7 @@ export interface StaleOperation extends OperationIdentity {
   previousWorkerId: string | null
   workerId: string
   primaryLeaseId: string | null
+  resultLeaseId: string | null
 }
 
 export class OperationRequestMismatchError extends Error {
@@ -126,6 +127,7 @@ interface OperationRow {
   generation: string
   heartbeat_at: Date | null
   primary_lease_id: string | null
+  result_lease_id: string | null
 }
 
 function rowToClaim(row: OperationRow, newlyClaimed: boolean): OperationClaim {
@@ -164,7 +166,7 @@ export class PostgresJournal {
             input.workerId, input.primaryLeaseId])
       const result = await client.query<OperationRow>(`
         SELECT tenant_id, request_hash, state, logical_response, error_code, error_message,
-               generation::text, heartbeat_at, primary_lease_id
+               generation::text, heartbeat_at, primary_lease_id, result_lease_id
         FROM hosted_agent_operations
         WHERE operation = $1 AND idempotency_key = $2
         FOR UPDATE
@@ -196,7 +198,7 @@ export class PostgresJournal {
       options.signal?.throwIfAborted()
       const result = await this.pool.query<OperationRow>(`
         SELECT tenant_id, request_hash, state, logical_response, error_code, error_message,
-               generation::text, heartbeat_at, primary_lease_id
+               generation::text, heartbeat_at, primary_lease_id, result_lease_id
         FROM hosted_agent_operations
         WHERE operation = $1 AND idempotency_key = $2
       `, [input.operation, input.idempotencyKey])
@@ -393,6 +395,40 @@ export class PostgresJournal {
     return executor ? bind(executor) : this.transaction(bind)
   }
 
+  async bindResultLeaseAndAdoptAllocations(identity: OperationIdentity, generation: number, workerId: string,
+    resultLeaseId: string, allocationIds: string[], executor?: PoolClient): Promise<OperationAllocation[]> {
+    validateIdentity(identity); validateGeneration(generation); validateWorkerId(workerId)
+    if (!resultLeaseId.trim() || Buffer.byteLength(resultLeaseId) > 512) throw new Error('invalid result lease ID')
+    const uniqueIds = [...new Set(allocationIds)]
+    if (uniqueIds.length !== allocationIds.length || uniqueIds.length > 10_000
+      || uniqueIds.some(allocationId => !/^[1-9][0-9]*$/.test(allocationId))) {
+      throw new Error('invalid allocation IDs')
+    }
+    const bind = async (client: PoolClient) => {
+      const result = await client.query(`
+        UPDATE hosted_agent_operations
+        SET result_lease_id = $6
+        WHERE operation = $1 AND idempotency_key = $2 AND tenant_id = $3
+          AND generation = $4 AND worker_id = $5 AND state = 'in_progress'
+          AND (result_lease_id IS NULL OR result_lease_id = $6)
+      `, [identity.operation, identity.idempotencyKey, identity.tenantId, generation, workerId, resultLeaseId])
+      if (result.rowCount !== 1) throw new OperationOwnershipError()
+      if (uniqueIds.length === 0) return []
+      const allocations = await client.query<AllocationRow>(`
+        UPDATE hosted_agent_operation_allocations
+        SET lease_id = $4, state = 'adopted'
+        WHERE operation = $1 AND idempotency_key = $2 AND tenant_id = $3
+          AND allocation_id = ANY($5::bigint[])
+          AND (state IN ('allocated', 'reclaim_pending') OR (state = 'adopted' AND lease_id = $4))
+        RETURNING allocation_id::text, allocation_kind, resource_id, lease_id, state,
+                  metadata, allocated_at, updated_at, reclaimed_at
+      `, [identity.operation, identity.idempotencyKey, identity.tenantId, resultLeaseId, uniqueIds])
+      if (allocations.rowCount !== uniqueIds.length) throw new OperationOwnershipError()
+      return allocations.rows.map(allocationFromRow)
+    }
+    return executor ? bind(executor) : this.transaction(bind)
+  }
+
   async claimStaleOperations(staleBefore: Date, limit: number, workerId: string, tenantId?: string): Promise<StaleOperation[]> {
     if (!Number.isInteger(limit) || limit < 1 || limit > 1000) throw new Error('invalid stale-operation limit')
     validateWorkerId(workerId)
@@ -420,7 +456,7 @@ export class PostgresJournal {
         RETURNING operation.operation, operation.idempotency_key, operation.tenant_id,
                   operation.request_hash, operation.generation::text,
                   candidates.worker_id AS previous_worker_id, operation.worker_id,
-                  operation.primary_lease_id
+                  operation.primary_lease_id, operation.result_lease_id
       `, [staleBefore, limit, workerId, tenantId ?? null])
       return result.rows.map(row => ({
         operation: row.operation,
@@ -431,6 +467,7 @@ export class PostgresJournal {
         previousWorkerId: row.previous_worker_id,
         workerId: row.worker_id,
         primaryLeaseId: row.primary_lease_id,
+        resultLeaseId: row.result_lease_id,
       }))
     })
   }
@@ -546,4 +583,5 @@ interface StaleRow {
   previous_worker_id: string | null
   worker_id: string
   primary_lease_id: string | null
+  result_lease_id: string | null
 }
