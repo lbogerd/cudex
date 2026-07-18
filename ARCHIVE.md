@@ -377,6 +377,18 @@ PostgreSQL 17, covering concurrency, tenant/owner isolation, release retention,
 direct-SQL immutability, and expiry. Artifact serialization/upload and the HTTP
 export/apply orchestration remain lifecycle work.
 
+The canonical artifact format now bundles the exact base/current snapshot IDs
+and manifests, complete sorted changed paths, nullable content-object IDs for
+changed current regular files, changed count, and current-content byte total.
+It never embeds file bodies. Serialization reconstructs the diff, requires every
+changed file digest's content object exactly once, and returns deterministic
+canonical bytes, SHA-256, and deduplicated content IDs for storage/repository
+registration. Parsing bounds bytes before decoding, requires exact UTF-8 JSON
+shape and byte-for-byte canonical encoding, verifies the checksum, then rebuilds
+the entire envelope from its manifests to reject altered order, paths, types,
+identities, counts, sizes, or references. Five focused tests cover deterministic
+binary/mode/directory/link/add/delete output and corruption/quota rejection.
+
 ### Multi-replica operation journal primitives
 
 The PostgreSQL layer now exposes atomic operation admission over the unique

@@ -124,11 +124,11 @@ identity remains isolated, and lifecycle replay never duplicates resources.
   with snapshot/object/content references, expiry, replay, and retention after
   source lease release.
 - [ ] Implement `POST v1/agents/patch/export` using the archived contract.
-- [ ] Build canonical sorted manifests with path, type, mode, link target or
+- [x] Build canonical sorted manifests with path, type, mode, link target or
   content digest, and immutable base/current identities.
 - [ ] Persist content-addressed blobs and the canonical artifact before returning.
-- [ ] Compare the exact requested base snapshot with the latest checkpoint.
-- [ ] Cover additions, modifications, deletions, binaries, executable modes,
+- [x] Compare the exact requested base snapshot with the latest checkpoint.
+- [x] Cover additions, modifications, deletions, binaries, executable modes,
   directories, and safe symlinks without requiring Git.
 - [ ] Return verified checksum, changed-file count, and size.
 - [ ] Enforce authorization, expiry, path, file, byte, and manifest quotas.
