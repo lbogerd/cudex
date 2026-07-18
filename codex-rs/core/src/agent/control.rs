@@ -194,6 +194,18 @@ impl AgentControl {
         state.checkpoint_hosted_runtime(thread_id, turn_id).await
     }
 
+    /// Finalizes an owned hosted runtime before its successful terminal event is published.
+    pub(crate) async fn finalize_hosted_runtime(
+        &self,
+        agent_id: ThreadId,
+        owner_thread_id: ThreadId,
+    ) -> CodexResult<Option<codex_hosted_agent::AgentPatchArtifact>> {
+        let state = self.upgrade()?;
+        state
+            .finalize_hosted_runtime(agent_id, owner_thread_id)
+            .await
+    }
+
     pub(crate) async fn release_hosted_delegate_runtime(&self, thread_id: ThreadId) {
         if let Ok(state) = self.upgrade() {
             state.release_hosted_runtime(thread_id).await;

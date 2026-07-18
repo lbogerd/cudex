@@ -215,6 +215,21 @@ fn hosted_provision_request(
         .expect("hosted provision request")
 }
 
+async fn start_hosted_owned_agent(
+    manager: &ThreadManager,
+    config: &Config,
+) -> (NewThread, NewThread) {
+    let owner = manager
+        .start_thread_with_options(start_thread_options(config.clone()))
+        .await
+        .expect("start hosted owner");
+    let agent = manager
+        .spawn_subagent(owner.thread_id, start_thread_options(config.clone()))
+        .await
+        .expect("spawn hosted owned agent");
+    (owner, agent)
+}
+
 #[tokio::test]
 async fn hosted_runtime_is_durable_and_checkpoints_only_successful_turns() {
     let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
@@ -347,6 +362,291 @@ async fn hosted_runtime_is_durable_and_checkpoints_only_successful_turns() {
         .shutdown_all_threads_bounded(Duration::from_secs(10))
         .await;
     assert_eq!(report.completed, vec![root.thread_id]);
+}
+
+#[tokio::test]
+async fn hosted_finalization_persists_patch_notifies_owner_and_releases() {
+    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
+    let mut patch_available = manager.subscribe_hosted_agent_patch_available();
+    let (owner, agent) = start_hosted_owned_agent(&manager, &config).await;
+    let owner_thread_id = owner.thread_id;
+    let request = hosted_provision_request(&hosted_service, agent.thread_id);
+    let lease_id = hosted_service
+        .provisioned_lease_id(&request.idempotency_key)
+        .expect("hosted lease");
+    let initial_record = manager
+        .state
+        .thread_store
+        .get_hosted_agent_runtime(agent.thread_id)
+        .await
+        .expect("read initial agent runtime")
+        .expect("initial agent runtime record");
+    let environment_id = initial_record.environment_id.clone();
+
+    let error = manager
+        .state
+        .finalize_hosted_runtime(agent.thread_id, ThreadId::new())
+        .await
+        .expect_err("non-owner must not finalize hosted agent");
+    assert!(error.to_string().contains("does not own hosted agent"));
+    assert_eq!(
+        manager
+            .state
+            .thread_store
+            .get_hosted_agent_runtime(agent.thread_id)
+            .await
+            .expect("read runtime after unauthorized finalization"),
+        Some(initial_record)
+    );
+
+    let artifact = manager
+        .state
+        .finalize_hosted_runtime(agent.thread_id, owner_thread_id)
+        .await
+        .expect("finalize hosted agent")
+        .expect("hosted patch artifact");
+    assert_eq!(
+        patch_available.recv().await.expect("patch notification"),
+        HostedAgentPatchAvailable {
+            owner_thread_id,
+            artifact: artifact.clone(),
+        }
+    );
+    let record = manager
+        .state
+        .thread_store
+        .get_hosted_agent_runtime(agent.thread_id)
+        .await
+        .expect("read finalized runtime")
+        .expect("finalized runtime record");
+    assert_eq!(record.last_exported_patch, Some(artifact));
+    assert_eq!(
+        record.lifecycle_state,
+        codex_hosted_agent::HostedAgentLifecycleState::Released
+    );
+    assert_eq!(
+        record.latest_snapshot_id,
+        hosted_service.latest_snapshot_id(&lease_id)
+    );
+    assert_eq!(hosted_service.active_lease_count(), 1);
+    assert!(
+        manager
+            .state
+            .environment_manager
+            .get_environment(&environment_id)
+            .is_none()
+    );
+
+    let report = manager
+        .shutdown_all_threads_bounded(Duration::from_secs(10))
+        .await;
+    assert_eq!(report.completed.len(), 2);
+}
+
+#[tokio::test]
+async fn hosted_finalization_checkpoint_failure_preserves_pending_lease() {
+    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
+    let mut patch_available = manager.subscribe_hosted_agent_patch_available();
+    let (owner, agent) = start_hosted_owned_agent(&manager, &config).await;
+    hosted_service.set_checkpoint_failure(Some(codex_hosted_agent::HostedAgentError::new(
+        codex_hosted_agent::HostedAgentErrorCategory::Unavailable,
+        "checkpoint unavailable",
+    )));
+
+    let error = manager
+        .state
+        .finalize_hosted_runtime(agent.thread_id, owner.thread_id)
+        .await
+        .expect_err("failed checkpoint must keep completion pending");
+    assert!(
+        error
+            .to_string()
+            .contains("failed to checkpoint hosted-agent lease")
+    );
+    let record = manager
+        .state
+        .thread_store
+        .get_hosted_agent_runtime(agent.thread_id)
+        .await
+        .expect("read pending runtime")
+        .expect("pending runtime record");
+    assert_eq!(
+        record.lifecycle_state,
+        codex_hosted_agent::HostedAgentLifecycleState::PendingFinalization
+    );
+    assert_eq!(record.last_exported_patch, None);
+    assert_eq!(hosted_service.active_lease_count(), 2);
+    assert!(matches!(
+        patch_available.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+
+    let report = manager
+        .shutdown_all_threads_bounded(Duration::from_secs(10))
+        .await;
+    assert_eq!(report.completed.len(), 2);
+    assert_eq!(hosted_service.active_lease_count(), 1);
+}
+
+#[tokio::test]
+async fn hosted_finalization_export_failure_persists_checkpoint_and_preserves_lease() {
+    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
+    let mut patch_available = manager.subscribe_hosted_agent_patch_available();
+    let (owner, agent) = start_hosted_owned_agent(&manager, &config).await;
+    let request = hosted_provision_request(&hosted_service, agent.thread_id);
+    let lease_id = hosted_service
+        .provisioned_lease_id(&request.idempotency_key)
+        .expect("hosted lease");
+    hosted_service.set_export_failure(Some(codex_hosted_agent::HostedAgentError::new(
+        codex_hosted_agent::HostedAgentErrorCategory::Unavailable,
+        "export unavailable",
+    )));
+
+    let error = manager
+        .state
+        .finalize_hosted_runtime(agent.thread_id, owner.thread_id)
+        .await
+        .expect_err("failed export must keep completion pending");
+    assert!(
+        error
+            .to_string()
+            .contains("failed to export hosted-agent patch")
+    );
+    let record = manager
+        .state
+        .thread_store
+        .get_hosted_agent_runtime(agent.thread_id)
+        .await
+        .expect("read pending runtime")
+        .expect("pending runtime record");
+    assert_eq!(
+        record.lifecycle_state,
+        codex_hosted_agent::HostedAgentLifecycleState::PendingFinalization
+    );
+    assert_eq!(
+        record.latest_snapshot_id,
+        hosted_service.latest_snapshot_id(&lease_id)
+    );
+    assert_ne!(record.latest_snapshot_id, Some(record.base_snapshot_id));
+    assert_eq!(record.last_exported_patch, None);
+    assert_eq!(hosted_service.active_lease_count(), 2);
+    assert!(matches!(
+        patch_available.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+}
+
+#[tokio::test]
+async fn hosted_finalization_failure_persists_error_before_failed_completion() {
+    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
+    let (owner, agent) = start_hosted_owned_agent(&manager, &config).await;
+    hosted_service.set_export_failure(Some(codex_hosted_agent::HostedAgentError::new(
+        codex_hosted_agent::HostedAgentErrorCategory::Unavailable,
+        "export unavailable",
+    )));
+    let mut turn = agent
+        .thread
+        .session
+        .new_default_turn_with_sub_id("hosted-finalization-failure".to_string())
+        .await;
+    Arc::get_mut(&mut turn)
+        .expect("new turn context must be uniquely owned")
+        .parent_thread_id = Some(owner.thread_id);
+
+    agent
+        .thread
+        .session
+        .send_event(
+            &turn,
+            EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: turn.sub_id.clone(),
+                last_agent_message: Some("done".to_string()),
+                error: None,
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            }),
+        )
+        .await;
+    let mut terminal_events = Vec::new();
+    while terminal_events.len() < 2 {
+        let event = tokio::time::timeout(Duration::from_secs(5), agent.thread.next_event())
+            .await
+            .expect("timed out waiting for finalization events")
+            .expect("read finalization event");
+        match event.msg {
+            EventMsg::Error(error) if error.message.contains("failed to finalize hosted agent") => {
+                terminal_events.push(EventMsg::Error(error));
+            }
+            EventMsg::TurnComplete(event) if event.turn_id == turn.sub_id => {
+                terminal_events.push(EventMsg::TurnComplete(event));
+            }
+            _ => {}
+        }
+    }
+    let [EventMsg::Error(error), EventMsg::TurnComplete(completion)] = terminal_events.as_slice()
+    else {
+        panic!("expected Error followed by TurnComplete, got {terminal_events:?}");
+    };
+    assert_eq!(completion.error.as_ref(), Some(error));
+    assert!(matches!(
+        agent.thread.agent_status().await,
+        codex_protocol::protocol::AgentStatus::Errored(_)
+    ));
+}
+
+#[tokio::test]
+async fn hosted_finalization_release_failure_is_durable_and_cleanup_retries() {
+    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
+    let mut patch_available = manager.subscribe_hosted_agent_patch_available();
+    let (owner, agent) = start_hosted_owned_agent(&manager, &config).await;
+    hosted_service.set_release_failure(Some(codex_hosted_agent::HostedAgentError::new(
+        codex_hosted_agent::HostedAgentErrorCategory::Unavailable,
+        "release unavailable",
+    )));
+
+    let artifact = manager
+        .state
+        .finalize_hosted_runtime(agent.thread_id, owner.thread_id)
+        .await
+        .expect("durable artifact makes finalization successful")
+        .expect("hosted patch artifact");
+    assert_eq!(
+        patch_available
+            .recv()
+            .await
+            .expect("patch notification")
+            .artifact,
+        artifact
+    );
+    let record = manager
+        .state
+        .thread_store
+        .get_hosted_agent_runtime(agent.thread_id)
+        .await
+        .expect("read release-pending runtime")
+        .expect("release-pending runtime record");
+    assert_eq!(
+        record.lifecycle_state,
+        codex_hosted_agent::HostedAgentLifecycleState::ReleasePending
+    );
+    assert_eq!(hosted_service.active_lease_count(), 2);
+
+    hosted_service.set_release_failure(None);
+    manager.state.release_hosted_runtime(agent.thread_id).await;
+    let record = manager
+        .state
+        .thread_store
+        .get_hosted_agent_runtime(agent.thread_id)
+        .await
+        .expect("read released runtime")
+        .expect("released runtime record");
+    assert_eq!(
+        record.lifecycle_state,
+        codex_hosted_agent::HostedAgentLifecycleState::Released
+    );
+    assert_eq!(hosted_service.active_lease_count(), 1);
 }
 
 #[tokio::test]

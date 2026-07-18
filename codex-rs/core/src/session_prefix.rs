@@ -43,6 +43,27 @@ pub(crate) fn format_inter_agent_completion_message(
     Some(InterAgentCompletionMessage::new(task_name, sender, payload).render())
 }
 
+pub(crate) fn append_hosted_patch_metadata(
+    last_agent_message: &mut Option<String>,
+    artifact: &codex_hosted_agent::AgentPatchArtifact,
+) {
+    if artifact.artifact_id.len() > codex_hosted_agent::MAX_OPAQUE_ID_BYTES {
+        return;
+    }
+    let metadata = format!(
+        "Hosted patch available: agent_id={}; artifact_id={}; changed_files={}; size_bytes={}",
+        artifact.agent_id, artifact.artifact_id, artifact.changed_files, artifact.size_bytes
+    );
+    match last_agent_message {
+        Some(message) if !message.is_empty() => {
+            message.push_str("\n\n");
+            message.push_str(&metadata);
+        }
+        Some(message) => *message = metadata,
+        None => *last_agent_message = Some(metadata),
+    }
+}
+
 #[cfg(test)]
 #[path = "session_prefix_tests.rs"]
 mod tests;

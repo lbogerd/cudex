@@ -6,7 +6,12 @@ use codex_protocol::protocol::EventMsg;
 pub(crate) fn agent_status_from_event(msg: &EventMsg) -> Option<AgentStatus> {
     match msg {
         EventMsg::TurnStarted(_) => Some(AgentStatus::Running),
-        EventMsg::TurnComplete(ev) => Some(AgentStatus::Completed(ev.last_agent_message.clone())),
+        EventMsg::TurnComplete(ev) => match &ev.error {
+            Some(error) if error.affects_turn_status() => {
+                Some(AgentStatus::Errored(error.message.clone()))
+            }
+            _ => Some(AgentStatus::Completed(ev.last_agent_message.clone())),
+        },
         EventMsg::TurnAborted(ev) => match ev.reason {
             codex_protocol::protocol::TurnAbortReason::Interrupted
             | codex_protocol::protocol::TurnAbortReason::BudgetLimited => {

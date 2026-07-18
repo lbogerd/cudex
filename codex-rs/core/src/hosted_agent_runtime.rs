@@ -7,6 +7,8 @@ use codex_exec_server::EnvironmentManager;
 use codex_exec_server::ExecServerError;
 use codex_hosted_agent::AgentCheckpoint;
 use codex_hosted_agent::AgentCheckpointRequest;
+use codex_hosted_agent::AgentPatchArtifact;
+use codex_hosted_agent::AgentPatchExportRequest;
 use codex_hosted_agent::AgentProvisionRequest;
 use codex_hosted_agent::AgentReconnectRequest;
 use codex_hosted_agent::AgentReleaseRequest;
@@ -30,6 +32,7 @@ pub(crate) const HOSTED_EXTERNAL_SANDBOX_DENIAL_MESSAGE: &str =
 /// Durable, non-secret state owned by one thread using a hosted environment.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct HostedAgentRuntime {
+    pub(crate) owner_agent_id: Option<codex_protocol::ThreadId>,
     pub(crate) lease_id: String,
     pub(crate) environment_id: String,
     pub(crate) agent_type: String,
@@ -113,6 +116,11 @@ trait ErasedHostedAgentService: Send + Sync {
         request: AgentCheckpointRequest,
     ) -> HostedServiceFuture<'_, AgentCheckpoint>;
 
+    fn export_patch(
+        &self,
+        request: AgentPatchExportRequest,
+    ) -> HostedServiceFuture<'_, AgentPatchArtifact>;
+
     fn release(&self, request: AgentReleaseRequest) -> HostedServiceFuture<'_, ()>;
 }
 
@@ -139,6 +147,13 @@ where
         request: AgentCheckpointRequest,
     ) -> HostedServiceFuture<'_, AgentCheckpoint> {
         Box::pin(HostedAgentService::checkpoint(self, request))
+    }
+
+    fn export_patch(
+        &self,
+        request: AgentPatchExportRequest,
+    ) -> HostedServiceFuture<'_, AgentPatchArtifact> {
+        Box::pin(HostedAgentService::export_patch(self, request))
     }
 
     fn release(&self, request: AgentReleaseRequest) -> HostedServiceFuture<'_, ()> {
@@ -176,12 +191,14 @@ impl HostedAgentProvisioner {
         let agent_type = request.agent_type.clone();
         let sandbox_template = request.sandbox_template.clone();
         let agent_id = request.agent_id;
+        let owner_agent_id = request.owner_agent_id;
         let provisioned = self
             .service
             .provision(request)
             .await
             .map_err(HostedAgentRuntimeError::Provision)?;
         let runtime = HostedAgentRuntime {
+            owner_agent_id,
             lease_id: provisioned.lease_id,
             environment_id: provisioned.environment_id,
             agent_type,
@@ -292,6 +309,7 @@ impl HostedAgentProvisioner {
             Err(error) => return Err(HostedAgentRuntimeError::Reconnect(error)),
         };
         let runtime = HostedAgentRuntime {
+            owner_agent_id,
             lease_id: provisioned.lease_id,
             environment_id: provisioned.environment_id,
             agent_type: record.agent_type,
@@ -365,6 +383,56 @@ impl HostedAgentProvisioner {
             })
             .await
             .map_err(HostedAgentRuntimeError::Checkpoint)
+    }
+
+    /// Creates the final durable snapshot for an owned agent's lease generation.
+    pub(crate) async fn checkpoint_for_completion(
+        &self,
+        agent_id: codex_protocol::ThreadId,
+        runtime: &HostedAgentRuntime,
+    ) -> Result<AgentCheckpoint, HostedAgentRuntimeError> {
+        self.service
+            .checkpoint(AgentCheckpointRequest {
+                lease_id: runtime.lease_id.clone(),
+                idempotency_key: format!(
+                    "hosted-agent:{agent_id}:lease:{}:finalize-checkpoint",
+                    runtime.lease_id
+                ),
+            })
+            .await
+            .map_err(HostedAgentRuntimeError::Checkpoint)
+    }
+
+    /// Exports the agent's final patch after its completion snapshot is durable.
+    pub(crate) async fn export_patch(
+        &self,
+        agent_id: codex_protocol::ThreadId,
+        snapshot_id: &str,
+        runtime: &HostedAgentRuntime,
+    ) -> Result<AgentPatchArtifact, HostedAgentRuntimeError> {
+        let artifact = self
+            .service
+            .export_patch(AgentPatchExportRequest {
+                lease_id: runtime.lease_id.clone(),
+                agent_id,
+                base_snapshot_id: runtime.base_snapshot_id.clone(),
+                idempotency_key: format!(
+                    "hosted-agent:{agent_id}:snapshot:{snapshot_id}:export-patch"
+                ),
+            })
+            .await
+            .map_err(HostedAgentRuntimeError::ExportPatch)?;
+        if artifact.agent_id != agent_id
+            || artifact.base_snapshot_id != runtime.base_snapshot_id
+            || artifact.artifact_id.trim().is_empty()
+            || artifact.artifact_id.len() > codex_hosted_agent::MAX_OPAQUE_ID_BYTES
+        {
+            return Err(HostedAgentRuntimeError::ExportPatch(HostedAgentError::new(
+                codex_hosted_agent::HostedAgentErrorCategory::InvalidResponse,
+                "patch artifact does not match the finalized agent",
+            )));
+        }
+        Ok(artifact)
     }
 }
 
@@ -444,6 +512,8 @@ pub(crate) enum HostedAgentRuntimeError {
     },
     #[error("failed to checkpoint hosted-agent lease: {0}")]
     Checkpoint(HostedAgentError),
+    #[error("failed to export hosted-agent patch: {0}")]
+    ExportPatch(HostedAgentError),
     #[error("failed to unregister hosted environment `{environment_id}`: {source}")]
     Unregister {
         environment_id: String,

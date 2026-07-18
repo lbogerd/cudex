@@ -41,6 +41,7 @@ use crate::parse_turn_item;
 use crate::realtime_conversation::RealtimeConversationManager;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnEnvironment;
+use crate::session_prefix::append_hosted_patch_metadata;
 use crate::session_prefix::format_inter_agent_completion_message;
 use crate::skills::SkillRenderSideEffects;
 use crate::skills_load_input_from_config;
@@ -1735,10 +1736,53 @@ impl Session {
     }
 
     /// Persist the event to rollout and send it to clients.
-    pub(crate) async fn send_event(&self, turn_context: &TurnContext, msg: EventMsg) {
+    pub(crate) async fn send_event(&self, turn_context: &TurnContext, mut msg: EventMsg) {
+        let mut hosted_runtime_finalized = false;
+        if let EventMsg::TurnComplete(event) = &mut msg
+            && event.error.is_none()
+            && let Some(owner_thread_id) = turn_context.parent_thread_id
+        {
+            match self
+                .services
+                .agent_control
+                .finalize_hosted_runtime(self.thread_id, owner_thread_id)
+                .await
+            {
+                Ok(Some(artifact)) => {
+                    append_hosted_patch_metadata(&mut event.last_agent_message, &artifact);
+                    hosted_runtime_finalized = true;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let error = ErrorEvent {
+                        message: format!("failed to finalize hosted agent: {error}"),
+                        codex_error_info: None,
+                    };
+                    self.send_event_after_hosted_finalization(
+                        turn_context,
+                        EventMsg::Error(error.clone()),
+                        /*hosted_runtime_finalized*/ false,
+                    )
+                    .await;
+                    event.error = Some(error);
+                }
+            }
+        }
+        self.send_event_after_hosted_finalization(turn_context, msg, hosted_runtime_finalized)
+            .await;
+    }
+
+    async fn send_event_after_hosted_finalization(
+        &self,
+        turn_context: &TurnContext,
+        msg: EventMsg,
+        hosted_runtime_finalized: bool,
+    ) {
         let legacy_source = msg.clone();
         let completed_turn_id = match &legacy_source {
-            EventMsg::TurnComplete(event) if event.error.is_none() => Some(event.turn_id.as_str()),
+            EventMsg::TurnComplete(event) if event.error.is_none() && !hosted_runtime_finalized => {
+                Some(event.turn_id.as_str())
+            }
             _ => None,
         };
         if let EventMsg::Error(error) = &legacy_source

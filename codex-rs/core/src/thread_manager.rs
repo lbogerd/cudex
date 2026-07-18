@@ -108,6 +108,10 @@ use tracing::instrument;
 use tracing::warn;
 
 const THREAD_CREATED_CHANNEL_CAPACITY: usize = 1024;
+const PATCH_AVAILABLE_CHANNEL_CAPACITY: usize = 1024;
+
+mod hosted_agent_lifecycle;
+pub use hosted_agent_lifecycle::HostedAgentPatchAvailable;
 /// Test-only override for enabling thread-manager behaviors used by integration
 /// tests.
 ///
@@ -143,6 +147,13 @@ impl HostedAgentRuntimeEntry {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .latest_snapshot_id = Some(snapshot_id);
+    }
+
+    fn replace(&self, runtime: HostedAgentRuntime) {
+        *self
+            .runtime
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = runtime;
     }
 }
 
@@ -342,6 +353,7 @@ pub(crate) struct ResumeThreadWithHistoryOptions {
 pub(crate) struct ThreadManagerState {
     threads: Arc<RwLock<HashMap<ThreadId, Arc<CodexThread>>>>,
     thread_created_tx: broadcast::Sender<ThreadId>,
+    patch_available_tx: broadcast::Sender<HostedAgentPatchAvailable>,
     auth_manager: Arc<AuthManager>,
     models_manager: SharedModelsManager,
     environment_manager: Arc<EnvironmentManager>,
@@ -446,6 +458,7 @@ impl ThreadManager {
         let codex_home = config.codex_home.clone();
         let restriction_product = session_source.restriction_product();
         let (thread_created_tx, _) = broadcast::channel(THREAD_CREATED_CHANNEL_CAPACITY);
+        let (patch_available_tx, _) = broadcast::channel(PATCH_AVAILABLE_CHANNEL_CAPACITY);
         let plugins_manager = Arc::new(PluginsManager::new_with_options(
             codex_home.to_path_buf(),
             restriction_product,
@@ -467,6 +480,7 @@ impl ThreadManager {
             state: Arc::new(ThreadManagerState {
                 threads: Arc::new(RwLock::new(HashMap::new())),
                 thread_created_tx,
+                patch_available_tx,
                 models_manager,
                 environment_manager,
                 skills_service,
@@ -561,6 +575,7 @@ impl ThreadManager {
             Err(err) => panic!("test codex_home should be absolute: {err}"),
         };
         let (thread_created_tx, _) = broadcast::channel(THREAD_CREATED_CHANNEL_CAPACITY);
+        let (patch_available_tx, _) = broadcast::channel(PATCH_AVAILABLE_CHANNEL_CAPACITY);
         let restriction_product = SessionSource::Exec.restriction_product();
         let plugins_manager = Arc::new(PluginsManager::new_with_options(
             codex_home.clone(),
@@ -588,6 +603,7 @@ impl ThreadManager {
             state: Arc::new(ThreadManagerState {
                 threads: Arc::new(RwLock::new(HashMap::new())),
                 thread_created_tx,
+                patch_available_tx,
                 models_manager: create_model_provider(provider, Some(auth_manager.clone()))
                     .models_manager(codex_home, /*config_model_catalog*/ None),
                 environment_manager,
@@ -702,6 +718,13 @@ impl ThreadManager {
 
     pub fn subscribe_thread_created(&self) -> broadcast::Receiver<ThreadId> {
         self.state.thread_created_tx.subscribe()
+    }
+
+    /// Subscribes to durable hosted-agent patches available to owning threads.
+    pub fn subscribe_hosted_agent_patch_available(
+        &self,
+    ) -> broadcast::Receiver<HostedAgentPatchAvailable> {
+        self.state.patch_available_tx.subscribe()
     }
 
     pub async fn get_thread(&self, thread_id: ThreadId) -> CodexResult<Arc<CodexThread>> {
@@ -1699,9 +1722,25 @@ impl ThreadManagerState {
                     .or_insert(runtime);
                 return;
             };
-            let runtime_value = runtime.snapshot();
+            let mut runtime_value = runtime.snapshot();
+            match runtime_value.lifecycle_state {
+                codex_hosted_agent::HostedAgentLifecycleState::PendingFinalization => {
+                    self.hosted_agent_runtimes
+                        .write()
+                        .await
+                        .entry(thread_id)
+                        .or_insert(runtime);
+                    return;
+                }
+                codex_hosted_agent::HostedAgentLifecycleState::Released => return,
+                codex_hosted_agent::HostedAgentLifecycleState::Active
+                | codex_hosted_agent::HostedAgentLifecycleState::Completed
+                | codex_hosted_agent::HostedAgentLifecycleState::ReleasePending => {}
+            }
             let cleanup_result = match &self.hosted_agent_provisioner {
-                Ok(Some(provisioner)) => provisioner.release(thread_id, runtime_value).await,
+                Ok(Some(provisioner)) => {
+                    provisioner.release(thread_id, runtime_value.clone()).await
+                }
                 Ok(None) => Err(
                     crate::hosted_agent_runtime::HostedAgentRuntimeError::Release(
                         HostedAgentError::new(
@@ -1715,6 +1754,20 @@ impl ThreadManagerState {
                 ),
             };
             if let Err(error) = cleanup_result {
+                runtime_value.lifecycle_state =
+                    codex_hosted_agent::HostedAgentLifecycleState::ReleasePending;
+                runtime.replace(runtime_value.clone());
+                if let Err(persistence_error) = self
+                    .thread_store
+                    .set_hosted_agent_runtime(thread_id, runtime_value.durable_record())
+                    .await
+                {
+                    warn!(
+                        %persistence_error,
+                        %thread_id,
+                        "failed to persist hosted runtime pending release"
+                    );
+                }
                 warn!(
                     %error,
                     %thread_id,
@@ -1725,6 +1778,20 @@ impl ThreadManagerState {
                     .await
                     .entry(thread_id)
                     .or_insert(runtime);
+            } else {
+                runtime_value.lifecycle_state =
+                    codex_hosted_agent::HostedAgentLifecycleState::Released;
+                if let Err(error) = self
+                    .thread_store
+                    .set_hosted_agent_runtime(thread_id, runtime_value.durable_record())
+                    .await
+                {
+                    warn!(
+                        %error,
+                        %thread_id,
+                        "failed to persist released hosted runtime"
+                    );
+                }
             }
         }
     }
