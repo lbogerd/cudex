@@ -23,10 +23,18 @@ const defaultPolicy: ToolPolicy = {
     { name: 'send_message', namespace: null }, { name: 'wait_agent', namespace: null },
   ],
 }
-interface ServiceOptions { templates: Record<string, string>; allowedRoots: string[]; ingress: IngressLimits }
+interface ServiceOptions { templates: Record<string, string>; allowedRoots: string[]; ingress: IngressLimits; allowLocalIngress?: boolean }
+interface ConnectionRevoker { revoke(leaseId: string): void }
 
 export class ControlPlane {
-  constructor(private readonly store: JsonStore, private readonly provider: ProviderAdapter, private readonly tickets: TicketIssuer, private readonly blobs: ObjectStore, private readonly options: ServiceOptions) {}
+  constructor(
+    private readonly store: JsonStore,
+    private readonly provider: ProviderAdapter,
+    private readonly tickets: TicketIssuer,
+    private readonly blobs: ObjectStore,
+    private readonly options: ServiceOptions,
+    private readonly connections?: ConnectionRevoker,
+  ) {}
 
   async reconcile(): Promise<void> {
     const abandoned = await this.store.read(database => Object.values(database.operations).filter(operation => operation.state === 'in_progress' && operation.allocatedSandboxId))
@@ -40,6 +48,9 @@ export class ControlPlane {
     return this.idempotent('provision', request.idempotencyKey, request, async operation => {
       const templateId = this.options.templates[request.sandboxTemplate]
       if (!templateId) throw new ServiceError(422, 'invalid sandbox template')
+      if (request.source.type === 'rootWorkspace' && this.options.allowLocalIngress === false) {
+        throw new ServiceError(400, 'local workspace ingress is disabled')
+      }
       const leaseId = opaque('lease'); const environmentId = opaque('env')
       let sandboxId: string | undefined; let cwd: string; let roots: string[]; let created
       try {
@@ -102,6 +113,7 @@ export class ControlPlane {
     await this.idempotent('release', request.idempotencyKey, request, async () => {
       const lease = await this.store.read(database => database.leases[request.leaseId])
       await this.tickets.revokeLease(request.leaseId)
+      this.connections?.revoke(request.leaseId)
       if (lease) { await this.provider.kill(lease.sandboxId).catch(() => undefined); await this.store.transaction(database => { database.leases[request.leaseId]!.state = 'released' }) }
       return { released: true }
     })

@@ -92,6 +92,13 @@ Migrations are checksummed, serialized across replicas, and transactional. Set
 `HOSTED_AGENT_TEST_DATABASE_URL` to include the live constraint and concurrent
 migration test in `npm test`.
 
+Production mode requires a TLS certificate/key pair and a `wss:`
+`HOSTED_AGENT_GATEWAY_URL`. Plain HTTP and `ws:` are accepted only when
+`HOSTED_AGENT_DEVELOPMENT=true`; that switch also identifies the local filesystem
+object store and co-located path ingress as non-production adapters. Gateway
+payload, connection, pending-message, and backpressure limits have bounded
+defaults and corresponding `HOSTED_AGENT_GATEWAY_MAX_*` overrides.
+
 ## Overrides
 
 - `CODEX_BUILD_TARGET`, `CODEX_BUILD_PROFILE`, `CODEX_ARTIFACT_DIR`: artifact build settings.

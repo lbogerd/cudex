@@ -219,6 +219,27 @@ The direct `ws` dependency was upgraded from 8.18.3 to 8.21.1, resolving the
 pinned tree's high-severity memory-disclosure/exhaustion advisories. The npm
 production audit reports zero known vulnerabilities after the upgrade.
 
+### Network-edge foundation
+
+The next productionization slice made TLS and WSS mandatory outside an explicit
+`HOSTED_AGENT_DEVELOPMENT=true` mode. TLS certificate/key configuration must be
+paired, gateway URLs cannot contain credentials/query/fragment material, ticket
+TTL is bounded in production, the local ingress bridge is rejected before
+provider allocation outside development, and production startup requires the
+authenticated object store. Release now synchronously asks the gateway to close
+all active lease connections.
+
+HTTP bodies are capped at 1 MiB from both declared length and streamed bytes;
+excess streamed data is discarded rather than retained. Responses disable
+caching and unexpected provider/storage failures use a generic error instead of
+reflecting potentially sensitive diagnostics. The WSS gateway bounds total and
+per-lease connections, payloads, pre-upstream messages/bytes, and socket
+backpressure. It handles malformed upgrade paths, verifies the same active
+lease/sandbox before and after provider connection and at upstream readiness,
+and removes empty connection sets. Focused race, rejection, redaction, payload,
+buffer, and connection-limit tests increased the provider-independent suite to
+20 passes with only the optional live PostgreSQL test skipped.
+
 CubeSandbox was verified on 2026-07-18 through stock E2B TypeScript SDK 2.35.0.
 Provider code lives in the external TypeScript control plane under `e2b/src`, not
 in `codex-core`.

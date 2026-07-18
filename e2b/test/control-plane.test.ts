@@ -64,3 +64,23 @@ test('release is idempotent and revokes active tickets', async () => {
   await context.service.release({ leaseId: agent.leaseId, idempotencyKey: 'release-1' }); await context.service.release({ leaseId: agent.leaseId, idempotencyKey: 'release-1' })
   assert.equal(await context.tickets.validate(agent.leaseId, ticket), false); assert.deepEqual(context.provider.live(), [])
 })
+
+test('production mode rejects local ingress before provider allocation', async () => {
+  const context = await fixture()
+  const service = new ControlPlane(context.store, context.provider, context.tickets, context.blobs, {
+    templates: { 'general-v1': 'tpl-1' }, allowedRoots: [], ingress: { maxBytes: 10_000_000, maxRoots: 4 }, allowLocalIngress: false,
+  })
+  await assert.rejects(service.provision(context.request), /local workspace ingress is disabled/)
+  assert.equal(context.provider.creates, 0)
+})
+
+test('release closes active gateway connections through the revoker', async () => {
+  const context = await fixture()
+  const revoked: string[] = []
+  const service = new ControlPlane(context.store, context.provider, context.tickets, context.blobs, {
+    templates: { 'general-v1': 'tpl-1' }, allowedRoots: [context.directory], ingress: { maxBytes: 10_000_000, maxRoots: 4 },
+  }, { revoke: leaseId => { revoked.push(leaseId) } })
+  const agent = await service.provision(context.request)
+  await service.release({ leaseId: agent.leaseId, idempotencyKey: 'release-close' })
+  assert.deepEqual(revoked, [agent.leaseId])
+})

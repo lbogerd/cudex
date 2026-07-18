@@ -9,9 +9,16 @@ import { startServer } from './http-server.js'
 import { BlobStore, S3BlobStore } from './blob-store.js'
 
 function required(name: string): string { const value = process.env[name]; if (!value) throw new Error(`${name} is required`); return value }
-const host = process.env.HOSTED_AGENT_HOST ?? '127.0.0.1'; const port = Number(process.env.HOSTED_AGENT_PORT ?? '8443')
+function positiveInteger(name: string, fallback: number): number {
+  const value = Number(process.env[name] ?? fallback)
+  if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`${name} must be a positive integer`)
+  return value
+}
+const development = process.env.HOSTED_AGENT_DEVELOPMENT === 'true'
+const host = process.env.HOSTED_AGENT_HOST ?? '127.0.0.1'; const port = positiveInteger('HOSTED_AGENT_PORT', 8443)
 const store = new JsonStore(resolve(process.env.HOSTED_AGENT_STATE_PATH ?? 'e2b/.state/control-plane.json')); await store.open()
 const objectBucket = process.env.HOSTED_AGENT_OBJECT_BUCKET
+if (!development && !objectBucket) throw new Error('HOSTED_AGENT_OBJECT_BUCKET is required outside development')
 const blobs = objectBucket
   ? new S3BlobStore({
       bucket: objectBucket,
@@ -29,13 +36,28 @@ const connection = {
   validateApiKey: process.env.E2B_VALIDATE_API_KEY !== 'false', requestTimeoutMs: 120_000,
 }
 const provider = new E2BProvider(connection)
-const tickets = new TicketIssuer(store, required('HOSTED_AGENT_GATEWAY_URL'), Number(process.env.HOSTED_AGENT_TICKET_TTL_MS ?? '60000'))
+const gatewayUrl = new URL(required('HOSTED_AGENT_GATEWAY_URL'))
+if (gatewayUrl.protocol !== 'wss:' && !(development && gatewayUrl.protocol === 'ws:')) throw new Error('HOSTED_AGENT_GATEWAY_URL must use WSS outside development')
+if (gatewayUrl.username || gatewayUrl.password || gatewayUrl.search || gatewayUrl.hash) throw new Error('HOSTED_AGENT_GATEWAY_URL must not contain credentials, query, or fragment')
+const ticketTtlMs = positiveInteger('HOSTED_AGENT_TICKET_TTL_MS', 60_000)
+if (!development && (ticketTtlMs < 5_000 || ticketTtlMs > 300_000)) throw new Error('HOSTED_AGENT_TICKET_TTL_MS must be between 5000 and 300000')
+const tickets = new TicketIssuer(store, gatewayUrl.href, ticketTtlMs)
 const templates = JSON.parse(required('HOSTED_AGENT_TEMPLATES')) as Record<string, string>
-const allowedRoots = required('HOSTED_AGENT_ALLOWED_ROOTS').split(':').map(root => resolve(root))
-const service = new ControlPlane(store, provider, tickets, blobs, { templates, allowedRoots, ingress: { maxBytes: Number(process.env.HOSTED_AGENT_MAX_ARCHIVE_BYTES ?? 536_870_912), maxRoots: Number(process.env.HOSTED_AGENT_MAX_ROOTS ?? 8) } })
+const allowedRoots = development ? required('HOSTED_AGENT_ALLOWED_ROOTS').split(':').map(root => resolve(root)) : []
+const gateway = new ExecGateway(tickets, store, provider, {
+  maxPayloadBytes: positiveInteger('HOSTED_AGENT_GATEWAY_MAX_PAYLOAD_BYTES', 1024 * 1024),
+  maxConnections: positiveInteger('HOSTED_AGENT_GATEWAY_MAX_CONNECTIONS', 1024),
+  maxConnectionsPerLease: positiveInteger('HOSTED_AGENT_GATEWAY_MAX_CONNECTIONS_PER_LEASE', 8),
+  maxPendingMessages: positiveInteger('HOSTED_AGENT_GATEWAY_MAX_PENDING_MESSAGES', 64),
+  maxPendingBytes: positiveInteger('HOSTED_AGENT_GATEWAY_MAX_PENDING_BYTES', 1024 * 1024),
+  maxBufferedBytes: positiveInteger('HOSTED_AGENT_GATEWAY_MAX_BUFFERED_BYTES', 1024 * 1024),
+})
+const service = new ControlPlane(store, provider, tickets, blobs, { templates, allowedRoots,
+  ingress: { maxBytes: positiveInteger('HOSTED_AGENT_MAX_ARCHIVE_BYTES', 536_870_912), maxRoots: positiveInteger('HOSTED_AGENT_MAX_ROOTS', 8) },
+  allowLocalIngress: development }, gateway)
 await service.reconcile()
-const gateway = new ExecGateway(tickets, store, provider)
 await startServer(service, gateway, { host, port, bearerToken: required('CODEX_HOSTED_AGENT_TOKEN'),
   ...(process.env.HOSTED_AGENT_TLS_CERT ? { tlsCertPath: process.env.HOSTED_AGENT_TLS_CERT } : {}),
-  ...(process.env.HOSTED_AGENT_TLS_KEY ? { tlsKeyPath: process.env.HOSTED_AGENT_TLS_KEY } : {}) })
+  ...(process.env.HOSTED_AGENT_TLS_KEY ? { tlsKeyPath: process.env.HOSTED_AGENT_TLS_KEY } : {}),
+  allowInsecureHttp: development })
 console.log(JSON.stringify({ event: 'control_plane_started', host, port, tls: Boolean(process.env.HOSTED_AGENT_TLS_CERT) }))

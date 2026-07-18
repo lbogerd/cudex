@@ -35,26 +35,30 @@ connection material or allocation is leaked.
   duplicate/conflicting paths, and unsafe archive entries.
 - [ ] Bound roots, archive/expanded bytes, files, per-file bytes, path depth, and
   extraction ratio; measure transfer/extraction/cleanup without sensitive paths.
-- [ ] Keep the co-located read-only bridge development-only.
+- [x] Keep the co-located read-only bridge development-only.
 
 Exit criterion: the remote service reproduces exact source state and reclaims all
 failed upload/extraction allocations without Git or shared host paths.
 
 ## 3. Control plane and WSS gateway hardening
 
-- [ ] Require HTTPS/WSS, bind raw exec-server to loopback/private networking, and
-  remove production reliance on direct 22101 and `secure:false`.
+- [x] Require HTTPS/WSS outside explicit development mode.
+- [ ] Bind raw exec-server to loopback/private networking and remove production
+  reliance on direct 22101 and `secure:false`.
 - [ ] Authorize every request by tenant, lease, agent, owner, snapshot, artifact,
   and trusted template.
 - [ ] Add ticket purpose/consumption policy, bounded TTL, rotation, revocation
   propagation, and multi-replica lookup.
-- [ ] Close every active connection on release/restore and reject inherited
-  snapshot sessions/secrets.
+- [x] Close every active connection on release.
+- [ ] Close stale connections on restore and reject inherited snapshot
+  sessions/secrets.
 - [ ] Keep provider credentials out of URLs, metadata, commands, persistence,
   errors, logs, traces, and metrics.
 - [ ] Health-probe exec before provision/reconnect success.
-- [ ] Add redacted logs, audit events, metrics, rate limits, retry budgets,
-  circuit breakers, and hard request/response bounds.
+- [x] Redact unexpected HTTP errors and hard-bound HTTP bodies plus gateway
+  payloads, connections, pending queues, and backpressure.
+- [ ] Add structured redacted logs, audit events, metrics, rate limits, retry
+  budgets, circuit breakers, and remaining request/response bounds.
 - [ ] Configure provider public traffic and egress per trusted role.
 - [ ] Test TLS, expiry, revocation races, reconnect, and upstream failures using
   an unmodified Codex exec client.
