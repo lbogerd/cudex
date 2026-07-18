@@ -11,6 +11,7 @@ import {
   type ProviderSnapshotQuery,
   validateExecUpstream,
 } from './provider.js'
+import { exportWorkspaceArchive, uploadWorkspaceArchive } from './workspace-transfer.js'
 
 interface Connection { apiKey: string; apiUrl?: string; domain?: string; validateApiKey?: boolean; requestTimeoutMs: number }
 
@@ -56,17 +57,10 @@ export class E2BProvider implements ProviderAdapter {
     })
   }
   async uploadArchive(sandboxId: string, archive: Uint8Array): Promise<void> {
-    const sandbox = await this.handle(sandboxId)
-    const copy = Uint8Array.from(archive)
-    await sandbox.files.write('/tmp/cudex-workspace.tar', copy.buffer)
-    const result = await sandbox.commands.run('mkdir -p /workspace && tar -xf /tmp/cudex-workspace.tar -C /workspace && chown -R 1000:1000 /workspace/roots && rm /tmp/cudex-workspace.tar', { user: 'root' })
-    if (result.exitCode !== 0) throw new Error(`workspace extraction failed: ${result.stderr}`)
+    await uploadWorkspaceArchive(await this.handle(sandboxId), archive)
   }
   async exportWorkspace(sandboxId: string): Promise<Uint8Array> {
-    const sandbox = await this.handle(sandboxId)
-    const result = await sandbox.commands.run('tar -cf /tmp/cudex-workspace.tar -C /workspace roots', { user: 'root' })
-    if (result.exitCode !== 0) throw new Error(`workspace capture failed: ${result.stderr}`)
-    return sandbox.files.read('/tmp/cudex-workspace.tar', { format: 'bytes' })
+    return exportWorkspaceArchive(await this.handle(sandboxId))
   }
   async startExecServer(sandboxId: string): Promise<void> {
     const sandbox = await this.handle(sandboxId)

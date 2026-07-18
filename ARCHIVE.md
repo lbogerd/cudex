@@ -384,8 +384,20 @@ checksum, and archive before provider creation, uploads the defensive archive
 copy, and uses its canonical remote cwd/root URIs. Missing configuration remains
 fail-closed with 503. Authorization or storage failure allocates nothing; later
 provision failure reclaims the sandbox; successful idempotent replay neither
-resolves nor allocates again. The full 145-test TypeScript run passed with 108
-passes and 37 database-gated skips.
+resolves nor allocates again.
+
+Linux workspace transfer no longer extracts over a live root or reuses a fixed
+temporary archive. Upload and export use unique opaque paths; upload extracts
+under a same-filesystem stage, requires the staged `roots` directory, applies
+ownership without following symlinks, moves the prior roots to a backup, and
+restores that backup when a failed swap or SDK-reported interruption returns.
+Shell traps and a separate SDK-level `finally` cleanup cover command and
+transport failures. Export removes
+its temporary archive even when readback fails, and both directions return only
+generic errors rather than provider stderr. Four Linux transfer tests prove
+exact replacement, binary bytes, executable modes, symlinks, failed extraction,
+interrupted-swap recovery, cleanup, and archive round trip. The full 149-test
+TypeScript run passed with 112 passes and 37 database-gated skips.
 
 `PostgresDurableState` now also exposes a final, transaction-composable source
 authorization primitive. It locks the exact source row only when tenant, opaque

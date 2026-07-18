@@ -70,8 +70,8 @@ connection material or allocation is leaked.
   allocation; fail closed when the resolver is unavailable or inconsistent.
 - [x] Add a same-transaction final authorization lock for the exact source
   tenant, ID, checksum, available state, and expiry; provision remains unwired.
-- [ ] Preserve roots, cwd, dirty/untracked and binary files, modes, and symlinks
-  under `/workspace/roots/<index>/...`.
+- [x] Preserve roots, cwd, dirty/untracked and binary files, modes, and symlinks
+  under `/workspace/roots/<index>/...` through staged Linux materialization.
 - [ ] Reject traversal, escaping links, devices, sockets, FIFOs, special files,
   duplicate/conflicting paths, and unsafe archive entries.
 - [ ] Bound roots, archive/expanded bytes, files, per-file bytes, path depth, and
