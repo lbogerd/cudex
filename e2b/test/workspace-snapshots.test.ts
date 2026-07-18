@@ -5,8 +5,11 @@ import { Pool, type PoolClient } from 'pg'
 import { Header, type HeaderData } from 'tar'
 import type { ObjectStore } from '../src/blob-store.js'
 import { runMigrations } from '../src/migrate.js'
+import { PostgresObjectReclaimer } from '../src/postgres-object-reclaimer.js'
 import { PostgresDurableState, type CreateLeaseInput, type Lease, type Snapshot, type SnapshotInput,
   type StoredObject } from '../src/postgres-state.js'
+import { canonicalRequestHash, PostgresJournal } from '../src/postgres-store.js'
+import { PostgresWorkspacePreparations } from '../src/postgres-workspace-preparations.js'
 import { ServiceError } from '../src/types.js'
 import { workspaceManifestChecksum } from '../src/workspace-manifest.js'
 import {
@@ -298,6 +301,81 @@ test('live PostgreSQL publication retains tenant-owned logical objects over shar
         ) shared) AS shared_locations
     `)
     assert.deepEqual(counts.rows[0], { objects: '9', references: '9', shared_locations: '2' })
+  } finally {
+    await pool.end(); await admin.query(`DROP SCHEMA ${schema} CASCADE`); await admin.end()
+  }
+})
+
+test('live durable preparation atomically ledgers every object, replays without puts, and reclaims partial failure', {
+  skip: databaseUrl ? false : 'HOSTED_AGENT_TEST_DATABASE_URL is not set',
+}, async () => {
+  const schema = `hosted_agent_workspace_durable_${randomUUID().replaceAll('-', '')}`
+  const admin = new Pool({ connectionString: databaseUrl }); await admin.query(`CREATE SCHEMA ${schema}`)
+  const pool = new Pool({ connectionString: databaseUrl, options: `-c search_path=${schema}`, max: 4 })
+  try {
+    await runMigrations(pool)
+    const state = new PostgresDurableState(pool); const journal = new PostgresJournal(pool)
+    const preparations = new PostgresWorkspacePreparations(pool); const objects = new MemoryObjects()
+    const reclaimer = new PostgresObjectReclaimer(pool, objects)
+    const publisher = new WorkspaceSnapshotPublisher(state, objects, {
+      reclaimer: { reclaimUnreferencedWorkspaceObject: async () => assert.fail('legacy cleanup must not run') },
+      durablePreparation: { journal, preparations, reclaimer },
+    })
+    const identity = { operation: 'provision', idempotencyKey: 'durable-publication', tenantId: 'tenant-a' }
+    const claimed = await journal.claimOperation({ ...identity, workerId: 'publisher-worker',
+      requestHash: canonicalRequestHash(identity) })
+    assert.equal(claimed.kind, 'claimed'); if (claimed.kind !== 'claimed') return
+    const input = { ...baseInput(), fence: { ...identity, generation: claimed.generation, workerId: 'publisher-worker' },
+      expectedSourceChecksum: null }
+    input.toolPolicy = { allowedDomains: [], allowedTools: [] }
+    const [prepared, concurrentReplay] = await Promise.all([
+      publisher.prepareDurableBase(input), publisher.prepareDurableBase(input),
+    ])
+    assert.equal(prepared.kind, 'prepared'); assert.equal(concurrentReplay.kind, 'prepared')
+    assert.equal(objects.puts, 3)
+    assert.equal((await publisher.prepareDurableBase(input)).kind, 'prepared')
+    assert.equal(objects.puts, 3)
+    const counts = await pool.query<{ preparations: string; associations: string; allocations: string; leases: string }>(`
+      SELECT
+        (SELECT count(*)::text FROM hosted_agent_workspace_preparations WHERE state = 'prepared') AS preparations,
+        (SELECT count(*)::text FROM hosted_agent_workspace_preparation_objects) AS associations,
+        (SELECT count(*)::text FROM hosted_agent_operation_allocations
+          WHERE allocation_kind = 'object' AND state = 'allocated') AS allocations,
+        (SELECT count(*)::text FROM hosted_agent_leases) AS leases
+    `)
+    assert.deepEqual(counts.rows[0], { preparations: '1', associations: '3', allocations: '3', leases: '0' })
+    await assert.rejects(publisher.prepareDurableBase({ ...input,
+      expectedSourceChecksum: `sha256:${'a'.repeat(64)}` }),
+    error => error instanceof ServiceError && error.status === 400)
+    assert.equal(objects.puts, 3)
+
+    objects.failAt = objects.puts + 2
+    const failedPublisher = new WorkspaceSnapshotPublisher(state, objects, {
+      reclaimer: { reclaimUnreferencedWorkspaceObject: async () => assert.fail('legacy cleanup must not run') },
+      durablePreparation: { journal, preparations, reclaimer },
+    })
+    const failedIdentity = { operation: 'provision', idempotencyKey: 'durable-partial', tenantId: 'tenant-a' }
+    const failedClaim = await journal.claimOperation({ ...failedIdentity, workerId: 'failed-worker',
+      requestHash: canonicalRequestHash(failedIdentity) })
+    assert.equal(failedClaim.kind, 'claimed'); if (failedClaim.kind !== 'claimed') return
+    const failedInput = { ...baseInput('tenant-a', 'snapshot-failed', 'lease-failed'),
+      fence: { ...failedIdentity, generation: failedClaim.generation, workerId: 'failed-worker' },
+      expectedSourceChecksum: null }
+    failedInput.toolPolicy = { allowedDomains: [], allowedTools: [] }
+    await assert.rejects(failedPublisher.prepareDurableBase(failedInput),
+      error => error instanceof ServiceError && error.status === 503)
+    const failedState = await pool.query<{ state: string; associations: string; reclaimed: string }>(`
+      SELECT preparation.state,
+        (SELECT count(*)::text FROM hosted_agent_workspace_preparation_objects AS object_row
+          WHERE object_row.preparation_id = preparation.preparation_id) AS associations,
+        (SELECT count(*)::text FROM hosted_agent_operation_allocations AS allocation
+          WHERE allocation.operation = 'provision' AND allocation.idempotency_key = 'durable-partial'
+            AND allocation.state = 'reclaimed') AS reclaimed
+      FROM hosted_agent_workspace_preparations AS preparation
+      WHERE preparation.idempotency_key = 'durable-partial'
+    `)
+    assert.deepEqual(failedState.rows[0], { state: 'reclaimed', associations: '1', reclaimed: '1' })
+    assert.equal(objects.values.size, 3)
   } finally {
     await pool.end(); await admin.query(`DROP SCHEMA ${schema} CASCADE`); await admin.end()
   }

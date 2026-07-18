@@ -6,6 +6,7 @@ import {
   type CapturedArchiveManifest,
 } from './archive-manifest.js'
 import type { ObjectStore } from './blob-store.js'
+import type { PostgresObjectReclaimer } from './postgres-object-reclaimer.js'
 import type {
   CreateLeaseInput,
   Lease,
@@ -14,6 +15,18 @@ import type {
   SnapshotInput,
   StoredObject,
 } from './postgres-state.js'
+import type { PostgresJournal } from './postgres-store.js'
+import {
+  canonicalWorkspacePreparationIntent,
+  workspacePreparationId,
+  workspacePreparationObjectId,
+  type PreparationFence,
+  type PostgresWorkspacePreparations,
+  type WorkspacePreparation,
+  type WorkspacePreparationIntent,
+  type WorkspacePreparationObjectDescriptor,
+  type WorkspacePreparationObjectPurpose,
+} from './postgres-workspace-preparations.js'
 import { ServiceError } from './types.js'
 import { WorkspaceManifestError, type WorkspaceManifest } from './workspace-manifest.js'
 
@@ -34,6 +47,20 @@ export interface AppendWorkspaceCheckpointInput {
   tenantId: string
   leaseId: string
   snapshot: WorkspaceSnapshotArchiveInput
+}
+
+export interface PrepareDurableBaseWorkspaceSnapshotInput extends CreateBaseWorkspaceSnapshotInput {
+  fence: PreparationFence
+  expectedSourceChecksum: string | null
+}
+
+export interface PreparedDurableBaseWorkspaceSnapshot {
+  kind: 'prepared' | 'committed'
+  preparation: WorkspacePreparation
+  intent: WorkspacePreparationIntent
+  snapshotInput: Readonly<SnapshotInput>
+  manifest: WorkspaceManifest
+  contentObjects: readonly PublishedWorkspaceContent[]
 }
 
 export interface PublishedWorkspaceContent {
@@ -65,6 +92,13 @@ export interface WorkspaceSnapshotReclaimer {
 export interface WorkspaceSnapshotPublisherOptions {
   archiveLimits?: ArchiveManifestLimits
   reclaimer: WorkspaceSnapshotReclaimer
+  durablePreparation?: {
+    journal: Pick<PostgresJournal, 'recordAllocation'>
+    preparations: Pick<PostgresWorkspacePreparations,
+      'createOrReplay' | 'lockObjectForPublication' | 'associateObject' | 'markPrepared' | 'beginAbort'>
+    reclaimer: Pick<PostgresObjectReclaimer, 'reclaimPreparationObjects'>
+    cleanupBatchSize?: number
+  }
 }
 
 type DurableWorkspaceState = Pick<PostgresDurableState,
@@ -126,6 +160,11 @@ function logicalObjectId(tenantId: string, snapshotId: string, kind: StoredObjec
   return `workspace_object_${createHash('sha256')
     .update(tenantId).update('\0').update(snapshotId).update('\0').update(kind).update('\0').update(objectChecksum)
     .digest('hex')}`
+}
+
+function preparationPurpose(kind: StoredObject['kind']): WorkspacePreparationObjectPurpose {
+  if (kind === 'workspace_archive' || kind === 'manifest' || kind === 'content_blob') return kind
+  throw new Error('invalid prepared workspace object kind')
 }
 
 function verifyRegisteredObject(actual: StoredObject, expected: StoredObject): void {
@@ -205,6 +244,73 @@ export class WorkspaceSnapshotPublisher {
     }
   }
 
+  async prepareDurableBase(input: PrepareDurableBaseWorkspaceSnapshotInput): Promise<PreparedDurableBaseWorkspaceSnapshot> {
+    const coordinator = this.options.durablePreparation
+    if (!coordinator) throw new ServiceError(503, 'durable workspace preparation is unavailable')
+    if (input.fence.operation !== 'provision') throw new ServiceError(400, 'invalid workspace preparation operation')
+    const tenantId = opaque('tenant ID', input.tenantId)
+    if (tenantId !== input.fence.tenantId) throw new ServiceError(400, 'workspace preparation tenant mismatch')
+    const preparationId = workspacePreparationId(input.fence)
+    const publication = await this.prepare(tenantId, input.snapshot, preparationId)
+    const descriptors = this.describePreparationObjects(publication.objects)
+    let intent: WorkspacePreparationIntent
+    try {
+      intent = canonicalWorkspacePreparationIntent({
+        tenantId, leaseId: input.leaseId, environmentId: input.environmentId, agentId: input.agentId,
+        ownerAgentId: input.ownerAgentId ?? null, ownerLeaseId: input.ownerLeaseId ?? null,
+        sourceSnapshotId: input.sourceSnapshotId ?? null, expectedSourceChecksum: input.expectedSourceChecksum,
+        providerSandboxId: input.providerSandboxId, sandboxTemplate: input.sandboxTemplate,
+        cwdUri: input.cwdUri, workspaceRootUris: [...input.workspaceRootUris],
+        toolPolicy: structuredClone(input.toolPolicy), policyVersion: input.policyVersion,
+        snapshotId: publication.snapshotInput.snapshotId,
+        providerSnapshotId: publication.snapshotInput.providerSnapshotId,
+        snapshotExpiresAt: publication.snapshotInput.expiresAt?.toISOString() ?? null,
+        archiveChecksum: publication.objects.find(plan => plan.durable.kind === 'workspace_archive')!.durable.checksum,
+        manifestChecksum: publication.captured.manifestChecksum,
+      }).intent
+    } catch { throw new ServiceError(400, 'invalid durable workspace preparation') }
+    const result = (verified: WorkspacePreparation): PreparedDurableBaseWorkspaceSnapshot => ({
+      kind: verified.state === 'committed' ? 'committed' : 'prepared', preparation: verified, intent,
+      snapshotInput: structuredClone(publication.snapshotInput),
+      manifest: structuredClone(publication.captured.manifest),
+      contentObjects: publication.contentObjects.map(content => ({ ...content })),
+    })
+    let abortEligible = false
+    try {
+      const preparation = await coordinator.preparations.createOrReplay({
+        ...input.fence, preparationId, intent, expectedObjectCount: descriptors.length,
+      })
+      if (preparation.state === 'reclaim_pending') {
+        await this.resumePreparationCleanup(input.fence, preparationId, coordinator)
+      }
+      if (preparation.state === 'reclaimed') throw new ServiceError(409, 'workspace preparation was aborted')
+      if (preparation.state === 'publishing') {
+        abortEligible = true
+        await this.publishPreparationObjects(input.fence, preparationId, intent,
+          publication.objects, descriptors, coordinator)
+      }
+      const verified = await coordinator.preparations.markPrepared(
+        input.fence, preparationId, intent, descriptors)
+      return result(verified)
+    } catch (error) {
+      if (abortEligible) {
+        try {
+          const completedByPeer = await coordinator.preparations.markPrepared(
+            input.fence, preparationId, intent, descriptors)
+          return result(completedByPeer)
+        } catch { /* The exact preparation is still incomplete, so this owner may abort it. */ }
+        try {
+          const aborted = await coordinator.preparations.beginAbort(input.fence, preparationId)
+          if (aborted.state === 'reclaim_pending') {
+            await this.resumePreparationCleanup(input.fence, preparationId, coordinator)
+          }
+        } catch { throw new ServiceError(503, 'workspace snapshot cleanup pending') }
+      }
+      if (error instanceof ServiceError) throw error
+      throw new ServiceError(503, 'workspace snapshot service unavailable')
+    }
+  }
+
   async appendCheckpoint(input: AppendWorkspaceCheckpointInput): Promise<PublishedWorkspaceSnapshot> {
     const tenantId = opaque('tenant ID', input.tenantId)
     const leaseId = opaque('lease ID', input.leaseId)
@@ -221,7 +327,8 @@ export class WorkspaceSnapshotPublisher {
     }
   }
 
-  private async prepare(tenantId: string, input: WorkspaceSnapshotArchiveInput): Promise<{
+  private async prepare(tenantId: string, input: WorkspaceSnapshotArchiveInput,
+    preparationId?: string): Promise<{
     captured: CapturedArchiveManifest
     snapshotInput: SnapshotInput
     objects: PlannedObject[]
@@ -248,7 +355,10 @@ export class WorkspaceSnapshotPublisher {
           bytes: Uint8Array.from(bytes),
           physicalObjectId,
           durable: {
-            objectId: logicalObjectId(tenantId, snapshotId, kind, objectChecksum), tenantId, kind,
+            objectId: preparationId === undefined
+              ? logicalObjectId(tenantId, snapshotId, kind, objectChecksum)
+              : workspacePreparationObjectId(preparationId, preparationPurpose(kind), objectChecksum),
+            tenantId, kind,
             storageBucket: '', storageKey: '', checksum: objectChecksum, sizeBytes: bytes.byteLength,
             state: 'available', expiresAt,
           },
@@ -307,6 +417,61 @@ export class WorkspaceSnapshotPublisher {
         verifyRegisteredObject(await this.state.registerObject(plan.durable, client), plan.durable)
       })
     }
+  }
+
+  private describePreparationObjects(plans: PlannedObject[]): WorkspacePreparationObjectDescriptor[] {
+    for (const plan of plans) {
+      const location = this.objects.location(plan.physicalObjectId)
+      plan.durable.storageBucket = opaque('storage bucket', location.storageBucket)
+      plan.durable.storageKey = opaque('storage key', location.storageKey, 2048)
+    }
+    plans.sort((left, right) => {
+      const leftKey = JSON.stringify([left.durable.storageBucket, left.durable.storageKey, left.durable.objectId])
+      const rightKey = JSON.stringify([right.durable.storageBucket, right.durable.storageKey, right.durable.objectId])
+      return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0
+    })
+    return plans.map(plan => ({
+      objectId: plan.durable.objectId, purpose: preparationPurpose(plan.durable.kind),
+      checksum: plan.durable.checksum, sizeBytes: plan.durable.sizeBytes,
+      expiresAt: plan.durable.expiresAt === null ? null : new Date(plan.durable.expiresAt),
+      storageBucket: plan.durable.storageBucket, storageKey: plan.durable.storageKey,
+    }))
+  }
+
+  private async publishPreparationObjects(fence: PreparationFence, preparationId: string,
+    intent: WorkspacePreparationIntent, plans: PlannedObject[], descriptors: WorkspacePreparationObjectDescriptor[],
+    coordinator: NonNullable<WorkspaceSnapshotPublisherOptions['durablePreparation']>): Promise<void> {
+    for (let index = 0; index < plans.length; index++) {
+      const plan = plans[index]!; const descriptor = descriptors[index]!
+      await this.state.withObjectLocationLock(descriptor.storageBucket, descriptor.storageKey, async client => {
+        const existing = await coordinator.preparations.lockObjectForPublication(
+          fence, preparationId, intent, descriptor, client)
+        if (existing) return
+        const storedId = await this.objects.put(plan.bytes)
+        if (storedId !== plan.physicalObjectId) throw new Error('object store returned a non-content-addressed identifier')
+        const location = this.objects.location(storedId)
+        if (location.storageBucket !== descriptor.storageBucket || location.storageKey !== descriptor.storageKey) {
+          throw new Error('object store location changed during publication')
+        }
+        verifyRegisteredObject(await this.state.registerObject(plan.durable, client), plan.durable)
+        const allocation = await coordinator.journal.recordAllocation(fence, fence.generation, fence.workerId, {
+          kind: 'object', resourceId: plan.durable.objectId,
+          metadata: { preparationId, purpose: descriptor.purpose },
+        }, client)
+        await coordinator.preparations.associateObject({ ...fence, preparationId,
+          allocationId: allocation.allocationId, objectId: descriptor.objectId, purpose: descriptor.purpose }, client)
+      })
+    }
+  }
+
+  private async resumePreparationCleanup(fence: PreparationFence, preparationId: string,
+    coordinator: NonNullable<WorkspaceSnapshotPublisherOptions['durablePreparation']>): Promise<never> {
+    const limit = coordinator.cleanupBatchSize ?? 100
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) {
+      throw new ServiceError(503, 'workspace snapshot cleanup pending')
+    }
+    await coordinator.reclaimer.reclaimPreparationObjects(fence, preparationId, limit)
+    throw new ServiceError(503, 'workspace snapshot cleanup pending')
   }
 
   private async cleanup(tenantId: string, plans: PlannedObject[]): Promise<void> {

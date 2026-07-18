@@ -137,6 +137,9 @@ tickets always fail, and secrets never enter durable or observable state.
 - [x] Add an unwired tenant-safe workspace snapshot publisher that validates
   provider archives, stores exact archive/manifest/content objects, and retains
   every content blob through the atomic base/checkpoint snapshot transaction.
+- [x] Add a provision-fenced durable preparation path that plans before writes,
+  atomically registers each successful put with its allocation/association,
+  skips exact replay puts, and resumes bounded preparation-scoped cleanup.
 - [ ] On restore, verify and overlay workspace state, remove inherited runtime
   identity, restart exec, and rekey transport credentials.
 - [ ] On child creation, atomically snapshot the owner, use a temporary capture,

@@ -495,6 +495,22 @@ protection, deduplicated files, and cross-tenant physical sharing; PostgreSQL 17
 coverage proves six distinct logical objects and snapshot references over the
 shared archive/content locations for two tenants.
 
+The publisher now has a separate unwired durable base-preparation entry point.
+It accepts only an owned `provision` fence whose tenant matches the complete
+canonical intent, derives preparation-scoped logical IDs, and finishes archive
+parsing, manifest capture, quota checks, locator resolution, and intent
+validation before the first write. For each missing object it holds the exact
+physical-location plus operation/preparation locks while put, logical
+registration, allocation recording, and association commit as one database
+unit. Exact concurrent or later replay verifies the full descriptor set and
+performs no duplicate put. Partial failure moves only that preparation into
+reclamation, attempts a bounded scoped batch, and exposes cleanup-pending so an
+aborted replay can continue it. A PostgreSQL live test proves three exact
+registrations/allocations/associations, concurrent no-put replay, no lease
+attachment, and terminal cleanup after a partial publication failure. A put
+whose database transaction never commits still has no safe durable identity and
+remains part of the explicitly open aged object-store inventory sweep.
+
 ### Multi-replica operation journal primitives
 
 The PostgreSQL layer now exposes atomic operation admission over the unique
