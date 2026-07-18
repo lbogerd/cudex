@@ -72,8 +72,8 @@ node e2b/scripts/live-lifecycle-canary.mjs <template_id>
 The external TypeScript control plane is under `e2b/src`. Build and run its
 provider-independent contract/failure suite with `npm test --prefix e2b`. Runtime
 configuration is supplied through `HOSTED_AGENT_*`; see `e2b/src/main.ts` for the
-small required set. Architecture results are recorded in
-[`ARCHITECTURE_DECISIONS.md`](ARCHITECTURE_DECISIONS.md).
+small required set. Architecture results and remaining production work are in
+[`../ARCHIVE.md`](../ARCHIVE.md) and [`../TODO.md`](../TODO.md).
 
 ## Overrides
 
