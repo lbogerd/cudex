@@ -101,6 +101,7 @@ mod external_auth;
 mod filters;
 mod fs_watch;
 mod fuzzy_file_search;
+mod hosted_agent_patch_notifications;
 mod image_url;
 pub mod in_process;
 mod mcp_refresh;
@@ -865,6 +866,7 @@ pub async fn run_main_with_transport_options(
             plugin_startup_tasks: runtime_options.plugin_startup_tasks,
         }));
         let mut thread_created_rx = processor.thread_created_receiver();
+        let mut hosted_agent_patch_available_rx = processor.hosted_agent_patch_available_receiver();
         let mut running_turn_count_rx = processor.subscribe_running_assistant_turn_count();
         let mut connections = HashMap::<ConnectionId, ConnectionState>::new();
         let mut connection_cleanup_tasks = ConnectionCleanupTasks::new();
@@ -873,6 +875,7 @@ pub async fn run_main_with_transport_options(
         let transport_shutdown_token = transport_shutdown_token.clone();
         async move {
             let mut listen_for_threads = true;
+            let mut listen_for_hosted_agent_patches = true;
             let mut shutdown_state = ShutdownState::default();
             let exit_reason = loop {
                 let running_turn_count = {
@@ -1105,6 +1108,19 @@ pub async fn run_main_with_transport_options(
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                                 listen_for_threads = false;
+                            }
+                        }
+                    }
+                    available = hosted_agent_patch_available_rx.recv(), if listen_for_hosted_agent_patches => {
+                        match available {
+                            Ok(available) => {
+                                processor.send_hosted_agent_patch_available(available).await;
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                warn!(skipped, "hosted-agent patch notification receiver lagged");
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                listen_for_hosted_agent_patches = false;
                             }
                         }
                     }

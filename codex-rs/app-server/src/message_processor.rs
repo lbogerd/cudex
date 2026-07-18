@@ -16,11 +16,13 @@ use crate::extensions::thread_extensions;
 use crate::external_agent_migration::ExternalAgentConfigRequestProcessor;
 use crate::external_agent_migration::ExternalAgentConfigRequestProcessorArgs;
 use crate::fs_watch::FsWatchManager;
+use crate::hosted_agent_patch_notifications::send_hosted_agent_patch_available;
 use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::ConnectionRequestId;
 use crate::outgoing_message::OutgoingMessageSender;
 use crate::outgoing_message::RequestContext;
 use crate::request_processors::AccountRequestProcessor;
+use crate::request_processors::AgentRequestProcessor;
 use crate::request_processors::AppsRequestProcessor;
 use crate::request_processors::CatalogRequestProcessor;
 use crate::request_processors::CommandExecRequestProcessor;
@@ -101,9 +103,12 @@ fn deserialize_client_request(
 
 pub(crate) struct MessageProcessor {
     outgoing: Arc<OutgoingMessageSender>,
+    thread_manager: Arc<ThreadManager>,
+    thread_state_manager: ThreadStateManager,
     models_refresh_worker: ModelsRefreshWorker,
     skills_watcher: Arc<SkillsWatcher>,
     account_processor: AccountRequestProcessor,
+    agent_processor: AgentRequestProcessor,
     apps_processor: AppsRequestProcessor,
     catalog_processor: CatalogRequestProcessor,
     command_exec_processor: CommandExecRequestProcessor,
@@ -361,6 +366,7 @@ impl MessageProcessor {
             config_manager.clone(),
             Arc::clone(&environment_manager_for_requests),
         );
+        let agent_processor = AgentRequestProcessor::new(Arc::clone(&thread_manager));
         let process_exec_processor = ProcessExecRequestProcessor::new(
             outgoing.clone(),
             Arc::clone(&environment_manager_for_requests),
@@ -438,7 +444,7 @@ impl MessageProcessor {
             Arc::clone(&config),
             config_manager.clone(),
             pending_thread_unloads,
-            thread_state_manager,
+            thread_state_manager.clone(),
             thread_watch_manager,
             thread_list_state_permit,
             Arc::clone(&skills_watcher),
@@ -481,9 +487,12 @@ impl MessageProcessor {
 
         Self {
             outgoing,
+            thread_manager,
+            thread_state_manager,
             models_refresh_worker,
             skills_watcher,
             account_processor,
+            agent_processor,
             apps_processor,
             catalog_processor,
             command_exec_processor,
@@ -645,6 +654,24 @@ impl MessageProcessor {
 
     pub(crate) fn thread_created_receiver(&self) -> broadcast::Receiver<ThreadId> {
         self.thread_processor.thread_created_receiver()
+    }
+
+    pub(crate) fn hosted_agent_patch_available_receiver(
+        &self,
+    ) -> broadcast::Receiver<codex_core::HostedAgentPatchAvailable> {
+        self.thread_manager.subscribe_hosted_agent_patch_available()
+    }
+
+    pub(crate) async fn send_hosted_agent_patch_available(
+        &self,
+        available: codex_core::HostedAgentPatchAvailable,
+    ) {
+        send_hosted_agent_patch_available(
+            Arc::clone(&self.outgoing),
+            self.thread_state_manager.clone(),
+            available,
+        )
+        .await;
     }
 
     pub(crate) async fn send_initialize_notifications_to_connection(
@@ -880,6 +907,11 @@ impl MessageProcessor {
             ClientRequest::Initialize { .. } => {
                 panic!("Initialize should be handled before initialized request dispatch");
             }
+            ClientRequest::AgentPatchApply { params, .. } => self
+                .agent_processor
+                .patch_apply(params)
+                .await
+                .map(|response| Some(response.into())),
             ClientRequest::ConfigRead { params, .. } => self
                 .config_processor
                 .read(params)

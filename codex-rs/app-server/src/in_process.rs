@@ -108,6 +108,7 @@ fn server_notification_requires_delivery(notification: &ServerNotification) -> b
         ServerNotification::TurnCompleted(_)
             | ServerNotification::ThreadSettingsUpdated(_)
             | ServerNotification::ExternalAgentConfigImportCompleted(_)
+            | ServerNotification::AgentPatchAvailable(_)
     )
 }
 
@@ -452,8 +453,11 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                 plugin_startup_tasks: crate::PluginStartupTasks::Start,
             }));
             let mut thread_created_rx = processor.thread_created_receiver();
+            let mut hosted_agent_patch_available_rx =
+                processor.hosted_agent_patch_available_receiver();
             let session = Arc::new(ConnectionSessionState::new());
             let mut listen_for_threads = true;
+            let mut listen_for_hosted_agent_patches = true;
 
             loop {
                 tokio::select! {
@@ -515,6 +519,19 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                                 listen_for_threads = false;
+                            }
+                        }
+                    }
+                    available = hosted_agent_patch_available_rx.recv(), if listen_for_hosted_agent_patches => {
+                        match available {
+                            Ok(available) => {
+                                processor.send_hosted_agent_patch_available(available).await;
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                warn!(skipped, "hosted-agent patch notification receiver lagged");
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                listen_for_hosted_agent_patches = false;
                             }
                         }
                     }
@@ -740,6 +757,8 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_app_server_protocol::AgentPatchArtifactMetadata;
+    use codex_app_server_protocol::AgentPatchAvailableNotification;
     use codex_app_server_protocol::ClientInfo;
     use codex_app_server_protocol::ConfigRequirementsReadResponse;
     use codex_app_server_protocol::ExternalAgentConfigImportCompletedNotification;
@@ -914,6 +933,19 @@ mod tests {
                     item_type_results: Vec::new(),
                 },
             )
+        ));
+        assert!(server_notification_requires_delivery(
+            &ServerNotification::AgentPatchAvailable(AgentPatchAvailableNotification {
+                thread_id: "thread-1".to_string(),
+                artifact: AgentPatchArtifactMetadata {
+                    artifact_id: "artifact-1".to_string(),
+                    agent_id: "agent-1".to_string(),
+                    base_snapshot_id: "snapshot-1".to_string(),
+                    checksum: "sha256:abc".to_string(),
+                    changed_files: 1,
+                    size_bytes: 42,
+                },
+            })
         ));
     }
 }
