@@ -54,7 +54,7 @@ test('child gets an isolated spawn-time workspace capture', async () => {
   assert.deepEqual(childSandbox.bytes, ownerSandbox.bytes); childSandbox.bytes[0] = childSandbox.bytes[0]! ^ 1; assert.notDeepEqual(childSandbox.bytes, ownerSandbox.bytes)
 })
 
-for (const point of ['upload', 'start', 'snapshot']) test(`failure at ${point} cleans provider allocation`, async () => {
+for (const point of ['upload', 'start', 'probe', 'snapshot']) test(`failure at ${point} cleans provider allocation`, async () => {
   const context = await fixture(); context.provider.failAt = point; await assert.rejects(context.service.provision(context.request), new RegExp(`injected ${point}`)); assert.deepEqual(context.provider.live(), [])
 })
 

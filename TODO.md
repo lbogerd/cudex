@@ -14,6 +14,8 @@ production backend. Stable decisions, evidence, and wire schemas are in
   primitives.
 - [x] Atomically bind a committed lease to its owned operation and adopt only
   explicitly selected allocations under worker/generation fencing.
+- [x] Add fail-closed provider health probing, tenant-scoped managed sandbox
+  inventory, scoped snapshot inventory/deletion, and observable cleanup errors.
 - [x] Add tenant-scoped PostgreSQL repositories for immutable source snapshots,
   leases, durable snapshots, object/snapshot references, and purpose-bound
   single-use ticket hashes.
@@ -72,7 +74,7 @@ failed upload/extraction allocations without Git or shared host paths.
   sessions/secrets.
 - [ ] Keep provider credentials out of URLs, metadata, commands, persistence,
   errors, logs, traces, and metrics.
-- [ ] Health-probe exec before provision/reconnect success.
+- [x] Health-probe exec before provision/reconnect success.
 - [x] Redact unexpected HTTP errors and hard-bound HTTP bodies plus gateway
   payloads, connections, pending queues, and backpressure.
 - [ ] Add structured redacted logs, audit events, metrics, rate limits, retry

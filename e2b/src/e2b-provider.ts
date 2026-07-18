@@ -1,13 +1,44 @@
 import { Sandbox } from 'e2b'
-import type { ProviderAdapter, CreatedSandbox } from './provider.js'
+import {
+  ProviderCapabilityError,
+  type CreatedSandbox,
+  type ManagedSandbox,
+  type ManagedSandboxQuery,
+  type ManagedSnapshot,
+  type ProviderAdapter,
+  type ProviderSnapshotOptions,
+  type ProviderSnapshotQuery,
+} from './provider.js'
 
 interface Connection { apiKey: string; apiUrl?: string; domain?: string; validateApiKey?: boolean; requestTimeoutMs: number }
+
+function validateOpaque(label: string, value: string, maxBytes = 512): void {
+  if (!value.trim() || Buffer.byteLength(value) > maxBytes || /[\u0000-\u001f\u007f]/u.test(value)) throw new Error(`invalid ${label}`)
+}
+
+function validateMetadata(metadata: Record<string, string>, requireOwnershipMarker = false): void {
+  if (requireOwnershipMarker && (!metadata.managedBy || !metadata.tenantId)) {
+    throw new ProviderCapabilityError('managed sandbox inventory', 'managedBy and tenantId metadata filters are required')
+  }
+  const entries = Object.entries(metadata)
+  if (entries.length === 0 || entries.length > 32) throw new Error('invalid provider metadata')
+  for (const [key, value] of entries) {
+    if (!/^[A-Za-z0-9_.-]{1,128}$/u.test(key) || Buffer.byteLength(value) > 512 || /[\u0000-\u001f\u007f]/u.test(value)) {
+      throw new Error('invalid provider metadata')
+    }
+    if (/(?:api.?key|credential|password|secret|token|url)/iu.test(key) || /(?:[?&]ticket=|:\/\/[^/\s]*@)/iu.test(value)) {
+      throw new Error('provider metadata must not contain credentials or connection material')
+    }
+  }
+}
+
 export class E2BProvider implements ProviderAdapter {
   private readonly sandboxes = new Map<string, Sandbox>()
   constructor(private readonly connection: Connection, private readonly timeoutMs = 120_000) {}
   async create(templateId: string, metadata: Record<string, string>): Promise<CreatedSandbox> { return this.createFrom(templateId, metadata) }
   async restore(snapshotId: string, metadata: Record<string, string>): Promise<CreatedSandbox> { return this.createFrom(snapshotId, metadata) }
   private async createFrom(template: string, metadata: Record<string, string>): Promise<CreatedSandbox> {
+    validateOpaque('provider template', template); validateMetadata(metadata)
     const sandbox = await Sandbox.create(template, { ...this.connection, metadata, timeoutMs: this.timeoutMs, secure: true, lifecycle: { onTimeout: 'pause', autoResume: false } })
     this.sandboxes.set(sandbox.sandboxId, sandbox); return this.describe(sandbox)
   }
@@ -32,9 +63,73 @@ export class E2BProvider implements ProviderAdapter {
     const sandbox = await this.handle(sandboxId)
     await sandbox.commands.run('pkill -x codex || true; codex exec-server --listen ws://0.0.0.0:22101', { background: true, timeoutMs: 10_000 })
   }
-  async snapshot(sandboxId: string): Promise<string> { return (await (await this.handle(sandboxId)).createSnapshot()).snapshotId }
+  async probeExecServer(sandboxId: string): Promise<void> {
+    const sandbox = await this.handle(sandboxId)
+    const result = await sandbox.commands.run(
+      "for attempt in 1 2 3 4 5 6 7 8 9 10; do (exec 3<>/dev/tcp/127.0.0.1/22101) >/dev/null 2>&1 && exit 0; sleep 0.1; done; exit 1",
+      { user: 'root', timeoutMs: 5_000 },
+    )
+    if (result.exitCode !== 0) throw new Error('exec server health probe failed')
+  }
+  async snapshot(sandboxId: string, options: ProviderSnapshotOptions = {}): Promise<string> {
+    if (options.name !== undefined) validateOpaque('provider snapshot name', options.name)
+    return (await (await this.handle(sandboxId)).createSnapshot(
+      options.name === undefined ? undefined : { name: options.name },
+    )).snapshotId
+  }
+  async listManagedSandboxes(query: ManagedSandboxQuery): Promise<ManagedSandbox[]> {
+    validateMetadata(query.metadata, true)
+    const paginator = Sandbox.list({ ...this.connection, query: { metadata: query.metadata }, limit: 100 })
+    const resources: ManagedSandbox[] = []
+    while (paginator.hasNext) {
+      const page = await paginator.nextItems()
+      for (const sandbox of page) {
+        if (resources.length >= 10_000) throw new Error('managed sandbox inventory limit exceeded')
+        validateOpaque('provider sandbox ID', sandbox.sandboxId)
+        validateOpaque('provider template ID', sandbox.templateId)
+        validateMetadata(sandbox.metadata)
+        resources.push({
+          sandboxId: sandbox.sandboxId,
+          templateId: sandbox.templateId,
+          metadata: { ...sandbox.metadata },
+          state: sandbox.state,
+          startedAt: new Date(sandbox.startedAt),
+          endAt: new Date(sandbox.endAt),
+        })
+      }
+    }
+    return resources
+  }
+  async listSnapshots(query: ProviderSnapshotQuery): Promise<ManagedSnapshot[]> {
+    if (query.sandboxId === undefined && query.name === undefined) {
+      throw new ProviderCapabilityError('managed snapshot inventory', 'E2B cannot filter snapshots by service metadata; sandboxId or deterministic name is required')
+    }
+    if (query.sandboxId !== undefined) validateOpaque('provider sandbox ID', query.sandboxId)
+    if (query.name !== undefined) validateOpaque('provider snapshot name', query.name)
+    const paginator = Sandbox.listSnapshots({ ...this.connection,
+      ...(query.sandboxId === undefined ? {} : { sandboxId: query.sandboxId }),
+      ...(query.name === undefined ? {} : { name: query.name }),
+      limit: 100 })
+    const resources: ManagedSnapshot[] = []
+    while (paginator.hasNext) {
+      const page = await paginator.nextItems()
+      for (const snapshot of page) {
+        if (resources.length >= 10_000) throw new Error('managed snapshot inventory limit exceeded')
+        validateOpaque('provider snapshot ID', snapshot.snapshotId)
+        for (const name of snapshot.names) validateOpaque('provider snapshot name', name)
+        resources.push({ snapshotId: snapshot.snapshotId, names: [...snapshot.names] })
+      }
+    }
+    return resources
+  }
+  async deleteSnapshot(snapshotId: string): Promise<boolean> {
+    validateOpaque('provider snapshot ID', snapshotId)
+    return Sandbox.deleteSnapshot(snapshotId, this.connection)
+  }
   async kill(sandboxId: string): Promise<void> {
-    this.sandboxes.delete(sandboxId); await Sandbox.kill(sandboxId, this.connection).catch(() => false)
+    validateOpaque('provider sandbox ID', sandboxId)
+    await Sandbox.kill(sandboxId, this.connection)
+    this.sandboxes.delete(sandboxId)
   }
   private describe(sandbox: Sandbox): CreatedSandbox { return { sandboxId: sandbox.sandboxId, rawExecUrl: `wss://${sandbox.getHost(22101)}` } }
   private async handle(id: string): Promise<Sandbox> { return this.sandboxes.get(id) ?? Sandbox.connect(id, { ...this.connection, timeoutMs: this.timeoutMs }) }

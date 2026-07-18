@@ -82,6 +82,7 @@ export class ControlPlane {
         }
         sandboxId = created.sandboxId
         await this.provider.startExecServer(sandboxId)
+        await this.provider.probeExecServer(sandboxId)
         const workspaceArchiveId = await this.blobs.put(await this.provider.exportWorkspace(sandboxId)); const providerSnapshotId = await this.provider.snapshot(sandboxId); const snapshotId = opaque('snapshot')
         const lease: LeaseRecord = { leaseId, environmentId, sandboxId, agentId: request.agentId, ownerAgentId: request.ownerAgentId,
           template: request.sandboxTemplate, cwd, workspaceRoots: roots, baseSnapshotId: snapshotId, latestSnapshotId: snapshotId, state: 'active', toolPolicy: defaultPolicy }
@@ -94,7 +95,11 @@ export class ControlPlane {
   async reconnect(request: ReconnectRequest): Promise<ProvisionedAgent> {
     return this.idempotent('reconnect', request.idempotencyKey, request, async () => {
       const lease = await this.activeLease(request.leaseId)
-      try { await this.provider.connect(lease.sandboxId); await this.provider.startExecServer(lease.sandboxId) }
+      try {
+        await this.provider.connect(lease.sandboxId)
+        await this.provider.startExecServer(lease.sandboxId)
+        await this.provider.probeExecServer(lease.sandboxId)
+      }
       catch { throw new ServiceError(404, 'lease missing') }
       return this.response(lease)
     })

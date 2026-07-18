@@ -245,6 +245,27 @@ and removes empty connection sets. Focused race, rejection, redaction, payload,
 buffer, and connection-limit tests increased the provider-independent suite to
 20 passes with only the optional live PostgreSQL test skipped.
 
+### Provider lifecycle and reconciliation capabilities
+
+The provider boundary now supports a fail-closed loopback exec-server probe,
+managed sandbox inventory scoped by both service and tenant metadata, snapshot
+inventory scoped by a known source sandbox or deterministic name, idempotent
+snapshot deletion, and optional deterministic snapshot names. Inventory results,
+metadata, identifiers, names, and collection sizes are bounded and validated;
+connection material is never returned. E2B cannot filter snapshots by arbitrary
+metadata, so unscoped snapshot inventory raises an explicit capability error
+instead of scanning unrelated resources.
+
+Provider create/restore rejects credential-like metadata and malformed template
+or metadata bounds. Sandbox kill no longer converts provider outages into false
+success: not-found remains idempotent, while transport/provider failure remains
+observable for reconciliation retry. Provision and reconnect now require the
+exec probe after startup and before returning connection material; injected probe
+failure cleans the provisioned sandbox. Fifteen focused control-plane/provider
+tests cover success, fail-closed probe behavior, scoped inventories, snapshot
+deletion, and cleanup error propagation. Continuous journal reconciliation and
+provider-orphan adoption/reclamation remain to be wired.
+
 ### Development ingress hardening
 
 The co-located path bridge remains unavailable outside explicit development
