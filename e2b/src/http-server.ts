@@ -5,6 +5,8 @@ import { timingSafeEqual } from 'node:crypto'
 import type { ControlPlane } from './service.js'
 import { ServiceError } from './types.js'
 import type { ExecGateway } from './gateway.js'
+import type { AuthenticatedSourceSnapshotApi } from './source-snapshot-api.js'
+import type { AuthenticatedTenant } from './source-snapshots.js'
 import {
   validateCheckpointRequest,
   validateCheckpointResponse,
@@ -21,8 +23,15 @@ interface ServerOptions {
   tlsCertPath?: string
   tlsKeyPath?: string
   allowInsecureHttp?: boolean
+  sourceSnapshots?: {
+    principal: AuthenticatedTenant
+    api: Pick<AuthenticatedSourceSnapshotApi, 'create'>
+    maxArchiveBytes: number
+  }
 }
 const maxRequestBytes = 1024 * 1024
+const maxSourceMetadataBytes = 64 * 1024
+export const sourceSnapshotContentType = 'application/vnd.codex.source-snapshot.v1'
 const routes = new Map([
   ['/v1/agents/provision', 'provision'], ['/v1/agents/reconnect', 'reconnect'],
   ['/v1/agents/checkpoint', 'checkpoint'], ['/v1/agents/release', 'release'],
@@ -53,30 +62,70 @@ function authorized(header: string | undefined, token: string): boolean {
   return supplied.length === expected.length && timingSafeEqual(supplied, expected)
 }
 async function body(request: IncomingMessage): Promise<unknown> {
+  const bytes = await boundedBody(request, maxRequestBytes)
+  try { return JSON.parse(bytes.toString('utf8')) }
+  catch { throw new ServiceError(400, 'invalid JSON') }
+}
+
+async function boundedBody(request: IncomingMessage, maximum: number): Promise<Buffer> {
   const contentLength = request.headers['content-length']
   if (contentLength !== undefined) {
     if (!/^\d+$/.test(contentLength)) throw new ServiceError(400, 'invalid content length')
-    if (Number(contentLength) > maxRequestBytes) throw new ServiceError(413, 'request too large')
+    if (Number(contentLength) > maximum) throw new ServiceError(413, 'request too large')
   }
   const chunks: Buffer[] = []; let size = 0; let oversized = false
   for await (const chunk of request) {
     size += chunk.length
-    if (size > maxRequestBytes) oversized = true
+    if (size > maximum) oversized = true
     else if (!oversized) chunks.push(chunk)
   }
   if (oversized) throw new ServiceError(413, 'request too large')
-  try { return JSON.parse(Buffer.concat(chunks).toString('utf8')) }
-  catch { throw new ServiceError(400, 'invalid JSON') }
+  return Buffer.concat(chunks)
+}
+
+function sourceEnvelope(bytes: Buffer): { metadata: unknown; archive: Uint8Array } {
+  if (bytes.byteLength < 5) throw new ServiceError(400, 'invalid source snapshot envelope')
+  const metadataLength = bytes.readUInt32BE(0)
+  if (metadataLength === 0 || metadataLength > maxSourceMetadataBytes || metadataLength > bytes.byteLength - 5) {
+    throw new ServiceError(400, 'invalid source snapshot envelope')
+  }
+  const metadataBytes = bytes.subarray(4, 4 + metadataLength)
+  const metadataText = metadataBytes.toString('utf8')
+  if (!Buffer.from(metadataText, 'utf8').equals(metadataBytes)) throw new ServiceError(400, 'invalid source snapshot metadata')
+  let metadata: unknown
+  try { metadata = JSON.parse(metadataText) } catch { throw new ServiceError(400, 'invalid source snapshot metadata') }
+  return { metadata, archive: Uint8Array.from(bytes.subarray(4 + metadataLength)) }
 }
 export async function startServer(service: ControlPlane, gateway: ExecGateway, options: ServerOptions) {
   if (Boolean(options.tlsCertPath) !== Boolean(options.tlsKeyPath)) throw new Error('TLS certificate and key must be configured together')
   if (!options.tlsCertPath && !options.allowInsecureHttp) throw new Error('TLS is required unless development HTTP is explicitly enabled')
+  if (options.sourceSnapshots && (!Number.isSafeInteger(options.sourceSnapshots.maxArchiveBytes)
+    || options.sourceSnapshots.maxArchiveBytes <= 0
+    || !Number.isSafeInteger(options.sourceSnapshots.maxArchiveBytes + maxSourceMetadataBytes + 4))) {
+    throw new Error('invalid source snapshot HTTP limit')
+  }
   const handler = async (request: IncomingMessage, response: ServerResponse) => {
     response.setHeader('cache-control', 'no-store')
+    response.setHeader('x-content-type-options', 'nosniff')
     try {
       if (request.method !== 'POST') throw new ServiceError(404, 'not found')
       if (!authorized(request.headers.authorization, options.bearerToken)) throw new ServiceError(401, 'unauthorized')
-      const method = routes.get(new URL(request.url ?? '/', 'http://localhost').pathname as '/v1/agents/provision')
+      const url = new URL(request.url ?? '/', 'http://localhost')
+      if (url.search || url.hash) throw new ServiceError(404, 'not found')
+      if (url.pathname === '/v1/source-snapshots') {
+        const source = options.sourceSnapshots
+        if (!source) throw new ServiceError(503, 'source snapshot service unavailable')
+        if (request.headers['content-type'] !== sourceSnapshotContentType) {
+          throw new ServiceError(415, 'unsupported source snapshot content type')
+        }
+        const bytes = await boundedBody(request, source.maxArchiveBytes + maxSourceMetadataBytes + 4)
+        const envelope = sourceEnvelope(bytes)
+        if (envelope.archive.byteLength > source.maxArchiveBytes) throw new ServiceError(413, 'request too large')
+        const result = await source.api.create(source.principal, envelope.metadata, envelope.archive)
+        response.statusCode = 201; response.setHeader('content-type', 'application/json')
+        response.end(JSON.stringify(result)); return
+      }
+      const method = routes.get(url.pathname as '/v1/agents/provision')
       if (!method) throw new ServiceError(404, 'not found')
       const input = validateInput(method, await body(request))
       const result = validateOutput(method, await (service[method] as (input: never) => Promise<unknown>)(input as never))

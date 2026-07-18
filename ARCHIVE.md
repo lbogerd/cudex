@@ -433,9 +433,23 @@ the metadata retain the allowlisted `rootWorkspace` bridge. The in-memory fake
 can register immutable source metadata for deterministic root-selection tests.
 Exact serde, invalid-config, root-selection, and ownership-lineage tests passed;
 the broader lineage test requires the repository's 16 MiB Rust test stack.
-Production startup still needs to construct the PostgreSQL resolver and expose
-a bounded authenticated creation/upload route before deployment tooling can
+Production startup still needs to construct the PostgreSQL lifecycle/resolver
+and activate the authenticated creation route before deployment tooling can
 produce and resolve these IDs end to end.
+
+The source creation HTTP boundary is now implemented behind explicit trusted
+principal/API injection. `POST /v1/source-snapshots` accepts only
+`application/vnd.codex.source-snapshot.v1`: a four-byte big-endian metadata
+length, at most 64 KiB of exact JSON metadata, then the separately bounded tar
+bytes. Tenant identity comes only from authenticated server context and is
+rejected in metadata; queries, wrong content types, malformed framing, invalid
+UTF-8, empty/oversized archives, and streamed or declared overflow fail before
+lifecycle dispatch. Responses are validated non-secret references with no-store
+and nosniff headers. API root/archive bounds are deployment-injectable instead
+of hard-coded. The full 155-test TypeScript run passed with 118 passes, 37
+database-gated skips, and zero failures. Production startup composition and
+reference-safe PostgreSQL partial-publication cleanup remain to activate the
+route.
 
 ### Connection-ticket lifecycle
 

@@ -12,8 +12,12 @@ import { ServiceError } from './types.js'
 
 const checksumPattern = /^sha256:[0-9a-f]{64}$/
 const sourceSnapshotIdPattern = /^source_[0-9a-f]{32}$/
-const maxRoots = 8
-const maxArchiveBytes = 512 * 1024 * 1024
+const defaultLimits: SourceSnapshotApiLimits = { maxRoots: 8, maxArchiveBytes: 512 * 1024 * 1024 }
+
+export interface SourceSnapshotApiLimits {
+  maxRoots: number
+  maxArchiveBytes: number
+}
 
 export interface SourceSnapshotCreateBody {
   checksum: string
@@ -67,7 +71,7 @@ function exactObject(value: unknown, keys: readonly string[], status: number, ki
   return value as Record<string, unknown>
 }
 
-function exactArray(value: unknown, status: number, kind: string): unknown[] {
+function exactArray(value: unknown, status: number, kind: string, maxRoots: number): unknown[] {
   if (!Array.isArray(value) || value.length === 0 || value.length > maxRoots) throw new ServiceError(status, `invalid ${kind}`)
   const keys = Reflect.ownKeys(value)
   if (keys.some(key => typeof key !== 'string' || (key !== 'length' && !/^(0|[1-9]\d*)$/.test(key)))) {
@@ -114,8 +118,8 @@ function below(path: string, root: string): boolean {
   return child === '' || (child !== '..' && !child.startsWith(`..${sep}`) && !isAbsolute(child))
 }
 
-function workspace(cwdValue: unknown, rootsValue: unknown, status: number): { cwdUri: string; workspaceRootUris: string[] } {
-  const rootValues = exactArray(rootsValue, status, 'workspace roots')
+function workspace(cwdValue: unknown, rootsValue: unknown, status: number, maxRoots: number): { cwdUri: string; workspaceRootUris: string[] } {
+  const rootValues = exactArray(rootsValue, status, 'workspace roots', maxRoots)
   const cwd = canonicalFileUri(cwdValue, status, 'workspace cwd')
   const roots = rootValues.map((root, index) => canonicalFileUri(root, status, `workspace root ${index}`))
   if (new Set(roots.map(root => root.uri)).size !== roots.length) throw new ServiceError(status, 'workspace roots must be unique')
@@ -130,16 +134,28 @@ function workspace(cwdValue: unknown, rootsValue: unknown, status: number): { cw
   return { cwdUri: cwd.uri, workspaceRootUris: roots.map(root => root.uri) }
 }
 
-function positiveSize(value: unknown, status: number): number {
+function positiveSize(value: unknown, status: number, maxArchiveBytes: number): number {
   if (!Number.isSafeInteger(value) || (value as number) <= 0 || (value as number) > maxArchiveBytes) {
     throw new ServiceError(status, 'invalid source snapshot size')
   }
   return value as number
 }
 
-export function validateSourceSnapshotCreateBody(value: unknown): SourceSnapshotCreateBody {
+function validateLimits(limits: SourceSnapshotApiLimits): SourceSnapshotApiLimits {
+  if (!Number.isSafeInteger(limits.maxRoots) || limits.maxRoots <= 0 || limits.maxRoots > 64
+    || !Number.isSafeInteger(limits.maxArchiveBytes) || limits.maxArchiveBytes <= 0) {
+    throw new Error('invalid source snapshot API limits')
+  }
+  return { ...limits }
+}
+
+export function validateSourceSnapshotCreateBody(
+  value: unknown,
+  limits: SourceSnapshotApiLimits = defaultLimits,
+): SourceSnapshotCreateBody {
+  limits = validateLimits(limits)
   const body = exactObject(value, ['checksum', 'cwdUri', 'workspaceRootUris', 'expiresAt'], 400, 'source snapshot create body')
-  const paths = workspace(body.cwdUri, body.workspaceRootUris, 400)
+  const paths = workspace(body.cwdUri, body.workspaceRootUris, 400, limits.maxRoots)
   return { checksum: checksum(body.checksum, 400), ...paths, expiresAt: canonicalTimestamp(body.expiresAt, 400) }
 }
 
@@ -149,21 +165,37 @@ export function validateSourceSnapshotResolveBody(value: unknown): SourceSnapsho
 }
 
 export function validateSourceSnapshotReferenceBody(value: unknown): SourceSnapshotReferenceBody {
+  return validateSourceSnapshotReferenceBodyWithLimits(value, defaultLimits)
+}
+
+function validateSourceSnapshotReferenceBodyWithLimits(
+  value: unknown,
+  limits: SourceSnapshotApiLimits,
+): SourceSnapshotReferenceBody {
+  limits = validateLimits(limits)
   const body = exactObject(value, ['sourceSnapshotId', 'checksum', 'expiresAt', 'manifestChecksum', 'sizeBytes'], 503, 'source snapshot response')
   return {
     sourceSnapshotId: sourceSnapshotId(body.sourceSnapshotId, 503), checksum: checksum(body.checksum, 503),
     expiresAt: canonicalTimestamp(body.expiresAt, 503), manifestChecksum: checksum(body.manifestChecksum, 503),
-    sizeBytes: positiveSize(body.sizeBytes, 503),
+    sizeBytes: positiveSize(body.sizeBytes, 503, limits.maxArchiveBytes),
   }
 }
 
 export function validateSourceSnapshotResolutionBody(value: unknown): SourceSnapshotResolutionBody {
+  return validateSourceSnapshotResolutionBodyWithLimits(value, defaultLimits)
+}
+
+function validateSourceSnapshotResolutionBodyWithLimits(
+  value: unknown,
+  limits: SourceSnapshotApiLimits,
+): SourceSnapshotResolutionBody {
+  limits = validateLimits(limits)
   const body = exactObject(value, ['sourceSnapshotId', 'checksum', 'expiresAt', 'manifestChecksum', 'sizeBytes', 'cwdUri', 'workspaceRootUris'], 503, 'source snapshot resolution')
-  const paths = workspace(body.cwdUri, body.workspaceRootUris, 503)
+  const paths = workspace(body.cwdUri, body.workspaceRootUris, 503, limits.maxRoots)
   return {
     sourceSnapshotId: sourceSnapshotId(body.sourceSnapshotId, 503), checksum: checksum(body.checksum, 503),
     expiresAt: canonicalTimestamp(body.expiresAt, 503), manifestChecksum: checksum(body.manifestChecksum, 503),
-    sizeBytes: positiveSize(body.sizeBytes, 503), ...paths,
+    sizeBytes: positiveSize(body.sizeBytes, 503, limits.maxArchiveBytes), ...paths,
   }
 }
 
@@ -179,19 +211,22 @@ function referenceBody(reference: SourceSnapshotReference): Record<string, unkno
 
 /** Adapter for an HTTP handler that authenticates the tenant and streams archive bytes separately from JSON. */
 export class AuthenticatedSourceSnapshotApi {
-  constructor(private readonly lifecycle: Lifecycle) {}
+  private readonly limits: SourceSnapshotApiLimits
+  constructor(private readonly lifecycle: Lifecycle, limits: SourceSnapshotApiLimits = defaultLimits) {
+    this.limits = validateLimits(limits)
+  }
 
   async create(principal: AuthenticatedTenant, body: unknown, archive: Uint8Array): Promise<SourceSnapshotReferenceBody> {
-    if (!(archive instanceof Uint8Array) || archive.byteLength > maxArchiveBytes) {
+    if (!(archive instanceof Uint8Array) || archive.byteLength === 0 || archive.byteLength > this.limits.maxArchiveBytes) {
       throw new ServiceError(400, 'invalid source snapshot archive')
     }
-    const request = validateSourceSnapshotCreateBody(body)
+    const request = validateSourceSnapshotCreateBody(body, this.limits)
     const input: CreateSourceSnapshotInput = {
       archive, checksum: request.checksum, cwdUri: request.cwdUri,
       workspaceRootUris: request.workspaceRootUris, expiresAt: new Date(request.expiresAt),
     }
     const created = await this.lifecycle.create(principal, input)
-    const response = validateSourceSnapshotReferenceBody(referenceBody(created))
+    const response = validateSourceSnapshotReferenceBodyWithLimits(referenceBody(created), this.limits)
     if (response.checksum !== request.checksum) throw new ServiceError(503, 'source snapshot response does not match its request')
     return response
   }
@@ -199,9 +234,9 @@ export class AuthenticatedSourceSnapshotApi {
   async resolve(principal: AuthenticatedTenant, body: unknown): Promise<SourceSnapshotResolution> {
     const request = validateSourceSnapshotResolveBody(body)
     const resolved = await this.lifecycle.resolve(principal, request.sourceSnapshotId, request.checksum)
-    const metadata = validateSourceSnapshotResolutionBody({
+    const metadata = validateSourceSnapshotResolutionBodyWithLimits({
       ...referenceBody(resolved), cwdUri: resolved.cwdUri, workspaceRootUris: resolved.workspaceRootUris,
-    })
+    }, this.limits)
     if (metadata.sourceSnapshotId !== request.sourceSnapshotId || metadata.checksum !== request.checksum
       || !(resolved.archive instanceof Uint8Array) || resolved.archive.byteLength !== metadata.sizeBytes
       || `sha256:${createHash('sha256').update(resolved.archive).digest('hex')}` !== metadata.checksum) {
