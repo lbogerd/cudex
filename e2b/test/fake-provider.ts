@@ -5,7 +5,7 @@ interface FakeSandbox { bytes: Uint8Array; alive: boolean; execReady: boolean; r
 interface FakeSnapshot { bytes: Uint8Array; runtimeIdentity: string | undefined; sandboxId: string; names: string[] }
 export class FakeProvider implements ProviderAdapter {
   readonly sandboxes = new Map<string, FakeSandbox>(); readonly snapshots = new Map<string, FakeSnapshot>()
-  creates = 0; restores = 0; kills = 0; connects = 0; failAt: string | undefined
+  creates = 0; restores = 0; kills = 0; snapshotDeletes = 0; connects = 0; failAt: string | undefined
   rawExecUpstream: unknown
   private id = 0
   async create(templateId = 'fake-template', metadata: Record<string, string> = {}): Promise<CreatedSandbox> { this.failure('create'); this.creates++; return this.allocate(templateId, metadata) }
@@ -55,7 +55,9 @@ export class FakeProvider implements ProviderAdapter {
       && (query.name === undefined || snapshot.names.includes(query.name)))
       .map(([snapshotId, snapshot]) => ({ snapshotId, names: [...snapshot.names] }))
   }
-  async deleteSnapshot(snapshotId: string): Promise<boolean> { this.failure('deleteSnapshot'); return this.snapshots.delete(snapshotId) }
+  async deleteSnapshot(snapshotId: string): Promise<boolean> {
+    this.failure('deleteSnapshot'); this.snapshotDeletes++; return this.snapshots.delete(snapshotId)
+  }
   async kill(sandboxId: string): Promise<void> { this.failure('kill'); this.kills++; const sandbox = this.sandboxes.get(sandboxId); if (sandbox) sandbox.alive = false }
   live(): string[] { return [...this.sandboxes].filter(([, sandbox]) => sandbox.alive).map(([id]) => id) }
   private allocate(templateId: string, metadata: Record<string, string>): CreatedSandbox {

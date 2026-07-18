@@ -655,8 +655,8 @@ available object rows before `prepared` or final commit. Commit and abort thus
 linearize across replicas, exact terminal transitions replay safely, and a stale
 generation can resume while the old worker is fenced. Reclaim preserves deleted
 object audit rows, while a later hard row purge cascades only its preparation
-association. Publication, preparation-scoped object reclaim, and the final
-provision coordinator remain unwired.
+association. At this foundation stage these primitives were not yet composed by
+a lifecycle coordinator.
 
 `PostgresObjectReclaimer` can now reclaim one `reclaim_pending` workspace
 preparation without sweeping unrelated object allocations owned by the same
@@ -681,6 +681,51 @@ size, expiry, bucket, and key—under sorted allocation/object locks. Same-count
 substitution, unavailable objects, changed locators, nonallocated rows, and
 intent drift fail closed. The abort transition also has a transaction-owning
 convenience path, while caller-supplied executors remain max-one-connection safe.
+
+### Durable immutable-source provision coordinator
+
+An unwired PostgreSQL provision coordinator now composes the existing primitives
+into one immutable-source lifecycle. It strictly validates the request, resolves
+agent type through a trusted role-to-sandbox-template/provider-template/policy
+mapping, and claims the tenant-bound canonical request hash. A competing replica
+waits for the same terminal operation; successful and failed replay perform no
+provider or object mutation.
+
+The owning worker resolves the authenticated source before allocation, creates a
+sandbox with only bounded `managedBy`, tenant, lease, agent, and trusted-template
+metadata, and journals the sandbox immediately under the provider-resource lock.
+After upload, exec start/probe, exact workspace export, and provider snapshot, it
+journals the snapshot and uses the durable workspace preparation to register the
+archive, manifest, and every distinct content blob. Operation heartbeats fence
+the long external stages.
+
+One final provider-locked PostgreSQL transaction repeats source authorization,
+creates the active lease/base snapshot and all retention references, adopts only
+the sandbox/snapshot/prepared-object allocations, and persists a secret-free
+logical response. The raw gateway ticket is created only after commit. Replay
+reloads the active durable lease and rotates a fresh ticket, so a ticket-service
+failure cannot roll back or duplicate the provider allocation.
+
+Failure before commit aborts and boundedly reclaims any preparation objects,
+deletes the provider snapshot, kills the sandbox, marks their allocations
+reclaimed under the same locks, and only then records terminal failure. Raw
+provider IDs are retained in process immediately after each external allocation,
+even before its ledger insert returns, while provider inventory metadata covers
+the process-crash gap. `WorkspaceSnapshotPublisher.abortDurableBase` supplies the
+bounded exact-preparation cleanup path used by this coordinator.
+
+Docker-backed PostgreSQL 17 tests force one replica to observe the other while a
+ledgered sandbox is blocked in upload, then prove one provider mutation, five
+adopted allocations, one committed lease/base snapshot/preparation, sanitized
+logical replay, and fresh tickets. A second test fails the second workspace
+object put after both provider resources exist and proves all three recorded
+allocations are reclaimed, no lease/snapshot is committed, shared source content
+survives, and terminal replay causes no mutation. A third test injects ticket
+failure after durable completion and proves the adopted lease/resources remain
+intact for fresh replay from another replica. The complete TypeScript suite
+passed 172 of 172 tests with zero skips against the isolated database. Production
+startup remains on the legacy lifecycle until checkpoint, reconnect, restore,
+child capture, and release can move to the same PostgreSQL authority together.
 
 ### Bounded PostgreSQL reconciliation foundation
 
@@ -816,8 +861,8 @@ cleanup outages still require the planned PostgreSQL allocation ledger and
 reconciler before the broader every-path child/provision cleanup invariant can be
 claimed.
 
-The provider-independent suite has 169 tests: 131 passed and 38 live-database
-tests were skipped without `HOSTED_AGENT_TEST_DATABASE_URL`. New coverage proves
+The provider-independent suite has 172 tests: 131 passed and 41 live-database
+tests are skipped without `HOSTED_AGENT_TEST_DATABASE_URL`. New coverage proves
 ticket/socket rotation on reconnect and replay, transient-versus-missing error
 classification, missing-sandbox revocation, and child temporary-resource cleanup
 on success plus restore/export failures. Recovery coverage additionally proves

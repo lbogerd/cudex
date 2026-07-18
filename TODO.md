@@ -19,8 +19,11 @@ production backend. Stable decisions, evidence, and wire schemas are in
 - [x] Add tenant-scoped PostgreSQL repositories for immutable source snapshots,
   leases, durable snapshots, object/snapshot references, and purpose-bound
   single-use ticket hashes.
-- [ ] Persist canonical request hashes, operation state, logical responses, and
-  all partial provider allocations.
+- [x] For immutable-source provision, persist the canonical request hash,
+  operation state, secret-free logical response, sandbox/provider-snapshot
+  allocations, and every archive/manifest/content allocation.
+- [ ] Extend the same journal/allocation protocol through checkpoint, reconnect,
+  restore, child capture, patch, and release.
 - [ ] Apply transactional per-lease locks and deterministic multi-lease lock
   order to every lifecycle mutation.
 - [x] Add composable same-transaction journal/state executors and sorted compound
@@ -51,7 +54,11 @@ production backend. Stable decisions, evidence, and wire schemas are in
   provision/checkpoint logical recovery, guarded provider inventory, and
   retained ticket cleanup. Keep it unwired until lifecycle writers share its
   provider-resource lock protocol.
-- [ ] Prove idempotency and restart recovery with multiple service replicas.
+- [x] Prove immutable-source provision idempotency across two service replicas,
+  including one provider mutation, exact logical replay, and terminal replay
+  after partial-publication cleanup.
+- [ ] Prove restart recovery and the remaining lifecycle mutations with multiple
+  service replicas.
 
 Exit criterion: concurrent replay causes one logical/provider mutation and no
 connection material or allocation is leaked.
@@ -139,8 +146,13 @@ tickets always fail, and secrets never enter durable or observable state.
 - [x] Strictly validate the exact patch export/apply request and tagged response
   wire shapes, including bounded checksums, counts, sizes, canonical conflicts,
   rejection reasons, and rejection of extra credential-bearing fields.
-- [ ] Make provision cleanup-safe after every allocation step, including response
-  persistence failure.
+- [x] Add an unwired PostgreSQL immutable-source provision coordinator that
+  immediately ledgers provider resources, durably prepares every workspace
+  object, atomically commits/adopts the lease graph and logical response, and
+  reclaims partial publication before terminal failure.
+- [ ] Extend cleanup-safe provision through child/restore sources and wire it to
+  production startup with reconciler recovery for process loss at every external
+  allocation boundary.
 - [ ] Serialize checkpoint, reconnect, child capture, patch, release, and command
   interaction per lease.
 - [ ] Persist checksummed base/current workspace manifests with snapshots and

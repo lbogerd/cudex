@@ -364,6 +364,31 @@ export class WorkspaceSnapshotPublisher {
     }
   }
 
+  async abortDurableBase(fence: PreparationFence,
+    prepared: PreparedDurableBaseWorkspaceSnapshot): Promise<void> {
+    const coordinator = this.options.durablePreparation
+    if (!coordinator) throw new ServiceError(503, 'durable workspace preparation is unavailable')
+    const limit = coordinator.cleanupBatchSize ?? 100
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) {
+      throw new ServiceError(503, 'workspace snapshot cleanup pending')
+    }
+    try {
+      const aborted = await coordinator.preparations.beginAbort(
+        fence, prepared.preparation.preparationId)
+      if (aborted.state === 'committed') throw new Error('committed workspace preparation cannot be aborted')
+      if (aborted.state === 'reclaimed') return
+      const maximumBatches = Math.ceil(aborted.expectedObjectCount / limit) + 1
+      for (let batch = 0; batch < maximumBatches; batch++) {
+        const result = await coordinator.reclaimer.reclaimPreparationObjects(
+          fence, aborted.preparationId, limit)
+        if (result.claimed < limit) return
+      }
+      throw new Error('workspace preparation cleanup exceeded its bound')
+    } catch {
+      throw new ServiceError(503, 'workspace snapshot cleanup pending')
+    }
+  }
+
   async appendCheckpoint(input: AppendWorkspaceCheckpointInput): Promise<PublishedWorkspaceSnapshot> {
     const tenantId = opaque('tenant ID', input.tenantId)
     const leaseId = opaque('lease ID', input.leaseId)
