@@ -42,7 +42,12 @@ impl ThreadRequestProcessor {
         self.validate_root_thread_delete(thread_id, thread_ids.len() > 1)
             .await?;
         let delete_order = thread_removal_order(&thread_ids);
-        self.prepare_threads_for_delete(&delete_order).await;
+        self.prepare_threads_for_delete(&delete_order).await?;
+        if let Some(pending_thread_id) = self.pending_hosted_cleanup(&delete_order).await {
+            return Err(internal_error(format!(
+                "hosted cleanup is still pending for thread {pending_thread_id}; retry deletion after cleanup succeeds"
+            )));
+        }
 
         for thread_id_to_delete in delete_order.iter().copied() {
             match self
@@ -146,11 +151,29 @@ impl ThreadRequestProcessor {
         }
     }
 
-    async fn prepare_threads_for_delete(&self, thread_ids: &[ThreadId]) {
-        self.prepare_threads_for_removal(thread_ids, "delete").await;
+    async fn prepare_threads_for_delete(
+        &self,
+        thread_ids: &[ThreadId],
+    ) -> Result<(), JSONRPCErrorError> {
+        self.prepare_threads_for_removal(thread_ids, "delete")
+            .await?;
         if let Some(log_db) = self.log_db.as_ref() {
             log_db.flush().await;
         }
+        Ok(())
+    }
+
+    async fn pending_hosted_cleanup(&self, thread_ids: &[ThreadId]) -> Option<ThreadId> {
+        for thread_id in thread_ids.iter().copied() {
+            if self
+                .thread_manager
+                .hosted_runtime_cleanup_pending(thread_id)
+                .await
+            {
+                return Some(thread_id);
+            }
+        }
+        None
     }
 }
 

@@ -12,7 +12,13 @@ use codex_protocol::protocol::ThreadHistoryMode;
 const THREAD_LIST_DEFAULT_LIMIT: usize = 25;
 const THREAD_LIST_MAX_LIMIT: usize = 100;
 const CODEX_TUI_CLIENT_NAME: &str = "codex-tui";
-const HOSTED_RELEASE_RETRY_DELAY: Duration = Duration::from_secs(1);
+const HOSTED_RELEASE_RETRY_DELAYS: [Duration; 5] = [
+    Duration::from_secs(1),
+    Duration::from_secs(5),
+    Duration::from_secs(30),
+    Duration::from_secs(120),
+    Duration::from_secs(300),
+];
 const THREAD_ROLLBACK_DEPRECATION_SUMMARY: &str =
     "thread/rollback is deprecated and will be removed soon";
 
@@ -36,6 +42,26 @@ pub(super) fn thread_removal_order(thread_ids: &[ThreadId]) -> Vec<ThreadId> {
         .copied()
         .chain(std::iter::once(*root_thread_id))
         .collect()
+}
+
+fn schedule_hosted_cleanup_retries(thread_manager: &Arc<ThreadManager>, thread_id: ThreadId) {
+    let thread_manager = Arc::downgrade(thread_manager);
+    tokio::spawn(async move {
+        for delay in HOSTED_RELEASE_RETRY_DELAYS {
+            tokio::time::sleep(delay).await;
+            let Some(thread_manager) = thread_manager.upgrade() else {
+                return;
+            };
+            thread_manager.retry_hosted_runtime_cleanup(thread_id).await;
+            if !thread_manager
+                .hosted_runtime_cleanup_pending(thread_id)
+                .await
+            {
+                return;
+            }
+        }
+        warn!(%thread_id, "hosted cleanup remains pending after asynchronous retries");
+    });
 }
 
 fn collect_resume_override_mismatches(
@@ -879,7 +905,7 @@ impl ThreadRequestProcessor {
         &self,
         thread_ids: &[ThreadId],
         operation: &str,
-    ) {
+    ) -> Result<(), JSONRPCErrorError> {
         // Keep every runtime registered until all descendants have stopped. In hosted mode,
         // removing a thread also releases its lease, so removal must be a distinct second phase.
         for thread_id in thread_ids.iter().copied() {
@@ -890,12 +916,14 @@ impl ThreadRequestProcessor {
             match wait_for_thread_shutdown(&conversation).await {
                 ThreadShutdownResult::Complete => {}
                 ThreadShutdownResult::SubmitFailed => {
-                    error!(
-                        "failed to submit Shutdown to thread {thread_id}; proceeding with {operation}"
-                    );
+                    return Err(internal_error(format!(
+                        "failed to shut down thread {thread_id} before {operation}"
+                    )));
                 }
                 ThreadShutdownResult::TimedOut => {
-                    warn!("thread {thread_id} shutdown timed out; proceeding with {operation}");
+                    return Err(internal_error(format!(
+                        "thread {thread_id} shutdown timed out before {operation}"
+                    )));
                 }
             }
         }
@@ -905,14 +933,15 @@ impl ThreadRequestProcessor {
         for thread_id in thread_ids {
             let thread_id = *thread_id;
             self.thread_manager.remove_thread(&thread_id).await;
-            let thread_manager = Arc::clone(&self.thread_manager);
-            tokio::spawn(async move {
-                // A failed hosted release is durably reinserted as ReleasePending. Retry once in
-                // this process; later resume/recovery remains the durable fallback.
-                tokio::time::sleep(HOSTED_RELEASE_RETRY_DELAY).await;
-                thread_manager.remove_thread(&thread_id).await;
-            });
+            if self
+                .thread_manager
+                .hosted_runtime_cleanup_pending(thread_id)
+                .await
+            {
+                schedule_hosted_cleanup_retries(&self.thread_manager, thread_id);
+            }
         }
+        Ok(())
     }
 
     fn listener_task_context(&self) -> ListenerTaskContext {
@@ -1523,7 +1552,7 @@ impl ThreadRequestProcessor {
 
         let removal_order = thread_removal_order(&archive_thread_ids);
         self.prepare_threads_for_removal(&removal_order, "archive")
-            .await;
+            .await?;
         match self
             .thread_store
             .archive_thread(StoreArchiveThreadParams {

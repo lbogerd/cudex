@@ -504,7 +504,6 @@ use tokio_util::sync::DropGuard;
 use tokio_util::task::TaskTracker;
 use toml::Value as TomlValue;
 use tracing::Instrument;
-use tracing::error;
 use tracing::info;
 use tracing::warn;
 use uuid::Uuid;

@@ -1,9 +1,7 @@
-use super::thread_processor::thread_removal_order;
 use super::*;
 use codex_protocol::config_types::MultiAgentMode;
 
 pub(super) const THREAD_UNLOADING_DELAY: Duration = Duration::from_secs(30 * 60);
-const HOSTED_RELEASE_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 pub(super) struct ListenerTaskContext {
@@ -411,83 +409,51 @@ pub(super) async fn unload_thread_without_subscribers(
 ) {
     info!("thread {thread_id} has no subscribers and is idle; shutting down");
 
-    let subtree_thread_ids = match thread_manager
-        .list_agent_subtree_thread_ids(thread_id)
-        .await
-    {
-        Ok(thread_ids) => thread_ids,
-        Err(error) => {
-            warn!(%error, %thread_id, "failed to load descendant subtree before idle unload");
-            pending_thread_unloads.lock().await.remove(&thread_id);
-            return;
-        }
-    };
-    let removal_order = thread_removal_order(&subtree_thread_ids);
-    for unloading_thread_id in removal_order.iter().copied() {
-        // Pending app-server -> client requests cannot be answered once subtree shutdown starts.
-        outgoing
-            .cancel_requests_for_thread(unloading_thread_id, /*error*/ None)
-            .await;
+    // Releasing an active hosted lease is terminal. Keep idle hosted threads resident so a later
+    // subscriber can safely reuse the same runtime generation.
+    if thread_manager.has_hosted_runtime(thread_id).await {
+        pending_thread_unloads.lock().await.remove(&thread_id);
+        return;
     }
 
-    tokio::spawn(async move {
-        let mut stopped_thread_ids = Vec::new();
-        for unloading_thread_id in removal_order.iter().copied() {
-            let unloading_thread = if unloading_thread_id == thread_id {
-                Some(Arc::clone(&thread))
-            } else {
-                thread_manager.get_thread(unloading_thread_id).await.ok()
-            };
-            let Some(unloading_thread) = unloading_thread else {
-                stopped_thread_ids.push(unloading_thread_id);
-                continue;
-            };
-            match wait_for_thread_shutdown(&unloading_thread).await {
-                ThreadShutdownResult::Complete => stopped_thread_ids.push(unloading_thread_id),
-                ThreadShutdownResult::SubmitFailed => {
-                    warn!("failed to submit Shutdown to descendant thread {unloading_thread_id}");
-                    break;
-                }
-                ThreadShutdownResult::TimedOut => {
-                    warn!(
-                        "descendant thread {unloading_thread_id} shutdown timed out; leaving it loaded"
-                    );
-                    break;
-                }
-            }
-        }
+    // Any pending app-server -> client requests for this thread can no longer be
+    // answered; cancel their callbacks before shutdown/unload.
+    outgoing
+        .cancel_requests_for_thread(thread_id, /*error*/ None)
+        .await;
+    thread_state_manager.remove_thread_state(thread_id).await;
 
-        // Release only after every selected descendant has stopped or was deliberately retained.
-        for unloading_thread_id in stopped_thread_ids {
-            let removed_thread = thread_manager.remove_thread(&unloading_thread_id).await;
-            let thread_manager = Arc::clone(&thread_manager);
-            tokio::spawn(async move {
-                tokio::time::sleep(HOSTED_RELEASE_RETRY_DELAY).await;
-                thread_manager.remove_thread(&unloading_thread_id).await;
-            });
-            thread_state_manager
-                .remove_thread_state(unloading_thread_id)
-                .await;
-            thread_watch_manager
-                .remove_thread(&unloading_thread_id.to_string())
-                .await;
-            pending_thread_unloads
-                .lock()
-                .await
-                .remove(&unloading_thread_id);
-            if removed_thread.is_some() {
-                outgoing
-                    .send_server_notification(ServerNotification::ThreadClosed(
-                        ThreadClosedNotification {
-                            thread_id: unloading_thread_id.to_string(),
-                        },
-                    ))
+    tokio::spawn(async move {
+        match wait_for_thread_shutdown(&thread).await {
+            ThreadShutdownResult::Complete => {
+                if thread_manager.remove_thread(&thread_id).await.is_none() {
+                    info!("thread {thread_id} was already removed before teardown finalized");
+                    thread_watch_manager
+                        .remove_thread(&thread_id.to_string())
+                        .await;
+                    pending_thread_unloads.lock().await.remove(&thread_id);
+                    return;
+                }
+                thread_watch_manager
+                    .remove_thread(&thread_id.to_string())
                     .await;
-            } else {
-                info!("thread {unloading_thread_id} was already removed before teardown finalized");
+                let notification = ThreadClosedNotification {
+                    thread_id: thread_id.to_string(),
+                };
+                outgoing
+                    .send_server_notification(ServerNotification::ThreadClosed(notification))
+                    .await;
+                pending_thread_unloads.lock().await.remove(&thread_id);
+            }
+            ThreadShutdownResult::SubmitFailed => {
+                pending_thread_unloads.lock().await.remove(&thread_id);
+                warn!("failed to submit Shutdown to thread {thread_id}");
+            }
+            ThreadShutdownResult::TimedOut => {
+                pending_thread_unloads.lock().await.remove(&thread_id);
+                warn!("thread {thread_id} shutdown timed out; leaving thread loaded");
             }
         }
-        pending_thread_unloads.lock().await.remove(&thread_id);
     });
 }
 
