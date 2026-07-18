@@ -14,7 +14,7 @@ Keep parent/child relationships only for ownership, messaging, quotas, result de
 
 Implement this behind an experimental `hosted_agents` feature and split the work into reviewable stages under the repository’s 800-line guidance.
 
-## Implementation Status (2026-07-17)
+## Foundation Snapshot (2026-07-17)
 
 The first foundation branch, `feat/hosted-agents`, implements the service,
 configuration, and environment-lifecycle seams needed before thread orchestration
@@ -159,6 +159,51 @@ Still pending:
   fork or detached subagent's project snapshot;
 - Stages 6–8: persistence/restore, completion and explicit patch acceptance,
   lifecycle finalization, telemetry, app-server APIs, and end-to-end coverage.
+
+## Final Implementation Status (2026-07-18)
+
+All eight implementation stages are complete on `feat/hosted-agents`.
+
+The completed runtime now provides:
+
+- one centrally provisioned, independently leased hosted environment for every hosted root,
+  spawned agent, and direct review/guardian delegate;
+- fail-closed external-sandbox permissions, exact tool/domain authorization at specification and
+  dispatch time, normalized service denials, and explicit local-fallback invariant failures;
+- durable owner lineage, lease/snapshot/lifecycle metadata, completed-turn checkpoints,
+  reconnect-or-restore behavior, and automatic recovery of interrupted finalization;
+- checkpoint/export/persist/release completion ordering with durable `PendingFinalization` and
+  `ReleasePending` recovery;
+- explicit, idempotent, conflict-safe patch acceptance through the plain `apply_agent_patch`
+  collaboration tool and experimental app-server `agent/patchApply` API;
+- owner-scoped, guaranteed-delivery `agent/patchAvailable` notifications with bounded non-secret
+  artifact metadata;
+- deepest-first descendant shutdown, generation-safe asynchronous cleanup retries with bounded
+  backoff, deletion protection while cleanup is pending, and no terminal idle release of otherwise
+  resumable hosted threads;
+- bounded telemetry for provision/restore/checkpoint latency, active leases, patch size/conflicts,
+  denied domains, cleanup retries, and prevented local fallback;
+- a bounded fake filesystem that verifies snapshot isolation, checkpoint authority, clean
+  add/modify/delete application, and atomic three-way conflicts without partial mutation.
+
+Validation for the final stages includes the full 17-test `codex-hosted-agent` suite; focused core
+tests for provision rollback, checkpoint/finalization/release recovery, reconnect/restore, durable
+lineage, patch application, follow-up rejection after terminal release, cleanup generation safety,
+tool policy, and telemetry; app-server protocol/schema validation; and public app-server tests for
+experimental gating, request validation, ownership non-disclosure, notification scoping, response
+mapping, and subtree removal ordering. Scoped Clippy fixes and repository formatting passed after
+each landing chunk.
+
+The Docker remote-executor command was attempted on 2026-07-18, but the development host reported
+that its Docker daemon was unreachable. The focused app-server patch route suite then ran locally
+and passed. Hosted external-service execution is intentionally not skipped silently: the standard
+remote harness cannot synthesize the hosting service's service-owned WSS lease connection, and Wine
+coverage remains delegated to the repository's Bazel CI matrix.
+
+Deployment still owns the two explicit service-side assumptions from this plan: transactional
+cleanup of any lease that is created before `provision` returns an error, and TTL reaping after a
+Codex process crash. Codex persists only opaque identifiers and retries every cleanup operation for
+which it has obtained a lease identifier.
 
 ## Success Criteria
 
