@@ -31,6 +31,11 @@ production backend. Stable decisions, evidence, and wire schemas are in
   Codex references them.
 - [ ] Reconcile abandoned operations, sandboxes, snapshots, capture sandboxes,
   tickets, archives, and expired blobs after crashes and timeouts.
+- [x] Add the bounded tenant-scoped PostgreSQL reconciliation foundation for
+  fenced stale takeover, sandbox/capture/snapshot reclaim or adoption,
+  provision/checkpoint logical recovery, guarded provider inventory, and
+  retained ticket cleanup. Keep it unwired until lifecycle writers share its
+  provider-resource lock protocol.
 - [ ] Prove idempotency and restart recovery with multiple service replicas.
 
 Exit criterion: concurrent replay causes one logical/provider mutation and no

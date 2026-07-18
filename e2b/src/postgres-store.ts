@@ -3,6 +3,7 @@ import type { Pool, PoolClient } from 'pg'
 
 const requestHashPattern = /^sha256:[0-9a-f]{64}$/
 const allocationKinds = new Set(['sandbox', 'capture_sandbox', 'provider_snapshot', 'ticket', 'object'])
+const providerResourceKinds = new Set(['sandbox', 'provider_snapshot'])
 const forbiddenResponseKeys = new Set([
   'connection', 'execServerUrl', 'rawExecUrl', 'ticket', 'apiKey', 'accessToken',
   'trafficAccessToken', 'bearerToken',
@@ -190,10 +191,11 @@ export class PostgresJournal {
     }
   }
 
-  async heartbeatOperation(identity: OperationIdentity, generation: number, workerId: string): Promise<boolean> {
+  async heartbeatOperation(identity: OperationIdentity, generation: number, workerId: string,
+    executor: Pick<PoolClient, 'query'> = this.pool): Promise<boolean> {
     validateIdentity(identity)
     validateGeneration(generation); validateWorkerId(workerId)
-    const result = await this.pool.query(`
+    const result = await executor.query(`
       UPDATE hosted_agent_operations
       SET heartbeat_at = now()
       WHERE operation = $1 AND idempotency_key = $2 AND tenant_id = $3
@@ -264,9 +266,10 @@ export class PostgresJournal {
     workerId: string,
     allocationId: string,
     state: 'adopted' | 'reclaim_pending' | 'reclaimed',
+    executor: Pick<PoolClient, 'query'> = this.pool,
   ): Promise<OperationAllocation> {
     validateIdentity(identity); validateGeneration(generation); validateWorkerId(workerId)
-    const result = await this.pool.query<AllocationRow>(`
+    const result = await executor.query<AllocationRow>(`
       UPDATE hosted_agent_operation_allocations AS allocation
       SET state = $7,
           reclaimed_at = CASE WHEN $7 = 'reclaimed' THEN now() ELSE NULL END
@@ -289,16 +292,36 @@ export class PostgresJournal {
     return allocationFromRow(row)
   }
 
-  async listAllocations(identity: OperationIdentity): Promise<OperationAllocation[]> {
+  async listAllocations(identity: OperationIdentity, limit = 10_000): Promise<OperationAllocation[]> {
     validateIdentity(identity)
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 10_001) throw new Error('invalid allocation limit')
     const result = await this.pool.query<AllocationRow>(`
       SELECT allocation_id::text, allocation_kind, resource_id, lease_id, state,
              metadata, allocated_at, updated_at, reclaimed_at
       FROM hosted_agent_operation_allocations
       WHERE operation = $1 AND idempotency_key = $2 AND tenant_id = $3
       ORDER BY allocation_id
-    `, [identity.operation, identity.idempotencyKey, identity.tenantId])
+      LIMIT $4
+    `, [identity.operation, identity.idempotencyKey, identity.tenantId, limit])
     return result.rows.map(allocationFromRow)
+  }
+
+  /** Read-only reconciliation guard: provider inventory must not reclaim a resource owned by any unfinished operation. */
+  async hasUnreclaimedAllocation(allocationKind: string, resourceId: string,
+    executor: Pick<PoolClient, 'query'> = this.pool): Promise<boolean> {
+    if (!allocationKinds.has(allocationKind)) throw new Error('invalid allocation kind')
+    if (!resourceId.trim() || Buffer.byteLength(resourceId) > 2048) throw new Error('invalid resource ID')
+    const result = await executor.query(`
+      SELECT 1
+      FROM hosted_agent_operation_allocations AS allocation
+      JOIN hosted_agent_operations AS operation
+        USING (operation, idempotency_key, tenant_id)
+      WHERE allocation.allocation_kind = $1 AND allocation.resource_id = $2
+        AND allocation.state <> 'reclaimed'
+        AND operation.state = 'in_progress'
+      LIMIT 1
+    `, [allocationKind, resourceId])
+    return result.rowCount === 1
   }
 
   async bindLeaseAndAdoptAllocations(
@@ -307,6 +330,7 @@ export class PostgresJournal {
     workerId: string,
     leaseId: string,
     allocationIds: string[],
+    executor?: PoolClient,
   ): Promise<OperationAllocation[]> {
     validateIdentity(identity); validateGeneration(generation); validateWorkerId(workerId)
     if (!leaseId.trim() || Buffer.byteLength(leaseId) > 512) throw new Error('invalid lease ID')
@@ -315,7 +339,7 @@ export class PostgresJournal {
       || uniqueIds.some(allocationId => !/^[1-9][0-9]*$/.test(allocationId))) {
       throw new Error('invalid allocation IDs')
     }
-    return this.transaction(async client => {
+    const bind = async (client: PoolClient) => {
       const operation = await client.query(`
         UPDATE hosted_agent_operations
         SET primary_lease_id = $6
@@ -330,18 +354,22 @@ export class PostgresJournal {
         SET lease_id = $4, state = 'adopted'
         WHERE operation = $1 AND idempotency_key = $2 AND tenant_id = $3
           AND allocation_id = ANY($5::bigint[])
-          AND (state = 'allocated' OR (state = 'adopted' AND lease_id = $4))
+          AND (state IN ('allocated', 'reclaim_pending') OR (state = 'adopted' AND lease_id = $4))
         RETURNING allocation_id::text, allocation_kind, resource_id, lease_id, state,
                   metadata, allocated_at, updated_at, reclaimed_at
       `, [identity.operation, identity.idempotencyKey, identity.tenantId, leaseId, uniqueIds])
       if (allocations.rowCount !== uniqueIds.length) throw new OperationOwnershipError()
       return allocations.rows.map(allocationFromRow)
-    })
+    }
+    return executor ? bind(executor) : this.transaction(bind)
   }
 
-  async claimStaleOperations(staleBefore: Date, limit: number, workerId: string): Promise<StaleOperation[]> {
+  async claimStaleOperations(staleBefore: Date, limit: number, workerId: string, tenantId?: string): Promise<StaleOperation[]> {
     if (!Number.isInteger(limit) || limit < 1 || limit > 1000) throw new Error('invalid stale-operation limit')
     validateWorkerId(workerId)
+    if (tenantId !== undefined) {
+      if (!tenantId.trim() || Buffer.byteLength(tenantId) > 512) throw new Error('invalid tenant ID')
+    }
     return this.transaction(async client => {
       const result = await client.query<StaleRow>(`
         WITH candidates AS (
@@ -349,6 +377,7 @@ export class PostgresJournal {
           FROM hosted_agent_operations
           WHERE state = 'in_progress'
             AND COALESCE(heartbeat_at, started_at) < $1
+            AND ($4::text IS NULL OR tenant_id = $4)
           ORDER BY COALESCE(heartbeat_at, started_at), operation, idempotency_key
           FOR UPDATE SKIP LOCKED
           LIMIT $2
@@ -362,7 +391,7 @@ export class PostgresJournal {
         RETURNING operation.operation, operation.idempotency_key, operation.tenant_id,
                   operation.request_hash, operation.generation::text,
                   candidates.worker_id AS previous_worker_id, operation.worker_id
-      `, [staleBefore, limit, workerId])
+      `, [staleBefore, limit, workerId, tenantId ?? null])
       return result.rows.map(row => ({
         operation: row.operation,
         idempotencyKey: row.idempotency_key,
@@ -396,6 +425,23 @@ export class PostgresJournal {
         `, [tenantId, sorted])
         if (existing.rowCount !== sorted.length) throw new Error('lease missing')
       }
+      return fn(client)
+    })
+  }
+
+  /**
+   * Holds a transaction-scoped advisory lock across an external provider
+   * mutation. Every production lifecycle writer must take the same lock before
+   * associating an already-created provider resource with durable state.
+   */
+  async withProviderResourceLock<T>(kind: 'sandbox' | 'provider_snapshot', resourceId: string,
+    fn: (client: PoolClient) => Promise<T>): Promise<T> {
+    if (!providerResourceKinds.has(kind)) throw new Error('invalid provider resource kind')
+    if (!resourceId.trim() || Buffer.byteLength(resourceId) > 2048) throw new Error('invalid resource ID')
+    const key = `hosted-agent:provider:${kind}:${resourceId}`
+    return this.transaction(async client => {
+      await client.query("SET LOCAL lock_timeout = '30s'")
+      await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [key])
       return fn(client)
     })
   }

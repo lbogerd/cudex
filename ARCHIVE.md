@@ -433,6 +433,39 @@ control-plane methods still need to be refactored onto this API before the
 production persistence checklist and provider-mutation exit criterion are
 satisfied.
 
+### Bounded PostgreSQL reconciliation foundation
+
+An intentionally unwired `PostgresReconciler` now claims stale operations only
+for its configured tenant and generation-fences every ledger mutation. Bounded
+passes adopt durable sandboxes and provider snapshots, reclaim abandoned
+sandboxes/capture sandboxes/snapshots, retry provider failures from
+`reclaim_pending`, reconstruct logical provision and checkpoint success from
+durable records, terminally fail operations whose allocations were all safely
+reclaimed, and delete a bounded batch of retained expired/consumed/revoked
+tickets. Concurrent `runOnce` calls coalesce and polling never overlaps.
+
+Provider inventory is restricted by both `managedBy` and tenant metadata, gives
+fresh unjournaled resources the same stale-age grace as operations, checks
+durable ownership and unfinished allocations globally before and after taking a
+resource lock, and only enumerates snapshots through a known sandbox. Provider
+locks use transaction-scoped PostgreSQL advisory locks with a bounded lock wait
+and pass one client through every database check/update, avoiding both leaked
+session locks and one-connection-pool deadlock. The allocation guard ignores
+terminal operations so released/deleted resources cannot be retained forever.
+
+Docker-backed PostgreSQL 17 coverage proves tenant-isolated takeover,
+`reclaim_pending` adoption, logical replay recovery, terminal-allocation
+cleanup, same-resource serialization across replicas, independent-resource
+parallelism, lock release on failure, and operation with a one-connection pool.
+The worker must not be started in production until every lifecycle writer takes
+the same provider-resource lock immediately after allocation, verifies the
+resource, and holds the lock through ledger recording and durable association.
+Archive/object/blob reconciliation,
+pagination beyond the provider adapter's hard inventory caps, startup wiring,
+and discovery of E2B snapshots after their source sandbox disappears remain
+open; E2B exposes neither arbitrary snapshot metadata filtering nor a safe
+unscoped snapshot listing API.
+
 ### Strict control-plane wire validation
 
 The HTTP boundary now parses the four implemented operations as exact plain JSON

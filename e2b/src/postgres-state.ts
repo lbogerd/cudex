@@ -366,9 +366,10 @@ export class PostgresDurableState {
     } catch (error) { return postgresError(error) }
   }
 
-  async getLease(tenantId: string, leaseId: string): Promise<Lease | null> {
+  async getLease(tenantId: string, leaseId: string,
+    executor: Pick<PoolClient, 'query'> = this.pool): Promise<Lease | null> {
     validateId('tenant ID', tenantId); validateId('lease ID', leaseId)
-    const result = await this.pool.query<LeaseRow>(`
+    const result = await executor.query<LeaseRow>(`
       SELECT ${leaseColumns} FROM hosted_agent_leases WHERE lease_id = $1 AND tenant_id = $2
     `, [leaseId, tenantId])
     return result.rows[0] ? leaseFromRow(result.rows[0]) : null
@@ -381,6 +382,31 @@ export class PostgresDurableState {
       WHERE lease_id = $1 AND state = 'active' AND provider_sandbox_id IS NOT NULL
     `, [leaseId])
     return result.rows[0]?.provider_sandbox_id
+  }
+
+  /** Internal global safety lookup used only to prevent provider reconciliation from killing a durable lease. */
+  async findLeaseByProviderSandboxForReconciliation(providerSandboxId: string,
+    executor: Pick<PoolClient, 'query'> = this.pool): Promise<Lease | null> {
+    validateId('provider sandbox ID', providerSandboxId)
+    const result = await executor.query<LeaseRow>(`
+      SELECT ${leaseColumns} FROM hosted_agent_leases
+      WHERE provider_sandbox_id = $1
+        AND state IN ('provisioning', 'active', 'paused', 'release_pending')
+      ORDER BY created_at DESC LIMIT 1
+    `, [providerSandboxId])
+    return result.rows[0] ? leaseFromRow(result.rows[0]) : null
+  }
+
+  /** Internal global safety lookup used only to protect provider snapshots retained by durable state. */
+  async findSnapshotByProviderIdForReconciliation(providerSnapshotId: string,
+    executor: Pick<PoolClient, 'query'> = this.pool): Promise<Snapshot | null> {
+    validateId('provider snapshot ID', providerSnapshotId)
+    const result = await executor.query<SnapshotRow>(`
+      SELECT ${snapshotColumns} FROM hosted_agent_snapshots
+      WHERE provider_snapshot_id = $1 AND state <> 'deleted'
+      ORDER BY created_at DESC LIMIT 1
+    `, [providerSnapshotId])
+    return result.rows[0] ? snapshotFromRow(result.rows[0]) : null
   }
 
   async getSnapshot(tenantId: string, snapshotId: string): Promise<Snapshot | null> {
@@ -494,12 +520,17 @@ export class PostgresDurableState {
     return result.rowCount ?? 0
   }
 
-  async cleanupTickets(before = new Date()): Promise<number> {
+  async cleanupTickets(before = new Date(), limit = 1000): Promise<number> {
     validateDate('ticket cleanup time', before)
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 10_000) throw new Error('invalid ticket cleanup limit')
     const result = await this.pool.query(`
       DELETE FROM hosted_agent_tickets
-      WHERE expires_at < $1 OR consumed_at < $1 OR revoked_at < $1
-    `, [before])
+      WHERE ctid IN (
+        SELECT ctid FROM hosted_agent_tickets
+        WHERE expires_at < $1 OR consumed_at < $1 OR revoked_at < $1
+        LIMIT $2
+      )
+    `, [before, limit])
     return result.rowCount ?? 0
   }
 

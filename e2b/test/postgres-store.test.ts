@@ -152,6 +152,19 @@ live('allocation ledger and stale claiming use generation fencing across replica
   assert.equal(reclaimed.state, 'reclaimed'); assert.ok(reclaimed.reclaimedAt)
 })
 
+live('stale operation takeover is restricted to the configured tenant', async context => {
+  for (const tenantId of ['tenant-1', 'tenant-2']) {
+    const identity = { operation: 'provision', idempotencyKey: `stale-${tenantId}`, tenantId }
+    assert.equal((await context.first.claimOperation({ ...identity, requestHash: canonicalRequestHash(identity),
+      workerId: 'dead' })).kind, 'claimed')
+  }
+  await context.firstPool.query("UPDATE hosted_agent_operations SET heartbeat_at = now() - interval '1 hour'")
+  const firstTenant = await context.second.claimStaleOperations(new Date(), 10, 'reconciler-1', 'tenant-1')
+  assert.deepEqual(firstTenant.map(operation => operation.tenantId), ['tenant-1'])
+  const remaining = await context.first.claimStaleOperations(new Date(), 10, 'reconciler-2', 'tenant-2')
+  assert.deepEqual(remaining.map(operation => operation.tenantId), ['tenant-2'])
+})
+
 live('lease binding atomically adopts only selected allocations under generation ownership', async context => {
   const identity = { operation: 'provision', idempotencyKey: 'bind-1', tenantId: 'tenant-1' }
   const claim = await context.first.claimOperation({ ...identity, requestHash: canonicalRequestHash(identity), workerId: 'worker-1' })
@@ -193,6 +206,9 @@ live('lease binding atomically adopts only selected allocations under generation
     SELECT primary_lease_id FROM hosted_agent_operations WHERE operation = $1 AND idempotency_key = $2
   `, [identity.operation, identity.idempotencyKey])
   assert.equal(after.rows[0]!.primary_lease_id, 'lease-1')
+  assert.equal(await context.second.hasUnreclaimedAllocation('sandbox', 'sandbox-1'), true)
+  await context.first.completeOperation(identity, claim.generation, 'worker-1', { leaseId: 'lease-1' })
+  assert.equal(await context.second.hasUnreclaimedAllocation('sandbox', 'sandbox-1'), false)
 })
 
 live('sorted multi-lease advisory locks avoid reversed-order deadlock', async context => {
@@ -216,4 +232,41 @@ live('sorted multi-lease advisory locks avoid reversed-order deadlock', async co
     }),
   ])
   assert.deepEqual(new Set(completed), new Set(['first', 'second']))
+})
+
+live('provider resource locks serialize the same durable provider identity across replicas', async context => {
+  let active = 0; let maximum = 0
+  const enter = async () => {
+    active += 1; maximum = Math.max(maximum, active)
+    await new Promise(resolve => setTimeout(resolve, 30))
+    active -= 1
+  }
+  await Promise.all([
+    context.first.withProviderResourceLock('sandbox', 'sandbox-shared', enter),
+    context.second.withProviderResourceLock('sandbox', 'sandbox-shared', enter),
+  ])
+  assert.equal(maximum, 1)
+
+  active = 0; maximum = 0
+  await Promise.all([
+    context.first.withProviderResourceLock('sandbox', 'sandbox-one', enter),
+    context.second.withProviderResourceLock('sandbox', 'sandbox-two', enter),
+  ])
+  assert.equal(maximum, 2)
+
+  await assert.rejects(context.first.withProviderResourceLock('provider_snapshot', 'snapshot-throw', async () => {
+    throw new Error('injected provider failure')
+  }), /injected provider failure/)
+  await context.second.withProviderResourceLock('provider_snapshot', 'snapshot-throw', async () => undefined)
+
+  const singlePool = new Pool({ connectionString: databaseUrl, options: `-c search_path=${context.schema}`, max: 1 })
+  try {
+    const single = new PostgresJournal(singlePool)
+    await single.withProviderResourceLock('sandbox', 'sandbox-single-pool', async client => {
+      const result = await client.query<{ value: number }>('SELECT 1 AS value')
+      assert.equal(result.rows[0]!.value, 1)
+    })
+  } finally {
+    await singlePool.end()
+  }
 })
