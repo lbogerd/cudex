@@ -686,7 +686,7 @@ The authenticated gateway, root workspace ingress, and snapshot-disconnect Codex
 recovery canaries remain in the focused spike plan. They are not implied by this
 completed foundation.
 
-### Chunk 2: Provision, reconnect, and release
+### Chunk 2: Provision, reconnect, and release — spike complete
 
 Implement the database, operation journal, template allowlist, and the three
 lifecycle endpoints. Start with root provisioning under the chosen ingress model.
@@ -695,7 +695,7 @@ Add a reconciler that kills any E2B sandbox left by an incomplete transaction.
 Exit criterion: duplicate requests are stable, service restarts preserve leases,
 reconnect resumes them, and release is idempotent.
 
-### Chunk 3: Checkpoint, child isolation, and restore
+### Chunk 3: Checkpoint, child isolation, and restore — spike complete
 
 Implement durable snapshot records and manifest generation. Provision children
 from an atomic owner snapshot, and restore killed leases from `durableSnapshot`.
@@ -712,6 +712,14 @@ without deleting artifacts still referenced by Codex.
 Exit criterion: additions, edits, deletions, binary files, modes, clean applies,
 and conflicts all behave like the in-memory fake, with no target mutation on
 conflict.
+
+The focused spike intentionally stops before Chunk 4. Its four lifecycle routes,
+workspace bridge, gateway, local failure suite, and live provider canaries are in
+`e2b/src`, `e2b/test`, and `e2b/scripts/live-lifecycle-canary.mjs`. The resulting
+six decisions, including measured security boundaries and operational costs, are
+recorded in `e2b/ARCHITECTURE_DECISIONS.md`. Production implementation should
+replace the JSON/blob stores with PostgreSQL and authenticated object storage,
+then resume here with patch export/application.
 
 ### Chunk 5: Production hardening
 

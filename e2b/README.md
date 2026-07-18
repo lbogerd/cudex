@@ -63,6 +63,18 @@ node e2b/scripts/verify-template.mjs e2b/.artifacts/templates/<build_id>.json
 
 The canary checks the revision and binary checksum, starts `codex exec-server` on port `22101`, executes a process over its WSS protocol, and kills the sandbox. Success ends with `"verified": true`.
 
+Run the lifecycle, recovery, and child-isolation canary with the same environment:
+
+```bash
+node e2b/scripts/live-lifecycle-canary.mjs <template_id>
+```
+
+The external TypeScript control plane is under `e2b/src`. Build and run its
+provider-independent contract/failure suite with `npm test --prefix e2b`. Runtime
+configuration is supplied through `HOSTED_AGENT_*`; see `e2b/src/main.ts` for the
+small required set. Architecture results are recorded in
+[`ARCHITECTURE_DECISIONS.md`](ARCHITECTURE_DECISIONS.md).
+
 ## Overrides
 
 - `CODEX_BUILD_TARGET`, `CODEX_BUILD_PROFILE`, `CODEX_ARTIFACT_DIR`: artifact build settings.

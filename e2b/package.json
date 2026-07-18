@@ -2,11 +2,21 @@
   "name": "cudex-e2b-development",
   "private": true,
   "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test dist/test/*.test.js",
+    "start": "node dist/src/main.js"
+  },
   "engines": {
     "node": ">=22"
   },
   "dependencies": {
     "e2b": "2.35.0",
     "ws": "8.18.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.18.3",
+    "@types/ws": "^8.18.1",
+    "typescript": "^5.9.2"
   }
 }

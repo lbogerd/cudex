@@ -92,3 +92,15 @@ security boundary, failure behavior, and operational cost.
 - Every injected failure is reconciled without leaked sandboxes or tickets.
 - The six architecture decisions above are recorded and the implementation
   sequence in the integration guide is updated from their results.
+
+## Spike result (2026-07-18)
+
+Implemented under `e2b/src` with black-box/failure tests under `e2b/test` and a
+live CubeSandbox lifecycle canary under `e2b/scripts`. The live run proved
+checkpoint reconnect, provider-snapshot restore after sandbox loss, credential
+and process cleanup, workspace-only child creation, and owner/child divergence.
+The provider-independent suite proves restart persistence, canonical idempotency,
+mismatched-key rejection, transactional cleanup, release replay, and ticket
+redaction/revocation. Decisions and rejected alternatives are recorded in
+`e2b/ARCHITECTURE_DECISIONS.md`; the integration guide now marks spike chunks 2
+and 3 complete and leaves patch operations for the production sequence.

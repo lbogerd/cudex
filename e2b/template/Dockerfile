@@ -9,6 +9,7 @@ COPY .build/build.json /etc/cudex/codex-build.json
 
 RUN echo "${CODEX_BINARY_SHA256}  /usr/local/bin/codex" | sha256sum -c - \
     && chmod 0755 /usr/local/bin/codex \
+    && chown 1000:1000 /workspace \
     && /usr/local/bin/codex --version \
     && /usr/local/bin/codex exec-server --help >/dev/null
 
