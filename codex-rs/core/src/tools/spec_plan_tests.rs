@@ -1498,6 +1498,85 @@ async fn multi_agent_v2_message_schemas_are_encrypted() {
 }
 
 #[tokio::test]
+async fn hosted_multi_agent_v2_exposes_plain_patch_apply_only_when_authorized() {
+    let non_hosted = probe(|turn| {
+        set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
+    })
+    .await;
+    non_hosted.assert_visible_lacks(&["apply_agent_patch"]);
+    non_hosted.assert_registered_lacks(&["apply_agent_patch"]);
+
+    let hosted = probe(|turn| {
+        set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
+        update_config(turn, |config| {
+            config.hosted_agents.enabled = true;
+            config.multi_agent_v2.tool_namespace = Some("agents".to_string());
+        });
+        set_hosted_tool_policy(
+            turn,
+            "hosted",
+            [ToolExecutionDomainKind::ControlPlane],
+            [ToolName::plain("apply_agent_patch")],
+        );
+    })
+    .await;
+    hosted.assert_visible_contains(&["apply_agent_patch"]);
+    hosted.assert_registered_contains(&["apply_agent_patch"]);
+    assert!(
+        !hosted
+            .registered_names
+            .contains(&ToolName::namespaced("agents", "apply_agent_patch").to_string())
+    );
+    let ToolSpec::Function(ResponsesApiTool { parameters, .. }) =
+        hosted.visible_spec("apply_agent_patch")
+    else {
+        panic!("expected plain apply_agent_patch function tool");
+    };
+    assert_eq!(
+        parameters.required.as_ref(),
+        Some(&vec!["agent_id".to_string(), "artifact_id".to_string()])
+    );
+    assert_eq!(
+        parameters
+            .properties
+            .as_ref()
+            .expect("patch apply should use object params")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec!["agent_id".to_string(), "artifact_id".to_string()]
+    );
+
+    let denied = probe(|turn| {
+        set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
+        update_config(turn, |config| config.hosted_agents.enabled = true);
+        set_hosted_tool_policy(
+            turn,
+            "hosted",
+            [ToolExecutionDomainKind::ControlPlane],
+            [ToolName::plain("update_plan")],
+        );
+    })
+    .await;
+    denied.assert_visible_lacks(&["apply_agent_patch"]);
+    denied.assert_registered_contains(&["apply_agent_patch"]);
+
+    let allowed = probe(|turn| {
+        set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
+        update_config(turn, |config| config.hosted_agents.enabled = true);
+        set_hosted_tool_policy(
+            turn,
+            "hosted",
+            [ToolExecutionDomainKind::ControlPlane],
+            [ToolName::plain("apply_agent_patch")],
+        );
+    })
+    .await;
+    allowed.assert_visible_contains(&["apply_agent_patch"]);
+    allowed.assert_registered_contains(&["apply_agent_patch"]);
+}
+
+#[tokio::test]
 async fn tool_mode_selector_overrides_feature_flags() {
     let direct = probe(|turn| {
         set_features(turn, &[Feature::CodeMode, Feature::CodeModeOnly]);

@@ -16,6 +16,7 @@ use crate::session::emit_subagent_session_started;
 use crate::session_prefix::format_inter_agent_completion_message;
 use crate::session_prefix::format_subagent_context_line;
 use crate::session_prefix::format_subagent_notification_message;
+use crate::thread_manager::HostedAgentPatchApplyResult;
 use crate::thread_manager::HostedAgentProvisioningLineage;
 use crate::thread_manager::ResumeThreadWithHistoryOptions;
 use crate::thread_manager::ThreadManagerState;
@@ -203,6 +204,50 @@ impl AgentControl {
         let state = self.upgrade()?;
         state
             .finalize_hosted_runtime(agent_id, owner_thread_id)
+            .await
+    }
+
+    /// Applies a finalized descendant's patch to this session's own hosted sandbox.
+    pub(crate) async fn apply_hosted_agent_patch(
+        &self,
+        requesting_agent_id: ThreadId,
+        source_agent_id: ThreadId,
+        artifact_id: &str,
+    ) -> CodexResult<HostedAgentPatchApplyResult> {
+        const UNAVAILABLE_PATCH_REASON: &str = "patch is not available to the requesting agent";
+
+        if requesting_agent_id == source_agent_id {
+            return Ok(HostedAgentPatchApplyResult::Rejected {
+                reason: UNAVAILABLE_PATCH_REASON.to_string(),
+            });
+        }
+
+        let state = self.upgrade()?;
+        let persisted_descendants = match state.agent_graph_store() {
+            Some(agent_graph_store) => agent_graph_store
+                .list_thread_spawn_descendants(requesting_agent_id, /*status_filter*/ None)
+                .await
+                .map_err(|error| {
+                    CodexErr::Fatal(format!("failed to load thread-spawn descendants: {error}"))
+                })?,
+            None => Vec::new(),
+        };
+        let source_is_owned = persisted_descendants.contains(&source_agent_id)
+            || self
+                .list_live_agent_subtree_thread_ids(requesting_agent_id)
+                .await?
+                .contains(&source_agent_id)
+            || state
+                .is_hosted_agent_descendant(requesting_agent_id, source_agent_id)
+                .await?;
+        if !source_is_owned {
+            return Ok(HostedAgentPatchApplyResult::Rejected {
+                reason: UNAVAILABLE_PATCH_REASON.to_string(),
+            });
+        }
+
+        state
+            .apply_hosted_agent_patch(requesting_agent_id, source_agent_id, artifact_id)
             .await
     }
 

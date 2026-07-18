@@ -11,6 +11,7 @@ use crate::session::turn_context::TurnContext;
 use crate::session_prefix::format_inter_agent_completion_message;
 use crate::thread_manager::thread_store_from_config;
 use crate::tools::context::ToolOutput;
+use crate::tools::handlers::multi_agents_v2::ApplyAgentPatchHandler;
 use crate::tools::handlers::multi_agents_v2::FollowupTaskHandler as FollowupTaskHandlerV2;
 use crate::tools::handlers::multi_agents_v2::InterruptAgentHandler;
 use crate::tools::handlers::multi_agents_v2::ListAgentsHandler as ListAgentsHandlerV2;
@@ -2547,6 +2548,84 @@ async fn send_input_rejects_invalid_id() {
         panic!("expected respond-to-model error");
     };
     assert!(msg.starts_with("invalid agent id not-a-uuid:"));
+}
+
+#[tokio::test]
+async fn apply_agent_patch_rejects_invalid_agent_id() {
+    let (session, turn) = make_session_and_context().await;
+    let invocation = invocation(
+        Arc::new(session),
+        Arc::new(turn),
+        "apply_agent_patch",
+        function_payload(json!({
+            "agent_id": "not-a-uuid",
+            "artifact_id": "artifact-1"
+        })),
+    );
+
+    let err = ApplyAgentPatchHandler
+        .handle(invocation)
+        .await
+        .err()
+        .expect("invalid agent id should be rejected");
+    let FunctionCallError::RespondToModel(message) = err else {
+        panic!("expected respond-to-model error");
+    };
+    assert!(message.starts_with("invalid agent id not-a-uuid:"));
+}
+
+#[tokio::test]
+async fn apply_agent_patch_targets_the_calling_session() {
+    let (mut session, turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    session.services.agent_control = manager.agent_control();
+    let requesting_agent_id = session.thread_id;
+    let output = ApplyAgentPatchHandler
+        .handle(invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "apply_agent_patch",
+            function_payload(json!({
+                "agent_id": requesting_agent_id.to_string(),
+                "artifact_id": "artifact-1"
+            })),
+        ))
+        .await
+        .expect("same-agent patch request should return a bounded rejection");
+
+    let (content, success) = expect_text_output(output);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&content)
+            .expect("patch apply result should be json"),
+        json!({
+            "type": "rejected",
+            "reason": "patch is not available to the requesting agent"
+        })
+    );
+    assert_eq!(success, Some(true));
+}
+
+#[tokio::test]
+async fn apply_agent_patch_does_not_accept_a_target_thread() {
+    let (session, turn) = make_session_and_context().await;
+    let err = ApplyAgentPatchHandler
+        .handle(invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "apply_agent_patch",
+            function_payload(json!({
+                "agent_id": ThreadId::new().to_string(),
+                "artifact_id": "artifact-1",
+                "thread_id": ThreadId::new().to_string()
+            })),
+        ))
+        .await
+        .err()
+        .expect("target override should be rejected");
+    let FunctionCallError::RespondToModel(message) = err else {
+        panic!("expected respond-to-model error");
+    };
+    assert!(message.contains("unknown field `thread_id`"));
 }
 
 #[tokio::test]
