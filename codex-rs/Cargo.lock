@@ -4065,6 +4065,7 @@ dependencies = [
  "chrono",
  "codex-app-server-protocol",
  "codex-git-utils",
+ "codex-hosted-agent",
  "codex-install-context",
  "codex-otel",
  "codex-protocol",
