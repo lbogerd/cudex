@@ -114,6 +114,9 @@ identity remains isolated, and lifecycle replay never duplicates resources.
 
 - [x] Add bounded canonical manifest, diff, checksum, and file-type validation
   primitives shared by export and apply.
+- [x] Add an immutable tenant/lineage-authorized PostgreSQL artifact repository
+  with snapshot/object/content references, expiry, replay, and retention after
+  source lease release.
 - [ ] Implement `POST v1/agents/patch/export` using the archived contract.
 - [ ] Build canonical sorted manifests with path, type, mode, link target or
   content digest, and immutable base/current identities.

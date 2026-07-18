@@ -300,6 +300,26 @@ targets, 300-conflict truncation, malformed inputs, and every quota dimension.
 Manifest capture/persistence and live workspace mutation remain subsequent
 lifecycle work.
 
+### Durable patch-artifact repository
+
+The PostgreSQL patch repository validates a canonical base/current manifest pair
+against the source lease's exact tenant, child agent, owner, immutable base, and
+latest snapshot. It derives the changed-path count and current regular-file byte
+total, verifies manifest/artifact/content object kinds, checksums, sizes, state,
+and expiry, and inserts the artifact plus all object, snapshot, and owner
+retention references in one transaction. Reads authorize either the source agent
+or its recorded owner without disclosing cross-tenant existence.
+
+Identical concurrent creation across independent pools converges on one durable
+identity; changed replay conflicts and rolls back references. Released source
+leases can replay and add Codex retention references, while expiry removes
+authorization without deleting the artifact graph. A follow-up migration makes
+every artifact identity column immutable even to direct SQL while permitting
+lifecycle state transitions. All four repository suites passed against
+PostgreSQL 17, covering concurrency, tenant/owner isolation, release retention,
+direct-SQL immutability, and expiry. Artifact serialization/upload and the HTTP
+export/apply orchestration remain lifecycle work.
+
 ### Multi-replica operation journal primitives
 
 The PostgreSQL layer now exposes atomic operation admission over the unique
