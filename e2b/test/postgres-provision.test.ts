@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict'
 import { createHash, randomUUID } from 'node:crypto'
 import test from 'node:test'
-import { Pool } from 'pg'
+import { Pool, type PoolClient } from 'pg'
 import { Header } from 'tar'
 import type { ObjectStore } from '../src/blob-store.js'
 import { runMigrations } from '../src/migrate.js'
 import { PostgresObjectReclaimer } from '../src/postgres-object-reclaimer.js'
+import { PostgresCheckpointCoordinator } from '../src/postgres-checkpoint.js'
 import { PostgresProvisionCoordinator } from '../src/postgres-provision.js'
 import { PostgresDurableState } from '../src/postgres-state.js'
 import {
@@ -84,13 +85,55 @@ class GatedProvider extends FakeProvider {
   }
 }
 
+class CheckpointGatedProvider extends FakeProvider {
+  private readonly gates: Array<{ entered: ReturnType<typeof deferred>; released: ReturnType<typeof deferred> }> = []
+  gateNextExport(): { entered: Promise<void>; release(): void } {
+    const gate = { entered: deferred(), released: deferred() }; this.gates.push(gate)
+    return { entered: gate.entered.promise, release: () => { gate.released.resolve() } }
+  }
+  override async exportWorkspace(sandboxId: string): Promise<Uint8Array> {
+    const gate = this.gates.shift()
+    if (gate) { gate.entered.resolve(); await gate.released.promise }
+    return super.exportWorkspace(sandboxId)
+  }
+}
+
 class ObservedJournal extends PostgresJournal {
   private readonly observed = deferred()
+  private readonly lockObserved = deferred()
+  private failRecoveryClaim = false
   readonly inProgressObserved = this.observed.promise
+  readonly leaseLockObserved = this.lockObserved.promise
+  throwAfterLeaseCommit = false
+  throwAfterCompoundProviderCommit = false
+  failClaimAfterAmbiguousCommit = false
   override async claimOperation(input: OperationClaimInput): Promise<OperationClaim> {
+    if (this.failRecoveryClaim) { this.failRecoveryClaim = false; throw new Error('injected recovery read outage') }
     const claim = await super.claimOperation(input)
     if (claim.kind === 'in_progress') this.observed.resolve()
     return claim
+  }
+  override async withLeaseLocks<T>(tenant: string, leaseIds: string[],
+    fn: (client: PoolClient) => Promise<T>): Promise<T> {
+    this.lockObserved.resolve()
+    const result = await super.withLeaseLocks(tenant, leaseIds, fn)
+    if (this.throwAfterLeaseCommit) {
+      this.throwAfterLeaseCommit = false
+      this.failRecoveryClaim = this.failClaimAfterAmbiguousCommit
+      throw new Error('injected ambiguous commit acknowledgement')
+    }
+    return result
+  }
+  override async withProviderResourceLocks<T>(
+    resources: Array<{ kind: 'sandbox' | 'provider_snapshot'; resourceId: string }>,
+    fn: (client: PoolClient) => Promise<T>,
+  ): Promise<T> {
+    const result = await super.withProviderResourceLocks(resources, fn)
+    if (this.throwAfterCompoundProviderCommit && resources.length > 1) {
+      this.throwAfterCompoundProviderCommit = false
+      throw new Error('injected ambiguous commit acknowledgement')
+    }
+    return result
   }
 }
 
@@ -110,24 +153,26 @@ class FailOnceTickets implements TicketAuthority {
 interface Fixture {
   admin: Pool
   pools: [Pool, Pool]
-  journals: [PostgresJournal, ObservedJournal]
+  journals: [ObservedJournal, ObservedJournal]
   states: [PostgresDurableState, PostgresDurableState]
   provider: FakeProvider
   objects: TrackingObjects
   lifecycle: SourceSnapshotLifecycle
   coordinators: [PostgresProvisionCoordinator, PostgresProvisionCoordinator]
+  checkpointCoordinators: [PostgresCheckpointCoordinator, PostgresCheckpointCoordinator]
   request: ProvisionRequest
   schema: string
 }
 
-async function fixture(provider: FakeProvider = new FakeProvider(), failFirstTicket = false): Promise<Fixture> {
+async function fixture(provider: FakeProvider = new FakeProvider(), failFirstTicket = false,
+  cleanupBatchSize?: number): Promise<Fixture> {
   const schema = `hosted_agent_provision_${randomUUID().replaceAll('-', '')}`
   const admin = new Pool({ connectionString: databaseUrl }); await admin.query(`CREATE SCHEMA ${schema}`)
   const pools = [0, 1].map(() => new Pool({ connectionString: databaseUrl,
     options: `-c search_path=${schema}`, max: 6 })) as [Pool, Pool]
   await runMigrations(pools[0])
   const states = pools.map(pool => new PostgresDurableState(pool)) as [PostgresDurableState, PostgresDurableState]
-  const journals: [PostgresJournal, ObservedJournal] = [new PostgresJournal(pools[0]), new ObservedJournal(pools[1])]
+  const journals: [ObservedJournal, ObservedJournal] = [new ObservedJournal(pools[0]), new ObservedJournal(pools[1])]
   const objects = new TrackingObjects()
   const sourceReclaimer = new PostgresObjectReclaimer(pools[0], objects)
   const lifecycle = new SourceSnapshotLifecycle(states[0], objects, { reclaimer: sourceReclaimer })
@@ -142,29 +187,37 @@ async function fixture(provider: FakeProvider = new FakeProvider(), failFirstTic
     sandboxTemplate: 'general-v1', providerTemplateId: 'provider-template-v1',
     toolPolicy: { allowedDomains: ['agentEnvironment'], allowedTools: [] }, policyVersion: 1,
   }
-  const coordinators = journals.map((journal, index) => {
+  const publishers = journals.map((journal, index) => {
     const reclaimer = new PostgresObjectReclaimer(pools[index]!, objects)
-    const publisher = new WorkspaceSnapshotPublisher(states[index]!, objects, {
+    return new WorkspaceSnapshotPublisher(states[index]!, objects, {
       reclaimer: { async reclaimUnreferencedWorkspaceObject() { assert.fail('durable publication must not use legacy cleanup') } },
       durablePreparation: {
         journal,
         preparations: new PostgresWorkspacePreparations(pools[index]!),
         reclaimer,
+        ...(cleanupBatchSize === undefined ? {} : { cleanupBatchSize }),
       },
     })
+  }) as [WorkspaceSnapshotPublisher, WorkspaceSnapshotPublisher]
+  const coordinators = journals.map((journal, index) => {
     const issuer = new PostgresTicketIssuer(states[index]!, tenantId, 'wss://gateway.example')
     const tickets = index === 0 && failFirstTicket ? new FailOnceTickets(issuer) : issuer
-    return new PostgresProvisionCoordinator(journal, states[index]!, publisher, provider, tickets, {
+    return new PostgresProvisionCoordinator(journal, states[index]!, publishers[index]!, provider, tickets, {
         principal, managedBy: 'cudex', workerId: `provision-worker-${index}`,
         roles: { default: role }, sourceResolver: lifecycle,
       })
   }) as [PostgresProvisionCoordinator, PostgresProvisionCoordinator]
+  const checkpointCoordinators = journals.map((journal, index) =>
+    new PostgresCheckpointCoordinator(journal, states[index]!, publishers[index]!, provider, {
+      tenantId, workerId: `checkpoint-worker-${index}`,
+    })) as [PostgresCheckpointCoordinator, PostgresCheckpointCoordinator]
   const request: ProvisionRequest = {
     agentId: 'agent-root', ownerAgentId: null, agentType: 'default', sandboxTemplate: 'general-v1',
     source: { type: 'sourceSnapshot', sourceSnapshotId: source.sourceSnapshotId, checksum: source.checksum },
     idempotencyKey: 'durable-provision',
   }
-  return { admin, pools, journals, states, provider, objects, lifecycle, coordinators, request, schema }
+  return { admin, pools, journals, states, provider, objects, lifecycle, coordinators,
+    checkpointCoordinators, request, schema }
 }
 
 async function close(context: Fixture): Promise<void> {
@@ -280,6 +333,7 @@ test('ticket failure after durable completion preserves the adopted lease for fr
 }, async () => {
   const context = await fixture(new FakeProvider(), true)
   try {
+    context.journals[0].throwAfterCompoundProviderCommit = true
     await assert.rejects(context.coordinators[0].provision(context.request), /injected ticket outage/)
     assert.equal(context.provider.creates, 1)
     assert.equal(context.provider.live().length, 1)
@@ -300,5 +354,146 @@ test('ticket failure after durable completion preserves the adopted lease for fr
     assert.equal(context.provider.creates, 1)
     assert.equal(context.provider.kills, 0)
     assert.equal(context.provider.snapshotDeletes, 0)
+  } finally { await close(context) }
+})
+
+test('durable checkpoints serialize per lease across replicas and replay without mutation', {
+  skip: databaseUrl ? false : 'HOSTED_AGENT_TEST_DATABASE_URL is not set',
+}, async () => {
+  const provider = new CheckpointGatedProvider(); const context = await fixture(provider)
+  try {
+    const lease = await context.coordinators[0].provision(context.request)
+    const baselineExports = provider.exports
+    const firstGate = provider.gateNextExport(); const secondGate = provider.gateNextExport()
+    const firstRequest = { leaseId: lease.leaseId, idempotencyKey: 'checkpoint-a' }
+    const secondRequest = { leaseId: lease.leaseId, idempotencyKey: 'checkpoint-b' }
+    const first = context.checkpointCoordinators[0].checkpoint(firstRequest)
+    await firstGate.entered
+    const duplicate = context.checkpointCoordinators[1].checkpoint(firstRequest)
+    await context.journals[1].inProgressObserved
+    const second = context.checkpointCoordinators[1].checkpoint(secondRequest)
+    await context.journals[1].leaseLockObserved
+    assert.equal(provider.exports, baselineExports)
+    firstGate.release()
+    const [firstResult, duplicateResult] = await Promise.all([first, duplicate])
+    assert.deepEqual(duplicateResult, firstResult)
+    await secondGate.entered
+    assert.equal(provider.exports, baselineExports + 1)
+    secondGate.release()
+    const secondResult = await second
+    assert.notEqual(secondResult.snapshotId, firstResult.snapshotId)
+    const mutations = { exports: provider.exports, snapshots: provider.snapshots.size, puts: context.objects.puts }
+    assert.deepEqual(await context.checkpointCoordinators[1].checkpoint(firstRequest), firstResult)
+    assert.deepEqual({ exports: provider.exports, snapshots: provider.snapshots.size, puts: context.objects.puts }, mutations)
+
+    const durableLease = await context.states[0].getLease(tenantId, lease.leaseId)
+    assert.equal(durableLease?.baseSnapshotId, lease.baseSnapshotId)
+    assert.equal(durableLease?.latestSnapshotId, secondResult.snapshotId)
+    const graph = await context.pools[0].query<{
+      operations: string; snapshots: string; preparations: string; allocations: string; adopted: string
+    }>(`
+      SELECT
+        (SELECT count(*)::text FROM hosted_agent_operations
+          WHERE operation = 'checkpoint' AND state = 'succeeded') AS operations,
+        (SELECT count(*)::text FROM hosted_agent_snapshots WHERE lease_id = $1 AND state = 'available') AS snapshots,
+        (SELECT count(*)::text FROM hosted_agent_workspace_preparations
+          WHERE operation = 'checkpoint' AND state = 'committed') AS preparations,
+        (SELECT count(*)::text FROM hosted_agent_operation_allocations
+          WHERE operation = 'checkpoint') AS allocations,
+        (SELECT count(*)::text FROM hosted_agent_operation_allocations
+          WHERE operation = 'checkpoint' AND state = 'adopted' AND lease_id = $1) AS adopted
+    `, [lease.leaseId])
+    assert.deepEqual(graph.rows[0], {
+      operations: '2', snapshots: '3', preparations: '2', allocations: '8', adopted: '8',
+    })
+    const operations = await context.pools[0].query<{
+      idempotency_key: string; request_hash: string; logical_response: { snapshotId: string }
+    }>(`SELECT idempotency_key, request_hash, logical_response FROM hosted_agent_operations
+      WHERE operation = 'checkpoint' ORDER BY idempotency_key`)
+    assert.deepEqual(operations.rows, [
+      { idempotency_key: firstRequest.idempotencyKey, request_hash: canonicalRequestHash(firstRequest),
+        logical_response: firstResult },
+      { idempotency_key: secondRequest.idempotencyKey, request_hash: canonicalRequestHash(secondRequest),
+        logical_response: secondResult },
+    ])
+  } finally { await close(context) }
+})
+
+test('partial checkpoint publication preserves the lease while reclaiming snapshot and objects', {
+  skip: databaseUrl ? false : 'HOSTED_AGENT_TEST_DATABASE_URL is not set',
+}, async () => {
+  const context = await fixture(new FakeProvider(), false, 1)
+  try {
+    const lease = await context.coordinators[0].provision(context.request)
+    const before = await context.states[0].getLease(tenantId, lease.leaseId)
+    const baseline = { puts: context.objects.puts, values: context.objects.values.size,
+      providerSnapshots: context.provider.snapshots.size, exports: context.provider.exports }
+    context.objects.failAt = baseline.puts + 3
+    const request = { leaseId: lease.leaseId, idempotencyKey: 'checkpoint-partial' }
+    await assert.rejects(context.checkpointCoordinators[0].checkpoint(request),
+      (error: unknown) => error instanceof ServiceError && error.status === 503 && error.message === 'durable checkpoint failed')
+    assert.equal(context.provider.live().length, 1)
+    assert.equal(context.provider.kills, 0)
+    assert.equal(context.provider.snapshots.size, baseline.providerSnapshots)
+    assert.equal(context.provider.snapshotDeletes, 1)
+    assert.equal(context.objects.values.size, baseline.values)
+    const after = await context.states[0].getLease(tenantId, lease.leaseId)
+    assert.equal(after?.state, 'active')
+    assert.equal(after?.baseSnapshotId, before?.baseSnapshotId)
+    assert.equal(after?.latestSnapshotId, before?.latestSnapshotId)
+
+    const graph = await context.pools[0].query<{
+      operation_state: string; primary_lease_id: string | null; snapshots: string
+      preparation_state: string; associations: string; allocations: string; reclaimed: string
+    }>(`
+      SELECT operation.state AS operation_state, operation.primary_lease_id,
+        (SELECT count(*)::text FROM hosted_agent_snapshots WHERE lease_id = $1) AS snapshots,
+        (SELECT state FROM hosted_agent_workspace_preparations
+          WHERE operation = 'checkpoint' AND idempotency_key = operation.idempotency_key) AS preparation_state,
+        (SELECT count(*)::text FROM hosted_agent_workspace_preparation_objects
+          WHERE operation = 'checkpoint' AND idempotency_key = operation.idempotency_key) AS associations,
+        (SELECT count(*)::text FROM hosted_agent_operation_allocations
+          WHERE operation = 'checkpoint' AND idempotency_key = operation.idempotency_key) AS allocations,
+        (SELECT count(*)::text FROM hosted_agent_operation_allocations
+          WHERE operation = 'checkpoint' AND idempotency_key = operation.idempotency_key AND state = 'reclaimed') AS reclaimed
+      FROM hosted_agent_operations AS operation
+      WHERE operation.operation = 'checkpoint' AND operation.idempotency_key = $2
+    `, [lease.leaseId, request.idempotencyKey])
+    assert.deepEqual(graph.rows[0], {
+      operation_state: 'failed_terminal', primary_lease_id: null, snapshots: '1',
+      preparation_state: 'reclaimed', associations: '2', allocations: '3', reclaimed: '3',
+    })
+    const mutations = { creates: context.provider.creates, exports: context.provider.exports,
+      snapshots: context.provider.snapshots.size, puts: context.objects.puts, deletes: context.provider.snapshotDeletes }
+    await assert.rejects(context.checkpointCoordinators[1].checkpoint(request),
+      (error: unknown) => error instanceof ServiceError && error.status === 503 && error.message === 'durable checkpoint failed')
+    assert.deepEqual({ creates: context.provider.creates, exports: context.provider.exports,
+      snapshots: context.provider.snapshots.size, puts: context.objects.puts, deletes: context.provider.snapshotDeletes }, mutations)
+  } finally { await close(context) }
+})
+
+test('ambiguous checkpoint commit never deletes adopted resources when recovery reads fail', {
+  skip: databaseUrl ? false : 'HOSTED_AGENT_TEST_DATABASE_URL is not set',
+}, async () => {
+  const context = await fixture()
+  try {
+    const lease = await context.coordinators[0].provision(context.request)
+    const request = { leaseId: lease.leaseId, idempotencyKey: 'checkpoint-ambiguous' }
+    context.journals[0].throwAfterLeaseCommit = true
+    context.journals[0].failClaimAfterAmbiguousCommit = true
+    await assert.rejects(context.checkpointCoordinators[0].checkpoint(request),
+      (error: unknown) => error instanceof ServiceError && error.status === 503
+        && error.message === 'durable checkpoint cleanup pending')
+
+    const durableLease = await context.states[0].getLease(tenantId, lease.leaseId)
+    assert.notEqual(durableLease?.latestSnapshotId, lease.baseSnapshotId)
+    assert.equal(context.provider.snapshotDeletes, 0)
+    assert.equal(context.provider.live().length, 1)
+    const mutations = { snapshots: context.provider.snapshots.size, puts: context.objects.puts,
+      deletes: context.provider.snapshotDeletes }
+    assert.deepEqual(await context.checkpointCoordinators[1].checkpoint(request),
+      { snapshotId: durableLease?.latestSnapshotId })
+    assert.deepEqual({ snapshots: context.provider.snapshots.size, puts: context.objects.puts,
+      deletes: context.provider.snapshotDeletes }, mutations)
   } finally { await close(context) }
 })

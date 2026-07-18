@@ -29,7 +29,7 @@ import {
   type WorkspacePreparationObjectPurpose,
 } from './postgres-workspace-preparations.js'
 import { ServiceError } from './types.js'
-import { WorkspaceManifestError, type WorkspaceManifest } from './workspace-manifest.js'
+import { canonicalJson, WorkspaceManifestError, type WorkspaceManifest } from './workspace-manifest.js'
 
 const checksumPattern = /^sha256:[0-9a-f]{64}$/
 
@@ -53,6 +53,7 @@ export interface AppendWorkspaceCheckpointInput {
 export interface PrepareDurableBaseWorkspaceSnapshotInput extends CreateBaseWorkspaceSnapshotInput {
   fence: PreparationFence
   expectedSourceChecksum: string | null
+  expectedLatestSnapshotId?: string | null
 }
 
 export interface PreparedDurableBaseWorkspaceSnapshot {
@@ -62,6 +63,11 @@ export interface PreparedDurableBaseWorkspaceSnapshot {
   snapshotInput: Readonly<SnapshotInput>
   manifest: WorkspaceManifest
   contentObjects: readonly PublishedWorkspaceContent[]
+}
+
+/** Internal signal that an attempted durable preparation was fully reclaimed. */
+export class WorkspacePreparationAbortedError extends ServiceError {
+  constructor() { super(503, 'workspace preparation was aborted') }
 }
 
 export interface CommittedDurableBaseWorkspaceSnapshot {
@@ -111,7 +117,7 @@ export interface WorkspaceSnapshotPublisherOptions {
 
 type DurableWorkspaceState = Pick<PostgresDurableState,
   'withObjectLocationLock' | 'registerObject' | 'createLeaseWithBaseSnapshot' | 'appendCheckpoint'>
-  & Partial<Pick<PostgresDurableState, 'lockAuthorizedSourceSnapshot'>>
+  & Partial<Pick<PostgresDurableState, 'getLease' | 'lockAuthorizedSourceSnapshot'>>
 
 interface PlannedObject {
   bytes: Uint8Array
@@ -256,7 +262,13 @@ export class WorkspaceSnapshotPublisher {
   async prepareDurableBase(input: PrepareDurableBaseWorkspaceSnapshotInput): Promise<PreparedDurableBaseWorkspaceSnapshot> {
     const coordinator = this.options.durablePreparation
     if (!coordinator) throw new ServiceError(503, 'durable workspace preparation is unavailable')
-    if (input.fence.operation !== 'provision') throw new ServiceError(400, 'invalid workspace preparation operation')
+    if (input.fence.operation !== 'provision' && input.fence.operation !== 'checkpoint') {
+      throw new ServiceError(400, 'invalid workspace preparation operation')
+    }
+    if (input.fence.operation === 'checkpoint'
+      && (input.sourceSnapshotId != null || input.expectedSourceChecksum !== null)) {
+      throw new ServiceError(400, 'checkpoint preparation must not rebind source identity')
+    }
     const tenantId = opaque('tenant ID', input.tenantId)
     if (tenantId !== input.fence.tenantId) throw new ServiceError(400, 'workspace preparation tenant mismatch')
     const preparationId = workspacePreparationId(input.fence)
@@ -268,6 +280,8 @@ export class WorkspaceSnapshotPublisher {
         tenantId, leaseId: input.leaseId, environmentId: input.environmentId, agentId: input.agentId,
         ownerAgentId: input.ownerAgentId ?? null, ownerLeaseId: input.ownerLeaseId ?? null,
         sourceSnapshotId: input.sourceSnapshotId ?? null, expectedSourceChecksum: input.expectedSourceChecksum,
+        expectedLatestSnapshotId: input.fence.operation === 'checkpoint'
+          ? input.expectedLatestSnapshotId ?? null : null,
         providerSandboxId: input.providerSandboxId, sandboxTemplate: input.sandboxTemplate,
         cwdUri: input.cwdUri, workspaceRootUris: [...input.workspaceRootUris],
         toolPolicy: structuredClone(input.toolPolicy), policyVersion: input.policyVersion,
@@ -290,9 +304,11 @@ export class WorkspaceSnapshotPublisher {
         ...input.fence, preparationId, intent, expectedObjectCount: descriptors.length,
       })
       if (preparation.state === 'reclaim_pending') {
-        await this.resumePreparationCleanup(input.fence, preparationId, coordinator)
+        await this.resumePreparationCleanup(
+          input.fence, preparationId, preparation.expectedObjectCount, coordinator)
+        throw new WorkspacePreparationAbortedError()
       }
-      if (preparation.state === 'reclaimed') throw new ServiceError(409, 'workspace preparation was aborted')
+      if (preparation.state === 'reclaimed') throw new WorkspacePreparationAbortedError()
       if (preparation.state === 'publishing') {
         abortEligible = true
         await this.publishPreparationObjects(input.fence, preparationId, intent,
@@ -311,9 +327,11 @@ export class WorkspaceSnapshotPublisher {
         try {
           const aborted = await coordinator.preparations.beginAbort(input.fence, preparationId)
           if (aborted.state === 'reclaim_pending') {
-            await this.resumePreparationCleanup(input.fence, preparationId, coordinator)
+            await this.resumePreparationCleanup(
+              input.fence, preparationId, aborted.expectedObjectCount, coordinator)
           }
         } catch { throw new ServiceError(503, 'workspace snapshot cleanup pending') }
+        throw new WorkspacePreparationAbortedError()
       }
       if (error instanceof ServiceError) throw error
       throw new ServiceError(503, 'workspace snapshot service unavailable')
@@ -358,6 +376,57 @@ export class WorkspaceSnapshotPublisher {
         fence, prepared.preparation.preparationId, prepared.intent, executor)
       return { lease: created.lease, snapshot: created.snapshot,
         objectAllocationIds: locked.objects.map(object => object.allocationId) }
+    } catch (error) {
+      if (error instanceof ServiceError) throw error
+      throw new ServiceError(503, 'workspace snapshot service unavailable')
+    }
+  }
+
+  async commitDurableCheckpoint(fence: PreparationFence,
+    prepared: PreparedDurableBaseWorkspaceSnapshot, executor: PoolClient): Promise<{
+      snapshot: Snapshot
+      objectAllocationIds: string[]
+    }> {
+    const coordinator = this.options.durablePreparation
+    if (!coordinator) throw new ServiceError(503, 'durable workspace preparation is unavailable')
+    if (fence.operation !== 'checkpoint') throw new ServiceError(400, 'invalid workspace preparation operation')
+    try {
+      const locked = await coordinator.preparations.lockForCommit(
+        fence, prepared.preparation.preparationId, prepared.intent, executor)
+      const intent = locked.preparation.intent
+      if (!this.state.getLease) throw new Error('checkpoint lease authorization is unavailable')
+      const lease = await this.state.getLease(intent.tenantId, intent.leaseId, executor)
+      if (!lease || !['active', 'paused'].includes(lease.state)
+        || intent.expectedLatestSnapshotId === null
+        || lease.latestSnapshotId !== intent.expectedLatestSnapshotId
+        || lease.environmentId !== intent.environmentId || lease.agentId !== intent.agentId
+        || lease.ownerAgentId !== intent.ownerAgentId || lease.ownerLeaseId !== intent.ownerLeaseId
+        || lease.providerSandboxId !== intent.providerSandboxId
+        || lease.sandboxTemplate !== intent.sandboxTemplate || lease.cwdUri !== intent.cwdUri
+        || canonicalJson(lease.workspaceRootUris) !== canonicalJson(intent.workspaceRootUris)
+        || canonicalJson(lease.toolPolicy) !== canonicalJson(intent.toolPolicy)
+        || lease.policyVersion !== intent.policyVersion) {
+        throw new Error('checkpoint lease identity changed')
+      }
+      const archive = locked.objects.find(object => object.purpose === 'workspace_archive')
+      const manifest = locked.objects.find(object => object.purpose === 'manifest')
+      if (!archive || !manifest) throw new Error('prepared workspace object set is incomplete')
+      const snapshotInput: SnapshotInput = {
+        snapshotId: intent.snapshotId,
+        providerSnapshotId: intent.providerSnapshotId,
+        workspaceArchiveObjectId: archive.objectId,
+        manifestObjectId: manifest.objectId,
+        manifestChecksum: intent.manifestChecksum,
+        contentObjectIds: locked.objects.filter(object => object.purpose === 'content_blob')
+          .map(object => object.objectId).sort(),
+        expiresAt: intent.snapshotExpiresAt === null ? null : new Date(intent.snapshotExpiresAt),
+      }
+      const snapshot = await this.state.appendCheckpoint(
+        intent.tenantId, intent.leaseId, snapshotInput, executor)
+      verifySnapshot(snapshot, intent.tenantId, intent.leaseId, snapshotInput)
+      await coordinator.preparations.markCommitted(
+        fence, prepared.preparation.preparationId, prepared.intent, executor)
+      return { snapshot, objectAllocationIds: locked.objects.map(object => object.allocationId) }
     } catch (error) {
       if (error instanceof ServiceError) throw error
       throw new ServiceError(503, 'workspace snapshot service unavailable')
@@ -543,12 +612,17 @@ export class WorkspaceSnapshotPublisher {
   }
 
   private async resumePreparationCleanup(fence: PreparationFence, preparationId: string,
-    coordinator: NonNullable<WorkspaceSnapshotPublisherOptions['durablePreparation']>): Promise<never> {
+    expectedObjectCount: number,
+    coordinator: NonNullable<WorkspaceSnapshotPublisherOptions['durablePreparation']>): Promise<void> {
     const limit = coordinator.cleanupBatchSize ?? 100
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) {
       throw new ServiceError(503, 'workspace snapshot cleanup pending')
     }
-    await coordinator.reclaimer.reclaimPreparationObjects(fence, preparationId, limit)
+    const maximumBatches = Math.ceil(expectedObjectCount / limit) + 1
+    for (let batch = 0; batch < maximumBatches; batch++) {
+      const result = await coordinator.reclaimer.reclaimPreparationObjects(fence, preparationId, limit)
+      if (result.claimed < limit) return
+    }
     throw new ServiceError(503, 'workspace snapshot cleanup pending')
   }
 

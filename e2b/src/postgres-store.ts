@@ -444,6 +444,15 @@ export class PostgresJournal {
 
   async withProviderResourceLocks<T>(resources: Array<{ kind: 'sandbox' | 'provider_snapshot'; resourceId: string }>,
     fn: (client: PoolClient) => Promise<T>): Promise<T> {
+    return this.transaction(async client => {
+      await this.lockProviderResources(resources, client)
+      return fn(client)
+    })
+  }
+
+  /** Adds sorted provider-resource advisory locks to an existing caller-owned transaction. */
+  async lockProviderResources(resources: Array<{ kind: 'sandbox' | 'provider_snapshot'; resourceId: string }>,
+    executor: Pick<PoolClient, 'query'>): Promise<void> {
     if (resources.length < 1 || resources.length > 10_000) throw new Error('invalid provider resource count')
     const keys = new Set<string>()
     for (const resource of resources) {
@@ -452,13 +461,10 @@ export class PostgresJournal {
       keys.add(`hosted-agent:provider:${JSON.stringify([resource.kind, resource.resourceId])}`)
     }
     const sorted = [...keys].sort()
-    return this.transaction(async client => {
-      await client.query("SET LOCAL lock_timeout = '30s'")
-      for (const key of sorted) {
-        await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [key])
-      }
-      return fn(client)
-    })
+    await executor.query("SET LOCAL lock_timeout = '30s'")
+    for (const key of sorted) {
+      await executor.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [key])
+    }
   }
 
   private async transaction<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {

@@ -18,6 +18,7 @@ import type {
   PreparedDurableBaseWorkspaceSnapshot,
   WorkspaceSnapshotPublisher,
 } from './workspace-snapshots.js'
+import { WorkspacePreparationAbortedError } from './workspace-snapshots.js'
 
 export interface TrustedProvisionRole {
   sandboxTemplate: string
@@ -144,6 +145,8 @@ export class PostgresProvisionCoordinator {
     }> = []
     let prepared: PreparedDurableBaseWorkspaceSnapshot | undefined
     let committed: LogicalProvisionResponse
+    let preparationStarted = false
+    let finalCommitStarted = false
     try {
       const source = await this.options.sourceResolver.resolve(
         this.options.principal, request.source.sourceSnapshotId, request.source.checksum)
@@ -180,6 +183,7 @@ export class PostgresProvisionCoordinator {
         fence, 'provider_snapshot', providerSnapshotId)
       snapshotResource.allocation = snapshotAllocation
       await this.heartbeat(fence)
+      preparationStarted = true
       prepared = await this.publisher.prepareDurableBase({
         fence,
         expectedSourceChecksum: request.source.checksum,
@@ -198,6 +202,7 @@ export class PostgresProvisionCoordinator {
         policyVersion: role.policyVersion,
         snapshot: { snapshotId, providerSnapshotId, archive, expiresAt: null },
       })
+      finalCommitStarted = true
       committed = await this.journal.withProviderResourceLocks([
         { kind: 'sandbox', resourceId: created.sandboxId },
         { kind: 'provider_snapshot', resourceId: providerSnapshotId },
@@ -211,8 +216,13 @@ export class PostgresProvisionCoordinator {
         return logical
       })
     } catch (error) {
+      if (finalCommitStarted) {
+        const succeeded = await this.recoverCommitOutcome(identity, requestHash, fence)
+        if (succeeded) return this.replay(identity, succeeded)
+      }
       const cleaned = await this.cleanupFailedProvision(fence, prepared, providerAllocations)
-      if (cleaned) {
+      const preparationReclaimed = error instanceof WorkspacePreparationAbortedError
+      if (cleaned && (!preparationStarted || prepared !== undefined || preparationReclaimed)) {
         const failure = error instanceof ServiceError && error.status < 500
           ? error
           : new ServiceError(503, 'durable provision failed')
@@ -243,6 +253,19 @@ export class PostgresProvisionCoordinator {
       ...logical,
       connection: { execServerUrl: await this.tickets.issue(logical.leaseId) },
     })
+  }
+
+  private async recoverCommitOutcome(identity: OperationIdentity, requestHash: string,
+    fence: OperationIdentity & { generation: number; workerId: string }): Promise<
+      Extract<OperationClaim, { kind: 'succeeded' }> | null
+    > {
+    try {
+      const claim = await this.journal.claimOperation({ ...identity, requestHash, workerId: this.workerId })
+      if (claim.kind === 'succeeded') return claim
+      if (claim.kind === 'in_progress' && claim.generation === fence.generation
+        && await this.journal.heartbeatOperation(fence, fence.generation, fence.workerId)) return null
+    } catch { /* An unreadable outcome must remain for reconciliation. */ }
+    throw new ServiceError(503, 'durable provision cleanup pending')
   }
 
   private async recordProviderAllocation(

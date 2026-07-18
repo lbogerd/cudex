@@ -22,10 +22,14 @@ production backend. Stable decisions, evidence, and wire schemas are in
 - [x] For immutable-source provision, persist the canonical request hash,
   operation state, secret-free logical response, sandbox/provider-snapshot
   allocations, and every archive/manifest/content allocation.
-- [ ] Extend the same journal/allocation protocol through checkpoint, reconnect,
-  restore, child capture, patch, and release.
+- [x] Extend the journal/allocation protocol through durable checkpoint,
+  including exact logical replay and cleanup of partial publication.
+- [ ] Extend the same journal/allocation protocol through reconnect, restore,
+  child capture, patch, and release.
+- [x] Apply transactional per-lease locking to durable checkpoint capture and
+  commit across service replicas.
 - [ ] Apply transactional per-lease locks and deterministic multi-lease lock
-  order to every lifecycle mutation.
+  order to every remaining lifecycle mutation.
 - [x] Add composable same-transaction journal/state executors and sorted compound
   provider-resource locks so allocation recording, lease/snapshot commit,
   allocation adoption, and logical completion can commit or roll back together.
@@ -150,13 +154,21 @@ tickets always fail, and secrets never enter durable or observable state.
   immediately ledgers provider resources, durably prepares every workspace
   object, atomically commits/adopts the lease graph and logical response, and
   reclaims partial publication before terminal failure.
+- [x] Add an unwired PostgreSQL checkpoint coordinator that holds the lease lock
+  across provider capture, durably prepares every workspace object, compare-and-
+  swaps the expected latest snapshot, and atomically adopts allocations and the
+  secret-free logical response.
 - [ ] Extend cleanup-safe provision through child/restore sources and wire it to
   production startup with reconciler recovery for process loss at every external
   allocation boundary.
-- [ ] Serialize checkpoint, reconnect, child capture, patch, release, and command
-  interaction per lease.
-- [ ] Persist checksummed base/current workspace manifests with snapshots and
-  service archives.
+- [x] Serialize durable checkpoint capture and commit per lease across replicas.
+- [ ] Serialize reconnect, child capture, patch, release, and command interaction
+  per lease; command execution must share the checkpoint gate before capture can
+  claim a command-consistent instant.
+- [x] Persist checksummed base/current workspace manifests with the unwired
+  durable provision and checkpoint snapshots and service archives.
+- [ ] Carry the same manifest persistence through the remaining production
+  lifecycle wiring and patch operations.
 - [x] Add an unwired tenant-safe workspace snapshot publisher that validates
   provider archives, stores exact archive/manifest/content objects, and retains
   every content blob through the atomic base/checkpoint snapshot transaction.

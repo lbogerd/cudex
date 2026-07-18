@@ -5,7 +5,7 @@ interface FakeSandbox { bytes: Uint8Array; alive: boolean; execReady: boolean; r
 interface FakeSnapshot { bytes: Uint8Array; runtimeIdentity: string | undefined; sandboxId: string; names: string[] }
 export class FakeProvider implements ProviderAdapter {
   readonly sandboxes = new Map<string, FakeSandbox>(); readonly snapshots = new Map<string, FakeSnapshot>()
-  creates = 0; restores = 0; kills = 0; snapshotDeletes = 0; connects = 0; failAt: string | undefined
+  creates = 0; restores = 0; exports = 0; kills = 0; snapshotDeletes = 0; connects = 0; failAt: string | undefined
   rawExecUpstream: unknown
   private id = 0
   async create(templateId = 'fake-template', metadata: Record<string, string> = {}): Promise<CreatedSandbox> { this.failure('create'); this.creates++; return this.allocate(templateId, metadata) }
@@ -27,7 +27,9 @@ export class FakeProvider implements ProviderAdapter {
     sandbox.bytes = Uint8Array.from(snapshot.bytes); sandbox.runtimeIdentity = snapshot.runtimeIdentity; return created
   }
   async uploadArchive(sandboxId: string, archive: Uint8Array): Promise<void> { this.failure('upload'); this.sandboxes.get(sandboxId)!.bytes = Uint8Array.from(archive) }
-  async exportWorkspace(sandboxId: string): Promise<Uint8Array> { this.failure('export'); return Uint8Array.from(this.sandboxes.get(sandboxId)!.bytes) }
+  async exportWorkspace(sandboxId: string): Promise<Uint8Array> {
+    this.failure('export'); this.exports++; return Uint8Array.from(this.sandboxes.get(sandboxId)!.bytes)
+  }
   async startExecServer(sandboxId: string): Promise<void> { this.failure('start'); const sandbox = this.sandboxes.get(sandboxId); if (!sandbox?.alive) throw new Error('missing'); sandbox.execReady = true }
   async probeExecServer(sandboxId: string): Promise<void> {
     this.failure('probe'); const sandbox = this.sandboxes.get(sandboxId)

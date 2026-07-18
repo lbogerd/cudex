@@ -7,7 +7,7 @@ const checksumPattern = /^sha256:[0-9a-f]{64}$/u
 const purposes = new Set<WorkspacePreparationObjectPurpose>(['workspace_archive', 'manifest', 'content_blob'])
 const intentKeys = [
   'tenantId', 'leaseId', 'environmentId', 'agentId', 'ownerAgentId', 'ownerLeaseId',
-  'sourceSnapshotId', 'expectedSourceChecksum', 'providerSandboxId', 'sandboxTemplate',
+  'sourceSnapshotId', 'expectedSourceChecksum', 'expectedLatestSnapshotId', 'providerSandboxId', 'sandboxTemplate',
   'cwdUri', 'workspaceRootUris', 'toolPolicy', 'policyVersion', 'snapshotId',
   'providerSnapshotId', 'snapshotExpiresAt', 'archiveChecksum', 'manifestChecksum',
 ] as const
@@ -30,6 +30,7 @@ export interface WorkspacePreparationIntent {
   ownerLeaseId: string | null
   sourceSnapshotId: string | null
   expectedSourceChecksum: string | null
+  expectedLatestSnapshotId: string | null
   providerSandboxId: string
   sandboxTemplate: string
   cwdUri: string
@@ -195,6 +196,7 @@ function validateIntent(value: WorkspacePreparationIntent): WorkspacePreparation
   id('tenant ID', value.tenantId); id('lease ID', value.leaseId); id('environment ID', value.environmentId)
   id('agent ID', value.agentId); nullableId('owner agent ID', value.ownerAgentId)
   nullableId('owner lease ID', value.ownerLeaseId); nullableId('source snapshot ID', value.sourceSnapshotId)
+  nullableId('expected latest snapshot ID', value.expectedLatestSnapshotId)
   id('provider sandbox ID', value.providerSandboxId); id('sandbox template', value.sandboxTemplate)
   id('cwd URI', value.cwdUri, 2048); id('snapshot ID', value.snapshotId)
   nullableId('provider snapshot ID', value.providerSnapshotId)

@@ -720,12 +720,62 @@ adopted allocations, one committed lease/base snapshot/preparation, sanitized
 logical replay, and fresh tickets. A second test fails the second workspace
 object put after both provider resources exist and proves all three recorded
 allocations are reclaimed, no lease/snapshot is committed, shared source content
-survives, and terminal replay causes no mutation. A third test injects ticket
-failure after durable completion and proves the adopted lease/resources remain
-intact for fresh replay from another replica. The complete TypeScript suite
-passed 172 of 172 tests with zero skips against the isolated database. Production
-startup remains on the legacy lifecycle until checkpoint, reconnect, restore,
-child capture, and release can move to the same PostgreSQL authority together.
+survives, and terminal replay causes no mutation. A third test loses the final
+commit acknowledgement and then injects ticket failure during confirmed-success
+replay, proving the adopted lease/resources remain intact for fresh replay from
+another replica. The complete TypeScript suite
+passed as part of the 175-of-175 suite with zero skips against the isolated
+database. Production startup remains on the legacy lifecycle until reconnect,
+restore, child capture, and release can move to the same PostgreSQL authority
+together.
+
+### Durable checkpoint coordinator
+
+An unwired PostgreSQL checkpoint coordinator now uses the same canonical
+operation journal, allocation ledger, durable workspace preparation, and
+secret-free terminal replay as immutable-source provision. It holds the
+transactional lease lock from authoritative lease loading through provider
+workspace export and snapshot capture, workspace-object publication, and final
+commit. Checkpoints for the same lease therefore serialize across replicas even
+when they use different idempotency keys.
+
+The preparation records the exact expected latest snapshot and the complete
+lease identity, including agent/owner lineage, provider sandbox, trusted
+template, cwd/roots, tool policy, and policy version. The final transaction
+locks the preparation and provider snapshot, reloads the lease, compare-and-
+swaps that expected latest identity, appends the snapshot and references, adopts
+only its provider/object allocations, and persists `{snapshotId}` atomically.
+The immutable base snapshot does not change.
+
+Provider snapshot identity is retained immediately after capture and ledgered
+under its provider-resource lock. If archive/object publication fails, cleanup
+aborts and boundedly reclaims the exact preparation and deletes only the new
+provider snapshot; it never kills the active lease sandbox or advances latest.
+Both provision and checkpoint resolve an uncertain final transaction outcome
+before cleanup. A confirmed success is replayed without deletion; a confirmed
+still-owned in-progress operation may be cleaned; an unreadable or ownership-
+changed outcome remains cleanup-pending for reconciliation. Thus a lost commit
+acknowledgement—or even a simultaneous recovery-read outage—cannot cause adopted
+resources to be deleted. Preparation abort also drains its complete bounded
+object set across as many configured cleanup batches as required before the
+operation may become terminal.
+
+Docker-backed PostgreSQL 17 tests gate provider capture to prove two coordinators
+serialize, commit distinct ordered checkpoints, preserve the base snapshot, and
+replay without mutation. An injected third-object failure with one-object
+cleanup batches proves the active sandbox survives while the provider snapshot
+and every published object are reclaimed, latest remains unchanged, and
+terminal replay is side-effect free.
+An ambiguous-commit test loses the commit acknowledgement and then fails the
+recovery read, proving the available snapshot and active sandbox remain intact
+for later replay. The complete live suite passed 175 of 175 tests with zero
+skips.
+
+This coordinator serializes lifecycle writers that use the PostgreSQL lease
+lock. The exec gateway's command path does not yet acquire that gate, so the
+captured workspace cannot yet be described as a command-consistent instant;
+production wiring must add command fencing (or an equivalent isolated capture
+protocol) before making that guarantee.
 
 ### Bounded PostgreSQL reconciliation foundation
 
@@ -861,7 +911,7 @@ cleanup outages still require the planned PostgreSQL allocation ledger and
 reconciler before the broader every-path child/provision cleanup invariant can be
 claimed.
 
-The provider-independent suite has 172 tests: 131 passed and 41 live-database
+The provider-independent suite has 175 tests: 131 passed and 44 live-database
 tests are skipped without `HOSTED_AGENT_TEST_DATABASE_URL`. New coverage proves
 ticket/socket rotation on reconnect and replay, transient-versus-missing error
 classification, missing-sandbox revocation, and child temporary-resource cleanup

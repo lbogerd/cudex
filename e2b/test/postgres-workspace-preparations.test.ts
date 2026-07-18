@@ -23,6 +23,7 @@ function intent(overrides: Partial<WorkspacePreparationIntent> = {}): WorkspaceP
   return {
     tenantId: 'tenant-1', leaseId: 'lease-1', environmentId: 'environment-1', agentId: 'agent-1',
     ownerAgentId: null, ownerLeaseId: null, sourceSnapshotId: null, expectedSourceChecksum: null,
+    expectedLatestSnapshotId: null,
     providerSandboxId: 'sandbox-1', sandboxTemplate: 'general-v1', cwdUri: 'file:///workspace/root',
     workspaceRootUris: ['file:///workspace/root'], toolPolicy: {
       allowedDomains: ['controlPlane'], allowedTools: [{ namespace: 'workspace', name: 'read' }],
