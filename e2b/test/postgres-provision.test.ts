@@ -8,6 +8,8 @@ import { runMigrations } from '../src/migrate.js'
 import { PostgresObjectReclaimer } from '../src/postgres-object-reclaimer.js'
 import { PostgresCheckpointCoordinator } from '../src/postgres-checkpoint.js'
 import { PostgresProvisionCoordinator } from '../src/postgres-provision.js'
+import { PostgresReconciler } from '../src/postgres-reconciler.js'
+import { PostgresReleaseCoordinator } from '../src/postgres-release.js'
 import { PostgresDurableState } from '../src/postgres-state.js'
 import {
   canonicalRequestHash,
@@ -24,6 +26,7 @@ import type { TicketPurpose } from '../src/types.js'
 import { ServiceError } from '../src/types.js'
 import { WorkspaceSnapshotPublisher } from '../src/workspace-snapshots.js'
 import { FakeProvider } from './fake-provider.js'
+import { ProviderSandboxMissingError } from '../src/provider.js'
 
 const databaseUrl = process.env.HOSTED_AGENT_TEST_DATABASE_URL
 const tenantId = 'tenant-provision'
@@ -98,6 +101,25 @@ class CheckpointGatedProvider extends FakeProvider {
   }
 }
 
+class ReleaseProvider extends CheckpointGatedProvider {
+  private readonly killGates: Array<{ entered: ReturnType<typeof deferred>; released: ReturnType<typeof deferred> }> = []
+  gateNextKill(): { entered: Promise<void>; release(): void } {
+    const gate = { entered: deferred(), released: deferred() }; this.killGates.push(gate)
+    return { entered: gate.entered.promise, release: () => { gate.released.resolve() } }
+  }
+  override async kill(sandboxId: string): Promise<void> {
+    const gate = this.killGates.shift()
+    if (gate) { gate.entered.resolve(); await gate.released.promise }
+    if (!this.sandboxes.get(sandboxId)?.alive) throw new ProviderSandboxMissingError()
+    return super.kill(sandboxId)
+  }
+}
+
+class ReleaseRevoker {
+  readonly leases: string[] = []
+  revoke(leaseId: string): void { this.leases.push(leaseId) }
+}
+
 class ObservedJournal extends PostgresJournal {
   private readonly observed = deferred()
   private readonly lockObserved = deferred()
@@ -105,6 +127,7 @@ class ObservedJournal extends PostgresJournal {
   readonly inProgressObserved = this.observed.promise
   readonly leaseLockObserved = this.lockObserved.promise
   throwAfterLeaseCommit = false
+  throwAfterLeaseCommitAt: number | undefined
   throwAfterCompoundProviderCommit = false
   failClaimAfterAmbiguousCommit = false
   override async claimOperation(input: OperationClaimInput): Promise<OperationClaim> {
@@ -117,6 +140,14 @@ class ObservedJournal extends PostgresJournal {
     fn: (client: PoolClient) => Promise<T>): Promise<T> {
     this.lockObserved.resolve()
     const result = await super.withLeaseLocks(tenant, leaseIds, fn)
+    if (this.throwAfterLeaseCommitAt !== undefined) {
+      this.throwAfterLeaseCommitAt--
+      if (this.throwAfterLeaseCommitAt === 0) {
+        this.throwAfterLeaseCommitAt = undefined
+        this.failRecoveryClaim = this.failClaimAfterAmbiguousCommit
+        throw new Error('injected ambiguous commit acknowledgement')
+      }
+    }
     if (this.throwAfterLeaseCommit) {
       this.throwAfterLeaseCommit = false
       this.failRecoveryClaim = this.failClaimAfterAmbiguousCommit
@@ -160,6 +191,8 @@ interface Fixture {
   lifecycle: SourceSnapshotLifecycle
   coordinators: [PostgresProvisionCoordinator, PostgresProvisionCoordinator]
   checkpointCoordinators: [PostgresCheckpointCoordinator, PostgresCheckpointCoordinator]
+  releaseCoordinators: [PostgresReleaseCoordinator, PostgresReleaseCoordinator]
+  releaseRevokers: [ReleaseRevoker, ReleaseRevoker]
   request: ProvisionRequest
   schema: string
 }
@@ -211,13 +244,18 @@ async function fixture(provider: FakeProvider = new FakeProvider(), failFirstTic
     new PostgresCheckpointCoordinator(journal, states[index]!, publishers[index]!, provider, {
       tenantId, workerId: `checkpoint-worker-${index}`,
     })) as [PostgresCheckpointCoordinator, PostgresCheckpointCoordinator]
+  const releaseRevokers: [ReleaseRevoker, ReleaseRevoker] = [new ReleaseRevoker(), new ReleaseRevoker()]
+  const releaseCoordinators = journals.map((journal, index) =>
+    new PostgresReleaseCoordinator(journal, states[index]!, provider, {
+      tenantId, workerId: `release-worker-${index}`, connections: releaseRevokers[index]!,
+    })) as [PostgresReleaseCoordinator, PostgresReleaseCoordinator]
   const request: ProvisionRequest = {
     agentId: 'agent-root', ownerAgentId: null, agentType: 'default', sandboxTemplate: 'general-v1',
     source: { type: 'sourceSnapshot', sourceSnapshotId: source.sourceSnapshotId, checksum: source.checksum },
     idempotencyKey: 'durable-provision',
   }
   return { admin, pools, journals, states, provider, objects, lifecycle, coordinators,
-    checkpointCoordinators, request, schema }
+    checkpointCoordinators, releaseCoordinators, releaseRevokers, request, schema }
 }
 
 async function close(context: Fixture): Promise<void> {
@@ -495,5 +533,187 @@ test('ambiguous checkpoint commit never deletes adopted resources when recovery 
       { snapshotId: durableLease?.latestSnapshotId })
     assert.deepEqual({ snapshots: context.provider.snapshots.size, puts: context.objects.puts,
       deletes: context.provider.snapshotDeletes }, mutations)
+  } finally { await close(context) }
+})
+
+test('durable release serializes after checkpoint, revokes access, and retains durable data', {
+  skip: databaseUrl ? false : 'HOSTED_AGENT_TEST_DATABASE_URL is not set',
+}, async () => {
+  const provider = new ReleaseProvider(); const context = await fixture(provider)
+  try {
+    const lease = await context.coordinators[0].provision(context.request)
+    const checkpointGate = provider.gateNextExport(); const killGate = provider.gateNextKill()
+    const checkpoint = context.checkpointCoordinators[0].checkpoint({
+      leaseId: lease.leaseId, idempotencyKey: 'checkpoint-before-release',
+    })
+    await checkpointGate.entered
+    const releaseRequest = { leaseId: lease.leaseId, idempotencyKey: 'release-a' }
+    const release = context.releaseCoordinators[1].release(releaseRequest)
+    assert.equal(provider.kills, 0)
+    checkpointGate.release()
+    const checkpointResult = await checkpoint
+    await killGate.entered
+    const duplicate = context.releaseCoordinators[0].release(releaseRequest)
+    const other = context.releaseCoordinators[0].release({
+      leaseId: lease.leaseId, idempotencyKey: 'release-b',
+    })
+    assert.equal(provider.kills, 0)
+    killGate.release()
+    await Promise.all([release, duplicate, other])
+
+    const durableLease = await context.states[0].getLease(tenantId, lease.leaseId)
+    assert.equal(durableLease?.state, 'released')
+    assert.equal(durableLease?.baseSnapshotId, lease.baseSnapshotId)
+    assert.equal(durableLease?.latestSnapshotId, checkpointResult.snapshotId)
+    assert.equal(provider.kills, 1)
+    assert.equal(provider.snapshotDeletes, 0)
+    assert.equal(provider.snapshots.size, 2)
+    const graph = await context.pools[0].query<{
+      snapshots: string; snapshot_refs: string; object_refs: string; live_tickets: string
+      operations: string; allocations: string; reclaimed: string
+    }>(`
+      SELECT
+        (SELECT count(*)::text FROM hosted_agent_snapshots WHERE lease_id = $1) AS snapshots,
+        (SELECT count(*)::text FROM hosted_agent_snapshot_references WHERE reference_id = $1) AS snapshot_refs,
+        (SELECT count(*)::text FROM hosted_agent_object_references
+          WHERE reference_kind = 'snapshot' AND reference_id IN
+            (SELECT snapshot_id FROM hosted_agent_snapshots WHERE lease_id = $1)) AS object_refs,
+        (SELECT count(*)::text FROM hosted_agent_tickets
+          WHERE lease_id = $1 AND revoked_at IS NULL) AS live_tickets,
+        (SELECT count(*)::text FROM hosted_agent_operations
+          WHERE operation = 'release' AND state = 'succeeded' AND logical_response = '{"released":true}'::jsonb) AS operations,
+        (SELECT count(*)::text FROM hosted_agent_operation_allocations
+          WHERE operation = 'release') AS allocations,
+        (SELECT count(*)::text FROM hosted_agent_operation_allocations
+          WHERE operation = 'release' AND state = 'reclaimed') AS reclaimed
+    `, [lease.leaseId])
+    assert.deepEqual(graph.rows[0], {
+      snapshots: '2', snapshot_refs: '2', object_refs: '6', live_tickets: '0',
+      operations: '2', allocations: '1', reclaimed: '1',
+    })
+    assert.ok(context.releaseRevokers[0].leases.includes(lease.leaseId))
+    assert.ok(context.releaseRevokers[1].leases.includes(lease.leaseId))
+    const mutations = { kills: provider.kills, snapshots: provider.snapshots.size,
+      objects: context.objects.values.size }
+    await context.releaseCoordinators[1].release(releaseRequest)
+    assert.deepEqual({ kills: provider.kills, snapshots: provider.snapshots.size,
+      objects: context.objects.values.size }, mutations)
+    await assert.rejects(context.checkpointCoordinators[1].checkpoint({
+      leaseId: lease.leaseId, idempotencyKey: 'checkpoint-after-release',
+    }), (error: unknown) => error instanceof ServiceError && error.status === 409)
+  } finally { await close(context) }
+})
+
+test('transient release kill failure remains pending until fenced reconciliation completes it', {
+  skip: databaseUrl ? false : 'HOSTED_AGENT_TEST_DATABASE_URL is not set',
+}, async () => {
+  const provider = new ReleaseProvider(); const context = await fixture(provider)
+  try {
+    const lease = await context.coordinators[0].provision(context.request)
+    const request = { leaseId: lease.leaseId, idempotencyKey: 'release-transient' }
+    provider.failAt = 'kill'
+    await assert.rejects(context.releaseCoordinators[0].release(request),
+      (error: unknown) => error instanceof ServiceError && error.status === 503
+        && error.message === 'durable release cleanup pending')
+    assert.equal((await context.states[0].getLease(tenantId, lease.leaseId))?.state, 'release_pending')
+    assert.equal(provider.live().length, 1)
+    const pending = await context.pools[0].query<{
+      operation_state: string; allocation_state: string; live_tickets: string
+    }>(`
+      SELECT operation.state AS operation_state, allocation.state AS allocation_state,
+        (SELECT count(*)::text FROM hosted_agent_tickets
+          WHERE lease_id = $1 AND revoked_at IS NULL) AS live_tickets
+      FROM hosted_agent_operations AS operation
+      JOIN hosted_agent_operation_allocations AS allocation
+        USING (operation, idempotency_key, tenant_id)
+      WHERE operation.operation = 'release' AND operation.idempotency_key = $2
+    `, [lease.leaseId, request.idempotencyKey])
+    assert.deepEqual(pending.rows[0], {
+      operation_state: 'in_progress', allocation_state: 'allocated', live_tickets: '0',
+    })
+
+    provider.failAt = undefined
+    await context.pools[0].query(`UPDATE hosted_agent_operations
+      SET heartbeat_at = now() - interval '1 hour'
+      WHERE operation = 'release' AND idempotency_key = $1`, [request.idempotencyKey])
+    const reconciler = new PostgresReconciler(context.journals[1], context.states[1], provider, {
+      managedBy: 'cudex', tenantId, workerId: 'release-reconciler', staleAfterMs: 1,
+    })
+    const result = await reconciler.runOnce()
+    assert.equal(result.operationsClaimed, 1)
+    assert.equal((await context.states[0].getLease(tenantId, lease.leaseId))?.state, 'released')
+    assert.equal(provider.kills, 1)
+    const completed = await context.pools[0].query<{ operation_state: string; allocation_state: string }>(`
+      SELECT operation.state AS operation_state, allocation.state AS allocation_state
+      FROM hosted_agent_operations AS operation
+      JOIN hosted_agent_operation_allocations AS allocation
+        USING (operation, idempotency_key, tenant_id)
+      WHERE operation.operation = 'release' AND operation.idempotency_key = $1
+    `, [request.idempotencyKey])
+    assert.deepEqual(completed.rows[0], { operation_state: 'succeeded', allocation_state: 'reclaimed' })
+    await context.releaseCoordinators[1].release(request)
+    assert.equal(provider.kills, 1)
+  } finally { await close(context) }
+})
+
+test('reconciler reconstructs release after a crash immediately following target-bound claim', {
+  skip: databaseUrl ? false : 'HOSTED_AGENT_TEST_DATABASE_URL is not set',
+}, async () => {
+  const provider = new ReleaseProvider(); const context = await fixture(provider)
+  try {
+    const lease = await context.coordinators[0].provision(context.request)
+    const request = { leaseId: lease.leaseId, idempotencyKey: 'release-claim-crash' }
+    assert.deepEqual(await context.journals[0].claimOperation({
+      operation: 'release', idempotencyKey: request.idempotencyKey, tenantId,
+      requestHash: canonicalRequestHash(request), workerId: 'dead-release-worker',
+      primaryLeaseId: lease.leaseId,
+    }), { kind: 'claimed', generation: 0 })
+    await context.pools[0].query(`UPDATE hosted_agent_operations
+      SET heartbeat_at = now() - interval '1 hour'
+      WHERE operation = 'release' AND idempotency_key = $1`, [request.idempotencyKey])
+    const reconciler = new PostgresReconciler(context.journals[1], context.states[1], provider, {
+      managedBy: 'cudex', tenantId, workerId: 'claim-crash-reconciler', staleAfterMs: 1,
+    })
+    assert.equal((await reconciler.runOnce()).operationsClaimed, 1)
+    assert.equal((await context.states[0].getLease(tenantId, lease.leaseId))?.state, 'released')
+    assert.equal(provider.kills, 1)
+    await context.releaseCoordinators[1].release(request)
+    assert.equal(provider.kills, 1)
+  } finally { await close(context) }
+})
+
+test('release treats a confirmed missing sandbox as success', {
+  skip: databaseUrl ? false : 'HOSTED_AGENT_TEST_DATABASE_URL is not set',
+}, async () => {
+  const provider = new ReleaseProvider(); const context = await fixture(provider)
+  try {
+    const lease = await context.coordinators[0].provision(context.request)
+    const durable = await context.states[0].getLease(tenantId, lease.leaseId)
+    await provider.kill(durable!.providerSandboxId!)
+    await context.releaseCoordinators[0].release({
+      leaseId: lease.leaseId, idempotencyKey: 'release-missing',
+    })
+    assert.equal((await context.states[0].getLease(tenantId, lease.leaseId))?.state, 'released')
+    assert.equal(provider.kills, 1)
+    assert.equal(provider.snapshotDeletes, 0)
+  } finally { await close(context) }
+})
+
+test('ambiguous release commit with failed outcome read never repeats provider cleanup', {
+  skip: databaseUrl ? false : 'HOSTED_AGENT_TEST_DATABASE_URL is not set',
+}, async () => {
+  const provider = new ReleaseProvider(); const context = await fixture(provider)
+  try {
+    const lease = await context.coordinators[0].provision(context.request)
+    const request = { leaseId: lease.leaseId, idempotencyKey: 'release-ambiguous' }
+    context.journals[0].throwAfterLeaseCommitAt = 2
+    context.journals[0].failClaimAfterAmbiguousCommit = true
+    await assert.rejects(context.releaseCoordinators[0].release(request),
+      (error: unknown) => error instanceof ServiceError && error.status === 503
+        && error.message === 'durable release cleanup pending')
+    assert.equal((await context.states[0].getLease(tenantId, lease.leaseId))?.state, 'released')
+    assert.equal(provider.kills, 1)
+    await context.releaseCoordinators[1].release(request)
+    assert.equal(provider.kills, 1)
   } finally { await close(context) }
 })

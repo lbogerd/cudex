@@ -120,6 +120,7 @@ live('artifact creation is durable, referenced, tenant isolated, and replayable 
       (SELECT count(*)::text FROM hosted_agent_artifact_references WHERE artifact_id = $1) AS artifacts
   `, [input.artifactId])
   assert.deepEqual(references.rows[0], { objects: '5', snapshots: '2', artifacts: '1' })
+  await context.state.beginRelease('tenant-1', input.sourceLeaseId)
   await context.state.releaseLease('tenant-1', input.sourceLeaseId)
   assert.deepEqual(await context.second.create(input), created)
   await context.second.addReference({ tenantId: 'tenant-1', artifactId: input.artifactId,

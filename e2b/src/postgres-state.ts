@@ -484,18 +484,42 @@ export class PostgresDurableState {
     })
   }
 
-  async releaseLease(tenantId: string, leaseId: string): Promise<Lease> {
+  async beginRelease(tenantId: string, leaseId: string, executor?: PoolClient): Promise<Lease> {
     validateId('tenant ID', tenantId); validateId('lease ID', leaseId)
-    return this.transaction(async client => {
-      const lease = await this.lockLease(client, tenantId, leaseId)
-      await client.query(`UPDATE hosted_agent_tickets SET revoked_at = COALESCE(revoked_at, now()) WHERE lease_id = $1`, [leaseId])
-      if (lease.state === 'released') return lease
-      const result = await client.query<LeaseRow>(`
-        UPDATE hosted_agent_leases SET state = 'released', released_at = now()
-        WHERE lease_id = $1 AND tenant_id = $2 RETURNING ${leaseColumns}
-      `, [leaseId, tenantId])
-      return leaseFromRow(result.rows[0]!)
-    })
+    try {
+      const begin = async (client: PoolClient) => {
+        const lease = await this.lockLease(client, tenantId, leaseId)
+        await client.query(`UPDATE hosted_agent_tickets SET revoked_at = COALESCE(revoked_at, now()) WHERE lease_id = $1`, [leaseId])
+        if (lease.state === 'released' || lease.state === 'release_pending') return lease
+        if (!['active', 'paused', 'failed'].includes(lease.state)) {
+          throw new DurableStateConflictError('lease cannot be released')
+        }
+        const result = await client.query<LeaseRow>(`
+          UPDATE hosted_agent_leases SET state = 'release_pending', released_at = NULL
+          WHERE lease_id = $1 AND tenant_id = $2 RETURNING ${leaseColumns}
+        `, [leaseId, tenantId])
+        return leaseFromRow(result.rows[0]!)
+      }
+      return executor ? await begin(executor) : await this.transaction(begin)
+    } catch (error) { return postgresError(error) }
+  }
+
+  async releaseLease(tenantId: string, leaseId: string, executor?: PoolClient): Promise<Lease> {
+    validateId('tenant ID', tenantId); validateId('lease ID', leaseId)
+    try {
+      const release = async (client: PoolClient) => {
+        const lease = await this.lockLease(client, tenantId, leaseId)
+        await client.query(`UPDATE hosted_agent_tickets SET revoked_at = COALESCE(revoked_at, now()) WHERE lease_id = $1`, [leaseId])
+        if (lease.state === 'released') return lease
+        if (lease.state !== 'release_pending') throw new DurableStateConflictError('lease release was not prepared')
+        const result = await client.query<LeaseRow>(`
+          UPDATE hosted_agent_leases SET state = 'released', released_at = now()
+          WHERE lease_id = $1 AND tenant_id = $2 RETURNING ${leaseColumns}
+        `, [leaseId, tenantId])
+        return leaseFromRow(result.rows[0]!)
+      }
+      return executor ? await release(executor) : await this.transaction(release)
+    } catch (error) { return postgresError(error) }
   }
 
   async issueTicketHash(input: { tenantId: string; leaseId: string; ticketHash: Uint8Array; purpose: TicketPurpose; expiresAt: Date }): Promise<void> {

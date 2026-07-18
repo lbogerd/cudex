@@ -24,10 +24,14 @@ production backend. Stable decisions, evidence, and wire schemas are in
   allocations, and every archive/manifest/content allocation.
 - [x] Extend the journal/allocation protocol through durable checkpoint,
   including exact logical replay and cleanup of partial publication.
+- [x] Extend the journal/allocation protocol through durable release, including
+  durable access revocation, provider cleanup work, and reconciled completion.
 - [ ] Extend the same journal/allocation protocol through reconnect, restore,
-  child capture, patch, and release.
+  child capture, and patch.
 - [x] Apply transactional per-lease locking to durable checkpoint capture and
   commit across service replicas.
+- [x] Apply transactional lease/provider locking to durable release across
+  service replicas and stale-operation takeover.
 - [ ] Apply transactional per-lease locks and deterministic multi-lease lock
   order to every remaining lifecycle mutation.
 - [x] Add composable same-transaction journal/state executors and sorted compound
@@ -58,6 +62,9 @@ production backend. Stable decisions, evidence, and wire schemas are in
   provision/checkpoint logical recovery, guarded provider inventory, and
   retained ticket cleanup. Keep it unwired until lifecycle writers share its
   provider-resource lock protocol.
+- [x] Reconcile stale durable release intent by preserving revoked access,
+  retrying exact sandbox cleanup, and atomically terminalizing lease/allocation/
+  operation state without deleting referenced snapshots or objects.
 - [x] Prove immutable-source provision idempotency across two service replicas,
   including one provider mutation, exact logical replay, and terminal replay
   after partial-publication cleanup.
@@ -158,11 +165,16 @@ tickets always fail, and secrets never enter durable or observable state.
   across provider capture, durably prepares every workspace object, compare-and-
   swaps the expected latest snapshot, and atomically adopts allocations and the
   secret-free logical response.
+- [x] Add an unwired PostgreSQL release coordinator that atomically binds its
+  target, persists `release_pending` plus ticket revocation and exact sandbox
+  cleanup work, and only marks released after kill or confirmed provider loss.
 - [ ] Extend cleanup-safe provision through child/restore sources and wire it to
   production startup with reconciler recovery for process loss at every external
   allocation boundary.
 - [x] Serialize durable checkpoint capture and commit per lease across replicas.
-- [ ] Serialize reconnect, child capture, patch, release, and command interaction
+- [x] Serialize durable release against checkpoint and other release operations
+  per lease while using the same deterministic provider-resource lock order.
+- [ ] Serialize reconnect, child capture, patch, and command interaction
   per lease; command execution must share the checkpoint gate before capture can
   claim a command-consistent instant.
 - [x] Persist checksummed base/current workspace manifests with the unwired
@@ -190,8 +202,8 @@ tickets always fail, and secrets never enter durable or observable state.
   provider cleanup outages cannot leak snapshots or sandboxes.
 - [ ] Reconcile pause with `autoResume:false`; choose active/paused timeouts from
   measured cost and latency.
-- [ ] Make release replay succeed after provider loss while retaining referenced
-  durable data.
+- [x] Make unwired durable release replay succeed after confirmed provider loss,
+  retain referenced durable data, and reconcile transient/ambiguous kill failure.
 
 Exit criterion: restart and sandbox-loss recovery work under concurrency, child
 identity remains isolated, and lifecycle replay never duplicates resources.

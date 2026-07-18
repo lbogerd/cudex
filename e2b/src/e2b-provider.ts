@@ -147,7 +147,10 @@ export class E2BProvider implements ProviderAdapter {
   }
   async kill(sandboxId: string): Promise<void> {
     validateOpaque('provider sandbox ID', sandboxId)
-    await Sandbox.kill(sandboxId, this.connection)
+    try {
+      if (!await Sandbox.kill(sandboxId, this.connection)) throw new ProviderSandboxMissingError()
+    }
+    catch (error) { this.sandboxes.delete(sandboxId); normalizeMissing(error) }
     this.sandboxes.delete(sandboxId)
   }
   private describe(sandbox: Sandbox): CreatedSandbox { return { sandboxId: sandbox.sandboxId } }

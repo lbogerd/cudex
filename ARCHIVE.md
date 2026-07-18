@@ -724,10 +724,9 @@ survives, and terminal replay causes no mutation. A third test loses the final
 commit acknowledgement and then injects ticket failure during confirmed-success
 replay, proving the adopted lease/resources remain intact for fresh replay from
 another replica. The complete TypeScript suite
-passed as part of the 175-of-175 suite with zero skips against the isolated
+passed as part of the 180-of-180 suite with zero skips against the isolated
 database. Production startup remains on the legacy lifecycle until reconnect,
-restore, child capture, and release can move to the same PostgreSQL authority
-together.
+restore, and child capture can move to the same PostgreSQL authority together.
 
 ### Durable checkpoint coordinator
 
@@ -768,7 +767,7 @@ and every published object are reclaimed, latest remains unchanged, and
 terminal replay is side-effect free.
 An ambiguous-commit test loses the commit acknowledgement and then fails the
 recovery read, proving the available snapshot and active sandbox remain intact
-for later replay. The complete live suite passed 175 of 175 tests with zero
+for later replay. The complete live suite passed 180 of 180 tests with zero
 skips.
 
 This coordinator serializes lifecycle writers that use the PostgreSQL lease
@@ -776,6 +775,45 @@ lock. The exec gateway's command path does not yet acquire that gate, so the
 captured workspace cannot yet be described as a command-consistent instant;
 production wiring must add command fencing (or an equivalent isolated capture
 protocol) before making that guarantee.
+
+### Durable release coordinator
+
+An unwired PostgreSQL release coordinator now makes loss of access durable
+before provider cleanup. Its tenant-bound operation claim atomically binds the
+existing target lease, closing the crash gap between a journal claim and release
+intent. Under the shared lease-then-provider lock order, the first transaction
+revokes every ticket, moves active/paused state to `release_pending`, and records
+the exact sandbox as lease-bound release cleanup work. Process-local gateway
+connections are also revoked on execution and every successful replay.
+
+A second lease/provider-locked transaction kills the sandbox, treating the
+provider-neutral confirmed-missing signal as success, then atomically marks the
+cleanup allocation reclaimed, the lease released, and the secret-free logical
+operation `{released:true}` succeeded. It never deletes base/latest snapshots,
+workspace objects, artifact data, or their references. A different release key
+against the same lease observes released state and succeeds without another
+kill; identical keys replay the same terminal operation.
+
+Ordinary provider errors and ambiguous kill outcomes never terminal-fail or
+restore access. They leave tickets revoked, the lease `release_pending`, the
+allocation unfinished, and the operation fenced in progress. The reconciler has
+an explicit release path—before generic sandbox adoption—that can reconstruct
+cleanup even after a crash immediately following the target-bound claim, retry
+kill under the same locks, and atomically complete the lease/allocation/operation
+graph. Final database acknowledgement ambiguity uses the same conservative
+outcome resolution as provision/checkpoint, so an unreadable success cannot
+repeat destructive work.
+
+The E2B adapter now maps both the SDK's false-on-missing kill result and
+`SandboxNotFoundError` to the provider-neutral missing signal used by reconnect,
+and removes stale cached handles. Docker-backed PostgreSQL 17 tests prove
+checkpoint-before-release
+ordering; one kill across duplicate and different keys; durable ticket and
+connection revocation; base/latest snapshot, object, and provider-snapshot
+retention; confirmed-missing success; transient kill recovery through real
+stale-operation reconciliation; reconstruction immediately after a target-bound
+claim with no allocation yet; and lost final acknowledgement plus failed outcome-
+read replay without a second kill.
 
 ### Bounded PostgreSQL reconciliation foundation
 
@@ -911,7 +949,7 @@ cleanup outages still require the planned PostgreSQL allocation ledger and
 reconciler before the broader every-path child/provision cleanup invariant can be
 claimed.
 
-The provider-independent suite has 175 tests: 131 passed and 44 live-database
+The provider-independent suite has 180 tests: 131 passed and 49 live-database
 tests are skipped without `HOSTED_AGENT_TEST_DATABASE_URL`. New coverage proves
 ticket/socket rotation on reconnect and replay, transient-versus-missing error
 classification, missing-sandbox revocation, and child temporary-resource cleanup

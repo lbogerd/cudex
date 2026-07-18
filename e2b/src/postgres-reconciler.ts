@@ -1,4 +1,5 @@
 import type { ProviderAdapter } from './provider.js'
+import { ProviderSandboxMissingError } from './provider.js'
 import type { PoolClient } from 'pg'
 import type { Lease, PostgresDurableState } from './postgres-state.js'
 import {
@@ -138,6 +139,10 @@ export class PostgresReconciler {
       result.allocationsPending += allocations.length
       return
     }
+    if (operation.operation === 'release') {
+      await this.reconcileRelease(operation, allocations, result)
+      return
+    }
     for (const allocation of allocations) {
       if (allocation.state === 'adopted' || allocation.state === 'reclaimed') continue
       if (allocation.allocationKind === 'sandbox' || allocation.allocationKind === 'capture_sandbox') {
@@ -163,6 +168,86 @@ export class PostgresReconciler {
         if (!(error instanceof OperationOwnershipError)) throw error
       }
     }
+  }
+
+  private async reconcileRelease(operation: StaleOperation, allocations: OperationAllocation[],
+    result: ReconcileRunResult): Promise<void> {
+    const identity: OperationIdentity = operation
+    const leaseId = operation.primaryLeaseId
+    if (!leaseId || allocations.length > 1) { result.allocationsPending += 1; return }
+    let allocation = allocations[0]
+    if (allocation && (allocation.allocationKind !== 'sandbox' || allocation.leaseId !== leaseId
+      || allocation.metadata.action !== 'release' || allocation.state === 'adopted')) {
+      result.allocationsPending += 1
+      return
+    }
+    let completed = false
+    try {
+      await this.journal.withLeaseLocks(operation.tenantId, [leaseId], async client => {
+        if (!await this.journal.heartbeatOperation(identity, operation.generation, operation.workerId, client)) {
+          throw new OperationOwnershipError()
+        }
+        const lease = await this.state.getLease(operation.tenantId, leaseId, client)
+        if (!lease) throw new OperationOwnershipError()
+        if (lease.state === 'released') {
+          if (allocation && allocation.state !== 'reclaimed') {
+            await this.journal.updateAllocationState(identity, operation.generation, operation.workerId,
+              allocation.allocationId, 'reclaimed', client)
+          }
+          await this.journal.completeOperation(
+            identity, operation.generation, operation.workerId, { released: true }, client)
+          completed = true
+          return
+        }
+        const pending = await this.state.beginRelease(operation.tenantId, leaseId, client)
+        if (pending.state === 'release_pending' && !pending.providerSandboxId) {
+          await this.state.releaseLease(operation.tenantId, leaseId, client)
+          await this.journal.completeOperation(
+            identity, operation.generation, operation.workerId, { released: true }, client)
+          completed = true
+          return
+        }
+        if (pending.state !== 'release_pending' || !pending.providerSandboxId) {
+          throw new OperationOwnershipError()
+        }
+        await this.journal.lockProviderResources(
+          [{ kind: 'sandbox', resourceId: pending.providerSandboxId }], client)
+        if (!allocation) {
+          allocation = await this.journal.recordAllocation(
+            identity, operation.generation, operation.workerId, {
+              kind: 'sandbox', resourceId: pending.providerSandboxId, leaseId,
+              metadata: { action: 'release' },
+            }, client)
+        } else if (allocation.resourceId !== pending.providerSandboxId) {
+          throw new OperationOwnershipError()
+        }
+      })
+    } catch { result.allocationsPending += 1; return }
+    if (completed || !allocation) return
+    try {
+      await this.journal.withLeaseLocks(operation.tenantId, [leaseId], async client => {
+        if (!await this.journal.heartbeatOperation(identity, operation.generation, operation.workerId, client)) {
+          throw new OperationOwnershipError()
+        }
+        const lease = await this.state.getLease(operation.tenantId, leaseId, client)
+        if (!lease) throw new OperationOwnershipError()
+        if (lease.state !== 'released') {
+          if (lease.state !== 'release_pending' || lease.providerSandboxId !== allocation!.resourceId) {
+            throw new OperationOwnershipError()
+          }
+          await this.journal.lockProviderResources(
+            [{ kind: 'sandbox', resourceId: allocation!.resourceId }], client)
+          try { await this.provider.kill(allocation!.resourceId) }
+          catch (error) { if (!(error instanceof ProviderSandboxMissingError)) throw error }
+          await this.state.releaseLease(operation.tenantId, leaseId, client)
+        }
+        await this.journal.updateAllocationState(identity, operation.generation, operation.workerId,
+          allocation!.allocationId, 'reclaimed', client)
+        await this.journal.completeOperation(
+          identity, operation.generation, operation.workerId, { released: true }, client)
+      })
+      result.allocationsReclaimed += 1
+    } catch { result.allocationsPending += 1 }
   }
 
   private async recoverLogicalCompletion(identity: OperationIdentity, operation: StaleOperation,

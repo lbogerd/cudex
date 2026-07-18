@@ -231,6 +231,7 @@ live('checkpoint references and durable data survive release', async context => 
   })
   await context.first.addSnapshotReference({ tenantId: 'tenant-1', snapshotId: checkpoint.snapshotId,
     referenceKind: 'codex_thread', referenceId: 'thread-1' })
+  await context.second.beginRelease('tenant-1', created.lease.leaseId)
   const released = await context.second.releaseLease('tenant-1', created.lease.leaseId)
   assert.equal(released.state, 'released')
   assert.equal(await context.first.activeSandbox(created.lease.leaseId), undefined)

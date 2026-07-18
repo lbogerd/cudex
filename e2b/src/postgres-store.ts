@@ -18,6 +18,7 @@ export interface OperationIdentity {
 export interface OperationClaimInput extends OperationIdentity {
   requestHash: string
   workerId: string
+  primaryLeaseId?: string
 }
 
 export type OperationClaim =
@@ -43,6 +44,7 @@ export interface StaleOperation extends OperationIdentity {
   generation: number
   previousWorkerId: string | null
   workerId: string
+  primaryLeaseId: string | null
 }
 
 export class OperationRequestMismatchError extends Error {
@@ -55,6 +57,10 @@ export class OperationOwnershipError extends Error {
 
 export class OperationWaitTimeoutError extends Error {
   constructor() { super('timed out waiting for the operation to finish') }
+}
+
+export class OperationTargetNotFoundError extends Error {
+  constructor() { super('operation target was not found') }
 }
 
 function canonical(value: unknown): unknown {
@@ -96,6 +102,10 @@ function validateClaim(input: OperationClaimInput): void {
   validateIdentity(input)
   if (!requestHashPattern.test(input.requestHash)) throw new Error('invalid canonical request hash')
   validateWorkerId(input.workerId)
+  if (input.primaryLeaseId !== undefined
+    && (!input.primaryLeaseId.trim() || Buffer.byteLength(input.primaryLeaseId) > 512)) {
+    throw new Error('invalid primary lease ID')
+  }
 }
 
 function validateWorkerId(workerId: string): void {
@@ -115,6 +125,7 @@ interface OperationRow {
   error_message: string | null
   generation: string
   heartbeat_at: Date | null
+  primary_lease_id: string | null
 }
 
 function rowToClaim(row: OperationRow, newlyClaimed: boolean): OperationClaim {
@@ -133,23 +144,38 @@ export class PostgresJournal {
   async claimOperation(input: OperationClaimInput): Promise<OperationClaim> {
     validateClaim(input)
     return this.transaction(async client => {
-      const inserted = await client.query<{ generation: string }>(`
-        INSERT INTO hosted_agent_operations
-          (operation, idempotency_key, tenant_id, request_hash, state, worker_id, heartbeat_at)
-        VALUES ($1, $2, $3, $4, 'in_progress', $5, now())
-        ON CONFLICT (operation, idempotency_key) DO NOTHING
-        RETURNING generation
-      `, [input.operation, input.idempotencyKey, input.tenantId, input.requestHash, input.workerId])
+      const inserted = input.primaryLeaseId === undefined
+        ? await client.query<{ generation: string }>(`
+            INSERT INTO hosted_agent_operations
+              (operation, idempotency_key, tenant_id, request_hash, state, worker_id, heartbeat_at)
+            VALUES ($1, $2, $3, $4, 'in_progress', $5, now())
+            ON CONFLICT (operation, idempotency_key) DO NOTHING
+            RETURNING generation
+          `, [input.operation, input.idempotencyKey, input.tenantId, input.requestHash, input.workerId])
+        : await client.query<{ generation: string }>(`
+            INSERT INTO hosted_agent_operations
+              (operation, idempotency_key, tenant_id, request_hash, state, worker_id,
+               heartbeat_at, primary_lease_id)
+            SELECT $1, $2, $3, $4, 'in_progress', $5, now(), lease_id
+            FROM hosted_agent_leases WHERE tenant_id = $3 AND lease_id = $6
+            ON CONFLICT (operation, idempotency_key) DO NOTHING
+            RETURNING generation
+          `, [input.operation, input.idempotencyKey, input.tenantId, input.requestHash,
+            input.workerId, input.primaryLeaseId])
       const result = await client.query<OperationRow>(`
         SELECT tenant_id, request_hash, state, logical_response, error_code, error_message,
-               generation::text, heartbeat_at
+               generation::text, heartbeat_at, primary_lease_id
         FROM hosted_agent_operations
         WHERE operation = $1 AND idempotency_key = $2
         FOR UPDATE
       `, [input.operation, input.idempotencyKey])
       const row = result.rows[0]
+      if (!row && input.primaryLeaseId !== undefined) throw new OperationTargetNotFoundError()
       if (!row) throw new Error('operation claim disappeared')
       if (row.tenant_id !== input.tenantId || row.request_hash !== input.requestHash) {
+        throw new OperationRequestMismatchError()
+      }
+      if (input.primaryLeaseId !== undefined && row.primary_lease_id !== input.primaryLeaseId) {
         throw new OperationRequestMismatchError()
       }
       return rowToClaim(row, inserted.rowCount === 1)
@@ -170,7 +196,7 @@ export class PostgresJournal {
       options.signal?.throwIfAborted()
       const result = await this.pool.query<OperationRow>(`
         SELECT tenant_id, request_hash, state, logical_response, error_code, error_message,
-               generation::text, heartbeat_at
+               generation::text, heartbeat_at, primary_lease_id
         FROM hosted_agent_operations
         WHERE operation = $1 AND idempotency_key = $2
       `, [input.operation, input.idempotencyKey])
@@ -393,7 +419,8 @@ export class PostgresJournal {
           AND operation.idempotency_key = candidates.idempotency_key
         RETURNING operation.operation, operation.idempotency_key, operation.tenant_id,
                   operation.request_hash, operation.generation::text,
-                  candidates.worker_id AS previous_worker_id, operation.worker_id
+                  candidates.worker_id AS previous_worker_id, operation.worker_id,
+                  operation.primary_lease_id
       `, [staleBefore, limit, workerId, tenantId ?? null])
       return result.rows.map(row => ({
         operation: row.operation,
@@ -403,6 +430,7 @@ export class PostgresJournal {
         generation: Number(row.generation),
         previousWorkerId: row.previous_worker_id,
         workerId: row.worker_id,
+        primaryLeaseId: row.primary_lease_id,
       }))
     })
   }
@@ -517,4 +545,5 @@ interface StaleRow {
   generation: string
   previous_worker_id: string | null
   worker_id: string
+  primary_lease_id: string | null
 }

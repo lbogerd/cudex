@@ -11,7 +11,7 @@ import { FakeProvider } from './fake-provider.js'
 const operation: StaleOperation = {
   operation: 'provision', idempotencyKey: 'stale', tenantId: 'tenant-1',
   requestHash: canonicalRequestHash({ operation: 'provision' }), generation: 1,
-  previousWorkerId: 'dead', workerId: 'reconciler',
+  previousWorkerId: 'dead', workerId: 'reconciler', primaryLeaseId: null,
 }
 
 const withoutProviderContention = async <T>(_kind: 'sandbox' | 'provider_snapshot', _resourceId: string,
