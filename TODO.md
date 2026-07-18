@@ -23,6 +23,9 @@ production backend. Stable decisions, evidence, and wire schemas are in
   all partial provider allocations.
 - [ ] Apply transactional per-lease locks and deterministic multi-lease lock
   order to every lifecycle mutation.
+- [x] Add composable same-transaction journal/state executors and sorted compound
+  provider-resource locks so allocation recording, lease/snapshot commit,
+  allocation adoption, and logical completion can commit or roll back together.
 - [x] Replace local blobs with authenticated object storage for workspace
   archives, manifests, content blobs, and patch artifacts.
 - [x] Make object stores report their exact durable bucket/key locator so

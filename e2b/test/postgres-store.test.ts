@@ -270,3 +270,29 @@ live('provider resource locks serialize the same durable provider identity acros
     await singlePool.end()
   }
 })
+
+live('compound provider locks deduplicate and avoid reversed-order replica deadlocks', async context => {
+  let active = 0
+  let maximum = 0
+  const completed: string[] = []
+  const enter = async (label: string, client: import('pg').PoolClient) => {
+    active += 1
+    maximum = Math.max(maximum, active)
+    await client.query('SELECT pg_sleep(0.05)')
+    completed.push(label)
+    active -= 1
+  }
+  await Promise.all([
+    context.first.withProviderResourceLocks([
+      { kind: 'sandbox', resourceId: 'compound-sandbox' },
+      { kind: 'provider_snapshot', resourceId: 'compound-snapshot' },
+      { kind: 'sandbox', resourceId: 'compound-sandbox' },
+    ], client => enter('first', client)),
+    context.second.withProviderResourceLocks([
+      { kind: 'provider_snapshot', resourceId: 'compound-snapshot' },
+      { kind: 'sandbox', resourceId: 'compound-sandbox' },
+    ], client => enter('second', client)),
+  ])
+  assert.equal(maximum, 1)
+  assert.deepEqual(new Set(completed), new Set(['first', 'second']))
+})

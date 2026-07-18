@@ -342,10 +342,10 @@ export class PostgresDurableState {
     return result.rows[0] ? sourceFromRow(result.rows[0]) : null
   }
 
-  async createLeaseWithBaseSnapshot(input: CreateLeaseInput): Promise<{ lease: Lease; snapshot: Snapshot }> {
+  async createLeaseWithBaseSnapshot(input: CreateLeaseInput, executor?: PoolClient): Promise<{ lease: Lease; snapshot: Snapshot }> {
     validateLeaseInput(input); validateSnapshotInput(input.baseSnapshot)
     try {
-      return await this.transaction(async client => {
+      const create = async (client: PoolClient) => {
         await client.query(`
           INSERT INTO hosted_agent_leases
             (lease_id, environment_id, tenant_id, agent_id, owner_agent_id, owner_lease_id,
@@ -371,7 +371,8 @@ export class PostgresDurableState {
         `, [input.leaseId, input.baseSnapshot.snapshotId, input.tenantId])
         const snapshot = await this.snapshotWithClient(client, input.tenantId, input.baseSnapshot.snapshotId)
         return { lease: leaseFromRow(leaseResult.rows[0]!), snapshot }
-      })
+      }
+      return executor ? await create(executor) : await this.transaction(create)
     } catch (error) { return postgresError(error) }
   }
 
@@ -426,10 +427,10 @@ export class PostgresDurableState {
     return result.rows[0] ? snapshotFromRow(result.rows[0]) : null
   }
 
-  async appendCheckpoint(tenantId: string, leaseId: string, snapshot: SnapshotInput): Promise<Snapshot> {
+  async appendCheckpoint(tenantId: string, leaseId: string, snapshot: SnapshotInput, executor?: PoolClient): Promise<Snapshot> {
     validateId('tenant ID', tenantId); validateId('lease ID', leaseId); validateSnapshotInput(snapshot)
     try {
-      return await this.transaction(async client => {
+      const append = async (client: PoolClient) => {
         const lease = await this.lockLease(client, tenantId, leaseId)
         if (!['active', 'paused'].includes(lease.state)) throw new DurableStateConflictError('lease cannot be checkpointed')
         await this.referenceSnapshotObjects(client, tenantId, leaseId, snapshot)
@@ -447,7 +448,8 @@ export class PostgresDurableState {
           WHERE lease_id = $1 AND tenant_id = $2
         `, [leaseId, tenantId, snapshot.snapshotId])
         return this.snapshotWithClient(client, tenantId, snapshot.snapshotId)
-      })
+      }
+      return executor ? await append(executor) : await this.transaction(append)
     } catch (error) { return postgresError(error) }
   }
 

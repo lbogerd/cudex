@@ -4,6 +4,7 @@ import test from 'node:test'
 import { Pool } from 'pg'
 import { runMigrations } from '../src/migrate.js'
 import { DurableStateConflictError, PostgresDurableState, type CreateLeaseInput, type StoredObject } from '../src/postgres-state.js'
+import { canonicalRequestHash, PostgresJournal } from '../src/postgres-store.js'
 import { PostgresTicketIssuer } from '../src/postgres-tickets.js'
 
 const databaseUrl = process.env.HOSTED_AGENT_TEST_DATABASE_URL
@@ -97,6 +98,98 @@ live('lease and base snapshot creation is atomic and unique across two pools', a
            (SELECT count(*) FROM hosted_agent_snapshots)::text AS snapshots
   `)
   assert.deepEqual(counts.rows[0], { leases: '1', snapshots: '1' })
+})
+
+live('one max-one-connection transaction composes allocation, lease, adoption, and logical completion', async context => {
+  const singlePool = new Pool({ connectionString: databaseUrl, options: `-c search_path=${context.schema}`, max: 1 })
+  const journal = new PostgresJournal(singlePool)
+  const state = new PostgresDurableState(singlePool)
+  try {
+    const ids = await objects(context)
+    const identity = { operation: 'provision', idempotencyKey: 'atomic-compose', tenantId: 'tenant-1' }
+    const workerId = 'compose-worker'
+    const claim = await journal.claimOperation({ ...identity, workerId, requestHash: canonicalRequestHash(identity) })
+    assert.equal(claim.kind, 'claimed')
+    if (claim.kind !== 'claimed') return
+
+    await journal.withProviderResourceLocks([
+      { kind: 'provider_snapshot', resourceId: 'provider-snapshot-1' },
+      { kind: 'sandbox', resourceId: 'sandbox-1' },
+    ], async client => {
+      const sandbox = await journal.recordAllocation(identity, claim.generation, workerId,
+        { kind: 'sandbox', resourceId: 'sandbox-1' }, client)
+      const providerSnapshot = await journal.recordAllocation(identity, claim.generation, workerId,
+        { kind: 'provider_snapshot', resourceId: 'provider-snapshot-1' }, client)
+      const created = await state.createLeaseWithBaseSnapshot(leaseInput(ids), client)
+      await journal.bindLeaseAndAdoptAllocations(identity, claim.generation, workerId,
+        created.lease.leaseId, [sandbox.allocationId, providerSnapshot.allocationId], client)
+      await journal.completeOperation(identity, claim.generation, workerId, {
+        leaseId: created.lease.leaseId,
+        connection: { execServerUrl: 'wss://gateway.invalid/leases/lease-1?ticket=secret' },
+      }, client)
+    })
+
+    assert.deepEqual(await journal.claimOperation({
+      ...identity, workerId: 'replay-worker', requestHash: canonicalRequestHash(identity),
+    }), { kind: 'succeeded', generation: claim.generation, response: { leaseId: 'lease-1' } })
+    const committed = await context.firstPool.query<{ allocations: string; adopted: string; leases: string; snapshots: string }>(`
+      SELECT
+        (SELECT count(*)::text FROM hosted_agent_operation_allocations
+          WHERE operation = 'provision' AND idempotency_key = 'atomic-compose') AS allocations,
+        (SELECT count(*)::text FROM hosted_agent_operation_allocations
+          WHERE operation = 'provision' AND idempotency_key = 'atomic-compose' AND state = 'adopted') AS adopted,
+        (SELECT count(*)::text FROM hosted_agent_leases WHERE lease_id = 'lease-1') AS leases,
+        (SELECT count(*)::text FROM hosted_agent_snapshots WHERE snapshot_id = 'snapshot-1') AS snapshots
+    `)
+    assert.deepEqual(committed.rows[0], { allocations: '2', adopted: '2', leases: '1', snapshots: '1' })
+
+    const rollbackIds = await objects(context, 'tenant-1', '-rollback')
+    const rollbackIdentity = { operation: 'provision', idempotencyKey: 'atomic-rollback', tenantId: 'tenant-1' }
+    const rollbackClaim = await journal.claimOperation({
+      ...rollbackIdentity, workerId, requestHash: canonicalRequestHash(rollbackIdentity),
+    })
+    assert.equal(rollbackClaim.kind, 'claimed')
+    if (rollbackClaim.kind !== 'claimed') return
+    const rollbackInput = leaseInput(rollbackIds, {
+      leaseId: 'lease-rollback', environmentId: 'env-rollback', agentId: 'agent-rollback',
+      providerSandboxId: 'sandbox-rollback',
+      baseSnapshot: {
+        snapshotId: 'snapshot-rollback', providerSnapshotId: 'provider-snapshot-rollback',
+        workspaceArchiveObjectId: rollbackIds.archive.objectId,
+        manifestObjectId: rollbackIds.manifest.objectId, manifestChecksum: rollbackIds.manifest.checksum,
+      },
+    })
+    await assert.rejects(journal.withProviderResourceLocks([
+      { kind: 'sandbox', resourceId: 'sandbox-rollback' },
+      { kind: 'provider_snapshot', resourceId: 'provider-snapshot-rollback' },
+    ], async client => {
+      const sandbox = await journal.recordAllocation(rollbackIdentity, rollbackClaim.generation, workerId,
+        { kind: 'sandbox', resourceId: 'sandbox-rollback' }, client)
+      const providerSnapshot = await journal.recordAllocation(rollbackIdentity, rollbackClaim.generation, workerId,
+        { kind: 'provider_snapshot', resourceId: 'provider-snapshot-rollback' }, client)
+      await state.createLeaseWithBaseSnapshot(rollbackInput, client)
+      await journal.bindLeaseAndAdoptAllocations(rollbackIdentity, rollbackClaim.generation, workerId,
+        rollbackInput.leaseId, [sandbox.allocationId, providerSnapshot.allocationId], client)
+      await journal.completeOperation(rollbackIdentity, rollbackClaim.generation, workerId,
+        { leaseId: rollbackInput.leaseId }, client)
+      throw new Error('injected final transaction failure')
+    }), /injected final transaction failure/)
+
+    const rolledBack = await context.firstPool.query<{
+      operation_state: string; allocations: string; leases: string; snapshots: string
+    }>(`
+      SELECT
+        (SELECT state FROM hosted_agent_operations
+          WHERE operation = 'provision' AND idempotency_key = 'atomic-rollback') AS operation_state,
+        (SELECT count(*)::text FROM hosted_agent_operation_allocations
+          WHERE operation = 'provision' AND idempotency_key = 'atomic-rollback') AS allocations,
+        (SELECT count(*)::text FROM hosted_agent_leases WHERE lease_id = 'lease-rollback') AS leases,
+        (SELECT count(*)::text FROM hosted_agent_snapshots WHERE snapshot_id = 'snapshot-rollback') AS snapshots
+    `)
+    assert.deepEqual(rolledBack.rows[0], {
+      operation_state: 'in_progress', allocations: '0', leases: '0', snapshots: '0',
+    })
+  } finally { await singlePool.end() }
 })
 
 live('checkpoint references and durable data survive release', async context => {

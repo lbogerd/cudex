@@ -204,12 +204,13 @@ export class PostgresJournal {
     return result.rowCount === 1
   }
 
-  async completeOperation(identity: OperationIdentity, generation: number, workerId: string, response: unknown): Promise<void> {
+  async completeOperation(identity: OperationIdentity, generation: number, workerId: string, response: unknown,
+    executor: Pick<PoolClient, 'query'> = this.pool): Promise<void> {
     validateIdentity(identity); validateGeneration(generation); validateWorkerId(workerId)
     const logicalResponse = sanitizeLogicalResponse(response)
     const encodedResponse = JSON.stringify(logicalResponse)
     if (encodedResponse === undefined || Buffer.byteLength(encodedResponse) > 1024 * 1024) throw new Error('invalid logical response')
-    const result = await this.pool.query(`
+    const result = await executor.query(`
       UPDATE hosted_agent_operations
       SET state = 'succeeded', logical_response = $6::jsonb, error_code = NULL,
           error_message = NULL, completed_at = now(), heartbeat_at = now()
@@ -219,11 +220,12 @@ export class PostgresJournal {
     if (result.rowCount !== 1) throw new OperationOwnershipError()
   }
 
-  async failOperation(identity: OperationIdentity, generation: number, workerId: string, errorCode: string, errorMessage: string): Promise<void> {
+  async failOperation(identity: OperationIdentity, generation: number, workerId: string, errorCode: string, errorMessage: string,
+    executor: Pick<PoolClient, 'query'> = this.pool): Promise<void> {
     validateIdentity(identity); validateGeneration(generation); validateWorkerId(workerId)
     if (!errorCode.trim() || Buffer.byteLength(errorCode) > 512) throw new Error('invalid error code')
     if (Buffer.byteLength(errorMessage) > 4096) throw new Error('error message is too large')
-    const result = await this.pool.query(`
+    const result = await executor.query(`
       UPDATE hosted_agent_operations
       SET state = 'failed_terminal', logical_response = NULL, error_code = $6,
           error_message = $7, completed_at = now(), heartbeat_at = now()
@@ -238,11 +240,12 @@ export class PostgresJournal {
     generation: number,
     workerId: string,
     allocation: { kind: string; resourceId: string; leaseId?: string; metadata?: Record<string, unknown> },
+    executor: Pick<PoolClient, 'query'> = this.pool,
   ): Promise<OperationAllocation> {
     validateIdentity(identity); validateGeneration(generation); validateWorkerId(workerId)
     if (!allocationKinds.has(allocation.kind)) throw new Error('invalid allocation kind')
     if (!allocation.resourceId.trim() || Buffer.byteLength(allocation.resourceId) > 2048) throw new Error('invalid resource ID')
-    const result = await this.pool.query<AllocationRow>(`
+    const result = await executor.query<AllocationRow>(`
       INSERT INTO hosted_agent_operation_allocations
         (operation, idempotency_key, tenant_id, allocation_kind, resource_id, lease_id, state, metadata)
       SELECT operation, idempotency_key, tenant_id, $6, $7, $8, 'allocated', $9::jsonb
@@ -436,12 +439,24 @@ export class PostgresJournal {
    */
   async withProviderResourceLock<T>(kind: 'sandbox' | 'provider_snapshot', resourceId: string,
     fn: (client: PoolClient) => Promise<T>): Promise<T> {
-    if (!providerResourceKinds.has(kind)) throw new Error('invalid provider resource kind')
-    if (!resourceId.trim() || Buffer.byteLength(resourceId) > 2048) throw new Error('invalid resource ID')
-    const key = `hosted-agent:provider:${kind}:${resourceId}`
+    return this.withProviderResourceLocks([{ kind, resourceId }], fn)
+  }
+
+  async withProviderResourceLocks<T>(resources: Array<{ kind: 'sandbox' | 'provider_snapshot'; resourceId: string }>,
+    fn: (client: PoolClient) => Promise<T>): Promise<T> {
+    if (resources.length < 1 || resources.length > 10_000) throw new Error('invalid provider resource count')
+    const keys = new Set<string>()
+    for (const resource of resources) {
+      if (!providerResourceKinds.has(resource.kind)) throw new Error('invalid provider resource kind')
+      if (!resource.resourceId.trim() || Buffer.byteLength(resource.resourceId) > 2048) throw new Error('invalid resource ID')
+      keys.add(`hosted-agent:provider:${JSON.stringify([resource.kind, resource.resourceId])}`)
+    }
+    const sorted = [...keys].sort()
     return this.transaction(async client => {
       await client.query("SET LOCAL lock_timeout = '30s'")
-      await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [key])
+      for (const key of sorted) {
+        await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [key])
+      }
       return fn(client)
     })
   }

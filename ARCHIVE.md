@@ -515,6 +515,18 @@ control-plane methods still need to be refactored onto this API before the
 production persistence checklist and provider-mutation exit criterion are
 satisfied.
 
+The journal's allocation, success, and terminal-failure writers and the durable
+state's base-lease/checkpoint writers also accept an existing PostgreSQL client.
+Provider locks now accept a bounded set of sandbox/provider-snapshot identities,
+deduplicate and sort their unambiguous keys, and acquire them in one transaction;
+the single-resource helper delegates to the same path. A max-one-connection live
+test composes allocation recording, base lease/snapshot creation, explicit
+adoption, response redaction, and logical completion in one commit. An injected
+final failure leaves the operation in progress and rolls back every allocation,
+lease, and snapshot, while independent replicas taking the same compound locks
+in reverse input order serialize without deadlock. These are coordinator
+primitives, not production lifecycle wiring.
+
 ### Bounded PostgreSQL reconciliation foundation
 
 An intentionally unwired `PostgresReconciler` now claims stale operations only
