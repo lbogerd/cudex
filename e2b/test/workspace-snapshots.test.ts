@@ -349,6 +349,28 @@ test('live durable preparation atomically ledgers every object, replays without 
     error => error instanceof ServiceError && error.status === 400)
     assert.equal(objects.puts, 3)
 
+    const rollbackClient = await pool.connect()
+    try {
+      await rollbackClient.query('BEGIN')
+      const attached = await publisher.commitDurableBase(input.fence, prepared, rollbackClient)
+      assert.equal(attached.objectAllocationIds.length, 3)
+      await rollbackClient.query('ROLLBACK')
+    } finally { rollbackClient.release() }
+    assert.equal((await pool.query(`SELECT 1 FROM hosted_agent_leases WHERE lease_id = 'lease-a'`)).rowCount, 0)
+    assert.equal((await pool.query<{ state: string }>(`
+      SELECT state FROM hosted_agent_workspace_preparations WHERE idempotency_key = 'durable-publication'
+    `)).rows[0]?.state, 'prepared')
+    const commitClient = await pool.connect()
+    try {
+      await commitClient.query('BEGIN')
+      await publisher.commitDurableBase(input.fence, prepared, commitClient)
+      await commitClient.query('COMMIT')
+    } finally { commitClient.release() }
+    assert.equal((await pool.query(`SELECT 1 FROM hosted_agent_leases WHERE lease_id = 'lease-a'`)).rowCount, 1)
+    assert.equal((await pool.query<{ state: string }>(`
+      SELECT state FROM hosted_agent_workspace_preparations WHERE idempotency_key = 'durable-publication'
+    `)).rows[0]?.state, 'committed')
+
     objects.failAt = objects.puts + 2
     const failedPublisher = new WorkspaceSnapshotPublisher(state, objects, {
       reclaimer: { reclaimUnreferencedWorkspaceObject: async () => assert.fail('legacy cleanup must not run') },

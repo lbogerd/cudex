@@ -511,6 +511,17 @@ attachment, and terminal cleanup after a partial publication failure. A put
 whose database transaction never commits still has no safe durable identity and
 remains part of the explicitly open aged object-store inventory sweep.
 
+The same publisher can now attach a prepared base using the caller's PostgreSQL
+transaction. It locks and re-verifies the durable intent and exact allocated
+object set, repeats tenant/ID/checksum/state/expiry source authorization in that
+transaction, reconstructs the snapshot only from locked database associations,
+creates the lease/base snapshot, and marks the preparation committed while its
+object allocations are still unadopted. It returns those locked allocation IDs
+for the outer journal coordinator to adopt with sandbox/provider allocations
+before logical completion. A live rollback test proves lease, snapshot, and
+preparation commit all disappear together; replay then commits them successfully.
+This is a transaction composition primitive, not production route wiring.
+
 ### Multi-replica operation journal primitives
 
 The PostgreSQL layer now exposes atomic operation admission over the unique

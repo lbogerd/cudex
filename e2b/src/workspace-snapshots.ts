@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import type { PoolClient } from 'pg'
 import {
   captureArchiveManifest,
   defaultArchiveManifestLimits,
@@ -63,6 +64,12 @@ export interface PreparedDurableBaseWorkspaceSnapshot {
   contentObjects: readonly PublishedWorkspaceContent[]
 }
 
+export interface CommittedDurableBaseWorkspaceSnapshot {
+  lease: Lease
+  snapshot: Snapshot
+  objectAllocationIds: string[]
+}
+
 export interface PublishedWorkspaceContent {
   path: string
   objectId: string
@@ -95,7 +102,8 @@ export interface WorkspaceSnapshotPublisherOptions {
   durablePreparation?: {
     journal: Pick<PostgresJournal, 'recordAllocation'>
     preparations: Pick<PostgresWorkspacePreparations,
-      'createOrReplay' | 'lockObjectForPublication' | 'associateObject' | 'markPrepared' | 'beginAbort'>
+      'createOrReplay' | 'lockObjectForPublication' | 'associateObject' | 'markPrepared' | 'beginAbort'
+      | 'lockForCommit' | 'markCommitted'>
     reclaimer: Pick<PostgresObjectReclaimer, 'reclaimPreparationObjects'>
     cleanupBatchSize?: number
   }
@@ -103,6 +111,7 @@ export interface WorkspaceSnapshotPublisherOptions {
 
 type DurableWorkspaceState = Pick<PostgresDurableState,
   'withObjectLocationLock' | 'registerObject' | 'createLeaseWithBaseSnapshot' | 'appendCheckpoint'>
+  & Partial<Pick<PostgresDurableState, 'lockAuthorizedSourceSnapshot'>>
 
 interface PlannedObject {
   bytes: Uint8Array
@@ -306,6 +315,50 @@ export class WorkspaceSnapshotPublisher {
           }
         } catch { throw new ServiceError(503, 'workspace snapshot cleanup pending') }
       }
+      if (error instanceof ServiceError) throw error
+      throw new ServiceError(503, 'workspace snapshot service unavailable')
+    }
+  }
+
+  async commitDurableBase(fence: PreparationFence, prepared: PreparedDurableBaseWorkspaceSnapshot,
+    executor: PoolClient): Promise<CommittedDurableBaseWorkspaceSnapshot> {
+    const coordinator = this.options.durablePreparation
+    if (!coordinator) throw new ServiceError(503, 'durable workspace preparation is unavailable')
+    if (fence.operation !== 'provision') throw new ServiceError(400, 'invalid workspace preparation operation')
+    try {
+      const locked = await coordinator.preparations.lockForCommit(
+        fence, prepared.preparation.preparationId, prepared.intent, executor)
+      const intent = locked.preparation.intent
+      if (intent.sourceSnapshotId !== null && intent.expectedSourceChecksum !== null) {
+        if (!this.state.lockAuthorizedSourceSnapshot) throw new Error('source authorization is unavailable')
+        await this.state.lockAuthorizedSourceSnapshot(intent.tenantId, intent.sourceSnapshotId,
+          intent.expectedSourceChecksum, new Date(), executor)
+      }
+      const archive = locked.objects.find(object => object.purpose === 'workspace_archive')
+      const manifest = locked.objects.find(object => object.purpose === 'manifest')
+      if (!archive || !manifest) throw new Error('prepared workspace object set is incomplete')
+      const snapshotInput: SnapshotInput = {
+        snapshotId: intent.snapshotId, providerSnapshotId: intent.providerSnapshotId,
+        workspaceArchiveObjectId: archive.objectId, manifestObjectId: manifest.objectId,
+        manifestChecksum: intent.manifestChecksum,
+        contentObjectIds: locked.objects.filter(object => object.purpose === 'content_blob')
+          .map(object => object.objectId).sort(),
+        expiresAt: intent.snapshotExpiresAt === null ? null : new Date(intent.snapshotExpiresAt),
+      }
+      const created = await this.state.createLeaseWithBaseSnapshot({
+        leaseId: intent.leaseId, environmentId: intent.environmentId, tenantId: intent.tenantId,
+        agentId: intent.agentId, ownerAgentId: intent.ownerAgentId, ownerLeaseId: intent.ownerLeaseId,
+        sourceSnapshotId: intent.sourceSnapshotId, providerSandboxId: intent.providerSandboxId,
+        sandboxTemplate: intent.sandboxTemplate, cwdUri: intent.cwdUri,
+        workspaceRootUris: [...intent.workspaceRootUris], toolPolicy: structuredClone(intent.toolPolicy),
+        policyVersion: intent.policyVersion, baseSnapshot: snapshotInput,
+      }, executor)
+      verifySnapshot(created.snapshot, intent.tenantId, intent.leaseId, snapshotInput)
+      await coordinator.preparations.markCommitted(
+        fence, prepared.preparation.preparationId, prepared.intent, executor)
+      return { lease: created.lease, snapshot: created.snapshot,
+        objectAllocationIds: locked.objects.map(object => object.allocationId) }
+    } catch (error) {
       if (error instanceof ServiceError) throw error
       throw new ServiceError(503, 'workspace snapshot service unavailable')
     }

@@ -140,6 +140,9 @@ tickets always fail, and secrets never enter durable or observable state.
 - [x] Add a provision-fenced durable preparation path that plans before writes,
   atomically registers each successful put with its allocation/association,
   skips exact replay puts, and resumes bounded preparation-scoped cleanup.
+- [x] Attach an exact durable preparation to its base lease inside the caller's
+  transaction, repeating source authorization there and marking the preparation
+  committed before allocation adoption.
 - [ ] On restore, verify and overlay workspace state, remove inherited runtime
   identity, restart exec, and rekey transport credentials.
 - [ ] On child creation, atomically snapshot the owner, use a temporary capture,
