@@ -4,6 +4,10 @@ import { ServiceError } from '../src/types.js'
 import {
   contractLimits,
   validateCheckpointRequest,
+  validatePatchApplyRequest,
+  validatePatchApplyResponse,
+  validatePatchExportRequest,
+  validatePatchExportResponse,
   validateProvisionedAgent,
   validateProvisionRequest,
   validateReconnectRequest,
@@ -28,6 +32,20 @@ const provisioned = () => ({
   },
 })
 
+const patchExportRequest = () => ({
+  leaseId: 'lease_child', agentId: 'agent_child', baseSnapshotId: 'snapshot_base',
+  idempotencyKey: 'patch-export-1',
+})
+
+const patchExportResponse = () => ({
+  artifactId: 'artifact_123', agentId: 'agent_child', baseSnapshotId: 'snapshot_base',
+  checksum: `sha256:${'a'.repeat(64)}`, changedFiles: 12, sizeBytes: 48_192,
+})
+
+const patchApplyRequest = () => ({
+  targetLeaseId: 'lease_owner', artifactId: 'artifact_123', idempotencyKey: 'patch-apply-1',
+})
+
 function rejectsStatus(status: number, fn: () => unknown): void {
   assert.throws(fn, error => error instanceof ServiceError && error.status === status)
 }
@@ -47,6 +65,8 @@ test('request validators accept every current exact request shape', () => {
   assert.deepEqual(validateReconnectRequest(leaseRequest), leaseRequest)
   assert.deepEqual(validateCheckpointRequest(leaseRequest), leaseRequest)
   assert.deepEqual(validateReleaseRequest(leaseRequest), leaseRequest)
+  assert.deepEqual(validatePatchExportRequest(patchExportRequest()), patchExportRequest())
+  assert.deepEqual(validatePatchApplyRequest(patchApplyRequest()), patchApplyRequest())
 })
 
 test('request validators reject malformed types, discriminants, extra keys, and owner violations', () => {
@@ -68,6 +88,79 @@ test('request validators reject malformed types, discriminants, extra keys, and 
   rejectsStatus(400, () => validateReconnectRequest({ leaseId: 'lease', idempotencyKey: 'key', extra: 1 }))
   rejectsStatus(400, () => validateCheckpointRequest({ leaseId: 1, idempotencyKey: 'key' }))
   rejectsStatus(400, () => validateReleaseRequest({ leaseId: 'lease' }))
+  rejectsStatus(400, () => validatePatchExportRequest({ ...patchExportRequest(), tenantId: 'tenant_from_body' }))
+  rejectsStatus(400, () => validatePatchExportRequest({ ...patchExportRequest(), agentId: 1 }))
+  rejectsStatus(400, () => validatePatchExportRequest({ ...patchExportRequest(), baseSnapshotId: '' }))
+  rejectsStatus(400, () => validatePatchApplyRequest({ ...patchApplyRequest(), accessToken: 'secret' }))
+  rejectsStatus(400, () => validatePatchApplyRequest({ targetLeaseId: 'lease', artifactId: 'artifact' }))
+})
+
+test('patch export response is exact, checksummed, and numerically bounded', () => {
+  assert.deepEqual(validatePatchExportResponse(patchExportResponse()), patchExportResponse())
+  assert.deepEqual(validatePatchExportResponse({ ...patchExportResponse(), changedFiles: 0, sizeBytes: 0 }), {
+    ...patchExportResponse(), changedFiles: 0, sizeBytes: 0,
+  })
+  rejectsStatus(503, () => validatePatchExportResponse(null))
+  rejectsStatus(503, () => validatePatchExportResponse({ ...patchExportResponse(), connection: { execServerUrl: 'wss://secret' } }))
+  rejectsStatus(503, () => validatePatchExportResponse({ ...patchExportResponse(), checksum: `sha256:${'A'.repeat(64)}` }))
+  rejectsStatus(503, () => validatePatchExportResponse({ ...patchExportResponse(), checksum: 'a'.repeat(64) }))
+  for (const changedFiles of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1, contractLimits.maxPatchChangedFiles + 1]) {
+    rejectsStatus(503, () => validatePatchExportResponse({ ...patchExportResponse(), changedFiles }))
+  }
+  for (const sizeBytes of [-1, 1.5, Number.POSITIVE_INFINITY, contractLimits.maxPatchSizeBytes + 1]) {
+    rejectsStatus(503, () => validatePatchExportResponse({ ...patchExportResponse(), sizeBytes }))
+  }
+})
+
+test('patch apply response accepts exact applied, conflict, and rejected variants', () => {
+  const applied = { type: 'applied', checkpoint: { snapshotId: 'snapshot_after' } }
+  const conflict = { type: 'conflict', paths: [
+    'file:///workspace/project/a.txt', 'file:///workspace/project/src/lib.rs',
+  ] }
+  const rejected = { type: 'rejected', reason: 'artifact expired' }
+  assert.deepEqual(validatePatchApplyResponse(applied), applied)
+  assert.deepEqual(validatePatchApplyResponse(conflict), conflict)
+  assert.deepEqual(validatePatchApplyResponse(rejected), rejected)
+})
+
+test('patch apply response rejects invalid tags, extra/access fields, and malformed nested shapes', () => {
+  for (const value of [null, [], {}, { type: 'unknown' }, { type: 'applied' },
+    { type: 'applied', checkpoint: { snapshotId: 'snapshot', ticket: 'secret' } },
+    { type: 'conflict', paths: ['file:///workspace/a'], accessToken: 'secret' },
+    { type: 'rejected', reason: 'rejected', connection: {} }]) {
+    rejectsStatus(503, () => validatePatchApplyResponse(value))
+  }
+  rejectsStatus(503, () => validatePatchApplyResponse({ type: 'applied', checkpoint: { snapshotId: 1 } }))
+  rejectsStatus(503, () => validatePatchApplyResponse({ type: 'rejected', reason: '' }))
+  rejectsStatus(503, () => validatePatchApplyResponse({ type: 'rejected', reason: ' line padded ' }))
+  rejectsStatus(503, () => validatePatchApplyResponse({ type: 'rejected', reason: 'bad\nreason' }))
+  const accessor = { checkpoint: { snapshotId: 'snapshot' } }
+  Object.defineProperty(accessor, 'type', { enumerable: true, get: () => 'applied' })
+  rejectsStatus(503, () => validatePatchApplyResponse(accessor))
+  rejectsStatus(503, () => validatePatchApplyResponse(Object.assign(Object.create({ inherited: true }), {
+    type: 'rejected', reason: 'rejected',
+  })))
+})
+
+test('patch conflicts require one to 256 unique sorted canonical workspace file URIs', () => {
+  const path = (index: number) => `file:///workspace/project/${String(index).padStart(3, '0')}.txt`
+  const maximum = Array.from({ length: contractLimits.maxConflictPaths }, (_, index) => path(index))
+  assert.deepEqual(validatePatchApplyResponse({ type: 'conflict', paths: maximum }),
+    { type: 'conflict', paths: maximum })
+  const invalid = [
+    [], [path(0), path(0)], [path(1), path(0)],
+    ['file:///host/project/a.txt'], ['file:///workspace'], ['https://example.test/workspace/a'],
+    ['file:///workspace/project/../secret'], ['file:///workspace/project/a.txt?ticket=secret'],
+    Array.from({ length: contractLimits.maxConflictPaths + 1 }, (_, index) => path(index)),
+  ]
+  for (const paths of invalid) rejectsStatus(503, () => validatePatchApplyResponse({ type: 'conflict', paths }))
+})
+
+test('patch rejection reasons use UTF-8 byte bounds without truncation', () => {
+  const exact = 'é'.repeat(contractLimits.maxRejectionReasonBytes / 2)
+  assert.deepEqual(validatePatchApplyResponse({ type: 'rejected', reason: exact }), { type: 'rejected', reason: exact })
+  rejectsStatus(503, () => validatePatchApplyResponse({ type: 'rejected', reason: `${exact}é` }))
+  rejectsStatus(503, () => validatePatchApplyResponse({ type: 'rejected', reason: '\ud800' }))
 })
 
 test('request string bounds use UTF-8 bytes and reject invalid Unicode', () => {

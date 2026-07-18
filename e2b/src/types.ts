@@ -11,6 +11,29 @@ export interface ProvisionRequest {
 export interface ReconnectRequest { leaseId: string; idempotencyKey: string }
 export interface CheckpointRequest { leaseId: string; idempotencyKey: string }
 export interface ReleaseRequest { leaseId: string; idempotencyKey: string }
+export interface PatchExportRequest {
+  leaseId: string
+  agentId: string
+  baseSnapshotId: string
+  idempotencyKey: string
+}
+export interface AgentPatchArtifact {
+  artifactId: string
+  agentId: string
+  baseSnapshotId: string
+  checksum: string
+  changedFiles: number
+  sizeBytes: number
+}
+export interface PatchApplyRequest {
+  targetLeaseId: string
+  artifactId: string
+  idempotencyKey: string
+}
+export type PatchApplyResult =
+  | { type: 'applied'; checkpoint: { snapshotId: string } }
+  | { type: 'conflict'; paths: string[] }
+  | { type: 'rejected'; reason: string }
 export interface ToolPolicy {
   allowedDomains: string[]
   allowedTools: Array<{ name: string; namespace: string | null }>

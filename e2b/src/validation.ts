@@ -1,6 +1,18 @@
 import { isAbsolute, relative, sep } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-import type { CheckpointRequest, ProvisionedAgent, ProvisionRequest, ReconnectRequest, ReleaseRequest, SnapshotSource, ToolPolicy } from './types.js'
+import type {
+  AgentPatchArtifact,
+  CheckpointRequest,
+  PatchApplyRequest,
+  PatchApplyResult,
+  PatchExportRequest,
+  ProvisionedAgent,
+  ProvisionRequest,
+  ReconnectRequest,
+  ReleaseRequest,
+  SnapshotSource,
+  ToolPolicy,
+} from './types.js'
 import { ServiceError } from './types.js'
 
 export const contractLimits = {
@@ -12,6 +24,10 @@ export const contractLimits = {
   maxAllowedDomains: 8,
   maxAllowedTools: 256,
   maxToolNameBytes: 512,
+  maxPatchChangedFiles: 100_000,
+  maxPatchSizeBytes: 512 * 1024 * 1024,
+  maxConflictPaths: 256,
+  maxRejectionReasonBytes: 4_096,
 } as const
 
 const toolDomains = new Set([
@@ -65,6 +81,16 @@ function boundedString(value: unknown, maxBytes: number, fail: Failure, kind: st
 
 function opaqueId(value: unknown, fail: Failure, kind: string): string {
   return boundedString(value, contractLimits.maxOpaqueIdBytes, fail, kind)
+}
+
+function sha256Checksum(value: unknown, fail: Failure, kind: string): string {
+  if (typeof value !== 'string' || !sha256ChecksumPattern.test(value)) fail(`${kind} is invalid`)
+  return value as string
+}
+
+function boundedNonnegativeInteger(value: unknown, maximum: number, fail: Failure, kind: string): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 0 || (value as number) > maximum) fail(`${kind} is invalid`)
+  return value as number
 }
 
 function canonicalFileUri(value: unknown, fail: Failure, kind: string): { uri: string; path: string } {
@@ -153,9 +179,93 @@ export function validateReconnectRequest(value: unknown): ReconnectRequest { ret
 export function validateCheckpointRequest(value: unknown): CheckpointRequest { return validateLeaseRequest(value, 'checkpoint') }
 export function validateReleaseRequest(value: unknown): ReleaseRequest { return validateLeaseRequest(value, 'release') }
 
+export function validatePatchExportRequest(value: unknown): PatchExportRequest {
+  const record = object(value, ['leaseId', 'agentId', 'baseSnapshotId', 'idempotencyKey'],
+    requestFailure, 'patch export request')
+  return {
+    leaseId: opaqueId(record.leaseId, requestFailure, 'lease ID'),
+    agentId: opaqueId(record.agentId, requestFailure, 'agent ID'),
+    baseSnapshotId: opaqueId(record.baseSnapshotId, requestFailure, 'base snapshot ID'),
+    idempotencyKey: opaqueId(record.idempotencyKey, requestFailure, 'idempotency key'),
+  }
+}
+
+export function validatePatchApplyRequest(value: unknown): PatchApplyRequest {
+  const record = object(value, ['targetLeaseId', 'artifactId', 'idempotencyKey'],
+    requestFailure, 'patch apply request')
+  return {
+    targetLeaseId: opaqueId(record.targetLeaseId, requestFailure, 'target lease ID'),
+    artifactId: opaqueId(record.artifactId, requestFailure, 'artifact ID'),
+    idempotencyKey: opaqueId(record.idempotencyKey, requestFailure, 'idempotency key'),
+  }
+}
+
 export function validateCheckpointResponse(value: unknown): { snapshotId: string } {
   const record = object(value, ['snapshotId'], responseFailure, 'checkpoint response')
   return { snapshotId: opaqueId(record.snapshotId, responseFailure, 'snapshot ID') }
+}
+
+export function validatePatchExportResponse(value: unknown): AgentPatchArtifact {
+  const record = object(value, [
+    'artifactId', 'agentId', 'baseSnapshotId', 'checksum', 'changedFiles', 'sizeBytes',
+  ], responseFailure, 'patch export response')
+  return {
+    artifactId: opaqueId(record.artifactId, responseFailure, 'artifact ID'),
+    agentId: opaqueId(record.agentId, responseFailure, 'agent ID'),
+    baseSnapshotId: opaqueId(record.baseSnapshotId, responseFailure, 'base snapshot ID'),
+    checksum: sha256Checksum(record.checksum, responseFailure, 'artifact checksum'),
+    changedFiles: boundedNonnegativeInteger(record.changedFiles, contractLimits.maxPatchChangedFiles,
+      responseFailure, 'changed-file count'),
+    sizeBytes: boundedNonnegativeInteger(record.sizeBytes, contractLimits.maxPatchSizeBytes,
+      responseFailure, 'patch size'),
+  }
+}
+
+function conflictPath(value: unknown, index: number): string {
+  const parsed = canonicalFileUri(value, responseFailure, `conflict path ${index}`)
+  if (parsed.path === '/workspace' || !parsed.path.startsWith('/workspace/')) {
+    responseFailure(`conflict path ${index} is invalid`)
+  }
+  return parsed.uri
+}
+
+export function validatePatchApplyResponse(value: unknown): PatchApplyResult {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)
+    || (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null)) {
+    responseFailure('patch apply response must be an object')
+  }
+  const record = value as Record<string, unknown>
+  const typeDescriptor = Object.getOwnPropertyDescriptor(record, 'type')
+  if (!typeDescriptor?.enumerable || !('value' in typeDescriptor) || typeof typeDescriptor.value !== 'string') {
+    return responseFailure('patch apply response type is invalid')
+  }
+  switch (typeDescriptor.value) {
+    case 'applied': {
+      const applied = object(record, ['type', 'checkpoint'], responseFailure, 'applied patch response')
+      const checkpoint = object(applied.checkpoint, ['snapshotId'], responseFailure, 'applied checkpoint')
+      return { type: 'applied', checkpoint: {
+        snapshotId: opaqueId(checkpoint.snapshotId, responseFailure, 'snapshot ID'),
+      } }
+    }
+    case 'conflict': {
+      const conflict = object(record, ['type', 'paths'], responseFailure, 'patch conflict response')
+      const values = array(conflict.paths, contractLimits.maxConflictPaths,
+        responseFailure, 'conflict paths', false)
+      const paths = values.map(conflictPath)
+      if (new Set(paths).size !== paths.length) responseFailure('conflict paths must be unique')
+      if (paths.some((path, index) => index > 0 && paths[index - 1]! >= path)) {
+        responseFailure('conflict paths must be sorted')
+      }
+      return { type: 'conflict', paths }
+    }
+    case 'rejected': {
+      const rejected = object(record, ['type', 'reason'], responseFailure, 'rejected patch response')
+      return { type: 'rejected', reason: boundedString(rejected.reason,
+        contractLimits.maxRejectionReasonBytes, responseFailure, 'rejection reason') }
+    }
+    default:
+      return responseFailure('patch apply response type is invalid')
+  }
 }
 
 function validateConnection(value: unknown, leaseId: string): { execServerUrl: string } {

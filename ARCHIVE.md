@@ -863,6 +863,17 @@ leaves the target byte-for-byte unchanged. Normal conflict is HTTP 200, not 409.
 Conflict output is at most 256 paths and rejection reasons at most 4 KiB.
 Successful application is atomic and returns a durable checkpoint.
 
+The TypeScript contract layer now validates patch export and apply independently
+of route wiring. Export requests/responses are exact objects with opaque IDs,
+lowercase SHA-256, and bounded changed-file and byte counts. Apply responses are
+exact tagged variants: checkpoints are opaque, conflicts contain at most 256
+unique strictly sorted canonical `file:///workspace/...` URIs, and rejection
+reasons are trimmed, control-free UTF-8 bounded to 4 KiB. Prototype/accessor
+objects, extra tenant/connection/ticket/access fields, malformed tags, unsafe
+paths, duplicate or unsorted conflicts, and oversized multibyte reasons fail
+closed. These validators do not implement the authenticated HTTP routes or
+their durable lifecycle authorization.
+
 ### Tool policy and errors
 
 A hosted tool requires both its exact `{namespace,name}` and its domain. Empty

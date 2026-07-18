@@ -122,6 +122,9 @@ tickets always fail, and secrets never enter durable or observable state.
   request shapes plus bounded provision/reconnect/checkpoint responses at HTTP.
 - [ ] Extend strict validation and authorization to patch requests, trusted
   template/role mappings, and persisted tenant/owner relationships.
+- [x] Strictly validate the exact patch export/apply request and tagged response
+  wire shapes, including bounded checksums, counts, sizes, canonical conflicts,
+  rejection reasons, and rejection of extra credential-bearing fields.
 - [ ] Make provision cleanup-safe after every allocation step, including response
   persistence failure.
 - [ ] Serialize checkpoint, reconnect, child capture, patch, release, and command
