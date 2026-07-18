@@ -26,6 +26,9 @@ production backend. Stable decisions, evidence, and wire schemas are in
 - [x] Add composable same-transaction journal/state executors and sorted compound
   provider-resource locks so allocation recording, lease/snapshot commit,
   allocation adoption, and logical completion can commit or roll back together.
+- [x] Add a fenced durable workspace-preparation ledger that binds canonical
+  lease/source/sandbox/snapshot intent to exact object allocations and
+  linearizes replica-safe commit, abort, and reclaim transitions.
 - [x] Replace local blobs with authenticated object storage for workspace
   archives, manifests, content blobs, and patch artifacts.
 - [x] Make object stores report their exact durable bucket/key locator so

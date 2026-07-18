@@ -535,6 +535,21 @@ lease, and snapshot, while independent replicas taking the same compound locks
 in reverse input order serialize without deadlock. These are coordinator
 primitives, not production lifecycle wiring.
 
+Migration 0006 and the unwired `PostgresWorkspacePreparations` repository add a
+durable authority for the object-publication gap before that final transaction.
+One preparation is bound to an owned operation and the canonical SHA-256 of its
+complete secret-free lease, source checksum, sandbox, policy, snapshot, archive,
+and manifest intent. Every associated logical object must be an available object
+allocation owned by that same operation, tenant, and exact purpose. The database
+protects immutable preparation/object identity and legal state transitions;
+repository gates lock the operation, preparation, sorted allocations, and
+available object rows before `prepared` or final commit. Commit and abort thus
+linearize across replicas, exact terminal transitions replay safely, and a stale
+generation can resume while the old worker is fenced. Reclaim preserves deleted
+object audit rows, while a later hard row purge cascades only its preparation
+association. Publication, preparation-scoped object reclaim, and the final
+provision coordinator remain unwired.
+
 ### Bounded PostgreSQL reconciliation foundation
 
 An intentionally unwired `PostgresReconciler` now claims stale operations only
