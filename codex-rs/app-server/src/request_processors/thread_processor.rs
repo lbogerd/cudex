@@ -12,6 +12,7 @@ use codex_protocol::protocol::ThreadHistoryMode;
 const THREAD_LIST_DEFAULT_LIMIT: usize = 25;
 const THREAD_LIST_MAX_LIMIT: usize = 100;
 const CODEX_TUI_CLIENT_NAME: &str = "codex-tui";
+const HOSTED_RELEASE_RETRY_DELAY: Duration = Duration::from_secs(1);
 const THREAD_ROLLBACK_DEPRECATION_SUMMARY: &str =
     "thread/rollback is deprecated and will be removed soon";
 
@@ -23,6 +24,18 @@ struct ThreadListFilters {
     search_term: Option<String>,
     use_state_db_only: bool,
     relation_filter: Option<StoreThreadRelationFilter>,
+}
+
+pub(super) fn thread_removal_order(thread_ids: &[ThreadId]) -> Vec<ThreadId> {
+    let Some((root_thread_id, descendant_thread_ids)) = thread_ids.split_first() else {
+        return Vec::new();
+    };
+    descendant_thread_ids
+        .iter()
+        .rev()
+        .copied()
+        .chain(std::iter::once(*root_thread_id))
+        .collect()
 }
 
 fn collect_resume_override_mismatches(
@@ -862,13 +875,17 @@ impl ThreadRequestProcessor {
         Ok(ThreadUnsubscribeResponse { status })
     }
 
-    async fn prepare_thread_for_archive(&self, thread_id: ThreadId) {
-        self.prepare_thread_for_removal(thread_id, "archive").await;
-    }
-
-    pub(super) async fn prepare_thread_for_removal(&self, thread_id: ThreadId, operation: &str) {
-        let removed_conversation = self.thread_manager.remove_thread(&thread_id).await;
-        if let Some(conversation) = removed_conversation {
+    pub(super) async fn prepare_threads_for_removal(
+        &self,
+        thread_ids: &[ThreadId],
+        operation: &str,
+    ) {
+        // Keep every runtime registered until all descendants have stopped. In hosted mode,
+        // removing a thread also releases its lease, so removal must be a distinct second phase.
+        for thread_id in thread_ids.iter().copied() {
+            let Ok(conversation) = self.thread_manager.get_thread(thread_id).await else {
+                continue;
+            };
             info!("thread {thread_id} was active; shutting down");
             match wait_for_thread_shutdown(&conversation).await {
                 ThreadShutdownResult::Complete => {}
@@ -882,7 +899,20 @@ impl ThreadRequestProcessor {
                 }
             }
         }
-        self.finalize_thread_teardown(thread_id).await;
+        for thread_id in thread_ids.iter().copied() {
+            self.finalize_thread_teardown(thread_id).await;
+        }
+        for thread_id in thread_ids {
+            let thread_id = *thread_id;
+            self.thread_manager.remove_thread(&thread_id).await;
+            let thread_manager = Arc::clone(&self.thread_manager);
+            tokio::spawn(async move {
+                // A failed hosted release is durably reinserted as ReleasePending. Retry once in
+                // this process; later resume/recovery remains the durable fallback.
+                tokio::time::sleep(HOSTED_RELEASE_RETRY_DELAY).await;
+                thread_manager.remove_thread(&thread_id).await;
+            });
+        }
     }
 
     fn listener_task_context(&self) -> ListenerTaskContext {
@@ -1491,7 +1521,9 @@ impl ThreadRequestProcessor {
             return Ok((ThreadArchiveResponse {}, archived_thread_ids));
         };
 
-        self.prepare_thread_for_archive(*parent_thread_id).await;
+        let removal_order = thread_removal_order(&archive_thread_ids);
+        self.prepare_threads_for_removal(&removal_order, "archive")
+            .await;
         match self
             .thread_store
             .archive_thread(StoreArchiveThreadParams {
@@ -1506,7 +1538,6 @@ impl ThreadRequestProcessor {
         }
 
         for descendant_thread_id in descendant_thread_ids.iter().rev().copied() {
-            self.prepare_thread_for_archive(descendant_thread_id).await;
             match self
                 .thread_store
                 .archive_thread(StoreArchiveThreadParams {

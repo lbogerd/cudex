@@ -1514,3 +1514,21 @@ mod thread_processor_behavior_tests {
         Ok(())
     }
 }
+
+mod thread_removal_order_tests {
+    use super::super::thread_removal_order;
+    use codex_protocol::ThreadId;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn removes_descendants_deepest_first_and_root_last() {
+        let root = ThreadId::new();
+        let child = ThreadId::new();
+        let grandchild = ThreadId::new();
+
+        assert_eq!(
+            thread_removal_order(&[root, child, grandchild]),
+            vec![grandchild, child, root]
+        );
+    }
+}

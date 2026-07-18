@@ -1,5 +1,6 @@
 //! `thread/delete` request handling.
 
+use super::thread_processor::thread_removal_order;
 use super::thread_processor::unsupported_thread_store_operation;
 use super::*;
 
@@ -40,12 +41,8 @@ impl ThreadRequestProcessor {
 
         self.validate_root_thread_delete(thread_id, thread_ids.len() > 1)
             .await?;
-        for thread_id_to_delete in thread_ids.iter().copied() {
-            self.prepare_thread_for_delete(thread_id_to_delete).await;
-        }
-
-        let mut delete_order: Vec<_> = thread_ids.iter().skip(1).rev().copied().collect();
-        delete_order.push(thread_id);
+        let delete_order = thread_removal_order(&thread_ids);
+        self.prepare_threads_for_delete(&delete_order).await;
 
         for thread_id_to_delete in delete_order.iter().copied() {
             match self
@@ -149,8 +146,8 @@ impl ThreadRequestProcessor {
         }
     }
 
-    async fn prepare_thread_for_delete(&self, thread_id: ThreadId) {
-        self.prepare_thread_for_removal(thread_id, "delete").await;
+    async fn prepare_threads_for_delete(&self, thread_ids: &[ThreadId]) {
+        self.prepare_threads_for_removal(thread_ids, "delete").await;
         if let Some(log_db) = self.log_db.as_ref() {
             log_db.flush().await;
         }
