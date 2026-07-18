@@ -8,6 +8,7 @@ use codex_exec_server::ExecServerError;
 use codex_hosted_agent::AgentCheckpoint;
 use codex_hosted_agent::AgentCheckpointRequest;
 use codex_hosted_agent::AgentProvisionRequest;
+use codex_hosted_agent::AgentReconnectRequest;
 use codex_hosted_agent::AgentReleaseRequest;
 use codex_hosted_agent::AgentToolPolicy;
 use codex_hosted_agent::HostedAgentError;
@@ -34,7 +35,9 @@ pub(crate) struct HostedAgentRuntime {
     pub(crate) agent_type: String,
     pub(crate) sandbox_template: String,
     pub(crate) base_snapshot_id: String,
-    pub(crate) latest_snapshot_id: String,
+    pub(crate) latest_snapshot_id: Option<String>,
+    pub(crate) last_exported_patch: Option<codex_hosted_agent::AgentPatchArtifact>,
+    pub(crate) lifecycle_state: HostedAgentLifecycleState,
     pub(crate) tool_policy: AgentToolPolicy,
 }
 
@@ -80,9 +83,9 @@ impl HostedAgentRuntime {
             lease_id: self.lease_id.clone(),
             environment_id: self.environment_id.clone(),
             base_snapshot_id: self.base_snapshot_id.clone(),
-            latest_snapshot_id: Some(self.latest_snapshot_id.clone()),
-            last_exported_patch: None,
-            lifecycle_state: HostedAgentLifecycleState::Active,
+            latest_snapshot_id: self.latest_snapshot_id.clone(),
+            last_exported_patch: self.last_exported_patch.clone(),
+            lifecycle_state: self.lifecycle_state,
         }
     }
 }
@@ -98,6 +101,11 @@ trait ErasedHostedAgentService: Send + Sync {
     fn provision(
         &self,
         request: AgentProvisionRequest,
+    ) -> HostedServiceFuture<'_, ProvisionedAgent>;
+
+    fn reconnect(
+        &self,
+        request: AgentReconnectRequest,
     ) -> HostedServiceFuture<'_, ProvisionedAgent>;
 
     fn checkpoint(
@@ -117,6 +125,13 @@ where
         request: AgentProvisionRequest,
     ) -> HostedServiceFuture<'_, ProvisionedAgent> {
         Box::pin(HostedAgentService::provision(self, request))
+    }
+
+    fn reconnect(
+        &self,
+        request: AgentReconnectRequest,
+    ) -> HostedServiceFuture<'_, ProvisionedAgent> {
+        Box::pin(HostedAgentService::reconnect(self, request))
     }
 
     fn checkpoint(
@@ -172,7 +187,9 @@ impl HostedAgentProvisioner {
             agent_type,
             sandbox_template,
             base_snapshot_id: provisioned.base_snapshot_id.clone(),
-            latest_snapshot_id: provisioned.base_snapshot_id,
+            latest_snapshot_id: Some(provisioned.base_snapshot_id),
+            last_exported_patch: None,
+            lifecycle_state: HostedAgentLifecycleState::Active,
             tool_policy: provisioned.tool_policy,
         };
         let environment_selection = TurnEnvironmentSelection {
@@ -212,6 +229,110 @@ impl HostedAgentProvisioner {
             environment_selection,
             service: Arc::clone(&self.service),
             environment_manager: Arc::clone(&self.environment_manager),
+            rollback: PendingRuntimeRollback::ReleaseLease,
+        })
+    }
+
+    /// Reconnects an active lease, restoring it from its latest durable snapshot only when the
+    /// service reports that the lease is missing.
+    pub(crate) async fn reconnect_or_restore(
+        &self,
+        agent_id: codex_protocol::ThreadId,
+        owner_agent_id: Option<codex_protocol::ThreadId>,
+        record: HostedAgentRuntimeRecord,
+    ) -> Result<PendingHostedAgentRuntime, HostedAgentRuntimeError> {
+        let reconnect = self
+            .service
+            .reconnect(AgentReconnectRequest {
+                lease_id: record.lease_id.clone(),
+                idempotency_key: format!(
+                    "hosted-agent:{agent_id}:lease:{}:reconnect",
+                    record.lease_id
+                ),
+            })
+            .await;
+        let (provisioned, rollback) = match reconnect {
+            Ok(provisioned) => {
+                if provisioned.lease_id != record.lease_id {
+                    return Err(HostedAgentRuntimeError::Reconnect(HostedAgentError::new(
+                        codex_hosted_agent::HostedAgentErrorCategory::InvalidResponse,
+                        "reconnect returned a different lease",
+                    )));
+                }
+                (provisioned, PendingRuntimeRollback::KeepLease)
+            }
+            Err(error)
+                if error.category == codex_hosted_agent::HostedAgentErrorCategory::LeaseMissing =>
+            {
+                let latest_snapshot_id = record.latest_snapshot_id.clone().ok_or_else(|| {
+                    HostedAgentRuntimeError::RestoreUnavailable(
+                        "hosted-agent runtime has no durable snapshot".to_string(),
+                    )
+                })?;
+                let request = AgentProvisionRequest {
+                    agent_id,
+                    owner_agent_id,
+                    agent_type: record.agent_type.clone(),
+                    sandbox_template: record.sandbox_template.clone(),
+                    source: codex_hosted_agent::ProjectSnapshotSource::DurableSnapshot {
+                        snapshot_id: latest_snapshot_id.clone(),
+                    },
+                    idempotency_key: format!(
+                        "hosted-agent:{agent_id}:snapshot:{latest_snapshot_id}:restore"
+                    ),
+                };
+                (
+                    self.service
+                        .provision(request)
+                        .await
+                        .map_err(HostedAgentRuntimeError::Provision)?,
+                    PendingRuntimeRollback::ReleaseLease,
+                )
+            }
+            Err(error) => return Err(HostedAgentRuntimeError::Reconnect(error)),
+        };
+        let runtime = HostedAgentRuntime {
+            lease_id: provisioned.lease_id,
+            environment_id: provisioned.environment_id,
+            agent_type: record.agent_type,
+            sandbox_template: record.sandbox_template,
+            base_snapshot_id: record.base_snapshot_id,
+            latest_snapshot_id: record.latest_snapshot_id,
+            last_exported_patch: record.last_exported_patch,
+            lifecycle_state: record.lifecycle_state,
+            tool_policy: provisioned.tool_policy,
+        };
+        let environment_selection = TurnEnvironmentSelection {
+            environment_id: runtime.environment_id.clone(),
+            cwd: provisioned.cwd,
+            workspace_roots: provisioned.workspace_roots,
+        };
+        if let Err(source) = provisioned.connection.register(
+            self.environment_manager.as_ref(),
+            runtime.environment_id.clone(),
+            HOSTED_ENVIRONMENT_CONNECT_TIMEOUT,
+        ) {
+            if rollback == PendingRuntimeRollback::ReleaseLease {
+                let _ = self
+                    .service
+                    .release(AgentReleaseRequest {
+                        lease_id: runtime.lease_id.clone(),
+                        idempotency_key: release_idempotency_key(agent_id, &runtime.lease_id),
+                    })
+                    .await;
+            }
+            return Err(HostedAgentRuntimeError::Register {
+                environment_id: runtime.environment_id,
+                source,
+            });
+        }
+        Ok(PendingHostedAgentRuntime {
+            agent_id,
+            runtime,
+            environment_selection,
+            service: Arc::clone(&self.service),
+            environment_manager: Arc::clone(&self.environment_manager),
+            rollback,
         })
     }
 
@@ -254,6 +375,13 @@ pub(crate) struct PendingHostedAgentRuntime {
     environment_selection: TurnEnvironmentSelection,
     service: Arc<dyn ErasedHostedAgentService>,
     environment_manager: Arc<EnvironmentManager>,
+    rollback: PendingRuntimeRollback,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingRuntimeRollback {
+    KeepLease,
+    ReleaseLease,
 }
 
 impl PendingHostedAgentRuntime {
@@ -277,13 +405,26 @@ impl PendingHostedAgentRuntime {
     }
 
     pub(crate) async fn rollback(self) -> Result<(), HostedAgentRuntimeError> {
-        cleanup_runtime(
-            self.agent_id,
-            self.runtime,
-            self.environment_manager.as_ref(),
-            self.service.as_ref(),
-        )
-        .await
+        match self.rollback {
+            PendingRuntimeRollback::KeepLease => self
+                .environment_manager
+                .remove_environment(&self.runtime.environment_id)
+                .await
+                .map(|_| ())
+                .map_err(|source| HostedAgentRuntimeError::Unregister {
+                    environment_id: self.runtime.environment_id,
+                    source,
+                }),
+            PendingRuntimeRollback::ReleaseLease => {
+                cleanup_runtime(
+                    self.agent_id,
+                    self.runtime,
+                    self.environment_manager.as_ref(),
+                    self.service.as_ref(),
+                )
+                .await
+            }
+        }
     }
 }
 
@@ -291,6 +432,10 @@ impl PendingHostedAgentRuntime {
 pub(crate) enum HostedAgentRuntimeError {
     #[error("hosted-agent provisioning failed: {0}")]
     Provision(HostedAgentError),
+    #[error("hosted-agent reconnect failed: {0}")]
+    Reconnect(HostedAgentError),
+    #[error("hosted-agent restore unavailable: {0}")]
+    RestoreUnavailable(String),
     #[error("failed to register hosted environment `{environment_id}`: {source}")]
     Register {
         environment_id: String,

@@ -379,6 +379,199 @@ async fn hosted_startup_rolls_back_when_runtime_metadata_cannot_be_stored() {
 }
 
 #[tokio::test]
+async fn stopped_hosted_thread_reconnects_without_releasing_its_lease() {
+    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
+    let root = manager
+        .start_thread_with_options(start_thread_options(config.clone()))
+        .await
+        .expect("start hosted root");
+    let original_record = manager
+        .state
+        .thread_store
+        .get_hosted_agent_runtime(root.thread_id)
+        .await
+        .expect("read hosted runtime")
+        .expect("hosted runtime record");
+    root.thread
+        .shutdown_and_wait()
+        .await
+        .expect("stop hosted thread");
+
+    let resumed = manager
+        .resume_thread_with_history(
+            config,
+            InitialHistory::Resumed(ResumedHistory {
+                conversation_id: root.thread_id,
+                history: Arc::new(Vec::new()),
+                rollout_path: root.session_configured.rollout_path.clone(),
+            }),
+            manager.auth_manager(),
+            /*parent_trace*/ None,
+            /*supports_openai_form_elicitation*/ false,
+        )
+        .await
+        .expect("resume hosted thread");
+    let resumed_runtime = manager
+        .state
+        .hosted_agent_runtimes
+        .read()
+        .await
+        .get(&root.thread_id)
+        .expect("resumed runtime")
+        .snapshot();
+    assert_eq!(resumed_runtime.lease_id, original_record.lease_id);
+    assert_eq!(hosted_service.active_lease_count(), 1);
+    assert_eq!(hosted_service.provisioned_environment_ids().len(), 1);
+
+    resumed
+        .thread
+        .shutdown_and_wait()
+        .await
+        .expect("stop resumed thread");
+    manager.remove_thread(&resumed.thread_id).await;
+}
+
+#[tokio::test]
+async fn stopped_hosted_thread_restores_a_missing_lease_and_persists_it() {
+    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
+    let root = manager
+        .start_thread_with_options(start_thread_options(config.clone()))
+        .await
+        .expect("start hosted root");
+    let original_record = manager
+        .state
+        .thread_store
+        .get_hosted_agent_runtime(root.thread_id)
+        .await
+        .expect("read hosted runtime")
+        .expect("hosted runtime record");
+    root.thread
+        .shutdown_and_wait()
+        .await
+        .expect("stop hosted thread");
+    hosted_service
+        .release(codex_hosted_agent::AgentReleaseRequest {
+            lease_id: original_record.lease_id.clone(),
+            idempotency_key: format!("hosted-agent:{}:expire-before-restore", root.thread_id),
+        })
+        .await
+        .expect("expire lease before restore");
+
+    let resumed = manager
+        .resume_thread_with_history(
+            config,
+            InitialHistory::Resumed(ResumedHistory {
+                conversation_id: root.thread_id,
+                history: Arc::new(Vec::new()),
+                rollout_path: root.session_configured.rollout_path.clone(),
+            }),
+            manager.auth_manager(),
+            /*parent_trace*/ None,
+            /*supports_openai_form_elicitation*/ false,
+        )
+        .await
+        .expect("restore hosted thread");
+    let restored_record = manager
+        .state
+        .thread_store
+        .get_hosted_agent_runtime(root.thread_id)
+        .await
+        .expect("read restored runtime")
+        .expect("restored runtime record");
+    assert_ne!(restored_record.lease_id, original_record.lease_id);
+    assert_ne!(
+        restored_record.environment_id,
+        original_record.environment_id
+    );
+    assert_eq!(
+        restored_record.base_snapshot_id,
+        original_record.base_snapshot_id
+    );
+    assert_eq!(
+        restored_record.latest_snapshot_id,
+        original_record.latest_snapshot_id
+    );
+    assert_eq!(hosted_service.active_lease_count(), 1);
+    assert_eq!(hosted_service.provisioned_environment_ids().len(), 2);
+
+    resumed
+        .thread
+        .shutdown_and_wait()
+        .await
+        .expect("stop restored thread");
+    manager.remove_thread(&resumed.thread_id).await;
+}
+
+#[tokio::test]
+async fn hosted_resume_without_snapshot_fails_without_reprovisioning() {
+    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
+    let root = manager
+        .start_thread_with_options(start_thread_options(config.clone()))
+        .await
+        .expect("start hosted root");
+    let mut record = manager
+        .state
+        .thread_store
+        .get_hosted_agent_runtime(root.thread_id)
+        .await
+        .expect("read hosted runtime")
+        .expect("hosted runtime record");
+    record.latest_snapshot_id = None;
+    let lease_id = record.lease_id.clone();
+    manager
+        .state
+        .thread_store
+        .set_hosted_agent_runtime(root.thread_id, record)
+        .await
+        .expect("remove durable snapshot");
+    root.thread
+        .shutdown_and_wait()
+        .await
+        .expect("stop hosted thread");
+    hosted_service
+        .release(codex_hosted_agent::AgentReleaseRequest {
+            lease_id,
+            idempotency_key: format!("hosted-agent:{}:expire-before-resume", root.thread_id),
+        })
+        .await
+        .expect("expire lease before resume");
+
+    let error = match manager
+        .resume_thread_with_history(
+            config,
+            InitialHistory::Resumed(ResumedHistory {
+                conversation_id: root.thread_id,
+                history: Arc::new(Vec::new()),
+                rollout_path: root.session_configured.rollout_path.clone(),
+            }),
+            manager.auth_manager(),
+            /*parent_trace*/ None,
+            /*supports_openai_form_elicitation*/ false,
+        )
+        .await
+    {
+        Ok(_) => panic!("resume without a durable snapshot must fail"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("hosted-agent runtime has no durable snapshot")
+    );
+    assert_eq!(hosted_service.active_lease_count(), 0);
+    assert_eq!(hosted_service.provisioned_environment_ids().len(), 1);
+    assert!(
+        manager
+            .state
+            .hosted_agent_runtimes
+            .read()
+            .await
+            .get(&root.thread_id)
+            .is_none()
+    );
+}
+
+#[tokio::test]
 async fn hosted_provisioning_separates_ownership_from_snapshot_lineage() {
     let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
     let root = manager

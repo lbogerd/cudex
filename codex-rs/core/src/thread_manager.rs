@@ -142,7 +142,7 @@ impl HostedAgentRuntimeEntry {
         self.runtime
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .latest_snapshot_id = snapshot_id;
+            .latest_snapshot_id = Some(snapshot_id);
     }
 }
 
@@ -1327,11 +1327,6 @@ impl ThreadManagerState {
                 ))
             })?;
         config.permissions.network = None;
-        if matches!(initial_history, InitialHistory::Resumed(_)) {
-            return Err(CodexErr::InvalidRequest(
-                "hosted-agent resume requires persisted runtime metadata".to_string(),
-            ));
-        }
         let provisioner = match &self.hosted_agent_provisioner {
             Ok(Some(provisioner)) => provisioner,
             Ok(None) => {
@@ -1345,6 +1340,35 @@ impl ThreadManagerState {
                 )));
             }
         };
+        if let InitialHistory::Resumed(resumed) = initial_history {
+            let record = self
+                .thread_store
+                .get_hosted_agent_runtime(resumed.conversation_id)
+                .await
+                .map_err(|error| {
+                    CodexErr::Fatal(format!(
+                        "failed to read hosted-agent runtime for thread {}: {error}",
+                        resumed.conversation_id
+                    ))
+                })?
+                .ok_or_else(|| {
+                    CodexErr::InvalidRequest(format!(
+                        "thread {} has no persisted hosted-agent runtime metadata",
+                        resumed.conversation_id
+                    ))
+                })?;
+            if record.lifecycle_state != codex_hosted_agent::HostedAgentLifecycleState::Active {
+                return Err(CodexErr::InvalidRequest(format!(
+                    "hosted-agent thread {} cannot resume from lifecycle state {:?}",
+                    resumed.conversation_id, record.lifecycle_state
+                )));
+            }
+            return provisioner
+                .reconnect_or_restore(thread_id, hosted_lineage.owner_agent_id, record)
+                .await
+                .map(Some)
+                .map_err(|error| CodexErr::Fatal(error.to_string()));
+        }
         let agent_type = requested_agent_type
             .or_else(|| session_source.get_agent_role())
             .unwrap_or_else(|| config.hosted_agents.default_agent_type.clone());
@@ -1505,6 +1529,37 @@ impl ThreadManagerState {
                 "failed to roll back hosted runtime after thread registration failed"
             );
         }
+    }
+
+    async fn detach_stopped_hosted_runtime(&self, thread_id: ThreadId) -> CodexResult<()> {
+        let Some(runtime) = self.hosted_agent_runtimes.write().await.remove(&thread_id) else {
+            return Ok(());
+        };
+        let Ok(_operation_permit) = Arc::clone(&runtime.operation_lock).acquire_owned().await
+        else {
+            self.hosted_agent_runtimes
+                .write()
+                .await
+                .insert(thread_id, runtime);
+            return Err(CodexErr::Fatal(format!(
+                "hosted runtime operation coordination closed for thread {thread_id}"
+            )));
+        };
+        let runtime_snapshot = runtime.snapshot();
+        if let Err(error) = self
+            .environment_manager
+            .remove_environment(&runtime_snapshot.environment_id)
+            .await
+        {
+            self.hosted_agent_runtimes
+                .write()
+                .await
+                .insert(thread_id, runtime);
+            return Err(CodexErr::Fatal(format!(
+                "failed to detach hosted environment for thread {thread_id}: {error}"
+            )));
+        }
+        Ok(())
     }
 
     pub(crate) fn agent_graph_store(&self) -> Option<Arc<dyn AgentGraphStore>> {
@@ -2084,24 +2139,38 @@ impl ThreadManagerState {
         let thread_id = thread_id_for_initial_history(&initial_history);
         let is_resumed_thread = matches!(&initial_history, InitialHistory::Resumed(_));
         if let InitialHistory::Resumed(resumed) = &initial_history {
-            let mut threads = self.threads.write().await;
-            if let Some(thread) = threads.get(&resumed.conversation_id).cloned() {
-                if thread.is_running() {
-                    if let Some(requested_rollout_path) = resumed.rollout_path.as_deref()
-                        && thread.rollout_path().as_deref() != Some(requested_rollout_path)
-                    {
-                        return Err(CodexErr::InvalidRequest(format!(
-                            "thread {} is already running with a different rollout path",
-                            resumed.conversation_id
-                        )));
+            let stopped_thread = {
+                let mut threads = self.threads.write().await;
+                match threads.get(&resumed.conversation_id).cloned() {
+                    Some(thread) if thread.is_running() => {
+                        if let Some(requested_rollout_path) = resumed.rollout_path.as_deref()
+                            && thread.rollout_path().as_deref() != Some(requested_rollout_path)
+                        {
+                            return Err(CodexErr::InvalidRequest(format!(
+                                "thread {} is already running with a different rollout path",
+                                resumed.conversation_id
+                            )));
+                        }
+                        return Ok(NewThread {
+                            thread_id: resumed.conversation_id,
+                            session_configured: thread.session_configured(),
+                            thread,
+                        });
                     }
-                    return Ok(NewThread {
-                        thread_id: resumed.conversation_id,
-                        session_configured: thread.session_configured(),
-                        thread,
-                    });
+                    Some(_) => threads.remove(&resumed.conversation_id),
+                    None => None,
                 }
-                threads.remove(&resumed.conversation_id);
+            };
+            if let Some(stopped_thread) = stopped_thread
+                && let Err(error) = self
+                    .detach_stopped_hosted_runtime(resumed.conversation_id)
+                    .await
+            {
+                self.threads
+                    .write()
+                    .await
+                    .insert(resumed.conversation_id, stopped_thread);
+                return Err(error);
             }
         }
         let user_instructions = self
