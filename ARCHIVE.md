@@ -240,6 +240,19 @@ and removes empty connection sets. Focused race, rejection, redaction, payload,
 buffer, and connection-limit tests increased the provider-independent suite to
 20 passes with only the optional live PostgreSQL test skipped.
 
+### Development ingress hardening
+
+The co-located path bridge remains unavailable outside explicit development
+mode, but is now hardened as a trustworthy test/reference capture. It accepts
+only canonical local `file:` URIs, resolves authorization roots with `realpath`,
+requires non-overlapping real directory roots and an in-root cwd, rejects root
+symlinks, escaping/absolute symlinks, devices, sockets, FIFOs, and other special
+files, and preserves multiple roots, dirty/untracked and binary bytes, modes,
+safe symlinks, and cwd placement. Preflight bounds roots, entries, expanded and
+per-file bytes, path depth, archive bytes, and extraction ratio before provider
+allocation. Focused tests inspect the extracted archive and exercise overlap,
+link, FIFO, and quota rejection.
+
 CubeSandbox was verified on 2026-07-18 through stock E2B TypeScript SDK 2.35.0.
 Provider code lives in the external TypeScript control plane under `e2b/src`, not
 in `codex-core`.

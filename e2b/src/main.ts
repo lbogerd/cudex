@@ -53,7 +53,15 @@ const gateway = new ExecGateway(tickets, store, provider, {
   maxBufferedBytes: positiveInteger('HOSTED_AGENT_GATEWAY_MAX_BUFFERED_BYTES', 1024 * 1024),
 })
 const service = new ControlPlane(store, provider, tickets, blobs, { templates, allowedRoots,
-  ingress: { maxBytes: positiveInteger('HOSTED_AGENT_MAX_ARCHIVE_BYTES', 536_870_912), maxRoots: positiveInteger('HOSTED_AGENT_MAX_ROOTS', 8) },
+  ingress: {
+    maxBytes: positiveInteger('HOSTED_AGENT_MAX_ARCHIVE_BYTES', 536_870_912),
+    maxRoots: positiveInteger('HOSTED_AGENT_MAX_ROOTS', 8),
+    maxExpandedBytes: positiveInteger('HOSTED_AGENT_MAX_EXPANDED_BYTES', 1_073_741_824),
+    maxEntries: positiveInteger('HOSTED_AGENT_MAX_ENTRIES', 100_000),
+    maxFileBytes: positiveInteger('HOSTED_AGENT_MAX_FILE_BYTES', 268_435_456),
+    maxPathDepth: positiveInteger('HOSTED_AGENT_MAX_PATH_DEPTH', 64),
+    maxExtractionRatio: positiveInteger('HOSTED_AGENT_MAX_EXTRACTION_RATIO', 4),
+  },
   allowLocalIngress: development }, gateway)
 await service.reconcile()
 await startServer(service, gateway, { host, port, bearerToken: required('CODEX_HOSTED_AGENT_TOKEN'),

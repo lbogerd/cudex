@@ -35,7 +35,8 @@ connection material or allocation is leaked.
   duplicate/conflicting paths, and unsafe archive entries.
 - [ ] Bound roots, archive/expanded bytes, files, per-file bytes, path depth, and
   extraction ratio; measure transfer/extraction/cleanup without sensitive paths.
-- [x] Keep the co-located read-only bridge development-only.
+- [x] Keep the co-located read-only bridge development-only; validate canonical
+  real paths and reject overlap, unsafe links, special files, and quota excess.
 
 Exit criterion: the remote service reproduces exact source state and reclaims all
 failed upload/extraction allocations without Git or shared host paths.
