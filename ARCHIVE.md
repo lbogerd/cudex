@@ -515,6 +515,19 @@ lifecycle work.
 
 ### Durable patch-artifact repository
 
+Patch export now has a verified immutable-source boundary. Canonical manifest
+bytes must be exact UTF-8 canonical JSON, match their snapshot identity and
+digest, and pass every workspace structural and quota check. The PostgreSQL
+resolver authorizes the active/paused child lease, exact requested base and
+durable latest snapshots, then follows only tenant-owned snapshot references;
+every manifest and content object must be available, unexpired, at the exact
+configured bucket/key, and match its durable size and digest. Artifact creation
+and snapshot reads can now join a caller-owned transaction, and artifact
+validation rejects unavailable or expired snapshots. Live PostgreSQL and parser
+coverage exercise authorization, locator/content corruption, expiry, canonical
+shape, and rollback visibility; all 213 tests pass. The journaled patch-export
+coordinator, artifact-object publication, stale cleanup, and HTTP wiring remain.
+
 The PostgreSQL patch repository validates a canonical base/current manifest pair
 against the source lease's exact tenant, child agent, owner, immutable base, and
 latest snapshot. It derives the changed-path count and current regular-file byte

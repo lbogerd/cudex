@@ -205,18 +205,33 @@ function sameIdentity(row: ArtifactRow, input: CreatePatchArtifactInput): boolea
 export class PostgresPatchArtifactRepository {
   constructor(private readonly pool: Pool) {}
 
-  async create(input: CreatePatchArtifactInput): Promise<PatchArtifact> {
+  async create(input: CreatePatchArtifactInput, executor?: PoolClient): Promise<PatchArtifact> {
     const manifests = validatedInput(input)
+    if (executor) return this.createWithClient(executor, input, manifests)
     const client = await this.pool.connect()
     try {
       await client.query('BEGIN')
+      const artifact = await this.createWithClient(client, input, manifests)
+      await client.query('COMMIT')
+      return artifact
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined)
+      if ((error as { code?: string }).code === '23503') throw new PatchArtifactNotFoundError('referenced patch state was not found')
+      throw error
+    } finally {
+      client.release()
+    }
+  }
+
+  private async createWithClient(client: PoolClient, input: CreatePatchArtifactInput,
+    manifests: ReturnType<typeof validatedInput>): Promise<PatchArtifact> {
+    try {
       const existing = await this.artifactById(client, input.artifactId, true)
       if (existing) {
         if (!sameIdentity(existing, input)) throw new PatchArtifactConflictError('artifact identity conflicts with its durable record')
         await this.validateSnapshots(client, input, manifests)
         await this.validateObjects(client, input, manifests)
         await this.addReferences(client, input, manifests.contentObjectIds)
-        await client.query('COMMIT')
         return fromRow(existing)
       }
 
@@ -236,14 +251,10 @@ export class PostgresPatchArtifactRepository {
       const row = await this.artifactById(client, input.artifactId, true)
       if (!row || !sameIdentity(row, input)) throw new PatchArtifactConflictError('artifact identity conflicts with its durable record')
       await this.addReferences(client, input, manifests.contentObjectIds)
-      await client.query('COMMIT')
       return fromRow(row)
     } catch (error) {
-      await client.query('ROLLBACK').catch(() => undefined)
       if ((error as { code?: string }).code === '23503') throw new PatchArtifactNotFoundError('referenced patch state was not found')
       throw error
-    } finally {
-      client.release()
     }
   }
 
@@ -337,7 +348,8 @@ export class PostgresPatchArtifactRepository {
       const snapshot = byId.get(snapshotId)
       if (!snapshot) throw new PatchArtifactNotFoundError('artifact snapshot was not found')
       if (snapshot.lease_id !== input.sourceLeaseId || snapshot.manifest_object_id !== objectId
-        || snapshot.manifest_checksum !== workspaceManifestChecksum(manifest) || snapshot.state !== 'available') {
+        || snapshot.manifest_checksum !== workspaceManifestChecksum(manifest) || snapshot.state !== 'available'
+        || (snapshot.expires_at !== null && snapshot.expires_at.getTime() <= Date.now())) {
         throw new PatchArtifactConflictError('artifact snapshot identity does not match its manifest')
       }
     }

@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 
 const utf8 = new TextEncoder()
+const utf8Decoder = new TextDecoder('utf-8', { fatal: true })
 const compareText = (left: string, right: string): number => left < right ? -1 : left > right ? 1 : 0
 
 export interface WorkspaceManifestLimits {
@@ -207,6 +208,45 @@ export function createWorkspaceManifest(
 
 export function workspaceManifestChecksum(manifest: WorkspaceManifest): string {
   return `sha256:${createHash('sha256').update(canonicalJson(manifest)).digest('hex')}`
+}
+
+/** Parses exact canonical manifest bytes and reapplies every structural and quota check. */
+export function parseWorkspaceManifest(
+  value: Uint8Array,
+  expectedIdentity: string,
+  expectedChecksum: string,
+  limits: WorkspaceManifestLimits = defaultWorkspaceManifestLimits,
+): WorkspaceManifest {
+  validateLimits(limits)
+  validateIdentity(expectedIdentity)
+  if (!(value instanceof Uint8Array)) invalid('workspace manifest must be bytes')
+  if (value.byteLength > limits.maxManifestBytes) quota('workspace manifest byte limit exceeded')
+  if (!/^sha256:[0-9a-f]{64}$/u.test(expectedChecksum)) invalid('workspace manifest checksum is invalid')
+  const actualChecksum = `sha256:${createHash('sha256').update(value).digest('hex')}`
+  if (actualChecksum !== expectedChecksum) invalid('workspace manifest checksum mismatch')
+  let text: string
+  try { text = utf8Decoder.decode(value) }
+  catch { return invalid('workspace manifest is not valid UTF-8') }
+  let decoded: unknown
+  try { decoded = JSON.parse(text) }
+  catch { return invalid('workspace manifest is not valid JSON') }
+  if (decoded === null || typeof decoded !== 'object' || Array.isArray(decoded)) {
+    return invalid('workspace manifest must be an object')
+  }
+  const record = decoded as Record<string, unknown>
+  const keys = Object.keys(record).sort(compareText)
+  if (keys.length !== 3 || keys[0] !== 'entries' || keys[1] !== 'identity' || keys[2] !== 'version'
+    || record.version !== 1 || record.identity !== expectedIdentity || !Array.isArray(record.entries)) {
+    return invalid('workspace manifest has an invalid shape')
+  }
+  let canonical: string
+  try { canonical = canonicalJson(decoded) }
+  catch { return invalid('workspace manifest is not canonical JSON') }
+  if (canonical !== text) invalid('workspace manifest bytes are not canonical JSON')
+  const manifest = createWorkspaceManifest(
+    expectedIdentity, record.entries as WorkspaceEntry[], limits)
+  if (canonicalJson(manifest) !== canonical) invalid('workspace manifest is not canonical or exact-shape')
+  return manifest
 }
 
 function sameEntry(left: WorkspaceEntry | null, right: WorkspaceEntry | null): boolean {

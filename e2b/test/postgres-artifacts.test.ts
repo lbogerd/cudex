@@ -146,6 +146,55 @@ live('artifact identity is immutable across replicas and conflicting replay roll
   assert.equal(count.rows[0]!.count, '1')
 })
 
+live('caller-owned artifact transactions compose and preserve rollback', async context => {
+  const input = await prepared(context)
+  const rollback = await context.firstPool.connect()
+  try {
+    await rollback.query('BEGIN')
+    assert.equal((await context.first.create(input, rollback)).artifactId, input.artifactId)
+    assert.equal(await context.second.getAuthorized(
+      input.tenantId, input.artifactId, input.agentId), null)
+    await rollback.query('ROLLBACK')
+  } finally { rollback.release() }
+  const rolledBack = await context.firstPool.query<{ artifacts: string; references: string }>(`
+    SELECT
+      (SELECT count(*)::text FROM hosted_agent_artifacts WHERE artifact_id = $1) AS artifacts,
+      (SELECT count(*)::text FROM hosted_agent_object_references
+        WHERE reference_kind = 'artifact' AND reference_id = $1) AS references
+  `, [input.artifactId])
+  assert.deepEqual(rolledBack.rows[0], { artifacts: '0', references: '0' })
+
+  const commit = await context.firstPool.connect()
+  try {
+    await commit.query('BEGIN')
+    await context.first.create(input, commit)
+    await commit.query('COMMIT')
+  } catch (error) {
+    await commit.query('ROLLBACK').catch(() => undefined)
+    throw error
+  } finally { commit.release() }
+  assert.equal((await context.second.getAuthorized(
+    input.tenantId, input.artifactId, input.agentId))?.artifactId, input.artifactId)
+})
+
+live('artifact creation rejects unavailable and expired snapshots', async context => {
+  const input = await prepared(context)
+  await context.firstPool.query(`
+    UPDATE hosted_agent_snapshots SET expires_at = now() - interval '1 second'
+    WHERE snapshot_id = $1
+  `, [input.baseSnapshotId])
+  await assert.rejects(context.first.create(input), PatchArtifactConflictError)
+  await context.firstPool.query(`
+    UPDATE hosted_agent_snapshots SET expires_at = NULL, state = 'failed'
+    WHERE snapshot_id = $1
+  `, [input.baseSnapshotId])
+  await assert.rejects(context.first.create(input), PatchArtifactConflictError)
+  const count = await context.firstPool.query<{ count: string }>(`
+    SELECT count(*)::text AS count FROM hosted_agent_artifacts WHERE artifact_id = $1
+  `, [input.artifactId])
+  assert.equal(count.rows[0]!.count, '0')
+})
+
 live('expiry changes authorization state without removing durable references', async context => {
   const input = await prepared(context); await context.first.create(input)
   const afterExpiry = new Date(input.expiresAt.getTime() + 1)

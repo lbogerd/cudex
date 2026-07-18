@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import test from 'node:test'
 import {
   WorkspaceManifestError,
@@ -8,6 +9,7 @@ import {
   createWorkspaceManifest,
   defaultWorkspaceManifestLimits,
   diffWorkspaceManifests,
+  parseWorkspaceManifest,
   validateSymlinkTarget,
   validateWorkspacePath,
   workspaceManifestChecksum,
@@ -19,6 +21,8 @@ const digest = (hex: string) => `sha256:${hex.repeat(64)}`
 const file = (path: string, contentDigest = digest('a'), mode = 0o644, sizeBytes = 1): WorkspaceEntry => ({ path, type: 'file', mode, digest: contentDigest, sizeBytes })
 const manifest = (identity: string, entries: WorkspaceEntry[]) => createWorkspaceManifest(identity, entries)
 const limits = (override: Partial<WorkspaceManifestLimits>): WorkspaceManifestLimits => ({ ...defaultWorkspaceManifestLimits, ...override })
+const encoded = (value: string): Uint8Array => new TextEncoder().encode(value)
+const bytesChecksum = (value: Uint8Array): string => `sha256:${createHash('sha256').update(value).digest('hex')}`
 
 test('manifest is sorted and canonical checksum is independent of input and object key order', () => {
   const first = manifest('snapshot-1', [
@@ -30,6 +34,63 @@ test('manifest is sorted and canonical checksum is independent of input and obje
   assert.deepEqual(first.entries.map(entry => entry.path), ['roots/0/project/bin', 'roots/0/project/bin/tool', 'roots/0/project/link'])
   assert.equal(workspaceManifestChecksum(first), workspaceManifestChecksum(second))
   assert.equal(canonicalJson({ z: 1, a: { y: 2, x: 3 } }), '{"a":{"x":3,"y":2},"z":1}')
+})
+
+test('strict manifest parsing accepts exact canonical bytes with the expected identity and checksum', () => {
+  const expected = manifest('snapshot-exact', [
+    file('roots/0/project/file', digest('b'), 0o755, 3),
+    { path: 'roots/0/project', type: 'directory', mode: 0o755 },
+  ])
+  const bytes = encoded(canonicalJson(expected))
+
+  assert.deepEqual(parseWorkspaceManifest(
+    bytes, expected.identity, workspaceManifestChecksum(expected)), expected)
+})
+
+test('strict manifest parsing rejects invalid or mismatched checksums and identities', () => {
+  const expected = manifest('snapshot-expected', [file('roots/0/file')])
+  const bytes = encoded(canonicalJson(expected))
+
+  assert.throws(() => parseWorkspaceManifest(bytes, expected.identity, `sha256:${'0'.repeat(64)}`), /checksum mismatch/)
+  assert.throws(() => parseWorkspaceManifest(bytes, expected.identity, 'sha256:not-a-digest'), /checksum is invalid/)
+  assert.throws(() => parseWorkspaceManifest(bytes, 'snapshot-other', bytesChecksum(bytes)), /invalid shape/)
+})
+
+test('strict manifest parsing rejects noncanonical JSON, top-level keys, and entry shapes', () => {
+  const expected = manifest('snapshot-shape', [file('roots/0/file')])
+  const noncanonical = encoded(JSON.stringify(expected, null, 2))
+  assert.throws(() => parseWorkspaceManifest(
+    noncanonical, expected.identity, bytesChecksum(noncanonical)), /not canonical JSON/)
+
+  const extraKey = encoded(canonicalJson({ ...expected, extra: true }))
+  assert.throws(() => parseWorkspaceManifest(
+    extraKey, expected.identity, bytesChecksum(extraKey)), /invalid shape/)
+
+  const extraEntryKey = encoded(canonicalJson({
+    ...expected,
+    entries: [{ ...expected.entries[0], extra: true }],
+  }))
+  assert.throws(() => parseWorkspaceManifest(
+    extraEntryKey, expected.identity, bytesChecksum(extraEntryKey)), /not canonical or exact-shape/)
+
+  const unsortedEntries = encoded(canonicalJson({
+    version: 1,
+    identity: expected.identity,
+    entries: [file('roots/0/z'), file('roots/0/a')],
+  }))
+  assert.throws(() => parseWorkspaceManifest(
+    unsortedEntries, expected.identity, bytesChecksum(unsortedEntries)), /not canonical or exact-shape/)
+})
+
+test('strict manifest parsing rejects invalid UTF-8 and enforces the byte quota before decoding', () => {
+  const invalidUtf8 = Uint8Array.from([0xc3, 0x28])
+  assert.throws(() => parseWorkspaceManifest(
+    invalidUtf8, 'snapshot', bytesChecksum(invalidUtf8)), /not valid UTF-8/)
+
+  const expected = manifest('snapshot-quota', [file('roots/0/file')])
+  const bytes = encoded(canonicalJson(expected))
+  assert.throws(() => parseWorkspaceManifest(bytes, expected.identity, bytesChecksum(bytes),
+    limits({ maxManifestBytes: bytes.byteLength - 1 })), /manifest byte limit/)
 })
 
 test('diff covers binary digest, executable mode, directory, symlink, addition, and deletion changes', () => {

@@ -231,6 +231,18 @@ live('checkpoint references and durable data survive release', async context => 
     manifestObjectId: checkpointObjects.manifest.objectId, manifestChecksum: checkpointObjects.manifest.checksum,
     contentObjectIds: [checkpointContent.objectId],
   })
+  const snapshotTransaction = await context.firstPool.connect()
+  try {
+    await snapshotTransaction.query('BEGIN')
+    await snapshotTransaction.query(`
+      UPDATE hosted_agent_snapshots SET state = 'failed' WHERE snapshot_id = $1
+    `, [checkpoint.snapshotId])
+    assert.equal((await context.first.getSnapshot(
+      'tenant-1', checkpoint.snapshotId, snapshotTransaction))?.state, 'failed')
+    assert.equal((await context.second.getSnapshot(
+      'tenant-1', checkpoint.snapshotId))?.state, 'available')
+    await snapshotTransaction.query('ROLLBACK')
+  } finally { snapshotTransaction.release() }
   await context.first.addSnapshotReference({ tenantId: 'tenant-1', snapshotId: checkpoint.snapshotId,
     referenceKind: 'codex_thread', referenceId: 'thread-1' })
   await context.second.beginRelease('tenant-1', created.lease.leaseId)

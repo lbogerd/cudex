@@ -240,6 +240,9 @@ identity remains isolated, and lifecycle replay never duplicates resources.
 - [x] Add an immutable tenant/lineage-authorized PostgreSQL artifact repository
   with snapshot/object/content references, expiry, replay, and retention after
   source lease release.
+- [x] Add strict canonical manifest-byte parsing, verified tenant/snapshot
+  material resolution, and caller-transaction artifact/snapshot repository APIs
+  needed by durable patch export.
 - [ ] Implement `POST v1/agents/patch/export` using the archived contract.
 - [x] Build canonical sorted manifests with path, type, mode, link target or
   content digest, and immutable base/current identities.

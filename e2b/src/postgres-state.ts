@@ -553,9 +553,10 @@ export class PostgresDurableState {
     return result.rows[0] ? snapshotFromRow(result.rows[0]) : null
   }
 
-  async getSnapshot(tenantId: string, snapshotId: string): Promise<Snapshot | null> {
+  async getSnapshot(tenantId: string, snapshotId: string,
+    executor: Pick<PoolClient, 'query'> = this.pool): Promise<Snapshot | null> {
     validateId('tenant ID', tenantId); validateId('snapshot ID', snapshotId)
-    const result = await this.pool.query<SnapshotRow>(`
+    const result = await executor.query<SnapshotRow>(`
       SELECT ${snapshotColumns} FROM hosted_agent_snapshots WHERE snapshot_id = $1 AND tenant_id = $2
     `, [snapshotId, tenantId])
     return result.rows[0] ? snapshotFromRow(result.rows[0]) : null
