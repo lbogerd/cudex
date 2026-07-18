@@ -22,6 +22,7 @@ pub use types::HostedAgentLifecycleState;
 pub use types::HostedAgentRuntimeRecord;
 pub use types::HostedAgentService;
 pub use types::HostedEnvironmentConnection;
+pub use types::MAX_OPAQUE_ID_BYTES;
 pub use types::PatchApplyResult;
 pub use types::ProjectSnapshotSource;
 pub use types::ProvisionedAgent;

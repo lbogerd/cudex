@@ -516,6 +516,35 @@ async fn http_client_validates_checkpoint_response() {
 }
 
 #[tokio::test]
+async fn http_client_rejects_oversized_artifact_ids() {
+    let server = MockServer::start().await;
+    let agent_id = ThreadId::new();
+    Mock::given(method("POST"))
+        .and(path("/v1/agents/patch/export"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "artifactId": "a".repeat(513),
+            "agentId": agent_id,
+            "baseSnapshotId": "snapshot-base",
+            "checksum": "sha256:abcd",
+            "changedFiles": 1,
+            "sizeBytes": 10
+        })))
+        .mount(&server)
+        .await;
+    let client = HttpHostedAgentService::for_test(&server.uri(), "secret").unwrap();
+    let error = client
+        .export_patch(AgentPatchExportRequest {
+            lease_id: "lease-1".to_string(),
+            agent_id,
+            base_snapshot_id: "snapshot-base".to_string(),
+            idempotency_key: "export".to_string(),
+        })
+        .await
+        .expect_err("oversized artifact ID must fail");
+    assert_eq!(error.category, HostedAgentErrorCategory::InvalidResponse);
+}
+
+#[tokio::test]
 async fn http_client_validates_applied_patch_checkpoint() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))

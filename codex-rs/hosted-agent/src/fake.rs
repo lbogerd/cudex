@@ -39,9 +39,11 @@ struct State {
     checkpoints: HashMap<String, (AgentCheckpointRequest, AgentCheckpoint)>,
     checkpoint_failure: Option<HostedAgentError>,
     exports: HashMap<String, (AgentPatchExportRequest, AgentPatchArtifact)>,
+    export_failure: Option<HostedAgentError>,
     artifacts: HashMap<String, AgentPatchArtifact>,
     applies: HashMap<String, (AgentPatchApplyRequest, PatchApplyResult)>,
     releases: HashMap<String, AgentReleaseRequest>,
+    release_failure: Option<HostedAgentError>,
     conflicts: HashMap<String, Vec<PathUri>>,
 }
 
@@ -113,6 +115,16 @@ impl FakeHostedAgentService {
     /// Configures a service error returned before any checkpoint mutation.
     pub fn set_checkpoint_failure(&self, error: Option<HostedAgentError>) {
         self.lock().checkpoint_failure = error;
+    }
+
+    /// Configures a service error returned before any patch export mutation.
+    pub fn set_export_failure(&self, error: Option<HostedAgentError>) {
+        self.lock().export_failure = error;
+    }
+
+    /// Configures a service error returned before any release mutation.
+    pub fn set_release_failure(&self, error: Option<HostedAgentError>) {
+        self.lock().release_failure = error;
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -311,6 +323,9 @@ impl HostedAgentService for FakeHostedAgentService {
 
     async fn export_patch(&self, request: AgentPatchExportRequest) -> Result<AgentPatchArtifact> {
         let mut state = self.lock();
+        if let Some(error) = &state.export_failure {
+            return Err(error.clone());
+        }
         if let Some((previous_request, artifact)) = state.exports.get(&request.idempotency_key) {
             return if previous_request == &request {
                 Ok(artifact.clone())
@@ -397,6 +412,9 @@ impl HostedAgentService for FakeHostedAgentService {
 
     async fn release(&self, request: AgentReleaseRequest) -> Result<()> {
         let mut state = self.lock();
+        if let Some(error) = &state.release_failure {
+            return Err(error.clone());
+        }
         if let Some(previous_request) = state.releases.get(&request.idempotency_key) {
             return if previous_request == &request {
                 Ok(())

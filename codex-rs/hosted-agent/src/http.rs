@@ -19,6 +19,7 @@ use crate::AgentReleaseRequest;
 use crate::HostedAgentError;
 use crate::HostedAgentErrorCategory;
 use crate::HostedAgentService;
+use crate::MAX_OPAQUE_ID_BYTES;
 use crate::PatchApplyResult;
 use crate::ProvisionedAgent;
 use crate::types::Result;
@@ -385,6 +386,10 @@ fn validate_opaque_id(value: &str, kind: &str) -> Result<()> {
     if value.trim().is_empty() {
         Err(HostedAgentError::invalid_response(format!(
             "service returned an empty {kind} ID"
+        )))
+    } else if value.len() > MAX_OPAQUE_ID_BYTES {
+        Err(HostedAgentError::invalid_response(format!(
+            "service returned an oversized {kind} ID"
         )))
     } else {
         Ok(())

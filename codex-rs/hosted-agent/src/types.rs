@@ -13,6 +13,9 @@ use serde::Serialize;
 
 pub type Result<T> = std::result::Result<T, HostedAgentError>;
 
+/// Maximum UTF-8 byte length for opaque service identifiers retained by Codex.
+pub const MAX_OPAQUE_ID_BYTES: usize = 512;
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentProvisionRequest {
