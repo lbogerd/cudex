@@ -27,6 +27,15 @@ fn root_request(key: &str) -> AgentProvisionRequest {
     }
 }
 
+fn child_request(key: &str, owner_lease_id: &str) -> AgentProvisionRequest {
+    AgentProvisionRequest {
+        source: ProjectSnapshotSource::AgentEnvironment {
+            owner_lease_id: owner_lease_id.to_string(),
+        },
+        ..root_request(key)
+    }
+}
+
 #[test]
 fn durable_runtime_record_round_trips_without_transient_data() {
     let agent_id =
@@ -303,6 +312,192 @@ async fn fake_patch_conflict_is_atomic_and_clean_apply_returns_checkpoint() {
         service.latest_snapshot_id(&clean_target.lease_id),
         Some(checkpoint.snapshot_id.clone())
     );
+}
+
+#[tokio::test]
+async fn fake_patch_exports_and_applies_isolated_file_changes() {
+    let service = FakeHostedAgentService::default();
+    let owner = service
+        .provision(root_request("file-owner"))
+        .await
+        .expect("owner provision succeeds");
+    let modified = PathUri::parse("file:///workspace/modified.txt").unwrap();
+    let deleted = PathUri::parse("file:///workspace/deleted.txt").unwrap();
+    let added = PathUri::parse("file:///workspace/added.txt").unwrap();
+    service
+        .write_lease_file(&owner.lease_id, modified.clone(), b"old".to_vec())
+        .unwrap();
+    service
+        .write_lease_file(&owner.lease_id, deleted.clone(), b"remove".to_vec())
+        .unwrap();
+    service
+        .checkpoint(AgentCheckpointRequest {
+            lease_id: owner.lease_id.clone(),
+            idempotency_key: "owner-files".to_string(),
+        })
+        .await
+        .unwrap();
+
+    let child = service
+        .provision(child_request("file-child", &owner.lease_id))
+        .await
+        .expect("child provision succeeds");
+    service
+        .write_lease_file(&child.lease_id, modified.clone(), b"new".to_vec())
+        .unwrap();
+    service
+        .write_lease_file(&child.lease_id, added.clone(), b"added".to_vec())
+        .unwrap();
+    service
+        .remove_lease_file(&child.lease_id, &deleted)
+        .unwrap();
+    service
+        .checkpoint(AgentCheckpointRequest {
+            lease_id: child.lease_id.clone(),
+            idempotency_key: "child-files".to_string(),
+        })
+        .await
+        .unwrap();
+    service
+        .write_lease_file(
+            &child.lease_id,
+            modified.clone(),
+            b"uncheckpointed".to_vec(),
+        )
+        .unwrap();
+    let artifact = service
+        .export_patch(AgentPatchExportRequest {
+            lease_id: child.lease_id,
+            agent_id: ThreadId::new(),
+            base_snapshot_id: child.base_snapshot_id,
+            idempotency_key: "export-files".to_string(),
+        })
+        .await
+        .expect("file patch exports");
+    assert_eq!(artifact.changed_files, 3);
+    assert_eq!(artifact.size_bytes, 8);
+    assert_eq!(
+        service.read_lease_file(&owner.lease_id, &modified).unwrap(),
+        Some(b"old".to_vec())
+    );
+
+    let result = service
+        .apply_patch(AgentPatchApplyRequest {
+            target_lease_id: owner.lease_id.clone(),
+            artifact_id: artifact.artifact_id,
+            idempotency_key: "apply-files".to_string(),
+        })
+        .await
+        .expect("file patch applies");
+    assert!(matches!(result, PatchApplyResult::Applied { .. }));
+    assert_eq!(
+        service.read_lease_file(&owner.lease_id, &modified).unwrap(),
+        Some(b"new".to_vec())
+    );
+    assert_eq!(
+        service.read_lease_file(&owner.lease_id, &added).unwrap(),
+        Some(b"added".to_vec())
+    );
+    assert_eq!(
+        service.read_lease_file(&owner.lease_id, &deleted).unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn fake_three_way_conflict_leaves_every_target_file_unchanged() {
+    let service = FakeHostedAgentService::default();
+    let owner = service
+        .provision(root_request("atomic-owner"))
+        .await
+        .expect("owner provision succeeds");
+    let conflicted = PathUri::parse("file:///workspace/conflicted.txt").unwrap();
+    let clean = PathUri::parse("file:///workspace/clean.txt").unwrap();
+    for path in [&conflicted, &clean] {
+        service
+            .write_lease_file(&owner.lease_id, path.clone(), b"base".to_vec())
+            .unwrap();
+    }
+    service
+        .checkpoint(AgentCheckpointRequest {
+            lease_id: owner.lease_id.clone(),
+            idempotency_key: "atomic-base".to_string(),
+        })
+        .await
+        .unwrap();
+    let child = service
+        .provision(child_request("atomic-child", &owner.lease_id))
+        .await
+        .unwrap();
+    service
+        .write_lease_file(&child.lease_id, conflicted.clone(), b"agent".to_vec())
+        .unwrap();
+    service
+        .write_lease_file(&child.lease_id, clean.clone(), b"agent".to_vec())
+        .unwrap();
+    service
+        .checkpoint(AgentCheckpointRequest {
+            lease_id: child.lease_id.clone(),
+            idempotency_key: "atomic-child-checkpoint".to_string(),
+        })
+        .await
+        .unwrap();
+    let artifact = service
+        .export_patch(AgentPatchExportRequest {
+            lease_id: child.lease_id,
+            agent_id: ThreadId::new(),
+            base_snapshot_id: child.base_snapshot_id,
+            idempotency_key: "atomic-export".to_string(),
+        })
+        .await
+        .unwrap();
+    service
+        .write_lease_file(&owner.lease_id, conflicted.clone(), b"owner".to_vec())
+        .unwrap();
+    let snapshot_before = service.latest_snapshot_id(&owner.lease_id);
+
+    assert_eq!(
+        service
+            .apply_patch(AgentPatchApplyRequest {
+                target_lease_id: owner.lease_id.clone(),
+                artifact_id: artifact.artifact_id,
+                idempotency_key: "atomic-apply".to_string(),
+            })
+            .await
+            .unwrap(),
+        PatchApplyResult::Conflict {
+            paths: vec![conflicted.clone()],
+        }
+    );
+    assert_eq!(service.latest_snapshot_id(&owner.lease_id), snapshot_before);
+    assert_eq!(
+        service
+            .read_lease_file(&owner.lease_id, &conflicted)
+            .unwrap(),
+        Some(b"owner".to_vec())
+    );
+    assert_eq!(
+        service.read_lease_file(&owner.lease_id, &clean).unwrap(),
+        Some(b"base".to_vec())
+    );
+}
+
+#[tokio::test]
+async fn fake_lease_files_are_bounded() {
+    let service = FakeHostedAgentService::default();
+    let lease = service
+        .provision(root_request("bounded-files"))
+        .await
+        .unwrap();
+    let error = service
+        .write_lease_file(
+            &lease.lease_id,
+            PathUri::parse("file:///workspace/too-large.bin").unwrap(),
+            vec![0; 1024 * 1024 + 1],
+        )
+        .expect_err("oversized fake file must be rejected");
+
+    assert_eq!(error.category, HostedAgentErrorCategory::QuotaExceeded);
 }
 
 #[tokio::test]
