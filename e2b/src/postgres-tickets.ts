@@ -13,6 +13,7 @@ interface DurableTicketHashes {
     ticketHash: Uint8Array
     purpose: TicketPurpose
     expiresAt: Date
+    expectedConnectionGeneration?: number
   }): Promise<void>
   consumeTicketHash(input: {
     tenantId: string
@@ -54,7 +55,8 @@ export class PostgresTicketIssuer implements TicketAuthority {
     this.publicBaseUrl = endpoint.href.replace(/\/$/, '')
   }
 
-  async issue(leaseId: string, purpose: TicketPurpose = gatewayConnectTicketPurpose): Promise<string> {
+  async issue(leaseId: string, purpose: TicketPurpose = gatewayConnectTicketPurpose,
+    expectedConnectionGeneration?: number): Promise<string> {
     if (!validId(leaseId)) throw new Error('invalid lease identifier')
     if (!purposes.has(purpose)) throw new Error('invalid ticket purpose')
     const ticket = randomBytes(32).toString('base64url')
@@ -64,6 +66,7 @@ export class PostgresTicketIssuer implements TicketAuthority {
       ticketHash: hash(ticket),
       purpose,
       expiresAt: new Date(Date.now() + this.ttlMs),
+      ...(expectedConnectionGeneration === undefined ? {} : { expectedConnectionGeneration }),
     })
     return `${this.publicBaseUrl}/leases/${encodeURIComponent(leaseId)}?ticket=${ticket}`
   }

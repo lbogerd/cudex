@@ -26,8 +26,12 @@ production backend. Stable decisions, evidence, and wire schemas are in
   including exact logical replay and cleanup of partial publication.
 - [x] Extend the journal/allocation protocol through durable release, including
   durable access revocation, provider cleanup work, and reconciled completion.
-- [ ] Extend the same journal/allocation protocol through reconnect, restore,
-  child capture, and patch.
+- [x] Extend the journal/fencing protocol through durable reconnect, including
+  target-bound claims, generation-bound access rotation, secret-free replay,
+  confirmed-loss terminalization, and explicit stale takeover without invented
+  resource allocations.
+- [ ] Extend the same journal/allocation protocol through restore, child capture,
+  and patch.
 - [x] Apply transactional per-lease locking to durable checkpoint capture and
   commit across service replicas.
 - [x] Apply transactional lease/provider locking to durable release across
@@ -170,15 +174,21 @@ tickets always fail, and secrets never enter durable or observable state.
 - [x] Add an unwired PostgreSQL release coordinator that atomically binds its
   target, persists `release_pending` plus ticket revocation and exact sandbox
   cleanup work, and only marks released after kill or confirmed provider loss.
+- [x] Add an unwired PostgreSQL reconnect coordinator that serializes and probes
+  the exact existing sandbox, atomically rotates durable access only after
+  health, replays with a fresh generation-bound ticket, preserves access on
+  transient connect failure, and marks confirmed loss atomically.
 - [ ] Extend cleanup-safe provision through child/restore sources and wire it to
   production startup with reconciler recovery for process loss at every external
   allocation boundary.
 - [x] Serialize durable checkpoint capture and commit per lease across replicas.
 - [x] Serialize durable release against checkpoint and other release operations
   per lease while using the same deterministic provider-resource lock order.
-- [ ] Serialize reconnect, child capture, patch, and command interaction
-  per lease; command execution must share the checkpoint gate before capture can
-  claim a command-consistent instant.
+- [x] Serialize durable reconnect against checkpoint, release, and other
+  reconnect operations per lease using the common lease/provider lock order.
+- [ ] Serialize child capture, patch, and command interaction per lease; command
+  execution must share the checkpoint gate before capture can claim a command-
+  consistent instant.
 - [x] Persist checksummed base/current workspace manifests with the unwired
   durable provision and checkpoint snapshots and service archives.
 - [ ] Carry the same manifest persistence through the remaining production

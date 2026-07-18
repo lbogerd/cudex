@@ -2,6 +2,7 @@ import type { ProviderAdapter } from './provider.js'
 import { ProviderSandboxMissingError } from './provider.js'
 import type { PoolClient } from 'pg'
 import type { Lease, PostgresDurableState } from './postgres-state.js'
+import { logicalReconnectFromLease } from './postgres-reconnect.js'
 import {
   OperationOwnershipError,
   type OperationAllocation,
@@ -22,6 +23,7 @@ export interface PostgresReconcilerOptions {
   maxInventorySnapshotsPerSandbox?: number
   maxTicketsPerRun?: number
   ticketRetentionMs?: number
+  connections?: { revoke(leaseId: string): void }
   onError?: (error: unknown) => void
 }
 
@@ -54,7 +56,8 @@ function positiveInteger(label: string, value: number, maximum: number): void {
 }
 
 export class PostgresReconciler {
-  private readonly options: Required<Omit<PostgresReconcilerOptions, 'onError'>> & Pick<PostgresReconcilerOptions, 'onError'>
+  private readonly options: Required<Omit<PostgresReconcilerOptions, 'connections' | 'onError'>>
+    & Pick<PostgresReconcilerOptions, 'connections' | 'onError'>
   private timer: ReturnType<typeof setTimeout> | undefined
   private running: Promise<ReconcileRunResult> | undefined
   private stopped = true
@@ -143,6 +146,10 @@ export class PostgresReconciler {
       await this.reconcileRelease(operation, allocations, result)
       return
     }
+    if (operation.operation === 'reconnect') {
+      await this.reconcileReconnect(operation, allocations, result)
+      return
+    }
     for (const allocation of allocations) {
       if (allocation.state === 'adopted' || allocation.state === 'reclaimed') continue
       if (allocation.allocationKind === 'sandbox' || allocation.allocationKind === 'capture_sandbox') {
@@ -168,6 +175,61 @@ export class PostgresReconciler {
         if (!(error instanceof OperationOwnershipError)) throw error
       }
     }
+  }
+
+  private async reconcileReconnect(operation: StaleOperation, allocations: OperationAllocation[],
+    result: ReconcileRunResult): Promise<void> {
+    const identity: OperationIdentity = operation
+    const leaseId = operation.primaryLeaseId
+    if (!leaseId || allocations.length !== 0) { result.allocationsPending += 1; return }
+    let accessChanged = false
+    try {
+      await this.journal.withLeaseLocks(operation.tenantId, [leaseId], async client => {
+        if (!await this.journal.heartbeatOperation(identity, operation.generation, operation.workerId, client)) {
+          throw new OperationOwnershipError()
+        }
+        const lease = await this.state.getLease(operation.tenantId, leaseId, client)
+        if (lease && ['active', 'paused'].includes(lease.state) && !lease.providerSandboxId) {
+          throw new OperationOwnershipError()
+        }
+        if (!lease || !['active', 'paused'].includes(lease.state) || !lease.providerSandboxId) {
+          const status = lease && !['release_pending', 'released', 'lost'].includes(lease.state) ? 409 : 404
+          await this.journal.failOperation(identity, operation.generation, operation.workerId,
+            `service_${status}`, status === 404 ? 'lease missing' : 'lease cannot be reconnected', client)
+          return
+        }
+        await this.journal.bindLeaseAndAdoptAllocations(
+          identity, operation.generation, operation.workerId, lease.leaseId, [], client)
+        await this.journal.lockProviderResources(
+          [{ kind: 'sandbox', resourceId: lease.providerSandboxId }], client)
+        try {
+          const connected = await this.provider.connect(lease.providerSandboxId)
+          if (connected.sandboxId !== lease.providerSandboxId) {
+            throw new Error('provider returned a different reconnect sandbox')
+          }
+          await this.provider.startExecServer(lease.providerSandboxId)
+          await this.provider.probeExecServer(lease.providerSandboxId)
+        } catch (error) {
+          if (!(error instanceof ProviderSandboxMissingError)) throw error
+          await this.state.markLeaseLost(
+            operation.tenantId, lease.leaseId, lease.providerSandboxId, client)
+          accessChanged = true
+          await this.journal.failOperation(identity, operation.generation, operation.workerId,
+            'service_404', 'lease missing', client)
+          return
+        }
+        const active = await this.state.completeReconnect(
+          operation.tenantId, lease.leaseId, lease.providerSandboxId, client)
+        accessChanged = true
+        const logical = logicalReconnectFromLease(active)
+        await this.journal.completeOperation(
+          identity, operation.generation, operation.workerId, logical, client)
+      })
+      if (accessChanged) {
+        try { this.options.connections?.revoke(leaseId) }
+        catch { /* The durable generation remains authoritative across gateway replicas. */ }
+      }
+    } catch { result.allocationsPending += 1 }
   }
 
   private async reconcileRelease(operation: StaleOperation, allocations: OperationAllocation[],

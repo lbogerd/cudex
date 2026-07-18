@@ -839,6 +839,49 @@ denial, fresh-ticket generation binding, and replica-visible active targets.
 The complete Docker-backed suite passed 183 of 183 tests with zero skips on
 x86_64 Linux.
 
+### Durable reconnect coordinator
+
+An unwired PostgreSQL reconnect coordinator now atomically claims its existing
+target lease and uses the shared lease-then-exact-sandbox lock order. It verifies
+that provider reconnect returns the same sandbox ID, starts and health-probes
+exec, then commits ticket-hash revocation, a monotonic connection-generation
+advance, active lease state, and the exact secret-free logical response in one
+transaction. Only a known commit triggers immediate process-local socket
+revocation and issuance of a raw gateway ticket.
+
+Ticket issuance is bound to the exact generation produced by that execution or
+replay. If a newer reconnect overtakes an older response, the older issuer fails
+closed instead of minting access across the newer revocation barrier. Every
+successful idempotent replay takes the lease lock, verifies the stored logical
+response against current durable identity, advances the generation again,
+revokes older hashes and sockets, and issues one fresh ticket. The raw URL never
+enters the journal. Ticket-service failure after commit leaves the operation
+succeeded so replay can repair delivery without repeating provider work.
+
+Confirmed provider absence atomically advances the generation, revokes ticket
+hashes, marks the lease `lost`, and stores terminal `service_404`; later loss or
+release also makes a previously successful replay return 404 without issuing
+access. Generic provider/database errors do not terminalize the operation or
+alter durable access. The ordering intentionally rotates only after a successful
+health probe so a transient connect/start/probe failure does not deliberately
+discard still-viable lease authorization; the provider work remains scoped to
+the same locked lease and sandbox.
+
+The reconciler has an explicit zero-allocation reconnect path. A stale owner is
+generation-fenced, reuses the same lease/provider order, retries exact provider
+health, completes success without generating bearer material, or records
+confirmed loss atomically. Durable generation changes close sockets on all
+replicas through gateway revalidation, while an optional local revoker closes
+same-process sockets immediately.
+
+Seven focused two-pool PostgreSQL tests prove duplicate-key single execution,
+distinct-key serialization, generation-bound fresh replay tickets, secret-free
+journal state, transient takeover, confirmed loss, ambiguous commit recovery,
+ticket-delivery repair, and 404 after later loss. Together with the gateway race
+coverage, the full Docker-backed PostgreSQL 17 suite passed 190 of 190 tests with
+zero skips on x86_64 Linux. Production startup remains on the legacy lifecycle
+until restore and child capture can move to the same authority together.
+
 ### Bounded PostgreSQL reconciliation foundation
 
 An intentionally unwired `PostgresReconciler` now claims stale operations only

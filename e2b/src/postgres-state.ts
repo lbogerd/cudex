@@ -529,6 +529,26 @@ export class PostgresDurableState {
     } catch (error) { return postgresError(error) }
   }
 
+  async rotateReconnectReplayAccess(tenantId: string, leaseId: string, expectedSandboxId: string,
+    executor: PoolClient): Promise<Lease> {
+    validateId('tenant ID', tenantId); validateId('lease ID', leaseId)
+    validateId('provider sandbox ID', expectedSandboxId)
+    try {
+      const lease = await this.lockLease(executor, tenantId, leaseId)
+      if (lease.state !== 'active' || lease.providerSandboxId !== expectedSandboxId) {
+        throw new DurableStateConflictError('lease reconnect cannot be replayed')
+      }
+      await executor.query(`UPDATE hosted_agent_tickets
+        SET revoked_at = COALESCE(revoked_at, now()) WHERE lease_id = $1`, [leaseId])
+      const result = await executor.query<LeaseRow>(`
+        UPDATE hosted_agent_leases
+        SET connection_generation = connection_generation + 1
+        WHERE lease_id = $1 AND tenant_id = $2 RETURNING ${leaseColumns}
+      `, [leaseId, tenantId])
+      return leaseFromRow(result.rows[0]!)
+    } catch (error) { return postgresError(error) }
+  }
+
   async markLeaseLost(tenantId: string, leaseId: string, expectedSandboxId: string,
     executor: PoolClient): Promise<Lease> {
     validateId('tenant ID', tenantId); validateId('lease ID', leaseId)
@@ -569,15 +589,24 @@ export class PostgresDurableState {
     } catch (error) { return postgresError(error) }
   }
 
-  async issueTicketHash(input: { tenantId: string; leaseId: string; ticketHash: Uint8Array; purpose: TicketPurpose; expiresAt: Date }): Promise<void> {
+  async issueTicketHash(input: { tenantId: string; leaseId: string; ticketHash: Uint8Array; purpose: TicketPurpose;
+    expiresAt: Date; expectedConnectionGeneration?: number }): Promise<void> {
     validateId('tenant ID', input.tenantId); validateId('lease ID', input.leaseId)
     validateTicketPurpose(input.purpose); validateDate('ticket expiry', input.expiresAt)
     const now = Date.now()
     if (input.expiresAt.getTime() <= now || input.expiresAt.getTime() > now + maxTicketTtlMs) throw new Error('invalid ticket expiry')
+    if (input.expectedConnectionGeneration !== undefined
+      && (!Number.isSafeInteger(input.expectedConnectionGeneration) || input.expectedConnectionGeneration < 0)) {
+      throw new Error('invalid connection generation')
+    }
     const ticketHash = validateHash(input.ticketHash)
     await this.transaction(async client => {
       const lease = await this.lockLease(client, input.tenantId, input.leaseId)
       if (lease.state !== 'active') throw new DurableStateConflictError('tickets require an active lease')
+      if (input.expectedConnectionGeneration !== undefined
+        && lease.connectionGeneration !== input.expectedConnectionGeneration) {
+        throw new DurableStateConflictError('lease connection generation changed')
+      }
       await client.query(`
         UPDATE hosted_agent_tickets SET revoked_at = COALESCE(revoked_at, now())
         WHERE lease_id = $1 AND revoked_at IS NULL

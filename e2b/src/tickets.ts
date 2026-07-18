@@ -10,7 +10,7 @@ const purposes = new Set<TicketPurpose>(['exec_gateway_connect', 'exec_gateway_p
 export interface ValidatedTicket { connectionGeneration: number }
 
 export interface TicketAuthority {
-  issue(leaseId: string, purpose?: TicketPurpose): Promise<string>
+  issue(leaseId: string, purpose?: TicketPurpose, expectedConnectionGeneration?: number): Promise<string>
   validate(leaseId: string, ticket: string, purpose?: TicketPurpose): Promise<ValidatedTicket | null>
   revokeLease(leaseId: string): Promise<void>
 }
@@ -25,16 +25,24 @@ export class TicketIssuer {
   constructor(private readonly store: JsonStore, private readonly publicBaseUrl: string, private readonly ttlMs = 60_000) {
     if (!Number.isSafeInteger(ttlMs) || ttlMs <= 0 || ttlMs > maxTicketTtlMs) throw new Error('invalid ticket TTL')
   }
-  async issue(leaseId: string, purpose: TicketPurpose = gatewayConnectTicketPurpose): Promise<string> {
+  async issue(leaseId: string, purpose: TicketPurpose = gatewayConnectTicketPurpose,
+    expectedConnectionGeneration?: number): Promise<string> {
     if (!leaseId.trim() || Buffer.byteLength(leaseId) > 512) throw new Error('invalid lease identifier')
     if (!purposes.has(purpose)) throw new Error('invalid ticket purpose')
+    if (expectedConnectionGeneration !== undefined
+      && (!Number.isSafeInteger(expectedConnectionGeneration) || expectedConnectionGeneration < 0)) {
+      throw new Error('invalid connection generation')
+    }
     const ticket = randomBytes(32).toString('base64url'); const ticketHash = digest(ticket)
     await this.store.transaction(database => {
       const now = Date.now(); cleanup(database, now)
+      const connectionGeneration = database.leases[leaseId]?.connectionGeneration ?? 0
+      if (expectedConnectionGeneration !== undefined
+        && connectionGeneration !== expectedConnectionGeneration) throw new Error('connection generation changed')
       for (const record of Object.values(database.tickets)) if (record.leaseId === leaseId && !record.revokedAt) record.revokedAt = now
       cleanup(database, now)
       database.tickets[ticketHash] = { ticketHash, leaseId, purpose, issuedAt: now, expiresAt: now + this.ttlMs,
-        connectionGeneration: database.leases[leaseId]?.connectionGeneration ?? 0 }
+        connectionGeneration }
     })
     return `${this.publicBaseUrl.replace(/\/$/, '')}/leases/${encodeURIComponent(leaseId)}?ticket=${ticket}`
   }
@@ -50,7 +58,7 @@ export class TicketIssuer {
         && record.leaseId === leaseId && record.purpose === purpose && record.consumedAt === undefined
       if (!matches) return null
       record.consumedAt = now
-      return { connectionGeneration: record.connectionGeneration }
+      return { connectionGeneration: record.connectionGeneration ?? 0 }
     })
   }
   async revokeLease(leaseId: string): Promise<void> {

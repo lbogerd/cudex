@@ -318,7 +318,9 @@ live('reconnect and loss transitions rotate durable connection generations acros
   assert.deepEqual(await context.first.activeLeaseTarget(created.lease.leaseId),
     { sandboxId: 'sandbox-1', connectionGeneration: 1 })
   assert.equal(await secondIssuer.validate(created.lease.leaseId, stale), null)
-  const current = new URL(await secondIssuer.issue(created.lease.leaseId)).searchParams.get('ticket')!
+  await assert.rejects(firstIssuer.issue(created.lease.leaseId, undefined, 0), DurableStateConflictError)
+  const current = new URL(await secondIssuer.issue(
+    created.lease.leaseId, undefined, 1)).searchParams.get('ticket')!
   assert.deepEqual(await firstIssuer.validate(created.lease.leaseId, current), { connectionGeneration: 1 })
 
   const lossClient = await context.firstPool.connect()
