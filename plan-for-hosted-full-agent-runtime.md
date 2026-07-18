@@ -164,6 +164,10 @@ Still pending:
 
 All eight implementation stages are complete on `feat/hosted-agents`.
 
+See [Hosted Agent Backend Integration Guide](hosted-agent-backend-integration-guide.md) for the
+provider-neutral HTTP contract and the E2B control-plane, transport, snapshot, artifact, security,
+and rollout guidance needed to connect a production backend.
+
 The completed runtime now provides:
 
 - one centrally provisioned, independently leased hosted environment for every hosted root,
