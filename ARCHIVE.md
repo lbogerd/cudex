@@ -922,8 +922,26 @@ on the caller's transaction, verifies the new snapshot, and only then marks the
 preparation committed. A restore resolver independently checks that the logical
 archive's registered bucket/key matches the configured object store and verifies
 its content-addressed digest and size before exposing bytes. Focused PostgreSQL
-coverage proves restore preparation/commit and the full suite remains green; the
-provider coordinator and restore-specific stale cleanup remain outstanding.
+coverage proves restore preparation/commit and the full suite remains green.
+
+The unwired PostgreSQL restore coordinator now claims the durable-snapshot
+request against its exact source lease, derives deterministic replacement
+lease/environment/snapshot identities, and loads the authorized archive before
+creating only the trusted clean provider template. It never invokes provider
+runtime restore. Provider calls are surrounded by renewable operation fencing;
+the provider snapshot has a deterministic operation-derived name, and cleanup
+rechecks generation ownership under the same resource lock before deleting it
+or the fresh sandbox. Final source authorization, lost-source retirement,
+replacement creation, allocation adoption, and secret-free logical completion
+share one source-lease/provider-resource transaction. Replay verifies the full
+source lease/snapshot/agent/owner/template lineage and issues a current-generation
+ticket only after commit. Duplicate template-to-role mappings are rejected so a
+restore cannot switch policy through an ambiguous trusted role. Live PostgreSQL
+coverage proves exact archive overlay without runtime identity inheritance,
+mutation-free replay, pre-allocation authorization rejection, partial cleanup,
+and ambiguous-commit recovery; all 199 tests pass. Restore-specific stale
+preparation recovery and the planned provider-snapshot allocation boundary are
+still required before production wiring.
 
 ### Bounded PostgreSQL reconciliation foundation
 

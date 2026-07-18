@@ -39,6 +39,9 @@ production backend. Stable decisions, evidence, and wire schemas are in
 - [x] Bind restore lineage into the durable workspace-preparation intent, add an
   atomic restore commit path, and load only the authorized content-addressed
   archive after exact locator/digest/size verification.
+- [x] Add an unwired PostgreSQL clean-restore coordinator with source-bound
+  journal claims, deterministic replacement identities, continuous fencing,
+  clean-template allocation, exact lineage replay, and cleanup-safe commit.
 - [x] Apply transactional per-lease locking to durable checkpoint capture and
   commit across service replicas.
 - [x] Apply transactional lease/provider locking to durable release across
@@ -212,7 +215,7 @@ tickets always fail, and secrets never enter durable or observable state.
 - [x] In the provider lifecycle, authorize the same agent/owner/template and
   latest terminal snapshot, overlay its verified workspace into a clean trusted
   template, restart exec, and rekey transport credentials.
-- [ ] Move clean restore authorization, old-lease terminalization, and new-lease
+- [x] Move clean restore authorization, old-lease terminalization, and new-lease
   creation into the PostgreSQL lifecycle transaction and cross-replica locks.
 - [x] Reclaim child-capture sandboxes and provider snapshots after successful
   workspace-only capture and ordinary restore/export failure paths.

@@ -16,6 +16,7 @@ import type {
   SnapshotInput,
   StoredObject,
 } from './postgres-state.js'
+import { DurableStateConflictError, DurableStateNotFoundError } from './postgres-state.js'
 import type { PostgresJournal } from './postgres-store.js'
 import {
   canonicalWorkspacePreparationIntent,
@@ -435,6 +436,8 @@ export class WorkspaceSnapshotPublisher {
         objectAllocationIds: locked.objects.map(object => object.allocationId) }
     } catch (error) {
       if (error instanceof ServiceError) throw error
+      if (error instanceof DurableStateConflictError) throw new ServiceError(409, error.message)
+      if (error instanceof DurableStateNotFoundError) throw new ServiceError(404, 'snapshot missing')
       throw new ServiceError(503, 'workspace snapshot service unavailable')
     }
   }
