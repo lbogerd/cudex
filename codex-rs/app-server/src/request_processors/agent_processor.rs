@@ -42,19 +42,29 @@ impl AgentRequestProcessor {
                 CodexErr::InvalidRequest(message) => invalid_request(message),
                 error => internal_error(format!("failed to apply hosted-agent patch: {error}")),
             })?;
-        match result {
-            HostedAgentPatchApplyResult::Applied => Ok(AgentPatchApplyResponse::Applied),
-            HostedAgentPatchApplyResult::Conflict { paths } => {
-                if paths.len() > MAX_AGENT_PATCH_CONFLICT_PATHS {
-                    return Err(internal_error(
-                        "hosted-agent service returned too many patch conflicts",
-                    ));
-                }
-                Ok(AgentPatchApplyResponse::Conflict { paths })
+        map_patch_apply_result(result)
+    }
+}
+
+fn map_patch_apply_result(
+    result: HostedAgentPatchApplyResult,
+) -> Result<AgentPatchApplyResponse, JSONRPCErrorError> {
+    match result {
+        HostedAgentPatchApplyResult::Applied => Ok(AgentPatchApplyResponse::Applied),
+        HostedAgentPatchApplyResult::Conflict { paths } => {
+            if paths.len() > MAX_AGENT_PATCH_CONFLICT_PATHS {
+                return Err(internal_error(
+                    "hosted-agent service returned too many patch conflicts",
+                ));
             }
-            HostedAgentPatchApplyResult::Rejected { reason } => {
-                Ok(AgentPatchApplyResponse::Rejected { reason })
-            }
+            Ok(AgentPatchApplyResponse::Conflict { paths })
+        }
+        HostedAgentPatchApplyResult::Rejected { reason } => {
+            Ok(AgentPatchApplyResponse::Rejected { reason })
         }
     }
 }
+
+#[cfg(test)]
+#[path = "agent_processor_tests.rs"]
+mod tests;
