@@ -5,7 +5,7 @@ import type { TicketIssuer } from './tickets.js'
 import { archiveWorkspace, type IngressLimits } from './ingress.js'
 import type { CheckpointRequest, LeaseRecord, OperationRecord, ProvisionRequest, ProvisionedAgent, ReconnectRequest, ReleaseRequest, ToolPolicy } from './types.js'
 import { ServiceError } from './types.js'
-import type { BlobStore } from './blob-store.js'
+import type { ObjectStore } from './blob-store.js'
 
 function canonical(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonical)
@@ -26,7 +26,7 @@ const defaultPolicy: ToolPolicy = {
 interface ServiceOptions { templates: Record<string, string>; allowedRoots: string[]; ingress: IngressLimits }
 
 export class ControlPlane {
-  constructor(private readonly store: JsonStore, private readonly provider: ProviderAdapter, private readonly tickets: TicketIssuer, private readonly blobs: BlobStore, private readonly options: ServiceOptions) {}
+  constructor(private readonly store: JsonStore, private readonly provider: ProviderAdapter, private readonly tickets: TicketIssuer, private readonly blobs: ObjectStore, private readonly options: ServiceOptions) {}
 
   async reconcile(): Promise<void> {
     const abandoned = await this.store.read(database => Object.values(database.operations).filter(operation => operation.state === 'in_progress' && operation.allocatedSandboxId))

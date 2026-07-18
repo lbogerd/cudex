@@ -6,12 +6,22 @@ import { E2BProvider } from './e2b-provider.js'
 import { ControlPlane } from './service.js'
 import { ExecGateway } from './gateway.js'
 import { startServer } from './http-server.js'
-import { BlobStore } from './blob-store.js'
+import { BlobStore, S3BlobStore } from './blob-store.js'
 
 function required(name: string): string { const value = process.env[name]; if (!value) throw new Error(`${name} is required`); return value }
 const host = process.env.HOSTED_AGENT_HOST ?? '127.0.0.1'; const port = Number(process.env.HOSTED_AGENT_PORT ?? '8443')
 const store = new JsonStore(resolve(process.env.HOSTED_AGENT_STATE_PATH ?? 'e2b/.state/control-plane.json')); await store.open()
-const blobs = new BlobStore(resolve(process.env.HOSTED_AGENT_BLOB_PATH ?? 'e2b/.state/blobs'))
+const objectBucket = process.env.HOSTED_AGENT_OBJECT_BUCKET
+const blobs = objectBucket
+  ? new S3BlobStore({
+      bucket: objectBucket,
+      ...(process.env.HOSTED_AGENT_OBJECT_PREFIX ? { prefix: process.env.HOSTED_AGENT_OBJECT_PREFIX } : {}),
+      ...(process.env.HOSTED_AGENT_OBJECT_REGION ? { region: process.env.HOSTED_AGENT_OBJECT_REGION } : {}),
+      ...(process.env.HOSTED_AGENT_OBJECT_ENDPOINT ? { endpoint: process.env.HOSTED_AGENT_OBJECT_ENDPOINT } : {}),
+      forcePathStyle: process.env.HOSTED_AGENT_OBJECT_FORCE_PATH_STYLE === 'true',
+      maxObjectBytes: Number(process.env.HOSTED_AGENT_MAX_OBJECT_BYTES ?? 1_073_741_824),
+    })
+  : new BlobStore(resolve(process.env.HOSTED_AGENT_BLOB_PATH ?? 'e2b/.state/blobs'))
 const connection = {
   apiKey: required('E2B_API_KEY'),
   ...(process.env.E2B_API_URL ? { apiUrl: process.env.E2B_API_URL } : {}),

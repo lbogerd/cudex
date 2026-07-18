@@ -6,13 +6,13 @@ production backend. Stable decisions, evidence, and wire schemas are in
 
 ## 1. Production persistence
 
-- [ ] Add PostgreSQL migrations for leases, snapshots, artifacts, operations,
+- [x] Add PostgreSQL migrations for leases, snapshots, artifacts, operations,
   and connection-ticket hashes.
-- [ ] Enforce unique operation/idempotency keys, lease IDs, and environment IDs.
+- [x] Enforce unique operation/idempotency keys, lease IDs, and environment IDs.
 - [ ] Persist canonical request hashes, operation state, logical responses, and
   all partial provider allocations.
 - [ ] Add transactional per-lease locks and deterministic multi-lease lock order.
-- [ ] Replace local blobs with authenticated object storage for workspace
+- [x] Replace local blobs with authenticated object storage for workspace
   archives, manifests, content blobs, and patch artifacts.
 - [ ] Add reference retention so snapshots/artifacts outlive lease release while
   Codex references them.
@@ -127,7 +127,7 @@ mode, symlink, addition, and deletion behavior matches the Codex fake.
   denial, cleanup lag, leaks, storage growth, and gateway health.
 - [ ] Exercise provider/API/gateway/database/object-store outages, process crash,
   and network partitions.
-- [ ] Resolve the pinned dependency tree's high-severity advisory before broader
+- [x] Resolve the pinned dependency tree's high-severity advisory before broader
   deployment.
 - [ ] Define backup, restore, retention, deletion, and tenant-erasure procedures.
 - [ ] Roll out by trusted role with a kill switch and rollback procedure.

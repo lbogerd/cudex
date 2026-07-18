@@ -194,6 +194,31 @@ coverage remains delegated to the repository Bazel CI matrix.
 
 ## Verified foundation and spike
 
+### Production storage foundation
+
+The first productionization slice landed on 2026-07-18. A checksummed,
+transactional PostgreSQL migration establishes constrained tables and indexes
+for immutable source snapshots, leases, durable snapshots, artifacts,
+idempotent operations, partial provider allocations, hashed purpose-bound
+connection tickets, authenticated objects, and explicit retention references.
+The migration runner serializes replicas with a schema-scoped advisory lock and
+rejects changed or unknown applied migrations. The live database constraint test
+is available through `HOSTED_AGENT_TEST_DATABASE_URL`; it remains skipped when a
+PostgreSQL fixture is unavailable.
+
+Production workspace archives and future manifests/content blobs/artifacts can
+now use an authenticated S3-compatible object store. Objects are addressed and
+verified by SHA-256, encrypted server-side, bounded on read/write, and obtained
+through the standard AWS credential chain. The filesystem implementation now
+validates identifiers and checksums and is explicitly development-only. The
+control plane still needs to move its operation protocol from the JSON journal
+onto this relational schema; adding the schema does not by itself satisfy
+multi-replica idempotency or recovery.
+
+The direct `ws` dependency was upgraded from 8.18.3 to 8.21.1, resolving the
+pinned tree's high-severity memory-disclosure/exhaustion advisories. The npm
+production audit reports zero known vulnerabilities after the upgrade.
+
 CubeSandbox was verified on 2026-07-18 through stock E2B TypeScript SDK 2.35.0.
 Provider code lives in the external TypeScript control plane under `e2b/src`, not
 in `codex-core`.
