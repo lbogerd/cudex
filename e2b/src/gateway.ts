@@ -7,8 +7,10 @@ import { validateExecUpstream, type ProviderAdapter } from './provider.js'
 import type { TicketAuthority } from './tickets.js'
 
 export interface ActiveLeaseDirectory {
-  activeSandbox(leaseId: string): Promise<string | undefined>
+  activeLeaseTarget(leaseId: string): Promise<ActiveLeaseTarget | undefined>
 }
+
+export interface ActiveLeaseTarget { sandboxId: string; connectionGeneration: number }
 
 export interface GatewayLimits {
   maxPayloadBytes: number
@@ -85,13 +87,19 @@ export class ExecGateway {
       reject(socket, 401, 'Unauthorized')
       return
     }
-    if (!ticket || !leaseId || leaseId.length > 512 || !(await this.tickets.validate(leaseId, ticket))) {
+    const validated = ticket && leaseId && leaseId.length <= 512
+      ? await this.tickets.validate(leaseId, ticket) : null
+    if (!validated) {
       reject(socket, 401, 'Unauthorized')
       return
     }
-    const sandboxId = await this.activeSandbox(leaseId)
-    if (!sandboxId) {
+    const target = await this.activeLeaseTarget(leaseId)
+    if (!target) {
       reject(socket, 404, 'Not Found')
+      return
+    }
+    if (target.connectionGeneration !== validated.connectionGeneration) {
+      reject(socket, 401, 'Unauthorized')
       return
     }
     const leaseConnections = this.active.get(leaseId)?.size ?? 0
@@ -100,13 +108,13 @@ export class ExecGateway {
       return
     }
     try {
-      this.server.handleUpgrade(request, socket, head, client => { void this.proxy(client, leaseId, sandboxId) })
+      this.server.handleUpgrade(request, socket, head, client => { void this.proxy(client, leaseId, target) })
     } catch {
       reject(socket, 400, 'Bad Request')
     }
   }
 
-  private async proxy(client: WebSocket, leaseId: string, sandboxId: string): Promise<void> {
+  private async proxy(client: WebSocket, leaseId: string, target: ActiveLeaseTarget): Promise<void> {
     const connections = this.active.get(leaseId) ?? new Set<WebSocket>()
     connections.add(client)
     this.active.set(leaseId, connections)
@@ -132,8 +140,8 @@ export class ExecGateway {
     revalidation = setInterval(() => {
       if (closed || revalidationPending) return
       revalidationPending = true
-      void this.activeSandbox(leaseId)
-        .then(active => { if (active !== sandboxId) cleanup(1008, 'lease inactive') })
+      void this.activeLeaseTarget(leaseId)
+        .then(active => { if (!sameTarget(active, target)) cleanup(1008, 'lease inactive') })
         .catch(() => cleanup(1013, 'gateway unavailable'))
         .finally(() => { revalidationPending = false })
     }, this.limits.leaseRevalidationMs)
@@ -141,16 +149,16 @@ export class ExecGateway {
     client.on('close', () => cleanup())
     client.on('error', () => cleanup())
 
-    if (await this.activeSandbox(leaseId) !== sandboxId) {
+    if (!sameTarget(await this.activeLeaseTarget(leaseId), target)) {
       cleanup(1008, 'lease inactive')
       return
     }
     if (closed) return
     let upstreamConnection
-    try { upstreamConnection = validateExecUpstream(await this.provider.execUpstream(sandboxId), this.allowInsecureUpstream) }
+    try { upstreamConnection = validateExecUpstream(await this.provider.execUpstream(target.sandboxId), this.allowInsecureUpstream) }
     catch { cleanup(1013, 'gateway upstream unavailable'); return }
     if (closed) return
-    if (await this.activeSandbox(leaseId) !== sandboxId) {
+    if (!sameTarget(await this.activeLeaseTarget(leaseId), target)) {
       cleanup(1008, 'lease inactive')
       return
     }
@@ -181,7 +189,7 @@ export class ExecGateway {
     })
     upstream.once('open', () => {
       void (async () => {
-        if (await this.activeSandbox(leaseId) !== sandboxId) {
+        if (!sameTarget(await this.activeLeaseTarget(leaseId), target)) {
           cleanup(1008, 'lease inactive')
           return
         }
@@ -206,8 +214,8 @@ export class ExecGateway {
     upstream.on('error', () => cleanup(1013, 'gateway upstream unavailable'))
   }
 
-  private async activeSandbox(leaseId: string): Promise<string | undefined> {
-    return this.leases.activeSandbox(leaseId)
+  private async activeLeaseTarget(leaseId: string): Promise<ActiveLeaseTarget | undefined> {
+    return this.leases.activeLeaseTarget(leaseId)
   }
 
   private activeConnections(): number {
@@ -215,4 +223,9 @@ export class ExecGateway {
     for (const connections of this.active.values()) count += connections.size
     return count
   }
+}
+
+function sameTarget(left: ActiveLeaseTarget | undefined, right: ActiveLeaseTarget): boolean {
+  return left?.sandboxId === right.sandboxId
+    && left.connectionGeneration === right.connectionGeneration
 }

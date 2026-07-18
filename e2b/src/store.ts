@@ -24,9 +24,10 @@ export class JsonStore {
     finally { resolve() }
   }
   async read<T>(fn: (database: Database) => T): Promise<T> { await this.queue; return fn(this.database) }
-  async activeSandbox(leaseId: string): Promise<string | undefined> {
+  async activeLeaseTarget(leaseId: string): Promise<{ sandboxId: string; connectionGeneration: number } | undefined> {
     return this.read(database => database.leases[leaseId]?.state === 'active'
-      ? database.leases[leaseId]!.sandboxId
+      ? { sandboxId: database.leases[leaseId]!.sandboxId,
+          connectionGeneration: database.leases[leaseId]!.connectionGeneration ?? 0 }
       : undefined)
   }
   private async persist(): Promise<void> {

@@ -30,10 +30,10 @@ test('ticket purpose and lease must match and successful validation consumes onc
   assert.equal(persisted.includes('ticket='), false)
   assert.equal(persisted.includes('wss://'), false)
 
-  assert.equal(await tickets.validate('lease_b', raw), false)
-  assert.equal(await tickets.validate('lease_a', raw, 'exec_gateway_probe'), false)
-  assert.equal(await tickets.validate('lease_a', raw, gatewayConnectTicketPurpose), true)
-  assert.equal(await tickets.validate('lease_a', raw), false)
+  assert.equal(await tickets.validate('lease_b', raw), null)
+  assert.equal(await tickets.validate('lease_a', raw, 'exec_gateway_probe'), null)
+  assert.deepEqual(await tickets.validate('lease_a', raw, gatewayConnectTicketPurpose), { connectionGeneration: 0 })
+  assert.equal(await tickets.validate('lease_a', raw), null)
   const records = await store.read(database => Object.values(database.tickets))
   assert.equal(records.length, 1)
   assert.equal(records[0]!.purpose, gatewayConnectTicketPurpose)
@@ -44,23 +44,23 @@ test('issuing a ticket rotates prior lease tickets and preserves wrong-purpose i
   const { tickets } = await fixture()
   const old = new URL(await tickets.issue('lease_a')).searchParams.get('ticket')!
   const current = new URL(await tickets.issue('lease_a')).searchParams.get('ticket')!
-  assert.equal(await tickets.validate('lease_a', old), false)
-  assert.equal(await tickets.validate('lease_a', current), true)
+  assert.equal(await tickets.validate('lease_a', old), null)
+  assert.deepEqual(await tickets.validate('lease_a', current), { connectionGeneration: 0 })
 
   const probe = new URL(await tickets.issue('lease_a', 'exec_gateway_probe')).searchParams.get('ticket')!
-  assert.equal(await tickets.validate('lease_a', probe), false)
-  assert.equal(await tickets.validate('lease_a', probe, 'exec_gateway_probe'), true)
+  assert.equal(await tickets.validate('lease_a', probe), null)
+  assert.deepEqual(await tickets.validate('lease_a', probe, 'exec_gateway_probe'), { connectionGeneration: 0 })
 })
 
 test('expired and revoked ticket records are reclaimed', async () => {
   const { store, tickets } = await fixture(1)
   const expired = new URL(await tickets.issue('lease_expired')).searchParams.get('ticket')!
   await new Promise(resolve => setTimeout(resolve, 5))
-  assert.equal(await tickets.validate('lease_expired', expired), false)
+  assert.equal(await tickets.validate('lease_expired', expired), null)
   assert.equal(await store.read(database => Object.keys(database.tickets).length), 0)
 
   const revoked = new URL(await tickets.issue('lease_revoked')).searchParams.get('ticket')!
   await tickets.revokeLease('lease_revoked')
-  assert.equal(await tickets.validate('lease_revoked', revoked), false)
+  assert.equal(await tickets.validate('lease_revoked', revoked), null)
   assert.equal(await store.read(database => Object.keys(database.tickets).length), 0)
 })

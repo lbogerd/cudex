@@ -47,9 +47,10 @@ export interface Lease {
   workspaceRootUris: string[]
   baseSnapshotId: string | null
   latestSnapshotId: string | null
-  state: 'provisioning' | 'active' | 'paused' | 'release_pending' | 'released' | 'failed'
+  state: 'provisioning' | 'active' | 'paused' | 'release_pending' | 'released' | 'lost' | 'failed'
   toolPolicy: Record<string, unknown>
   policyVersion: number
+  connectionGeneration: number
   releasedAt: Date | null
 }
 
@@ -108,7 +109,8 @@ interface LeaseRow {
   owner_agent_id: string | null; owner_lease_id: string | null; source_snapshot_id: string | null
   provider_sandbox_id: string | null; sandbox_template: string; cwd_uri: string
   workspace_root_uris: string[]; base_snapshot_id: string | null; latest_snapshot_id: string | null
-  state: LeaseState; tool_policy: Record<string, unknown>; policy_version: string; released_at: Date | null
+  state: LeaseState; tool_policy: Record<string, unknown>; policy_version: string
+  connection_generation: string; released_at: Date | null
 }
 interface SnapshotRow {
   snapshot_id: string; tenant_id: string; lease_id: string; provider_snapshot_id: string | null
@@ -173,7 +175,7 @@ function postgresError(error: unknown): never {
 const leaseColumns = `lease_id, environment_id, tenant_id, agent_id, owner_agent_id,
   owner_lease_id, source_snapshot_id, provider_sandbox_id, sandbox_template, cwd_uri,
   workspace_root_uris, base_snapshot_id, latest_snapshot_id, state, tool_policy,
-  policy_version::text, released_at`
+  policy_version::text, connection_generation::text, released_at`
 const snapshotColumns = `snapshot_id, tenant_id, lease_id, provider_snapshot_id,
   workspace_archive_object_id, manifest_object_id, manifest_checksum, state, expires_at, created_at`
 
@@ -193,7 +195,8 @@ function leaseFromRow(row: LeaseRow): Lease {
     sourceSnapshotId: row.source_snapshot_id, providerSandboxId: row.provider_sandbox_id,
     sandboxTemplate: row.sandbox_template, cwdUri: row.cwd_uri, workspaceRootUris: row.workspace_root_uris,
     baseSnapshotId: row.base_snapshot_id, latestSnapshotId: row.latest_snapshot_id, state: row.state,
-    toolPolicy: row.tool_policy, policyVersion: Number(row.policy_version), releasedAt: row.released_at }
+    toolPolicy: row.tool_policy, policyVersion: Number(row.policy_version),
+    connectionGeneration: Number(row.connection_generation), releasedAt: row.released_at }
 }
 function snapshotFromRow(row: SnapshotRow): Snapshot {
   return { snapshotId: row.snapshot_id, tenantId: row.tenant_id, leaseId: row.lease_id,
@@ -401,13 +404,14 @@ export class PostgresDurableState {
     return result.rows[0] ? leaseFromRow(result.rows[0]) : null
   }
 
-  async activeSandbox(leaseId: string): Promise<string | undefined> {
+  async activeLeaseTarget(leaseId: string): Promise<{ sandboxId: string; connectionGeneration: number } | undefined> {
     validateId('lease ID', leaseId)
-    const result = await this.pool.query<{ provider_sandbox_id: string }>(`
-      SELECT provider_sandbox_id FROM hosted_agent_leases
+    const result = await this.pool.query<{ provider_sandbox_id: string; connection_generation: string }>(`
+      SELECT provider_sandbox_id, connection_generation::text FROM hosted_agent_leases
       WHERE lease_id = $1 AND state = 'active' AND provider_sandbox_id IS NOT NULL
     `, [leaseId])
-    return result.rows[0]?.provider_sandbox_id
+    const row = result.rows[0]
+    return row ? { sandboxId: row.provider_sandbox_id, connectionGeneration: Number(row.connection_generation) } : undefined
   }
 
   /** Internal global safety lookup used only to prevent provider reconciliation from killing a durable lease. */
@@ -491,7 +495,7 @@ export class PostgresDurableState {
         const lease = await this.lockLease(client, tenantId, leaseId)
         await client.query(`UPDATE hosted_agent_tickets SET revoked_at = COALESCE(revoked_at, now()) WHERE lease_id = $1`, [leaseId])
         if (lease.state === 'released' || lease.state === 'release_pending') return lease
-        if (!['active', 'paused', 'failed'].includes(lease.state)) {
+        if (!['active', 'paused', 'lost', 'failed'].includes(lease.state)) {
           throw new DurableStateConflictError('lease cannot be released')
         }
         const result = await client.query<LeaseRow>(`
@@ -501,6 +505,49 @@ export class PostgresDurableState {
         return leaseFromRow(result.rows[0]!)
       }
       return executor ? await begin(executor) : await this.transaction(begin)
+    } catch (error) { return postgresError(error) }
+  }
+
+  async completeReconnect(tenantId: string, leaseId: string, expectedSandboxId: string,
+    executor: PoolClient): Promise<Lease> {
+    validateId('tenant ID', tenantId); validateId('lease ID', leaseId)
+    validateId('provider sandbox ID', expectedSandboxId)
+    try {
+      const lease = await this.lockLease(executor, tenantId, leaseId)
+      if (!['active', 'paused'].includes(lease.state)
+        || lease.providerSandboxId !== expectedSandboxId) {
+        throw new DurableStateConflictError('lease cannot be reconnected')
+      }
+      await executor.query(`UPDATE hosted_agent_tickets
+        SET revoked_at = COALESCE(revoked_at, now()) WHERE lease_id = $1`, [leaseId])
+      const result = await executor.query<LeaseRow>(`
+        UPDATE hosted_agent_leases
+        SET state = 'active', released_at = NULL, connection_generation = connection_generation + 1
+        WHERE lease_id = $1 AND tenant_id = $2 RETURNING ${leaseColumns}
+      `, [leaseId, tenantId])
+      return leaseFromRow(result.rows[0]!)
+    } catch (error) { return postgresError(error) }
+  }
+
+  async markLeaseLost(tenantId: string, leaseId: string, expectedSandboxId: string,
+    executor: PoolClient): Promise<Lease> {
+    validateId('tenant ID', tenantId); validateId('lease ID', leaseId)
+    validateId('provider sandbox ID', expectedSandboxId)
+    try {
+      const lease = await this.lockLease(executor, tenantId, leaseId)
+      if (lease.providerSandboxId !== expectedSandboxId
+        || (!['active', 'paused'].includes(lease.state) && lease.state !== 'lost')) {
+        throw new DurableStateConflictError('lease cannot be marked lost')
+      }
+      await executor.query(`UPDATE hosted_agent_tickets
+        SET revoked_at = COALESCE(revoked_at, now()) WHERE lease_id = $1`, [leaseId])
+      if (lease.state === 'lost') return lease
+      const result = await executor.query<LeaseRow>(`
+        UPDATE hosted_agent_leases
+        SET state = 'lost', released_at = NULL, connection_generation = connection_generation + 1
+        WHERE lease_id = $1 AND tenant_id = $2 RETURNING ${leaseColumns}
+      `, [leaseId, tenantId])
+      return leaseFromRow(result.rows[0]!)
     } catch (error) { return postgresError(error) }
   }
 
@@ -537,14 +584,15 @@ export class PostgresDurableState {
       `, [input.leaseId])
       try {
         await client.query(`
-          INSERT INTO hosted_agent_tickets (ticket_hash, lease_id, purpose, expires_at)
-          VALUES ($1, $2, $3, $4)
-        `, [ticketHash, input.leaseId, input.purpose, input.expiresAt])
+          INSERT INTO hosted_agent_tickets
+            (ticket_hash, lease_id, purpose, expires_at, connection_generation)
+          VALUES ($1, $2, $3, $4, $5)
+        `, [ticketHash, input.leaseId, input.purpose, input.expiresAt, lease.connectionGeneration])
       } catch (error) { postgresError(error) }
     })
   }
 
-  async consumeTicketHash(input: { tenantId: string; leaseId: string; ticketHash: Uint8Array; purpose: TicketPurpose; at?: Date }): Promise<boolean> {
+  async consumeTicketHash(input: { tenantId: string; leaseId: string; ticketHash: Uint8Array; purpose: TicketPurpose; at?: Date }): Promise<number | null> {
     validateId('tenant ID', input.tenantId); validateId('lease ID', input.leaseId); validateTicketPurpose(input.purpose)
     if (input.at) validateDate('ticket consumption time', input.at)
     const ticketHash = validateHash(input.ticketHash)
@@ -554,10 +602,13 @@ export class PostgresDurableState {
       FROM hosted_agent_leases AS lease
       WHERE ticket.ticket_hash = $1 AND ticket.lease_id = $2 AND ticket.purpose = $3
         AND ticket.lease_id = lease.lease_id AND lease.tenant_id = $4 AND lease.state = 'active'
+        AND ticket.connection_generation = lease.connection_generation
         AND ticket.consumed_at IS NULL AND ticket.revoked_at IS NULL
         AND ticket.expires_at > $5
+      RETURNING ticket.connection_generation::text
     `, [ticketHash, input.leaseId, input.purpose, input.tenantId, input.at ?? new Date()])
-    return result.rowCount === 1
+    const generation = (result.rows[0] as { connection_generation?: string } | undefined)?.connection_generation
+    return generation === undefined ? null : Number(generation)
   }
 
   async revokeLeaseTickets(tenantId: string, leaseId: string): Promise<number> {

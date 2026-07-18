@@ -46,6 +46,7 @@ export interface LeaseRecord {
   leaseId: string; environmentId: string; sandboxId: string; agentId: string
   ownerAgentId: string | null; template: string; cwd: string; workspaceRoots: string[]
   baseSnapshotId: string; latestSnapshotId: string; state: 'provisioning' | 'active' | 'lost' | 'released'
+  connectionGeneration?: number
   toolPolicy: ToolPolicy
 }
 export interface SnapshotRecord {
@@ -59,6 +60,7 @@ export interface OperationRecord {
 export type TicketPurpose = 'exec_gateway_connect' | 'exec_gateway_probe'
 export interface TicketRecord {
   ticketHash: string; leaseId: string; purpose: TicketPurpose; issuedAt: number; expiresAt: number
+  connectionGeneration: number
   consumedAt?: number; revokedAt?: number
 }
 export interface Database {

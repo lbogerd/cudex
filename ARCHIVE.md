@@ -815,6 +815,30 @@ stale-operation reconciliation; reconstruction immediately after a target-bound
 claim with no allocation yet; and lost final acknowledgement plus failed outcome-
 read replay without a second kill.
 
+### Durable connection generations
+
+Reconnect cannot invalidate established gateway sockets across replicas by
+rotating ticket hashes alone: an accepted socket no longer presents its ticket,
+and a reconnect normally retains the same provider sandbox ID. Leases and
+ticket hashes now therefore carry a bounded monotonic `connection_generation`.
+Ticket consumption returns the generation authenticated by its atomic database
+update, while the active-lease directory returns the current sandbox ID and
+generation. The gateway compares both before upgrading and at every bounded
+revalidation point, closing a connection when either changes.
+
+Successful reconnect and confirmed sandbox loss atomically increment the lease
+generation and revoke prior ticket hashes under the lease lock. This also closes
+the validate-before-rotation race: a ticket consumed at generation N cannot be
+attached after the directory advances to N+1, even when both rows still name the
+same sandbox. The JSON development backend mirrors the generation behavior.
+
+Two focused gateway tests prove pre-upgrade race rejection and closure of an
+established socket after a separate durable writer changes only the generation.
+A two-pool PostgreSQL 17 test proves reconnect/loss increments, old-ticket
+denial, fresh-ticket generation binding, and replica-visible active targets.
+The complete Docker-backed suite passed 183 of 183 tests with zero skips on
+x86_64 Linux.
+
 ### Bounded PostgreSQL reconciliation foundation
 
 An intentionally unwired `PostgresReconciler` now claims stale operations only

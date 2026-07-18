@@ -62,7 +62,7 @@ test('durable recovery uses a clean template, overlays only the latest workspace
   await assert.rejects(context.service.reconnect({ leaseId: agent.leaseId, idempotencyKey: 'clean-restore-missing' }),
     (error: unknown) => error instanceof ServiceError && error.status === 404)
   assert.equal((await context.store.read(database => database.leases[agent.leaseId]!.state)), 'lost')
-  assert.equal(await context.tickets.validate(agent.leaseId, oldTicket), false)
+  assert.equal(await context.tickets.validate(agent.leaseId, oldTicket), null)
 
   const request = { ...context.request, source: { type: 'durableSnapshot' as const, snapshotId: checkpoint.snapshotId }, idempotencyKey: 'clean-restore' }
   const restored = await context.service.provision(request)
@@ -133,9 +133,9 @@ for (const point of ['upload', 'start', 'probe', 'snapshot']) test(`failure at $
 
 test('release is idempotent and revokes active tickets', async () => {
   const context = await fixture(); const agent = await context.service.provision(context.request); const url = new URL(agent.connection.execServerUrl); const ticket = url.searchParams.get('ticket')!
-  assert.equal(await context.tickets.validate(agent.leaseId, ticket), true)
+  assert.deepEqual(await context.tickets.validate(agent.leaseId, ticket), { connectionGeneration: 0 })
   await context.service.release({ leaseId: agent.leaseId, idempotencyKey: 'release-1' }); await context.service.release({ leaseId: agent.leaseId, idempotencyKey: 'release-1' })
-  assert.equal(await context.tickets.validate(agent.leaseId, ticket), false); assert.deepEqual(context.provider.live(), [])
+  assert.equal(await context.tickets.validate(agent.leaseId, ticket), null); assert.deepEqual(context.provider.live(), [])
 })
 
 test('production mode rejects local ingress before provider allocation', async () => {
@@ -278,11 +278,11 @@ test('reconnect rotates tickets and closes stale gateway connections, including 
   const originalTicket = new URL(agent.connection.execServerUrl).searchParams.get('ticket')!
   const first = await service.reconnect({ leaseId: agent.leaseId, idempotencyKey: 'reconnect-close' })
   const firstTicket = new URL(first.connection.execServerUrl).searchParams.get('ticket')!
-  assert.equal(await context.tickets.validate(agent.leaseId, originalTicket), false)
+  assert.equal(await context.tickets.validate(agent.leaseId, originalTicket), null)
   const replay = await service.reconnect({ leaseId: agent.leaseId, idempotencyKey: 'reconnect-close' })
   const replayTicket = new URL(replay.connection.execServerUrl).searchParams.get('ticket')!
-  assert.equal(await context.tickets.validate(agent.leaseId, firstTicket), false)
-  assert.equal(await context.tickets.validate(agent.leaseId, replayTicket), true)
+  assert.equal(await context.tickets.validate(agent.leaseId, firstTicket), null)
+  assert.deepEqual(await context.tickets.validate(agent.leaseId, replayTicket), { connectionGeneration: 1 })
   assert.deepEqual(revoked, [agent.leaseId, agent.leaseId])
 })
 
@@ -296,7 +296,7 @@ test('transient reconnect failure is a retryable provider error and preserves ex
   context.provider.failAt = 'connect'
   await assert.rejects(service.reconnect({ leaseId: agent.leaseId, idempotencyKey: 'reconnect-outage' }),
     (error: unknown) => error instanceof ServiceError && error.status === 503 && error.message === 'provider temporarily unavailable')
-  assert.equal(await context.tickets.validate(agent.leaseId, ticket), true)
+  assert.deepEqual(await context.tickets.validate(agent.leaseId, ticket), { connectionGeneration: 0 })
   assert.deepEqual(revoked, [])
 })
 
@@ -311,6 +311,6 @@ test('missing sandbox reconnect returns lease-missing and revokes stale access',
   await context.provider.kill(lease.sandboxId)
   await assert.rejects(service.reconnect({ leaseId: agent.leaseId, idempotencyKey: 'reconnect-missing' }),
     (error: unknown) => error instanceof ServiceError && error.status === 404 && error.message === 'lease missing')
-  assert.equal(await context.tickets.validate(agent.leaseId, ticket), false)
+  assert.equal(await context.tickets.validate(agent.leaseId, ticket), null)
   assert.deepEqual(revoked, [agent.leaseId])
 })

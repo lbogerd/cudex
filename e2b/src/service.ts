@@ -132,7 +132,8 @@ export class ControlPlane {
         await this.provider.probeExecServer(sandboxId)
         const workspaceArchiveId = await this.blobs.put(await this.provider.exportWorkspace(sandboxId)); const providerSnapshotId = await this.provider.snapshot(sandboxId); const snapshotId = opaque('snapshot')
         const lease: LeaseRecord = { leaseId, environmentId, sandboxId, agentId: request.agentId, ownerAgentId: request.ownerAgentId,
-          template: request.sandboxTemplate, cwd, workspaceRoots: roots, baseSnapshotId: snapshotId, latestSnapshotId: snapshotId, state: 'active', toolPolicy: defaultPolicy }
+          template: request.sandboxTemplate, cwd, workspaceRoots: roots, baseSnapshotId: snapshotId, latestSnapshotId: snapshotId,
+          state: 'active', connectionGeneration: 0, toolPolicy: defaultPolicy }
         await this.store.transaction(database => {
           if (durableSource) database.leases[durableSource.lease.leaseId]!.state = 'released'
           database.leases[leaseId] = lease
@@ -153,7 +154,10 @@ export class ControlPlane {
         if (error instanceof ProviderSandboxMissingError) {
           await this.store.transaction(database => {
             const current = database.leases[lease.leaseId]
-            if (current?.state === 'active' && current.sandboxId === lease.sandboxId) current.state = 'lost'
+            if (current?.state === 'active' && current.sandboxId === lease.sandboxId) {
+              current.state = 'lost'
+              current.connectionGeneration = (current.connectionGeneration ?? 0) + 1
+            }
           })
           await this.revokeLeaseAccess(request.leaseId)
         }
@@ -165,7 +169,14 @@ export class ControlPlane {
         await this.provider.probeExecServer(lease.sandboxId)
       }
       catch (error) { throw this.reconnectError(error) }
-      return this.response(lease)
+      await this.store.transaction(database => {
+        const current = database.leases[lease.leaseId]
+        if (current?.state !== 'active' || current.sandboxId !== lease.sandboxId) {
+          throw new ServiceError(409, 'lease cannot be reconnected')
+        }
+        current.connectionGeneration = (current.connectionGeneration ?? 0) + 1
+      })
+      return this.response(await this.activeLease(lease.leaseId))
     })
   }
 

@@ -122,8 +122,10 @@ failed upload/extraction allocations without Git or shared host paths.
   issue, rotation, single-use consumption, and revocation state.
 - [x] Decouple gateway lease authorization from the JSON store and provide a
   PostgreSQL active-sandbox directory for replica-consistent revalidation.
-- [x] Add multi-replica ticket lookup and active-connection revocation
-  propagation.
+- [x] Add a durable per-lease connection generation to PostgreSQL and JSON
+  leases/tickets; reject pre-rotation tickets after validation races and close
+  established connections across replicas when the generation changes even if
+  the provider sandbox ID does not.
 - [x] Close every active connection on release.
 - [x] On reconnect, rotate every lease ticket, close active gateway connections
   on both first execution and idempotent replay, revoke access on confirmed

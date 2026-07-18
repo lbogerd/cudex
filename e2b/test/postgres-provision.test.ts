@@ -175,7 +175,7 @@ class FailOnceTickets implements TicketAuthority {
     if (!this.failed) { this.failed = true; throw new Error('injected ticket outage') }
     return this.delegate.issue(leaseId, purpose)
   }
-  async validate(leaseId: string, ticket: string, purpose?: TicketPurpose): Promise<boolean> {
+  async validate(leaseId: string, ticket: string, purpose?: TicketPurpose) {
     return this.delegate.validate(leaseId, ticket, purpose)
   }
   async revokeLease(leaseId: string): Promise<void> { return this.delegate.revokeLease(leaseId) }

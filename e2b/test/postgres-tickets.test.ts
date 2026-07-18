@@ -3,7 +3,7 @@ import test from 'node:test'
 import { PostgresTicketIssuer } from '../src/postgres-tickets.js'
 import type { TicketPurpose } from '../src/types.js'
 
-interface HashRecord { hash: string; leaseId: string; purpose: TicketPurpose; expiresAt: Date; consumed: boolean; revoked: boolean }
+interface HashRecord { hash: string; leaseId: string; purpose: TicketPurpose; expiresAt: Date; consumed: boolean; revoked: boolean; generation: number }
 
 class SharedTicketHashes {
   readonly records = new Map<string, HashRecord>()
@@ -12,16 +12,16 @@ class SharedTicketHashes {
     for (const record of this.records.values()) if (record.leaseId === input.leaseId && !record.revoked) record.revoked = true
     this.records.set(Buffer.from(input.ticketHash).toString('hex'), {
       hash: Buffer.from(input.ticketHash).toString('hex'), leaseId: input.leaseId, purpose: input.purpose,
-      expiresAt: input.expiresAt, consumed: false, revoked: false,
+      expiresAt: input.expiresAt, consumed: false, revoked: false, generation: 3,
     })
   }
 
-  async consumeTicketHash(input: { tenantId: string; leaseId: string; ticketHash: Uint8Array; purpose: TicketPurpose; at?: Date }): Promise<boolean> {
+  async consumeTicketHash(input: { tenantId: string; leaseId: string; ticketHash: Uint8Array; purpose: TicketPurpose; at?: Date }): Promise<number | null> {
     const record = this.records.get(Buffer.from(input.ticketHash).toString('hex'))
     if (!record || record.leaseId !== input.leaseId || record.purpose !== input.purpose || record.consumed
-      || record.revoked || record.expiresAt <= (input.at ?? new Date())) return false
+      || record.revoked || record.expiresAt <= (input.at ?? new Date())) return null
     record.consumed = true
-    return true
+    return record.generation
   }
 
   async revokeLeaseTickets(_tenantId: string, leaseId: string): Promise<number> {
@@ -49,13 +49,13 @@ test('separate issuer replicas share rotation, purpose, consumption, and revocat
   const second = new PostgresTicketIssuer(hashes, 'tenant-1', 'wss://gateway.example')
   const old = new URL(await first.issue('lease-1')).searchParams.get('ticket')!
   const current = new URL(await second.issue('lease-1', 'exec_gateway_probe')).searchParams.get('ticket')!
-  assert.equal(await second.validate('lease-1', old), false)
-  assert.equal(await first.validate('lease-1', current), false)
-  assert.equal(await first.validate('lease-1', current, 'exec_gateway_probe'), true)
-  assert.equal(await second.validate('lease-1', current, 'exec_gateway_probe'), false)
+  assert.equal(await second.validate('lease-1', old), null)
+  assert.equal(await first.validate('lease-1', current), null)
+  assert.deepEqual(await first.validate('lease-1', current, 'exec_gateway_probe'), { connectionGeneration: 3 })
+  assert.equal(await second.validate('lease-1', current, 'exec_gateway_probe'), null)
   const revoked = new URL(await first.issue('lease-1')).searchParams.get('ticket')!
   await second.revokeLease('lease-1')
-  assert.equal(await first.validate('lease-1', revoked), false)
+  assert.equal(await first.validate('lease-1', revoked), null)
 })
 
 test('constructor and request boundaries reject invalid configuration and bearer shapes', async () => {
@@ -65,6 +65,6 @@ test('constructor and request boundaries reject invalid configuration and bearer
   assert.throws(() => new PostgresTicketIssuer(hashes, 'tenant-1', 'wss://user@gateway.example'))
   assert.throws(() => new PostgresTicketIssuer(hashes, 'tenant-1', 'wss://gateway.example', 300_001))
   const issuer = new PostgresTicketIssuer(hashes, 'tenant-1', 'wss://gateway.example')
-  assert.equal(await issuer.validate('lease-1', 'raw-ticket'), false)
+  assert.equal(await issuer.validate('lease-1', 'raw-ticket'), null)
   await assert.rejects(issuer.issue(' '.repeat(2)))
 })

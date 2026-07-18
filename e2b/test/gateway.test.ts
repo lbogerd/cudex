@@ -7,7 +7,7 @@ import test from 'node:test'
 import WebSocket, { WebSocketServer } from 'ws'
 import { ExecGateway, type GatewayLimits } from '../src/gateway.js'
 import { JsonStore } from '../src/store.js'
-import { TicketIssuer } from '../src/tickets.js'
+import { TicketIssuer, type TicketAuthority } from '../src/tickets.js'
 import { FakeProvider } from './fake-provider.js'
 
 const listening = (server: ReturnType<typeof createServer> | WebSocketServer) => new Promise<void>(resolve => server.once('listening', resolve))
@@ -30,7 +30,8 @@ async function fixture(rawExecUrl: string, limits: Partial<GatewayLimits> = {}) 
   provider.rawExecUpstream = { url: rawExecUrl, accessToken: 'fake-traffic-access-token' }
   await store.transaction(database => { database.leases.lease_test = { leaseId: 'lease_test', environmentId: 'env_test', sandboxId: created.sandboxId,
     agentId: 'agent', ownerAgentId: null, template: 'general-v1', cwd: 'file:///workspace', workspaceRoots: ['file:///workspace'],
-    baseSnapshotId: 'snapshot', latestSnapshotId: 'snapshot', state: 'active', toolPolicy: { allowedDomains: [], allowedTools: [] } } })
+    baseSnapshotId: 'snapshot', latestSnapshotId: 'snapshot', state: 'active', connectionGeneration: 0,
+    toolPolicy: { allowedDomains: [], allowedTools: [] } } })
   const tickets = new TicketIssuer(store, 'wss://gateway.example'); const gateway = new ExecGateway(tickets, store, provider, limits, true)
   const server = createServer(); gateway.attach(server); server.listen(0, '127.0.0.1'); await listening(server)
   const port = (server.address() as import('node:net').AddressInfo).port
@@ -144,6 +145,48 @@ test('gateway closes an established connection after another replica durably rel
   const close = closed(client)
   await context.store.transaction(database => { database.leases.lease_test!.state = 'released' })
   assert.equal(await close, 1008)
+})
+
+test('gateway rejects a consumed ticket when the lease generation changes before target lookup', async t => {
+  const upstream = await echoServer(); t.after(() => { upstream.websocket.close(); upstream.server.close() })
+  const context = await fixture(upstream.url); t.after(() => context.server.close())
+  let releaseValidation!: () => void
+  let validationFinished!: () => void
+  const gate = new Promise<void>(resolve => { releaseValidation = resolve })
+  const finished = new Promise<void>(resolve => { validationFinished = resolve })
+  const gated: TicketAuthority = {
+    issue: (...arguments_) => context.tickets.issue(...arguments_),
+    revokeLease: leaseId => context.tickets.revokeLease(leaseId),
+    validate: async (...arguments_) => {
+      const result = await context.tickets.validate(...arguments_)
+      validationFinished()
+      await gate
+      return result
+    },
+  }
+  const server = createServer()
+  new ExecGateway(gated, context.store, context.provider, {}, true).attach(server)
+  server.listen(0, '127.0.0.1'); await listening(server); t.after(() => server.close())
+  const issued = new URL(await gated.issue('lease_test'))
+  const port = (server.address() as import('node:net').AddressInfo).port
+  const rejection = rejectedStatus(`ws://127.0.0.1:${port}${issued.pathname}${issued.search}`)
+  await finished
+  await context.store.transaction(database => { database.leases.lease_test!.connectionGeneration = 1 })
+  releaseValidation()
+  assert.equal(await rejection, 401)
+})
+
+test('gateway closes an established connection after another replica bumps its generation', async t => {
+  const upstream = await echoServer(); t.after(() => { upstream.websocket.close(); upstream.server.close() })
+  const context = await fixture(upstream.url, { leaseRevalidationMs: 5 }); t.after(() => context.server.close())
+  const client = new WebSocket(context.url); await opened(client)
+  const echoed = new Promise<string>(resolve => client.once('message', data => resolve(data.toString())))
+  client.send('ready'); assert.equal(await echoed, 'ready')
+  const close = closed(client)
+  await context.store.transaction(database => { database.leases.lease_test!.connectionGeneration = 1 })
+  assert.equal(await close, 1008)
+  assert.equal((await context.store.activeLeaseTarget('lease_test'))?.sandboxId,
+    (await context.provider.live())[0])
 })
 
 test('gateway fails closed on missing, malformed, or rejected upstream authentication without leaking it', async t => {

@@ -33,7 +33,7 @@ test('known cleanup is fenced, active durable sandboxes are adopted, and failure
     providerSandboxId: protectedSandbox.sandboxId, sandboxTemplate: 'template',
     cwdUri: 'file:///workspace/root', workspaceRootUris: ['file:///workspace/root'],
     baseSnapshotId: 'snapshot-base', latestSnapshotId: 'snapshot-base', state: 'active',
-    toolPolicy: {}, policyVersion: 1, releasedAt: null,
+    toolPolicy: {}, policyVersion: 1, connectionGeneration: 0, releasedAt: null,
   } satisfies Lease
   const journal = {
     claimStaleOperations: async () => [operation],

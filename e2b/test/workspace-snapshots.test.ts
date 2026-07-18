@@ -104,6 +104,7 @@ function lease(input: CreateLeaseInput): Lease {
     ownerLeaseId: input.ownerLeaseId ?? null,
     sourceSnapshotId: input.sourceSnapshotId ?? null,
     providerSandboxId: input.providerSandboxId,
+    connectionGeneration: 0,
     sandboxTemplate: input.sandboxTemplate,
     cwdUri: input.cwdUri,
     workspaceRootUris: [...input.workspaceRootUris],

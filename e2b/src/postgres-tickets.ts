@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto'
 import type { TicketAuthority } from './tickets.js'
+import type { ValidatedTicket } from './tickets.js'
 import { gatewayConnectTicketPurpose, maxTicketTtlMs } from './tickets.js'
 import type { TicketPurpose } from './types.js'
 
@@ -19,7 +20,7 @@ interface DurableTicketHashes {
     ticketHash: Uint8Array
     purpose: TicketPurpose
     at?: Date
-  }): Promise<boolean>
+  }): Promise<number | null>
   revokeLeaseTickets(tenantId: string, leaseId: string): Promise<number>
 }
 
@@ -67,14 +68,16 @@ export class PostgresTicketIssuer implements TicketAuthority {
     return `${this.publicBaseUrl}/leases/${encodeURIComponent(leaseId)}?ticket=${ticket}`
   }
 
-  async validate(leaseId: string, ticket: string, purpose: TicketPurpose = gatewayConnectTicketPurpose): Promise<boolean> {
-    if (!validId(leaseId) || !/^[A-Za-z0-9_-]{43}$/.test(ticket) || !purposes.has(purpose)) return false
-    return this.state.consumeTicketHash({
+  async validate(leaseId: string, ticket: string,
+    purpose: TicketPurpose = gatewayConnectTicketPurpose): Promise<ValidatedTicket | null> {
+    if (!validId(leaseId) || !/^[A-Za-z0-9_-]{43}$/.test(ticket) || !purposes.has(purpose)) return null
+    const connectionGeneration = await this.state.consumeTicketHash({
       tenantId: this.tenantId,
       leaseId,
       ticketHash: hash(ticket),
       purpose,
     })
+    return connectionGeneration === null ? null : { connectionGeneration }
   }
 
   async revokeLease(leaseId: string): Promise<void> {

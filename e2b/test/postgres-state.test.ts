@@ -219,7 +219,8 @@ live('one max-one-connection transaction composes allocation, lease, adoption, a
 
 live('checkpoint references and durable data survive release', async context => {
   const ids = await objects(context); const created = await context.first.createLeaseWithBaseSnapshot(leaseInput(ids))
-  assert.equal(await context.second.activeSandbox(created.lease.leaseId), 'sandbox-1')
+  assert.deepEqual(await context.second.activeLeaseTarget(created.lease.leaseId),
+    { sandboxId: 'sandbox-1', connectionGeneration: 0 })
   const checkpointObjects = await objects(context, 'tenant-1', '-checkpoint')
   const checkpointContent = object('tenant-1', 'content-checkpoint', 'content_blob', 'e')
   await context.first.registerObject(checkpointContent)
@@ -234,7 +235,7 @@ live('checkpoint references and durable data survive release', async context => 
   await context.second.beginRelease('tenant-1', created.lease.leaseId)
   const released = await context.second.releaseLease('tenant-1', created.lease.leaseId)
   assert.equal(released.state, 'released')
-  assert.equal(await context.first.activeSandbox(created.lease.leaseId), undefined)
+  assert.equal(await context.first.activeLeaseTarget(created.lease.leaseId), undefined)
   assert.equal((await context.first.getLease('tenant-1', created.lease.leaseId))?.latestSnapshotId, checkpoint.snapshotId)
   assert.equal((await context.first.getSnapshot('tenant-1', checkpoint.snapshotId))?.state, 'available')
   const retained = await context.firstPool.query<{ count: string }>(`
@@ -272,27 +273,64 @@ live('ticket hashes rotate, consume once, expire, revoke, and clean up across po
   const secondIssuer = new PostgresTicketIssuer(context.second, 'tenant-1', 'wss://gateway.example')
   const issued = new URL(await firstIssuer.issue(created.lease.leaseId))
   const rawTicket = issued.searchParams.get('ticket')!
-  assert.equal(await secondIssuer.validate(created.lease.leaseId, rawTicket), true)
-  assert.equal(await firstIssuer.validate(created.lease.leaseId, rawTicket), false)
+  assert.deepEqual(await secondIssuer.validate(created.lease.leaseId, rawTicket), { connectionGeneration: 0 })
+  assert.equal(await firstIssuer.validate(created.lease.leaseId, rawTicket), null)
   const persistedTicket = await context.firstPool.query<{ ticket_hash: Buffer }>('SELECT ticket_hash FROM hosted_agent_tickets')
   assert.equal(persistedTicket.rows.some(row => row.ticket_hash.includes(Buffer.from(rawTicket))), false)
   const firstHash = randomBytes(32); const secondHash = randomBytes(32); const expiredHash = randomBytes(32)
   await context.first.issueTicketHash({ tenantId: 'tenant-1', leaseId: created.lease.leaseId,
     ticketHash: firstHash, purpose: 'exec_gateway_connect', expiresAt: new Date(Date.now() + 60_000) })
-  assert.equal(await context.second.consumeTicketHash({ tenantId: 'tenant-2', leaseId: created.lease.leaseId, ticketHash: firstHash, purpose: 'exec_gateway_connect' }), false)
-  assert.equal(await context.second.consumeTicketHash({ tenantId: 'tenant-1', leaseId: created.lease.leaseId, ticketHash: firstHash, purpose: 'exec_gateway_connect' }), true)
-  assert.equal(await context.first.consumeTicketHash({ tenantId: 'tenant-1', leaseId: created.lease.leaseId, ticketHash: firstHash, purpose: 'exec_gateway_connect' }), false)
+  assert.equal(await context.second.consumeTicketHash({ tenantId: 'tenant-2', leaseId: created.lease.leaseId, ticketHash: firstHash, purpose: 'exec_gateway_connect' }), null)
+  assert.equal(await context.second.consumeTicketHash({ tenantId: 'tenant-1', leaseId: created.lease.leaseId, ticketHash: firstHash, purpose: 'exec_gateway_connect' }), 0)
+  assert.equal(await context.first.consumeTicketHash({ tenantId: 'tenant-1', leaseId: created.lease.leaseId, ticketHash: firstHash, purpose: 'exec_gateway_connect' }), null)
   await context.second.issueTicketHash({ tenantId: 'tenant-1', leaseId: created.lease.leaseId,
     ticketHash: secondHash, purpose: 'exec_gateway_probe', expiresAt: new Date(Date.now() + 60_000) })
-  assert.equal(await context.first.consumeTicketHash({ tenantId: 'tenant-1', leaseId: created.lease.leaseId, ticketHash: firstHash, purpose: 'exec_gateway_connect' }), false)
-  assert.equal(await context.first.consumeTicketHash({ tenantId: 'tenant-1', leaseId: created.lease.leaseId, ticketHash: secondHash, purpose: 'exec_gateway_connect' }), false)
-  assert.equal(await context.first.consumeTicketHash({ tenantId: 'tenant-1', leaseId: created.lease.leaseId, ticketHash: secondHash, purpose: 'exec_gateway_probe' }), true)
+  assert.equal(await context.first.consumeTicketHash({ tenantId: 'tenant-1', leaseId: created.lease.leaseId, ticketHash: firstHash, purpose: 'exec_gateway_connect' }), null)
+  assert.equal(await context.first.consumeTicketHash({ tenantId: 'tenant-1', leaseId: created.lease.leaseId, ticketHash: secondHash, purpose: 'exec_gateway_connect' }), null)
+  assert.equal(await context.first.consumeTicketHash({ tenantId: 'tenant-1', leaseId: created.lease.leaseId, ticketHash: secondHash, purpose: 'exec_gateway_probe' }), 0)
   await context.first.issueTicketHash({ tenantId: 'tenant-1', leaseId: created.lease.leaseId,
     ticketHash: expiredHash, purpose: 'exec_gateway_connect', expiresAt: new Date(Date.now() + 60_000) })
   assert.equal(await context.second.consumeTicketHash({ tenantId: 'tenant-1', leaseId: created.lease.leaseId, ticketHash: expiredHash,
-    purpose: 'exec_gateway_connect', at: new Date(Date.now() + 120_000) }), false)
+    purpose: 'exec_gateway_connect', at: new Date(Date.now() + 120_000) }), null)
   await context.second.revokeLeaseTickets('tenant-1', created.lease.leaseId)
   assert.ok(await context.first.cleanupTickets(new Date(Date.now() + 180_000)) >= 3)
   const remaining = await context.firstPool.query<{ count: string }>('SELECT count(*)::text AS count FROM hosted_agent_tickets')
   assert.equal(remaining.rows[0]!.count, '0')
+})
+
+live('reconnect and loss transitions rotate durable connection generations across replicas', async context => {
+  const ids = await objects(context)
+  const created = await context.first.createLeaseWithBaseSnapshot(leaseInput(ids))
+  const firstIssuer = new PostgresTicketIssuer(context.first, 'tenant-1', 'wss://gateway.example')
+  const secondIssuer = new PostgresTicketIssuer(context.second, 'tenant-1', 'wss://gateway.example')
+  const stale = new URL(await firstIssuer.issue(created.lease.leaseId)).searchParams.get('ticket')!
+  const client = await context.secondPool.connect()
+  try {
+    await client.query('BEGIN')
+    const reconnected = await context.second.completeReconnect(
+      'tenant-1', created.lease.leaseId, 'sandbox-1', client)
+    assert.equal(reconnected.connectionGeneration, 1)
+    await client.query('COMMIT')
+  } catch (error) {
+    await client.query('ROLLBACK')
+    throw error
+  } finally { client.release() }
+  assert.deepEqual(await context.first.activeLeaseTarget(created.lease.leaseId),
+    { sandboxId: 'sandbox-1', connectionGeneration: 1 })
+  assert.equal(await secondIssuer.validate(created.lease.leaseId, stale), null)
+  const current = new URL(await secondIssuer.issue(created.lease.leaseId)).searchParams.get('ticket')!
+  assert.deepEqual(await firstIssuer.validate(created.lease.leaseId, current), { connectionGeneration: 1 })
+
+  const lossClient = await context.firstPool.connect()
+  try {
+    await lossClient.query('BEGIN')
+    const lost = await context.first.markLeaseLost(
+      'tenant-1', created.lease.leaseId, 'sandbox-1', lossClient)
+    assert.equal(lost.connectionGeneration, 2)
+    await lossClient.query('COMMIT')
+  } catch (error) {
+    await lossClient.query('ROLLBACK')
+    throw error
+  } finally { lossClient.release() }
+  assert.equal(await context.second.activeLeaseTarget(created.lease.leaseId), undefined)
 })
