@@ -57,6 +57,8 @@ failed upload/extraction allocations without Git or shared host paths.
   and trusted template.
 - [x] Add ticket purpose, single-use consumption, bounded TTL, rotation, and
   expired/revoked lookup cleanup without persisting bearer material.
+- [x] Add a tenant-bound PostgreSQL ticket authority so replicas share hashed
+  issue, rotation, single-use consumption, and revocation state.
 - [ ] Add multi-replica ticket lookup and active-connection revocation
   propagation.
 - [x] Close every active connection on release.

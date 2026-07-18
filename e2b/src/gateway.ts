@@ -5,7 +5,7 @@ import type { Duplex } from 'node:stream'
 import WebSocket, { WebSocketServer } from 'ws'
 import type { ProviderAdapter } from './provider.js'
 import type { JsonStore } from './store.js'
-import type { TicketIssuer } from './tickets.js'
+import type { TicketAuthority } from './tickets.js'
 
 export interface GatewayLimits {
   maxPayloadBytes: number
@@ -41,7 +41,7 @@ export class ExecGateway {
   private readonly limits: GatewayLimits
 
   constructor(
-    private readonly tickets: TicketIssuer,
+    private readonly tickets: TicketAuthority,
     private readonly store: JsonStore,
     private readonly provider: ProviderAdapter,
     limits: Partial<GatewayLimits> = {},

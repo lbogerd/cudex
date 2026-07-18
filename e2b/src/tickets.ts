@@ -7,6 +7,12 @@ export const gatewayConnectTicketPurpose: TicketPurpose = 'exec_gateway_connect'
 export const maxTicketTtlMs = 5 * 60_000
 const purposes = new Set<TicketPurpose>(['exec_gateway_connect', 'exec_gateway_probe'])
 
+export interface TicketAuthority {
+  issue(leaseId: string, purpose?: TicketPurpose): Promise<string>
+  validate(leaseId: string, ticket: string, purpose?: TicketPurpose): Promise<boolean>
+  revokeLease(leaseId: string): Promise<void>
+}
+
 function cleanup(database: Database, now: number): void {
   for (const [ticketHash, record] of Object.entries(database.tickets)) {
     if (record.expiresAt <= now || record.revokedAt !== undefined) delete database.tickets[ticketHash]

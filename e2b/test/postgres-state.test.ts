@@ -4,6 +4,7 @@ import test from 'node:test'
 import { Pool } from 'pg'
 import { runMigrations } from '../src/migrate.js'
 import { DurableStateConflictError, PostgresDurableState, type CreateLeaseInput, type StoredObject } from '../src/postgres-state.js'
+import { PostgresTicketIssuer } from '../src/postgres-tickets.js'
 
 const databaseUrl = process.env.HOSTED_AGENT_TEST_DATABASE_URL
 interface Fixture { admin: Pool; firstPool: Pool; secondPool: Pool; first: PostgresDurableState; second: PostgresDurableState; schema: string }
@@ -113,6 +114,14 @@ live('checkpoint references and durable data survive release', async context => 
 
 live('ticket hashes rotate, consume once, expire, revoke, and clean up across pools', async context => {
   const ids = await objects(context); const created = await context.first.createLeaseWithBaseSnapshot(leaseInput(ids))
+  const firstIssuer = new PostgresTicketIssuer(context.first, 'tenant-1', 'wss://gateway.example')
+  const secondIssuer = new PostgresTicketIssuer(context.second, 'tenant-1', 'wss://gateway.example')
+  const issued = new URL(await firstIssuer.issue(created.lease.leaseId))
+  const rawTicket = issued.searchParams.get('ticket')!
+  assert.equal(await secondIssuer.validate(created.lease.leaseId, rawTicket), true)
+  assert.equal(await firstIssuer.validate(created.lease.leaseId, rawTicket), false)
+  const persistedTicket = await context.firstPool.query<{ ticket_hash: Buffer }>('SELECT ticket_hash FROM hosted_agent_tickets')
+  assert.equal(persistedTicket.rows.some(row => row.ticket_hash.includes(Buffer.from(rawTicket))), false)
   const firstHash = randomBytes(32); const secondHash = randomBytes(32); const expiredHash = randomBytes(32)
   await context.first.issueTicketHash({ tenantId: 'tenant-1', leaseId: created.lease.leaseId,
     ticketHash: firstHash, purpose: 'exec_gateway_connect', expiresAt: new Date(Date.now() + 60_000) })

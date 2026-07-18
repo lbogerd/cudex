@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import type { ProviderAdapter } from './provider.js'
 import type { JsonStore } from './store.js'
-import type { TicketIssuer } from './tickets.js'
+import type { TicketAuthority } from './tickets.js'
 import { archiveWorkspace, type IngressLimits } from './ingress.js'
 import type { CheckpointRequest, LeaseRecord, OperationRecord, ProvisionRequest, ProvisionedAgent, ReconnectRequest, ReleaseRequest, ToolPolicy } from './types.js'
 import { ServiceError } from './types.js'
@@ -30,7 +30,7 @@ export class ControlPlane {
   constructor(
     private readonly store: JsonStore,
     private readonly provider: ProviderAdapter,
-    private readonly tickets: TicketIssuer,
+    private readonly tickets: TicketAuthority,
     private readonly blobs: ObjectStore,
     private readonly options: ServiceOptions,
     private readonly connections?: ConnectionRevoker,

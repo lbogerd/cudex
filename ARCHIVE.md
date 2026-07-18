@@ -268,8 +268,15 @@ and revoke prune expired/revoked lookup records. Validation accepts only the
 expected 256-bit base64url shape before hashing. Persistence tests prove that
 only SHA-256 lookup material—not the raw bearer, WSS URL, or query—is written.
 A follow-up migration aligns the PostgreSQL ticket-purpose constraint with the
-gateway/probe purposes. Cross-replica lookup and active-socket revocation still
-require the PostgreSQL store/event propagation integration.
+gateway/probe purposes. The gateway and control plane now consume a common
+ticket-authority interface, with a deployment-tenant-bound PostgreSQL
+implementation that generates a 256-bit raw bearer only long enough to return
+its WSS URL. Independent authorities sharing the database rotate and atomically
+consume the same hash state. The PostgreSQL 17 two-pool test validates issue on
+one replica and consumption/replay denial on another. Production startup still
+needs to select this authority as part of the full PostgreSQL control-plane
+cutover, and active-socket revocation still needs cross-replica event
+propagation.
 
 ### Canonical workspace comparison foundation
 
