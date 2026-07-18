@@ -42,6 +42,15 @@ export interface CapturedArchiveManifest {
   totalSizeBytes: number
 }
 
+class ValidationObjectStore implements ObjectStore {
+  async put(bytes: Uint8Array): Promise<string> { return createHash('sha256').update(bytes).digest('hex') }
+  async get(): Promise<Uint8Array> { throw new Error('validation object store is write-only') }
+  async delete(): Promise<void> {}
+  location(id: string): { storageBucket: string; storageKey: string } {
+    return { storageBucket: 'validation', storageKey: id }
+  }
+}
+
 const invalid = (message: string): WorkspaceManifestError => new WorkspaceManifestError('invalid', message)
 const quota = (message: string): WorkspaceManifestError => new WorkspaceManifestError('quota', message)
 
@@ -229,4 +238,12 @@ export async function captureArchiveManifest(
     contentObjects,
     totalSizeBytes,
   }
+}
+
+/** Fully validates a provider workspace tar without persisting its file bodies. */
+export async function validateWorkspaceArchive(
+  archive: Uint8Array,
+  limits: ArchiveManifestLimits = defaultArchiveManifestLimits,
+): Promise<void> {
+  await captureArchiveManifest(archive, 'workspace-transfer', new ValidationObjectStore(), limits)
 }

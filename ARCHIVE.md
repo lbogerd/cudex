@@ -387,7 +387,11 @@ provision failure reclaims the sandbox; successful idempotent replay neither
 resolves nor allocates again.
 
 Linux workspace transfer no longer extracts over a live root or reuses a fixed
-temporary archive. Upload and export use unique opaque paths; upload extracts
+temporary archive. Every upload first runs the complete non-extracting manifest
+parser with archive, entry, file, byte, path, link, type, conflict, and expansion
+limits; malformed input causes no SDK file write or command. This covers child
+and durable captures as well as already-validated source uploads. Upload and
+export use unique opaque paths; upload extracts
 under a same-filesystem stage, requires the staged `roots` directory, applies
 ownership without following symlinks, moves the prior roots to a backup, and
 restores that backup when a failed swap or SDK-reported interruption returns.

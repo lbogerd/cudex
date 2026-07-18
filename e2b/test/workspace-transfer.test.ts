@@ -11,13 +11,16 @@ const execute = promisify(execFile)
 
 class LocalSandbox implements WorkspaceTransferSandbox {
   private commandCount = 0
+  writes = 0
+  commandsRun = 0
   constructor(private readonly interruptFirstCommand?: () => Promise<void>) {}
   readonly files = {
-    write: async (path: string, data: ArrayBuffer) => { await writeFile(path, new Uint8Array(data)) },
+    write: async (path: string, data: ArrayBuffer) => { this.writes += 1; await writeFile(path, new Uint8Array(data)) },
     read: async (path: string) => new Uint8Array(await readFile(path)),
   }
   readonly commands = {
     run: async (command: string) => {
+      this.commandsRun += 1
       if (this.commandCount++ === 0 && this.interruptFirstCommand) {
         await this.interruptFirstCommand(); return { exitCode: 1 }
       }
@@ -68,12 +71,14 @@ test('failed workspace upload preserves existing roots, cleans temporary state, 
   await mkdir(join(workspace, 'roots'), { recursive: true }); await mkdir(temporary)
   await writeFile(join(workspace, 'roots', 'existing'), 'preserved')
   const secret = new TextEncoder().encode('not a tar: secret-must-not-leak')
+  const sandbox = new LocalSandbox()
   await assert.rejects(
-    uploadWorkspaceArchive(new LocalSandbox(), secret, options(directory, 'b'.repeat(32))),
+    uploadWorkspaceArchive(sandbox, secret, options(directory, 'b'.repeat(32))),
     error => error instanceof Error && error.message === 'workspace materialization failed'
       && !error.message.includes('secret-must-not-leak'),
   )
   assert.equal(await readFile(join(workspace, 'roots', 'existing'), 'utf8'), 'preserved')
+  assert.equal(sandbox.writes, 0); assert.equal(sandbox.commandsRun, 0)
   assert.deepEqual((await readdir(workspace)).filter(name => name.startsWith('.cudex-')), [])
   assert.deepEqual(await readdir(temporary), [])
 })

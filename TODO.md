@@ -72,8 +72,8 @@ connection material or allocation is leaked.
   tenant, ID, checksum, available state, and expiry; provision remains unwired.
 - [x] Preserve roots, cwd, dirty/untracked and binary files, modes, and symlinks
   under `/workspace/roots/<index>/...` through staged Linux materialization.
-- [ ] Reject traversal, escaping links, devices, sockets, FIFOs, special files,
-  duplicate/conflicting paths, and unsafe archive entries.
+- [x] Reject traversal, escaping links, devices, sockets, FIFOs, special files,
+  duplicate/conflicting paths, and unsafe archive entries before provider upload.
 - [ ] Bound roots, archive/expanded bytes, files, per-file bytes, path depth, and
   extraction ratio; measure transfer/extraction/cleanup without sensitive paths.
 - [x] Keep the co-located read-only bridge development-only; validate canonical

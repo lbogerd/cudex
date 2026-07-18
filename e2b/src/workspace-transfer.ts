@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { validateWorkspaceArchive } from './archive-manifest.js'
 
 interface TransferFiles {
   write(path: string, data: ArrayBuffer): Promise<unknown>
@@ -60,6 +61,8 @@ export async function uploadWorkspaceArchive(
   const owner = options.owner ?? '1000:1000'
   if (!/^\d+:\d+$/u.test(owner)) throw new Error('invalid workspace owner')
   const cleanup = cleanupScript(paths)
+  try { await validateWorkspaceArchive(archiveBytes) }
+  catch { throw new Error('workspace materialization failed') }
   const script = `set -eu
 archive=${shell(paths.archive)}
 workspace=${shell(paths.workspace)}
