@@ -389,19 +389,31 @@ resolves nor allocates again.
 Linux workspace transfer no longer extracts over a live root or reuses a fixed
 temporary archive. Every upload first runs the complete non-extracting manifest
 parser with archive, entry, file, byte, path, link, type, conflict, and expansion
-limits; malformed input causes no SDK file write or command. This covers child
-and durable captures as well as already-validated source uploads. Upload and
-export use unique opaque paths; upload extracts
+limits; malformed input causes no SDK file write or command. The provider now
+uses the deployment's configured ingress limits, including checked archive
+wrapper overhead, and independently requires contiguous indexed roots within
+the configured root-count cap. This covers child and durable captures as well
+as already-validated source uploads. Upload and export use unique opaque paths;
+upload extracts
 under a same-filesystem stage, requires the staged `roots` directory, applies
 ownership without following symlinks, moves the prior roots to a backup, and
 restores that backup when a failed swap or SDK-reported interruption returns.
 Shell traps and a separate SDK-level `finally` cleanup cover command and
-transport failures. Export removes
-its temporary archive even when readback fails, and both directions return only
-generic errors rather than provider stderr. Four Linux transfer tests prove
-exact replacement, binary bytes, executable modes, symlinks, failed extraction,
-interrupted-swap recovery, cleanup, and archive round trip. The full 149-test
-TypeScript run passed with 112 passes and 37 database-gated skips.
+transport failures. Export checks its remote archive size before SDK readback,
+validates the downloaded archive again, and always removes its temporary file.
+The development ingress now writes canonical `roots/...` tar names accepted by
+the universal boundary.
+
+Both directions emit fixed-cardinality, path-free phase events containing only
+direction, phase, bounded duration/bytes, and success. They cover validation,
+transfer, extraction or capture, and cleanup; observer failure cannot affect
+workspace state. Both directions return only generic errors rather than provider
+stderr. Eight Linux transfer tests prove exact replacement, binary bytes,
+executable modes, symlinks, failed extraction, interrupted-swap recovery,
+configured archive/root rejection before provider I/O, pre-read export bounds,
+metric redaction/isolation, cleanup, archive round trip, and actual development
+ingress compatibility. The full 153-test TypeScript run passed with 116 passes
+and 37 database-gated skips.
 
 `PostgresDurableState` now also exposes a final, transaction-composable source
 authorization primitive. It locks the exact source row only when tenant, opaque

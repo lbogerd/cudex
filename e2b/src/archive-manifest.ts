@@ -244,6 +244,6 @@ export async function captureArchiveManifest(
 export async function validateWorkspaceArchive(
   archive: Uint8Array,
   limits: ArchiveManifestLimits = defaultArchiveManifestLimits,
-): Promise<void> {
-  await captureArchiveManifest(archive, 'workspace-transfer', new ValidationObjectStore(), limits)
+): Promise<CapturedArchiveManifest> {
+  return captureArchiveManifest(archive, 'workspace-transfer', new ValidationObjectStore(), limits)
 }

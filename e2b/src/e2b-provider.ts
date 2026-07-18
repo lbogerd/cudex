@@ -11,7 +11,7 @@ import {
   type ProviderSnapshotQuery,
   validateExecUpstream,
 } from './provider.js'
-import { exportWorkspaceArchive, uploadWorkspaceArchive } from './workspace-transfer.js'
+import { exportWorkspaceArchive, uploadWorkspaceArchive, type WorkspaceTransferOptions } from './workspace-transfer.js'
 
 interface Connection { apiKey: string; apiUrl?: string; domain?: string; validateApiKey?: boolean; requestTimeoutMs: number }
 
@@ -37,7 +37,11 @@ function validateMetadata(metadata: Record<string, string>, requireOwnershipMark
 
 export class E2BProvider implements ProviderAdapter {
   private readonly sandboxes = new Map<string, Sandbox>()
-  constructor(private readonly connection: Connection, private readonly timeoutMs = 120_000) {}
+  constructor(
+    private readonly connection: Connection,
+    private readonly timeoutMs = 120_000,
+    private readonly workspaceTransfer: WorkspaceTransferOptions = {},
+  ) {}
   async create(templateId: string, metadata: Record<string, string>): Promise<CreatedSandbox> { return this.createFrom(templateId, metadata) }
   async restore(snapshotId: string, metadata: Record<string, string>): Promise<CreatedSandbox> { return this.createFrom(snapshotId, metadata) }
   private async createFrom(template: string, metadata: Record<string, string>): Promise<CreatedSandbox> {
@@ -57,10 +61,10 @@ export class E2BProvider implements ProviderAdapter {
     })
   }
   async uploadArchive(sandboxId: string, archive: Uint8Array): Promise<void> {
-    await uploadWorkspaceArchive(await this.handle(sandboxId), archive)
+    await uploadWorkspaceArchive(await this.handle(sandboxId), archive, this.workspaceTransfer)
   }
   async exportWorkspace(sandboxId: string): Promise<Uint8Array> {
-    return exportWorkspaceArchive(await this.handle(sandboxId))
+    return exportWorkspaceArchive(await this.handle(sandboxId), this.workspaceTransfer)
   }
   async startExecServer(sandboxId: string): Promise<void> {
     const sandbox = await this.handle(sandboxId)

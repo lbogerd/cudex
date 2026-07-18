@@ -128,7 +128,7 @@ export async function archiveWorkspace(
     const containing = roots.findIndex(root => below(cwd, root))
     const sandboxCwd = resolve(sandboxRoots[containing]!, relative(roots[containing]!, cwd))
     const archivePath = `${temporary}/workspace.tar`
-    await run('tar', ['-cf', archivePath, '-C', staging, '.'])
+    await run('tar', ['-cf', archivePath, '-C', staging, 'roots'])
     const archiveStat = await stat(archivePath)
     if (archiveStat.size > limits.maxBytes) throw new ServiceError(429, 'workspace archive quota exceeded')
     if (expandedBytes / Math.max(archiveStat.size, 1) > expandedLimits.maxExtractionRatio) throw new ServiceError(429, 'workspace extraction-ratio quota exceeded')

@@ -7,6 +7,8 @@ import { ControlPlane } from './service.js'
 import { ExecGateway } from './gateway.js'
 import { startServer } from './http-server.js'
 import { BlobStore, S3BlobStore } from './blob-store.js'
+import { defaultArchiveManifestLimits, type ArchiveManifestLimits } from './archive-manifest.js'
+import type { WorkspaceTransferMetric } from './workspace-transfer.js'
 
 function required(name: string): string { const value = process.env[name]; if (!value) throw new Error(`${name} is required`); return value }
 function positiveInteger(name: string, fallback: number): number {
@@ -35,7 +37,39 @@ const connection = {
   ...(process.env.E2B_DOMAIN ? { domain: process.env.E2B_DOMAIN } : {}),
   validateApiKey: process.env.E2B_VALIDATE_API_KEY !== 'false', requestTimeoutMs: 120_000,
 }
-const provider = new E2BProvider(connection)
+const ingress = {
+  maxBytes: positiveInteger('HOSTED_AGENT_MAX_ARCHIVE_BYTES', 536_870_912),
+  maxRoots: positiveInteger('HOSTED_AGENT_MAX_ROOTS', 8),
+  maxExpandedBytes: positiveInteger('HOSTED_AGENT_MAX_EXPANDED_BYTES', 1_073_741_824),
+  maxEntries: positiveInteger('HOSTED_AGENT_MAX_ENTRIES', 100_000),
+  maxFileBytes: positiveInteger('HOSTED_AGENT_MAX_FILE_BYTES', 268_435_456),
+  maxPathDepth: positiveInteger('HOSTED_AGENT_MAX_PATH_DEPTH', 64),
+  maxExtractionRatio: positiveInteger('HOSTED_AGENT_MAX_EXTRACTION_RATIO', 4),
+}
+if (ingress.maxRoots > 64) throw new Error('HOSTED_AGENT_MAX_ROOTS must not exceed 64')
+function withOverhead(name: string, value: number, overhead: number): number {
+  const result = value + overhead
+  if (!Number.isSafeInteger(result)) throw new Error(`${name} is too large`)
+  return result
+}
+const archiveLimits: ArchiveManifestLimits = {
+  ...defaultArchiveManifestLimits,
+  maxArchiveBytes: ingress.maxBytes,
+  maxEntries: withOverhead('HOSTED_AGENT_MAX_ENTRIES', ingress.maxEntries, ingress.maxRoots + 1),
+  maxFiles: ingress.maxEntries,
+  maxTotalBytes: ingress.maxExpandedBytes,
+  maxFileBytes: ingress.maxFileBytes,
+  maxPathDepth: withOverhead('HOSTED_AGENT_MAX_PATH_DEPTH', ingress.maxPathDepth, 3),
+  maxExtractionRatio: ingress.maxExtractionRatio,
+}
+function observeWorkspaceTransfer(metric: WorkspaceTransferMetric): void {
+  console.log(JSON.stringify({ event: 'workspace_transfer_phase', ...metric }))
+}
+const provider = new E2BProvider(connection, 120_000, {
+  archiveLimits,
+  maxRoots: ingress.maxRoots,
+  observe: observeWorkspaceTransfer,
+})
 const gatewayUrl = new URL(required('HOSTED_AGENT_GATEWAY_URL'))
 if (gatewayUrl.protocol !== 'wss:' && !(development && gatewayUrl.protocol === 'ws:')) throw new Error('HOSTED_AGENT_GATEWAY_URL must use WSS outside development')
 if (gatewayUrl.username || gatewayUrl.password || gatewayUrl.search || gatewayUrl.hash) throw new Error('HOSTED_AGENT_GATEWAY_URL must not contain credentials, query, or fragment')
@@ -54,15 +88,7 @@ const gateway = new ExecGateway(tickets, store, provider, {
   leaseRevalidationMs: positiveInteger('HOSTED_AGENT_GATEWAY_LEASE_REVALIDATION_MS', 5_000),
 })
 const service = new ControlPlane(store, provider, tickets, blobs, { templates, allowedRoots,
-  ingress: {
-    maxBytes: positiveInteger('HOSTED_AGENT_MAX_ARCHIVE_BYTES', 536_870_912),
-    maxRoots: positiveInteger('HOSTED_AGENT_MAX_ROOTS', 8),
-    maxExpandedBytes: positiveInteger('HOSTED_AGENT_MAX_EXPANDED_BYTES', 1_073_741_824),
-    maxEntries: positiveInteger('HOSTED_AGENT_MAX_ENTRIES', 100_000),
-    maxFileBytes: positiveInteger('HOSTED_AGENT_MAX_FILE_BYTES', 268_435_456),
-    maxPathDepth: positiveInteger('HOSTED_AGENT_MAX_PATH_DEPTH', 64),
-    maxExtractionRatio: positiveInteger('HOSTED_AGENT_MAX_EXTRACTION_RATIO', 4),
-  },
+  ingress,
   allowLocalIngress: development }, gateway)
 await service.reconcile()
 await startServer(service, gateway, { host, port, bearerToken: required('CODEX_HOSTED_AGENT_TOKEN'),

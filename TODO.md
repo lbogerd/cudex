@@ -74,7 +74,7 @@ connection material or allocation is leaked.
   under `/workspace/roots/<index>/...` through staged Linux materialization.
 - [x] Reject traversal, escaping links, devices, sockets, FIFOs, special files,
   duplicate/conflicting paths, and unsafe archive entries before provider upload.
-- [ ] Bound roots, archive/expanded bytes, files, per-file bytes, path depth, and
+- [x] Bound roots, archive/expanded bytes, files, per-file bytes, path depth, and
   extraction ratio; measure transfer/extraction/cleanup without sensitive paths.
 - [x] Keep the co-located read-only bridge development-only; validate canonical
   real paths and reject overlap, unsafe links, special files, and quota excess.
