@@ -143,6 +143,45 @@ pub struct NewThread {
     pub session_configured: SessionConfiguredEvent,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct HostedAgentProvisioningLineage {
+    owner_agent_id: Option<ThreadId>,
+    snapshot_source_thread_id: Option<ThreadId>,
+}
+
+impl HostedAgentProvisioningLineage {
+    fn owned_by(owner_agent_id: ThreadId) -> Self {
+        Self {
+            owner_agent_id: Some(owner_agent_id),
+            snapshot_source_thread_id: Some(owner_agent_id),
+        }
+    }
+
+    fn forked_from(snapshot_source_thread_id: Option<ThreadId>) -> Self {
+        Self {
+            owner_agent_id: None,
+            snapshot_source_thread_id,
+        }
+    }
+
+    fn for_subagent(
+        session_source: &SessionSource,
+        parent_thread_id: Option<ThreadId>,
+        forked_from_thread_id: Option<ThreadId>,
+    ) -> Self {
+        let owner_agent_id = match session_source {
+            SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id, ..
+            }) => Some(*parent_thread_id),
+            _ => parent_thread_id,
+        };
+        Self {
+            owner_agent_id,
+            snapshot_source_thread_id: forked_from_thread_id.or(owner_agent_id),
+        }
+    }
+}
+
 // TODO(ccunningham): Add an explicit non-interrupting live-turn snapshot once
 // core can represent sampling boundaries directly instead of relying on
 // whichever items happened to be persisted mid-turn.
@@ -751,7 +790,10 @@ impl ThreadManager {
         options: StartThreadOptions,
     ) -> CodexResult<NewThread> {
         self.start_thread_with_options_and_fork_source(
-            options, /*forked_from_thread_id*/ None, /*agent_type*/ None,
+            options,
+            /*forked_from_thread_id*/ None,
+            /*agent_type*/ None,
+            HostedAgentProvisioningLineage::default(),
         )
         .await
     }
@@ -766,6 +808,7 @@ impl ThreadManager {
             options,
             /*forked_from_thread_id*/ None,
             Some(agent_type),
+            HostedAgentProvisioningLineage::default(),
         )
         .await
     }
@@ -775,6 +818,7 @@ impl ThreadManager {
         options: StartThreadOptions,
         forked_from_thread_id: Option<ThreadId>,
         agent_type: Option<String>,
+        hosted_lineage: HostedAgentProvisioningLineage,
     ) -> CodexResult<NewThread> {
         let agent_control = self.agent_control_for_config(&options.config);
         let (resumed_session_source, resumed_thread_source) = options
@@ -792,6 +836,7 @@ impl ThreadManager {
             agent_control,
             session_source,
             agent_type,
+            hosted_lineage,
             /*parent_thread_id*/ None,
             forked_from_thread_id,
             thread_source,
@@ -845,6 +890,7 @@ impl ThreadManager {
             options,
             Some(forked_from_thread_id),
             /*agent_type*/ None,
+            HostedAgentProvisioningLineage::owned_by(forked_from_thread_id),
         )
         .await
     }
@@ -903,6 +949,7 @@ impl ThreadManager {
             agent_control,
             session_source,
             /*agent_type*/ None,
+            HostedAgentProvisioningLineage::default(),
             /*parent_thread_id*/ None,
             /*forked_from_thread_id*/ None,
             thread_source,
@@ -936,6 +983,7 @@ impl ThreadManager {
             InitialHistory::New,
             Arc::clone(&self.state.auth_manager),
             agent_control,
+            HostedAgentProvisioningLineage::default(),
             /*parent_thread_id*/ None,
             /*forked_from_thread_id*/ None,
             /*thread_source*/ None,
@@ -977,6 +1025,7 @@ impl ThreadManager {
             agent_control,
             session_source,
             /*agent_type*/ None,
+            HostedAgentProvisioningLineage::default(),
             /*parent_thread_id*/ None,
             /*forked_from_thread_id*/ None,
             thread_source,
@@ -1165,6 +1214,7 @@ impl ThreadManager {
             history,
             Arc::clone(&self.state.auth_manager),
             agent_control,
+            HostedAgentProvisioningLineage::forked_from(source_thread_id),
             /*parent_thread_id*/ None,
             source_thread_id,
             thread_source,
@@ -1205,7 +1255,7 @@ impl ThreadManagerState {
         initial_history: &InitialHistory,
         session_source: &SessionSource,
         requested_agent_type: Option<String>,
-        parent_thread_id: Option<ThreadId>,
+        hosted_lineage: HostedAgentProvisioningLineage,
     ) -> CodexResult<Option<PendingHostedAgentRuntime>> {
         let requested_agent_type = match requested_agent_type {
             Some(agent_type) => {
@@ -1257,23 +1307,17 @@ impl ThreadManagerState {
                     "agent role `{agent_type}` does not define a hosted sandbox template"
                 ))
             })?;
-        let owner_agent_id = match session_source {
-            SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-                parent_thread_id, ..
-            }) => Some(*parent_thread_id),
-            _ => parent_thread_id,
-        };
-        let source = match owner_agent_id {
-            Some(owner_agent_id) => {
+        let source = match hosted_lineage.snapshot_source_thread_id {
+            Some(snapshot_source_thread_id) => {
                 let owner_runtime = self
                     .hosted_agent_runtimes
                     .read()
                     .await
-                    .get(&owner_agent_id)
+                    .get(&snapshot_source_thread_id)
                     .cloned()
                     .ok_or_else(|| {
                         CodexErr::InvalidRequest(format!(
-                            "hosted owner thread {owner_agent_id} has no active runtime"
+                            "hosted snapshot source thread {snapshot_source_thread_id} has no active runtime"
                         ))
                     })?;
                 ProjectSnapshotSource::AgentEnvironment {
@@ -1291,7 +1335,7 @@ impl ThreadManagerState {
         };
         let request = AgentProvisionRequest {
             agent_id: thread_id,
-            owner_agent_id,
+            owner_agent_id: hosted_lineage.owner_agent_id,
             agent_type,
             sandbox_template,
             source,
@@ -1656,6 +1700,11 @@ impl ThreadManagerState {
         inherited_exec_policy: Option<Arc<crate::exec_policy::ExecPolicyManager>>,
         environments: Option<Vec<TurnEnvironmentSelection>>,
     ) -> CodexResult<NewThread> {
+        let hosted_lineage = HostedAgentProvisioningLineage::for_subagent(
+            &session_source,
+            parent_thread_id,
+            forked_from_thread_id,
+        );
         let environments = environments.unwrap_or_else(|| {
             default_thread_environment_selections(
                 self.environment_manager.as_ref(),
@@ -1672,6 +1721,7 @@ impl ThreadManagerState {
             agent_control,
             session_source,
             /*agent_type*/ None,
+            hosted_lineage,
             parent_thread_id,
             forked_from_thread_id,
             thread_source,
@@ -1707,6 +1757,11 @@ impl ThreadManagerState {
             &config.workspace_roots,
         );
         let thread_source = initial_history.get_resumed_thread_source();
+        let hosted_lineage = HostedAgentProvisioningLineage::for_subagent(
+            &session_source,
+            parent_thread_id,
+            /*forked_from_thread_id*/ None,
+        );
         Box::pin(self.spawn_thread_with_source(
             config,
             initial_history,
@@ -1716,6 +1771,7 @@ impl ThreadManagerState {
             agent_control,
             session_source,
             /*agent_type*/ None,
+            hosted_lineage,
             parent_thread_id,
             /*forked_from_thread_id*/ None,
             thread_source,
@@ -1748,6 +1804,11 @@ impl ThreadManagerState {
         environments: Option<Vec<TurnEnvironmentSelection>>,
         thread_extension_init: ExtensionDataInit,
     ) -> CodexResult<NewThread> {
+        let hosted_lineage = HostedAgentProvisioningLineage::for_subagent(
+            &session_source,
+            parent_thread_id,
+            forked_from_thread_id,
+        );
         let environments = environments.unwrap_or_else(|| {
             default_thread_environment_selections(
                 self.environment_manager.as_ref(),
@@ -1764,6 +1825,7 @@ impl ThreadManagerState {
             agent_control,
             session_source,
             /*agent_type*/ None,
+            hosted_lineage,
             parent_thread_id,
             forked_from_thread_id,
             thread_source,
@@ -1782,12 +1844,13 @@ impl ThreadManagerState {
 
     /// Spawn a new thread with optional history and register it with the manager.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn spawn_thread(
+    async fn spawn_thread(
         &self,
         config: Config,
         initial_history: InitialHistory,
         auth_manager: Arc<AuthManager>,
         agent_control: AgentControl,
+        hosted_lineage: HostedAgentProvisioningLineage,
         parent_thread_id: Option<ThreadId>,
         forked_from_thread_id: Option<ThreadId>,
         thread_source: Option<ThreadSource>,
@@ -1808,6 +1871,7 @@ impl ThreadManagerState {
             agent_control,
             self.session_source.clone(),
             /*agent_type*/ None,
+            hosted_lineage,
             parent_thread_id,
             forked_from_thread_id,
             thread_source,
@@ -1825,7 +1889,7 @@ impl ThreadManagerState {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn spawn_thread_with_source(
+    async fn spawn_thread_with_source(
         &self,
         mut config: Config,
         initial_history: InitialHistory,
@@ -1835,6 +1899,7 @@ impl ThreadManagerState {
         agent_control: AgentControl,
         session_source: SessionSource,
         agent_type: Option<String>,
+        hosted_lineage: HostedAgentProvisioningLineage,
         parent_thread_id: Option<ThreadId>,
         forked_from_thread_id: Option<ThreadId>,
         thread_source: Option<ThreadSource>,
@@ -1918,7 +1983,7 @@ impl ThreadManagerState {
                 &initial_history,
                 &session_source,
                 agent_type,
-                parent_thread_id,
+                hosted_lineage,
             )
             .await?;
         let (environments, inherited_environments, inherited_exec_policy) =

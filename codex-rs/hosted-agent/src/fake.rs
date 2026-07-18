@@ -70,6 +70,14 @@ impl FakeHostedAgentService {
             .map(|(_, provisioned)| provisioned.lease_id.clone())
     }
 
+    /// Returns the request recorded for a provision idempotency key.
+    pub fn provision_request(&self, idempotency_key: &str) -> Option<AgentProvisionRequest> {
+        self.lock()
+            .provisions
+            .get(idempotency_key)
+            .map(|(request, _)| request.clone())
+    }
+
     pub fn set_patch_conflict(&self, artifact_id: impl Into<String>, paths: Vec<PathUri>) {
         self.lock().conflicts.insert(artifact_id.into(), paths);
     }

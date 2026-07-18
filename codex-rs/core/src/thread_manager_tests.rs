@@ -133,6 +133,145 @@ fn start_thread_options(config: Config) -> StartThreadOptions {
     }
 }
 
+async fn hosted_thread_manager_for_tests() -> (
+    tempfile::TempDir,
+    Config,
+    ThreadManager,
+    Arc<codex_hosted_agent::FakeHostedAgentService>,
+) {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = temp_dir.path().join("workspace").abs();
+    config.workspace_roots = vec![config.cwd.clone()];
+    config.hosted_agents = crate::config::HostedAgentsConfig {
+        enabled: true,
+        service_url: Some("https://hosted.invalid".to_string()),
+        default_agent_type: "default".to_string(),
+    };
+    config.agent_roles.insert(
+        "default".to_string(),
+        crate::config::AgentRoleConfig {
+            description: Some("Hosted test agent".to_string()),
+            sandbox_template: Some("general-v1".to_string()),
+            ..Default::default()
+        },
+    );
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+    std::fs::create_dir_all(&config.cwd).expect("create workspace");
+
+    let environment_manager = Arc::new(EnvironmentManager::without_environments());
+    let mut manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::clone(&environment_manager),
+    );
+    let hosted_service = Arc::new(codex_hosted_agent::FakeHostedAgentService::default());
+    let provisioner = Arc::new(HostedAgentProvisioner::new(
+        Arc::clone(&hosted_service),
+        environment_manager,
+    ));
+    Arc::get_mut(&mut manager.state)
+        .expect("new thread manager state must be unshared")
+        .hosted_agent_provisioner = Ok(Some(provisioner));
+
+    (temp_dir, config, manager, hosted_service)
+}
+
+fn hosted_provision_request(
+    service: &codex_hosted_agent::FakeHostedAgentService,
+    thread_id: ThreadId,
+) -> codex_hosted_agent::AgentProvisionRequest {
+    service
+        .provision_request(&format!("hosted-agent:{thread_id}:provision"))
+        .expect("hosted provision request")
+}
+
+#[tokio::test]
+async fn hosted_provisioning_separates_ownership_from_snapshot_lineage() {
+    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
+    let root = manager
+        .start_thread_with_options(start_thread_options(config.clone()))
+        .await
+        .expect("start hosted root");
+    let root_request = hosted_provision_request(&hosted_service, root.thread_id);
+    assert_eq!(root_request.owner_agent_id, None);
+    assert_eq!(
+        root_request.source,
+        ProjectSnapshotSource::RootWorkspace {
+            cwd: PathUri::from_abs_path(&config.cwd),
+            workspace_roots: vec![PathUri::from_abs_path(&config.cwd)],
+        }
+    );
+    let root_lease_id = hosted_service
+        .provisioned_lease_id(&root_request.idempotency_key)
+        .expect("root lease");
+
+    let detached = manager
+        .spawn_subagent(root.thread_id, start_thread_options(config.clone()))
+        .await
+        .expect("spawn hosted detached subagent");
+    let detached_request = hosted_provision_request(&hosted_service, detached.thread_id);
+    assert_eq!(detached_request.owner_agent_id, Some(root.thread_id));
+    assert_eq!(
+        detached_request.source,
+        ProjectSnapshotSource::AgentEnvironment {
+            owner_lease_id: root_lease_id.clone(),
+        }
+    );
+
+    root.thread.ensure_rollout_materialized().await;
+    root.thread
+        .flush_rollout()
+        .await
+        .expect("flush hosted root");
+    let fork = manager
+        .fork_thread(
+            ForkSnapshot::Interrupted,
+            config.clone(),
+            root.thread.rollout_path().expect("root rollout path"),
+            Some(ThreadSource::User),
+            /*parent_trace*/ None,
+        )
+        .await
+        .expect("fork hosted root");
+    let fork_request = hosted_provision_request(&hosted_service, fork.thread_id);
+    assert_eq!(fork_request.owner_agent_id, None);
+    assert_eq!(
+        fork_request.source,
+        ProjectSnapshotSource::AgentEnvironment {
+            owner_lease_id: root_lease_id,
+        }
+    );
+
+    let mut non_hosted_config = config;
+    non_hosted_config.hosted_agents.enabled = false;
+    let non_hosted = manager
+        .start_thread_with_options(start_thread_options(non_hosted_config))
+        .await
+        .expect("start non-hosted root");
+    assert!(
+        hosted_service
+            .provision_request(&format!("hosted-agent:{}:provision", non_hosted.thread_id))
+            .is_none()
+    );
+    assert!(
+        manager
+            .state
+            .hosted_agent_runtimes
+            .read()
+            .await
+            .get(&non_hosted.thread_id)
+            .is_none()
+    );
+
+    let report = manager
+        .shutdown_all_threads_bounded(Duration::from_secs(10))
+        .await;
+    assert_eq!(report.completed.len(), 4);
+}
+
 #[tokio::test]
 async fn hosted_root_and_spawned_threads_own_distinct_provisioned_environments() {
     let temp_dir = tempdir().expect("tempdir");
