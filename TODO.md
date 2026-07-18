@@ -227,8 +227,9 @@ then run the complete app-server flow against live E2B.
   final live app-server acceptance flow. The broad core run's host-local helper,
   network/proxy, and nested-sandbox failures remain harness debt rather than a
   green remote run.
-- [ ] Confirm Windows/Wine path and type compatibility through the Bazel CI matrix;
-  external-service behavior may be skipped only with a specific harness reason.
+- [x] Defer Windows/Wine and macOS compatibility. Current implementation and
+  acceptance scope is x86_64 Linux; reopen cross-platform validation before any
+  broader rollout.
 
 | Scenario | Required assertion |
 | --- | --- |

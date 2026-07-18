@@ -185,8 +185,9 @@ changing the three explicit shell fixtures to `/bin/bash`, all 19 `codex-core`
 `SIGBUS` gap caused by the root filesystem being 99% full. The focused local
 app-server patch-route suite also passed. The standard remote harness still
 cannot synthesize the service-owned WSS lease; that remains part of the final
-live app-server acceptance flow, while Wine coverage remains delegated to the
-repository Bazel CI matrix.
+live app-server acceptance flow. Windows/Wine and macOS compatibility were
+explicitly deferred when the implementation and acceptance scope narrowed to
+x86_64 Linux.
 
 ### Runtime success invariants and assumptions
 
