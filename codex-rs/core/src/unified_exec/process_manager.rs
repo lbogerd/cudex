@@ -811,6 +811,16 @@ impl UnifiedExecProcessManager {
             }
         };
 
+        if process_id.is_none() {
+            let text = String::from_utf8_lossy(&collected);
+            process
+                .check_for_sandbox_denial_with_text(&text)
+                .await
+                .map_err(|err| {
+                    err.with_output_collection_metadata(original_token_count, output_omitted_bytes)
+                })?;
+        }
+
         let response = ExecCommandToolOutput {
             event_call_id,
             chunk_id,

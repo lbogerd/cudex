@@ -18,6 +18,10 @@ use thiserror::Error;
 
 const HOSTED_ENVIRONMENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Stable model-facing diagnostic for hosted service and authorization denials.
+pub(crate) const HOSTED_EXTERNAL_SANDBOX_DENIAL_MESSAGE: &str =
+    "external sandbox denied: operation rejected by the hosted environment";
+
 /// Durable, non-secret state owned by one thread using a hosted environment.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct HostedAgentRuntime {

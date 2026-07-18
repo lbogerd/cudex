@@ -214,9 +214,9 @@ async fn hosted_policy_rechecks_authorization_before_dispatch() {
 
     assert_eq!(
         err,
-        FunctionCallError::RespondToModel(format!(
-            "tool {tool_name} is not authorized for this hosted agent (ControlPlane)"
-        ))
+        FunctionCallError::RespondToModel(
+            crate::hosted_agent_runtime::HOSTED_EXTERNAL_SANDBOX_DENIAL_MESSAGE.to_string()
+        )
     );
 }
 

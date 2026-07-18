@@ -2,6 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::function_tool::FunctionCallError;
+use crate::hosted_agent_runtime::HOSTED_EXTERNAL_SANDBOX_DENIAL_MESSAGE;
 use crate::maybe_emit_implicit_skill_invocation;
 use crate::tools::context::ExecCommandToolOutput;
 use crate::tools::context::ToolInvocation;
@@ -387,7 +388,10 @@ impl ExecCommandHandler {
                 output_omitted_bytes,
                 ..
             }) => {
-                let output_text = output.aggregated_output.text;
+                let output_text = normalize_sandbox_denial_output(
+                    output.aggregated_output.text,
+                    context.turn.as_ref(),
+                )?;
                 let original_token_count =
                     original_token_count.unwrap_or_else(|| approx_token_count(&output_text));
                 Ok(boxed_tool_output(ExecCommandToolOutput {
@@ -410,6 +414,19 @@ impl ExecCommandHandler {
                 "exec_command failed for `{command_for_display}`: {err:?}"
             ))),
         }
+    }
+}
+
+pub(super) fn normalize_sandbox_denial_output(
+    output: String,
+    turn: &crate::session::turn_context::TurnContext,
+) -> Result<String, FunctionCallError> {
+    if turn.hosted_tool_authorization.is_some() {
+        Err(FunctionCallError::RespondToModel(
+            HOSTED_EXTERNAL_SANDBOX_DENIAL_MESSAGE.to_string(),
+        ))
+    } else {
+        Ok(output)
     }
 }
 

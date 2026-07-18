@@ -9,6 +9,7 @@ use crate::hook_runtime::PreToolUseHookResult;
 use crate::hook_runtime::record_additional_contexts;
 use crate::hook_runtime::run_post_tool_use_hooks;
 use crate::hook_runtime::run_pre_tool_use_hooks;
+use crate::hosted_agent_runtime::HOSTED_EXTERNAL_SANDBOX_DENIAL_MESSAGE;
 use crate::memory_usage::emit_metric_for_tool_read;
 use crate::memory_usage::shell_script_for_invocation;
 use crate::sandbox_tags::permission_profile_policy_tag;
@@ -557,10 +558,7 @@ impl ToolRegistry {
             .as_ref()
             .is_some_and(|authorization| !authorization.allows(&tool_name, &execution_domain))
         {
-            let domain_kind = execution_domain.kind();
-            let message = format!(
-                "tool {tool_name} is not authorized for this hosted agent ({domain_kind:?})"
-            );
+            let message = HOSTED_EXTERNAL_SANDBOX_DENIAL_MESSAGE.to_string();
             let log_payload = invocation.payload.log_payload();
             otel.tool_result_with_tags(
                 tool_name_flat.as_ref(),
