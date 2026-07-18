@@ -354,6 +354,15 @@ export class PostgresDurableState {
     return result.rows[0] ? leaseFromRow(result.rows[0]) : null
   }
 
+  async activeSandbox(leaseId: string): Promise<string | undefined> {
+    validateId('lease ID', leaseId)
+    const result = await this.pool.query<{ provider_sandbox_id: string }>(`
+      SELECT provider_sandbox_id FROM hosted_agent_leases
+      WHERE lease_id = $1 AND state = 'active' AND provider_sandbox_id IS NOT NULL
+    `, [leaseId])
+    return result.rows[0]?.provider_sandbox_id
+  }
+
   async getSnapshot(tenantId: string, snapshotId: string): Promise<Snapshot | null> {
     validateId('tenant ID', tenantId); validateId('snapshot ID', snapshotId)
     const result = await this.pool.query<SnapshotRow>(`

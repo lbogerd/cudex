@@ -24,6 +24,11 @@ export class JsonStore {
     finally { resolve() }
   }
   async read<T>(fn: (database: Database) => T): Promise<T> { await this.queue; return fn(this.database) }
+  async activeSandbox(leaseId: string): Promise<string | undefined> {
+    return this.read(database => database.leases[leaseId]?.state === 'active'
+      ? database.leases[leaseId]!.sandboxId
+      : undefined)
+  }
   private async persist(): Promise<void> {
     const temporary = `${this.path}.tmp`
     await writeFile(temporary, `${JSON.stringify(this.database, null, 2)}\n`, { mode: 0o600 })

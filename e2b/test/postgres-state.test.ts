@@ -93,6 +93,7 @@ live('lease and base snapshot creation is atomic and unique across two pools', a
 
 live('checkpoint references and durable data survive release', async context => {
   const ids = await objects(context); const created = await context.first.createLeaseWithBaseSnapshot(leaseInput(ids))
+  assert.equal(await context.second.activeSandbox(created.lease.leaseId), 'sandbox-1')
   const checkpointObjects = await objects(context, 'tenant-1', '-checkpoint')
   const checkpoint = await context.second.appendCheckpoint('tenant-1', created.lease.leaseId, {
     snapshotId: 'snapshot-checkpoint', providerSnapshotId: 'provider-checkpoint',
@@ -103,6 +104,7 @@ live('checkpoint references and durable data survive release', async context => 
     referenceKind: 'codex_thread', referenceId: 'thread-1' })
   const released = await context.second.releaseLease('tenant-1', created.lease.leaseId)
   assert.equal(released.state, 'released')
+  assert.equal(await context.first.activeSandbox(created.lease.leaseId), undefined)
   assert.equal((await context.first.getLease('tenant-1', created.lease.leaseId))?.latestSnapshotId, checkpoint.snapshotId)
   assert.equal((await context.first.getSnapshot('tenant-1', checkpoint.snapshotId))?.state, 'available')
   const retained = await context.firstPool.query<{ count: string }>(`

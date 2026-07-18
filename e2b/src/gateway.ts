@@ -4,8 +4,11 @@ import type { Server as HttpsServer } from 'node:https'
 import type { Duplex } from 'node:stream'
 import WebSocket, { WebSocketServer } from 'ws'
 import type { ProviderAdapter } from './provider.js'
-import type { JsonStore } from './store.js'
 import type { TicketAuthority } from './tickets.js'
+
+export interface ActiveLeaseDirectory {
+  activeSandbox(leaseId: string): Promise<string | undefined>
+}
 
 export interface GatewayLimits {
   maxPayloadBytes: number
@@ -42,7 +45,7 @@ export class ExecGateway {
 
   constructor(
     private readonly tickets: TicketAuthority,
-    private readonly store: JsonStore,
+    private readonly leases: ActiveLeaseDirectory,
     private readonly provider: ProviderAdapter,
     limits: Partial<GatewayLimits> = {},
   ) {
@@ -182,7 +185,7 @@ export class ExecGateway {
   }
 
   private async activeSandbox(leaseId: string): Promise<string | undefined> {
-    return this.store.read(database => database.leases[leaseId]?.state === 'active' ? database.leases[leaseId]!.sandboxId : undefined)
+    return this.leases.activeSandbox(leaseId)
   }
 
   private activeConnections(): number {

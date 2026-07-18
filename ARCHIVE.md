@@ -273,10 +273,13 @@ ticket-authority interface, with a deployment-tenant-bound PostgreSQL
 implementation that generates a 256-bit raw bearer only long enough to return
 its WSS URL. Independent authorities sharing the database rotate and atomically
 consume the same hash state. The PostgreSQL 17 two-pool test validates issue on
-one replica and consumption/replay denial on another. Production startup still
-needs to select this authority as part of the full PostgreSQL control-plane
-cutover, and active-socket revocation still needs cross-replica event
-propagation.
+one replica and consumption/replay denial on another. The gateway's active-lease
+check is also storage-neutral now; PostgreSQL supplies the active provider
+sandbox directly and the two-pool test proves another replica stops resolving it
+immediately after durable release. Production startup still needs to select
+these implementations as part of the full PostgreSQL control-plane cutover, and
+active sockets already accepted by other gateway replicas still need revocation
+event propagation.
 
 ### Canonical workspace comparison foundation
 

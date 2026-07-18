@@ -59,6 +59,8 @@ failed upload/extraction allocations without Git or shared host paths.
   expired/revoked lookup cleanup without persisting bearer material.
 - [x] Add a tenant-bound PostgreSQL ticket authority so replicas share hashed
   issue, rotation, single-use consumption, and revocation state.
+- [x] Decouple gateway lease authorization from the JSON store and provide a
+  PostgreSQL active-sandbox directory for replica-consistent revalidation.
 - [ ] Add multi-replica ticket lookup and active-connection revocation
   propagation.
 - [x] Close every active connection on release.
