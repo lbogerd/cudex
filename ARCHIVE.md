@@ -369,8 +369,8 @@ Seven lifecycle tests cover creation/resolution, cross-tenant denial, replay,
 multi-tenant identical bytes, all pre-publication validation, cleanup failures,
 and stored corruption. PostgreSQL 17 tests additionally prove transactional
 migration, tenant-isolated shared content, immutable replay, and lookup by
-checksum. HTTP upload/auth wiring, service resolution before provider allocation,
-and successful-expiry garbage collection remain open.
+checksum. Production startup wiring and successful-expiry garbage collection
+remain open.
 
 The TypeScript wire contract now has an exact `sourceSnapshot` provision source
 containing only the opaque source ID and trusted lowercase SHA-256. It rejects
@@ -378,17 +378,23 @@ tenant IDs, owners, host paths, archive bytes, and extra properties. A separate
 authenticated API adapter validates canonical create/resolve JSON, takes tenant
 only from trusted context, receives archive bytes out of band with a 512 MiB
 pre-dispatch cap, and revalidates lifecycle response identity and archive
-integrity. Seven API tests plus provision/validation coverage pass. Provisioning
-intentionally returns 503 before provider allocation because no mixed JSON/PG
-backend is permitted.
+integrity. The control plane now accepts that trusted principal and a narrow
+resolver as injected service configuration, resolves and verifies the exact ID,
+checksum, and archive before provider creation, uploads the defensive archive
+copy, and uses its canonical remote cwd/root URIs. Missing configuration remains
+fail-closed with 503. Authorization or storage failure allocates nothing; later
+provision failure reclaims the sandbox; successful idempotent replay neither
+resolves nor allocates again. The full 145-test TypeScript run passed with 108
+passes and 37 database-gated skips.
 
 `PostgresDurableState` now also exposes a final, transaction-composable source
 authorization primitive. It locks the exact source row only when tenant, opaque
 ID, trusted checksum, `available` state, and unexpired lifetime all still match,
 using the caller's PostgreSQL client so authorization can be repeated in the
 same transaction that eventually attaches the lease. Mismatch is deliberately
-reported as not found. This closes the persistence-level time-of-check gap, but
-does not yet authorize before allocation or wire production provision.
+reported as not found. Together with the pre-allocation resolver, this closes
+both sides of the authorization time-of-check gap. Production provision still
+needs to select the PostgreSQL lifecycle and resolver at startup.
 
 The current Rust Codex `ProjectSnapshotSource` has only root-workspace,
 agent-environment, and durable-snapshot variants, so it cannot yet emit or parse

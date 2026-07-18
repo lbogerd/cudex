@@ -9,6 +9,7 @@ import { TicketIssuer } from '../src/tickets.js'
 import { ControlPlane } from '../src/service.js'
 import { FakeProvider } from './fake-provider.js'
 import { BlobStore } from '../src/blob-store.js'
+import { ServiceError } from '../src/types.js'
 
 async function fixture(provider = new FakeProvider()) {
   const directory = await mkdtemp(join(tmpdir(), 'cudex-control-')); const root = join(directory, 'project')
@@ -83,6 +84,106 @@ test('immutable source snapshot provision fails closed before provider allocatio
   await assert.rejects(context.service.provision(request), /immutable source snapshot provisioning is not configured/)
   assert.equal(context.provider.creates, 0)
   assert.deepEqual(context.provider.live(), [])
+})
+
+function immutableRequest(context: Awaited<ReturnType<typeof fixture>>, idempotencyKey: string) {
+  return {
+    ...context.request,
+    source: { type: 'sourceSnapshot' as const, sourceSnapshotId: `source_${'a'.repeat(32)}`,
+      checksum: `sha256:${'b'.repeat(64)}` },
+    idempotencyKey,
+  }
+}
+
+function immutableResolution(request: ReturnType<typeof immutableRequest>) {
+  const archive = Uint8Array.from([0, 255, 1, 2, 3])
+  return {
+    sourceSnapshotId: request.source.sourceSnapshotId, checksum: request.source.checksum,
+    expiresAt: new Date(Date.now() + 60_000), manifestChecksum: `sha256:${'c'.repeat(64)}`,
+    sizeBytes: archive.byteLength, archive,
+    cwdUri: 'file:///workspace/roots/1/second/nested',
+    workspaceRootUris: ['file:///workspace/roots/0/first', 'file:///workspace/roots/1/second'],
+    manifest: { version: 1 as const, identity: request.source.sourceSnapshotId, entries: [] },
+  }
+}
+
+test('immutable source snapshot resolves with trusted identity before allocation and materializes exact state', async () => {
+  const context = await fixture(); const request = immutableRequest(context, 'immutable-success')
+  const resolution = immutableResolution(request); const principal = { tenantId: 'tenant-trusted' }; const calls: unknown[] = []
+  const service = new ControlPlane(context.store, context.provider, context.tickets, context.blobs, {
+    templates: { 'general-v1': 'tpl-1' }, allowedRoots: [], ingress: { maxBytes: 10_000_000, maxRoots: 4 },
+    allowLocalIngress: false,
+    sourceSnapshots: { principal, resolver: { async resolve(...args) {
+      assert.equal(context.provider.creates, 0); calls.push(args); return resolution
+    } } },
+  })
+
+  const provisioned = await service.provision(request)
+  assert.deepEqual(calls, [[principal, request.source.sourceSnapshotId, request.source.checksum]])
+  assert.equal(Object.hasOwn(request, 'tenantId'), false)
+  assert.equal(provisioned.cwd, resolution.cwdUri)
+  assert.deepEqual(provisioned.workspaceRoots, resolution.workspaceRootUris)
+  const lease = await context.store.read(database => database.leases[provisioned.leaseId]!)
+  assert.deepEqual(context.provider.sandboxes.get(lease.sandboxId)!.bytes, resolution.archive)
+})
+
+test('immutable source authorization failure happens before provider allocation', async () => {
+  const context = await fixture(); const request = immutableRequest(context, 'immutable-denied')
+  const service = new ControlPlane(context.store, context.provider, context.tickets, context.blobs, {
+    templates: { 'general-v1': 'tpl-1' }, allowedRoots: [], ingress: { maxBytes: 10_000_000, maxRoots: 4 },
+    sourceSnapshots: { principal: { tenantId: 'tenant-trusted' }, resolver: {
+      async resolve() { throw new ServiceError(404, 'source snapshot unavailable') },
+    } },
+  })
+
+  await assert.rejects(service.provision(request), /source snapshot unavailable/)
+  assert.equal(context.provider.creates, 0)
+  assert.deepEqual(context.provider.live(), [])
+})
+
+test('immutable source resolution mismatch fails before provider allocation', async () => {
+  const context = await fixture(); const request = immutableRequest(context, 'immutable-mismatch')
+  const service = new ControlPlane(context.store, context.provider, context.tickets, context.blobs, {
+    templates: { 'general-v1': 'tpl-1' }, allowedRoots: [], ingress: { maxBytes: 10_000_000, maxRoots: 4 },
+    sourceSnapshots: { principal: { tenantId: 'tenant-trusted' }, resolver: {
+      async resolve() { return { ...immutableResolution(request), checksum: `sha256:${'d'.repeat(64)}` } },
+    } },
+  })
+
+  await assert.rejects(service.provision(request), /immutable source snapshot resolution mismatch/)
+  assert.equal(context.provider.creates, 0)
+  assert.deepEqual(context.provider.live(), [])
+})
+
+test('immutable source provisioning cleans its allocation after a later failure', async () => {
+  const context = await fixture(); const request = immutableRequest(context, 'immutable-cleanup')
+  context.provider.failAt = 'start'
+  const service = new ControlPlane(context.store, context.provider, context.tickets, context.blobs, {
+    templates: { 'general-v1': 'tpl-1' }, allowedRoots: [], ingress: { maxBytes: 10_000_000, maxRoots: 4 },
+    sourceSnapshots: { principal: { tenantId: 'tenant-trusted' }, resolver: {
+      async resolve() { return immutableResolution(request) },
+    } },
+  })
+
+  await assert.rejects(service.provision(request), /injected start/)
+  assert.equal(context.provider.creates, 1)
+  assert.deepEqual(context.provider.live(), [])
+})
+
+test('immutable source idempotent replay neither resolves nor allocates again', async () => {
+  const context = await fixture(); const request = immutableRequest(context, 'immutable-replay'); let resolutions = 0
+  const service = new ControlPlane(context.store, context.provider, context.tickets, context.blobs, {
+    templates: { 'general-v1': 'tpl-1' }, allowedRoots: [], ingress: { maxBytes: 10_000_000, maxRoots: 4 },
+    sourceSnapshots: { principal: { tenantId: 'tenant-trusted' }, resolver: {
+      async resolve() { resolutions += 1; return immutableResolution(request) },
+    } },
+  })
+
+  const first = await service.provision(request); const replay = await service.provision(request)
+  assert.equal(resolutions, 1)
+  assert.equal(context.provider.creates, 1)
+  assert.equal(replay.leaseId, first.leaseId)
+  assert.notEqual(replay.connection.execServerUrl, first.connection.execServerUrl)
 })
 
 test('release closes active gateway connections through the revoker', async () => {

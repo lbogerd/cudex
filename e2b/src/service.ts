@@ -6,6 +6,7 @@ import { archiveWorkspace, type IngressLimits } from './ingress.js'
 import type { CheckpointRequest, LeaseRecord, OperationRecord, ProvisionRequest, ProvisionedAgent, ReconnectRequest, ReleaseRequest, ToolPolicy } from './types.js'
 import { ServiceError } from './types.js'
 import type { ObjectStore } from './blob-store.js'
+import type { AuthenticatedTenant, ResolvedSourceSnapshot } from './source-snapshots.js'
 
 function canonical(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonical)
@@ -23,7 +24,21 @@ const defaultPolicy: ToolPolicy = {
     { name: 'send_message', namespace: null }, { name: 'wait_agent', namespace: null },
   ],
 }
-interface ServiceOptions { templates: Record<string, string>; allowedRoots: string[]; ingress: IngressLimits; allowLocalIngress?: boolean }
+interface SourceSnapshotProvisioning {
+  /** Trusted deployment identity; it must never be populated from request JSON. */
+  principal: AuthenticatedTenant
+  resolver: {
+    resolve(principal: AuthenticatedTenant, sourceSnapshotId: string,
+      expectedChecksum: string): Promise<ResolvedSourceSnapshot>
+  }
+}
+interface ServiceOptions {
+  templates: Record<string, string>
+  allowedRoots: string[]
+  ingress: IngressLimits
+  allowLocalIngress?: boolean
+  sourceSnapshots?: SourceSnapshotProvisioning
+}
 interface ConnectionRevoker { revoke(leaseId: string): void }
 
 export class ControlPlane {
@@ -51,8 +66,17 @@ export class ControlPlane {
       if (request.source.type === 'rootWorkspace' && this.options.allowLocalIngress === false) {
         throw new ServiceError(400, 'local workspace ingress is disabled')
       }
+      let immutableSource: ResolvedSourceSnapshot | undefined
       if (request.source.type === 'sourceSnapshot') {
-        throw new ServiceError(503, 'immutable source snapshot provisioning is not configured')
+        const configured = this.options.sourceSnapshots
+        if (!configured) throw new ServiceError(503, 'immutable source snapshot provisioning is not configured')
+        immutableSource = await configured.resolver.resolve(
+          configured.principal, request.source.sourceSnapshotId, request.source.checksum)
+        if (immutableSource.sourceSnapshotId !== request.source.sourceSnapshotId
+          || immutableSource.checksum !== request.source.checksum
+          || !(immutableSource.archive instanceof Uint8Array)) {
+          throw new ServiceError(503, 'immutable source snapshot resolution mismatch')
+        }
       }
       const leaseId = opaque('lease'); const environmentId = opaque('env')
       let sandboxId: string | undefined; let cwd: string; let roots: string[]; let created
@@ -69,7 +93,10 @@ export class ControlPlane {
         } else {
           created = await this.provider.create(templateId, { leaseId, agentId: request.agentId, template: request.sandboxTemplate })
           sandboxId = created.sandboxId; operation.allocatedSandboxId = sandboxId; await this.persistOperation(operation)
-          if (request.source.type === 'rootWorkspace') {
+          if (immutableSource) {
+            await this.provider.uploadArchive(created.sandboxId, immutableSource.archive)
+            cwd = immutableSource.cwdUri; roots = [...immutableSource.workspaceRootUris]
+          } else if (request.source.type === 'rootWorkspace') {
             const archive = await archiveWorkspace(request.source.cwd, request.source.workspaceRoots, this.options.allowedRoots, this.options.ingress)
             await this.provider.uploadArchive(created.sandboxId, archive.bytes); cwd = archive.cwd; roots = archive.roots
           } else if (request.source.type === 'agentEnvironment') {

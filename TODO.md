@@ -66,7 +66,8 @@ connection material or allocation is leaked.
 - [x] Define the exact `sourceSnapshot` provision wire shape and authenticated
   create/resolve API adapter without accepting tenant identity or host paths from
   JSON; keep provision fail-closed until the durable backend owns the route.
-- [ ] Authorize tenant/checksum/expiry before sandbox allocation.
+- [x] Authorize tenant/checksum/expiry through a trusted resolver before sandbox
+  allocation; fail closed when the resolver is unavailable or inconsistent.
 - [x] Add a same-transaction final authorization lock for the exact source
   tenant, ID, checksum, available state, and expiry; provision remains unwired.
 - [ ] Preserve roots, cwd, dirty/untracked and binary files, modes, and symlinks
