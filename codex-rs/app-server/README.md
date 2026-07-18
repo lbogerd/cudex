@@ -155,6 +155,8 @@ Example with notification opt-out:
 - `thread/goal/clear` — clear the current persisted goal for a materialized thread; returns whether a goal was removed and emits `thread/goal/cleared` when state changes.
 - `thread/goal/updated` — notification emitted whenever a thread goal changes; includes the full current goal.
 - `thread/goal/cleared` — notification emitted whenever a thread goal is removed.
+- `agent/patchApply` — experimental; atomically apply a completed hosted child agent's exported artifact to the requesting owner's current sandbox. The request is `{ threadId, agentId, artifactId }`; the tagged response is `applied`, `conflict` with at most 256 canonical file-URI paths, or `rejected` with a reason. Conflicts leave the owner's sandbox unchanged.
+- `agent/patchAvailable` — experimental notification emitted when a completed hosted child agent has a durable exported patch. It includes the owner `threadId` and non-secret artifact metadata (`artifactId`, `agentId`, `baseSnapshotId`, `checksum`, `changedFiles`, and `sizeBytes`).
 - `thread/settings/updated` — experimental notification emitted to subscribed clients when a loaded thread’s effective next-turn settings change; includes `threadId` and the full `threadSettings`.
 - `thread/status/changed` — notification emitted when a loaded thread’s status changes (`threadId` + new `status`).
 - `thread/archive` — move a thread’s rollout file into the archived directory and attempt to move any spawned descendant thread rollout files; returns `{}` on success and emits `thread/archived` for each archived thread.

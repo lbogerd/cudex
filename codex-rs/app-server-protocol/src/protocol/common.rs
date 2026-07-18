@@ -945,6 +945,13 @@ client_request_definitions! {
         serialization: None,
         response: v2::CollaborationModeListResponse,
     },
+    #[experimental("agent/patchApply")]
+    /// Atomically applies an exported hosted-agent patch to its owner's sandbox.
+    AgentPatchApply => "agent/patchApply" {
+        params: v2::AgentPatchApplyParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::AgentPatchApplyResponse,
+    },
     #[experimental("mock/experimentalMethod")]
     /// Test-only method used to validate experimental gating.
     MockExperimentalMethod => "mock/experimentalMethod" {
@@ -1640,6 +1647,8 @@ server_notification_definitions! {
     ThreadNameUpdated => "thread/name/updated" (v2::ThreadNameUpdatedNotification),
     ThreadGoalUpdated => "thread/goal/updated" (v2::ThreadGoalUpdatedNotification),
     ThreadGoalCleared => "thread/goal/cleared" (v2::ThreadGoalClearedNotification),
+    #[experimental("agent/patchAvailable")]
+    AgentPatchAvailable => "agent/patchAvailable" (v2::AgentPatchAvailableNotification),
     #[experimental("thread/environment/connected")]
     EnvironmentConnected => "thread/environment/connected" (v2::EnvironmentConnectionNotification),
     #[experimental("thread/environment/disconnected")]
@@ -1731,6 +1740,17 @@ server_notification_definitions! {
     AccountLoginCompleted(v2::AccountLoginCompletedNotification),
 
 }
+
+/// Experimental server notifications that must be omitted from stable schema fixtures.
+///
+/// Unlike request definitions, the notification macro accepts arbitrary variant metadata and
+/// cannot derive an export-filter list from `#[experimental(...)]` attributes. Keep this list in
+/// sync with new notification-only API surfaces that must not appear in stable client schemas.
+pub(crate) const EXPERIMENTAL_SERVER_NOTIFICATION_METHODS: &[&str] = &["agent/patchAvailable"];
+pub(crate) const EXPERIMENTAL_SERVER_NOTIFICATION_PAYLOAD_TYPES: &[&str] = &[
+    "AgentPatchAvailableNotification",
+    "AgentPatchArtifactMetadata",
+];
 
 /// Server notification envelope sent over app-server transports.
 ///

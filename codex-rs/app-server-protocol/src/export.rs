@@ -18,6 +18,8 @@ use crate::protocol::common::EXPERIMENTAL_CLIENT_METHODS;
 use crate::protocol::common::EXPERIMENTAL_SERVER_METHOD_PARAM_TYPES;
 use crate::protocol::common::EXPERIMENTAL_SERVER_METHOD_RESPONSE_TYPES;
 use crate::protocol::common::EXPERIMENTAL_SERVER_METHODS;
+use crate::protocol::common::EXPERIMENTAL_SERVER_NOTIFICATION_METHODS;
+use crate::protocol::common::EXPERIMENTAL_SERVER_NOTIFICATION_PAYLOAD_TYPES;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
@@ -262,6 +264,16 @@ fn filter_experimental_ts(out_dir: &Path) -> Result<()> {
     // post-processing because they encode method/field information locally.
     filter_request_ts(out_dir, "ClientRequest.ts", EXPERIMENTAL_CLIENT_METHODS)?;
     filter_request_ts(out_dir, "ServerRequest.ts", EXPERIMENTAL_SERVER_METHODS)?;
+    filter_request_ts(
+        out_dir,
+        "ServerNotification.ts",
+        EXPERIMENTAL_SERVER_NOTIFICATION_METHODS,
+    )?;
+    filter_request_ts(
+        out_dir,
+        "ServerNotificationEnvelope.ts",
+        EXPERIMENTAL_SERVER_NOTIFICATION_METHODS,
+    )?;
     filter_experimental_type_fields_ts(out_dir, &registered_fields)?;
     remove_generated_type_files(out_dir, &experimental_method_types, "ts")?;
     Ok(())
@@ -273,6 +285,14 @@ pub(crate) fn filter_experimental_ts_tree(tree: &mut BTreeMap<PathBuf, String>) 
     for (file_name, experimental_methods) in [
         ("ClientRequest.ts", EXPERIMENTAL_CLIENT_METHODS),
         ("ServerRequest.ts", EXPERIMENTAL_SERVER_METHODS),
+        (
+            "ServerNotification.ts",
+            EXPERIMENTAL_SERVER_NOTIFICATION_METHODS,
+        ),
+        (
+            "ServerNotificationEnvelope.ts",
+            EXPERIMENTAL_SERVER_NOTIFICATION_METHODS,
+        ),
     ] {
         if let Some(content) = tree.get_mut(Path::new(file_name)) {
             *content = filter_request_ts_contents(std::mem::take(content), experimental_methods);
@@ -328,20 +348,48 @@ fn filter_request_ts_contents(mut content: String, experimental_methods: &[&str]
         .copied()
         .filter(|method| !method.is_empty())
         .collect();
-    let arms = split_top_level(&body, '|');
-    let filtered_arms: Vec<String> = arms
-        .into_iter()
-        .filter(|arm| {
-            extract_method_from_arm(arm)
-                .is_none_or(|method| !experimental_methods.contains(method.as_str()))
-        })
-        .collect();
-    let new_body = filtered_arms.join(" | ");
+    let new_body = filter_method_union(&body, &experimental_methods);
     content = format!("{prefix}{new_body}{suffix}");
     let import_usage_scope = split_type_alias(&content)
         .map(|(_, filtered_body, _)| filtered_body)
         .unwrap_or_else(|| new_body.clone());
     prune_unused_type_imports(content, &import_usage_scope)
+}
+
+fn filter_method_union(body: &str, experimental_methods: &HashSet<&str>) -> String {
+    let leading_len = body.len() - body.trim_start().len();
+    let trailing_start = body.trim_end().len();
+    let trimmed = &body[leading_len..trailing_start];
+
+    let arms = split_top_level(trimmed, '|');
+    if arms.len() > 1 {
+        let filtered_arms: Vec<String> = arms
+            .into_iter()
+            .filter(|arm| {
+                extract_method_from_arm(arm)
+                    .is_none_or(|method| !experimental_methods.contains(method.as_str()))
+            })
+            .collect();
+        return filtered_arms.join(" | ");
+    }
+
+    let Some(intersection_index) = trimmed.find("& (") else {
+        return body.to_string();
+    };
+    let union_start = leading_len + intersection_index + "& (".len();
+    let Some(union_end) = body[..trailing_start].rfind(')') else {
+        return body.to_string();
+    };
+    if union_end <= union_start {
+        return body.to_string();
+    }
+    let filtered_union = filter_method_union(&body[union_start..union_end], experimental_methods);
+    format!(
+        "{}{}{}",
+        &body[..union_start],
+        filtered_union,
+        &body[union_end..]
+    )
 }
 
 /// Removes experimental properties from generated TypeScript type files.
@@ -417,6 +465,7 @@ fn filter_experimental_schema(bundle: &mut Value) -> Result<()> {
     filter_experimental_fields_in_definitions(bundle, &registered_fields);
     prune_experimental_methods(bundle, EXPERIMENTAL_CLIENT_METHODS);
     prune_experimental_methods(bundle, EXPERIMENTAL_SERVER_METHODS);
+    prune_experimental_methods(bundle, EXPERIMENTAL_SERVER_NOTIFICATION_METHODS);
     remove_experimental_method_type_definitions(bundle);
     Ok(())
 }
@@ -575,6 +624,10 @@ fn experimental_method_types() -> HashSet<String> {
     collect_experimental_type_names(EXPERIMENTAL_CLIENT_METHOD_DEPENDENCY_TYPES, &mut type_names);
     collect_experimental_type_names(EXPERIMENTAL_SERVER_METHOD_PARAM_TYPES, &mut type_names);
     collect_experimental_type_names(EXPERIMENTAL_SERVER_METHOD_RESPONSE_TYPES, &mut type_names);
+    collect_experimental_type_names(
+        EXPERIMENTAL_SERVER_NOTIFICATION_PAYLOAD_TYPES,
+        &mut type_names,
+    );
     type_names
 }
 
