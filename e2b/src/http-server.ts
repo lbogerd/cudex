@@ -5,6 +5,14 @@ import { timingSafeEqual } from 'node:crypto'
 import type { ControlPlane } from './service.js'
 import { ServiceError } from './types.js'
 import type { ExecGateway } from './gateway.js'
+import {
+  validateCheckpointRequest,
+  validateCheckpointResponse,
+  validateProvisionedAgent,
+  validateProvisionRequest,
+  validateReconnectRequest,
+  validateReleaseRequest,
+} from './validation.js'
 
 interface ServerOptions {
   host: string
@@ -19,6 +27,25 @@ const routes = new Map([
   ['/v1/agents/provision', 'provision'], ['/v1/agents/reconnect', 'reconnect'],
   ['/v1/agents/checkpoint', 'checkpoint'], ['/v1/agents/release', 'release'],
 ] as const)
+type Method = 'provision' | 'reconnect' | 'checkpoint' | 'release'
+
+function validateInput(method: Method, value: unknown): unknown {
+  switch (method) {
+    case 'provision': return validateProvisionRequest(value)
+    case 'reconnect': return validateReconnectRequest(value)
+    case 'checkpoint': return validateCheckpointRequest(value)
+    case 'release': return validateReleaseRequest(value)
+  }
+}
+
+function validateOutput(method: Method, value: unknown): unknown {
+  switch (method) {
+    case 'provision':
+    case 'reconnect': return validateProvisionedAgent(value)
+    case 'checkpoint': return validateCheckpointResponse(value)
+    case 'release': return value
+  }
+}
 
 function authorized(header: string | undefined, token: string): boolean {
   if (!header?.startsWith('Bearer ')) return false
@@ -51,14 +78,16 @@ export async function startServer(service: ControlPlane, gateway: ExecGateway, o
       if (!authorized(request.headers.authorization, options.bearerToken)) throw new ServiceError(401, 'unauthorized')
       const method = routes.get(new URL(request.url ?? '/', 'http://localhost').pathname as '/v1/agents/provision')
       if (!method) throw new ServiceError(404, 'not found')
-      const result = await (service[method] as (input: never) => Promise<unknown>)(await body(request) as never)
+      const input = validateInput(method, await body(request))
+      const result = validateOutput(method, await (service[method] as (input: never) => Promise<unknown>)(input as never))
       response.statusCode = method === 'release' ? 204 : 200
       response.setHeader('content-type', 'application/json'); response.end(method === 'release' ? undefined : JSON.stringify(result))
     } catch (error) {
       const status = error instanceof ServiceError ? error.status : 503
       response.statusCode = status; response.setHeader('content-type', 'application/json')
       if (status === 413) response.setHeader('connection', 'close')
-      response.end(JSON.stringify({ error: error instanceof ServiceError ? error.message : 'service unavailable' }))
+      const message = error instanceof ServiceError && error.status < 500 ? error.message : 'service unavailable'
+      response.end(JSON.stringify({ error: message }))
     }
   }
   const server = options.tlsCertPath && options.tlsKeyPath

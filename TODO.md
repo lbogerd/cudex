@@ -75,8 +75,10 @@ tickets always fail, and secrets never enter durable or observable state.
 
 ## 4. Complete production lifecycle behavior
 
-- [ ] Strictly validate every request, canonical file URI, identifier, template,
-  relationship, and response bound in `ARCHIVE.md`.
+- [x] Strictly validate exact provision, reconnect, checkpoint, and release
+  request shapes plus bounded provision/reconnect/checkpoint responses at HTTP.
+- [ ] Extend strict validation and authorization to patch requests, trusted
+  template/role mappings, and persisted tenant/owner relationships.
 - [ ] Make provision cleanup-safe after every allocation step, including response
   persistence failure.
 - [ ] Serialize checkpoint, reconnect, child capture, patch, release, and command

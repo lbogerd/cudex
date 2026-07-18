@@ -46,17 +46,24 @@ async function fixture(service: object) {
 
 test('HTTP responses disable caching and redact unexpected service errors', async t => {
   const service = {
-    async reconnect() { return { ok: true } },
+    async reconnect() {
+      return {
+        leaseId: 'lease', environmentId: 'environment', baseSnapshotId: 'snapshot',
+        connection: { execServerUrl: 'wss://gateway.example/leases/lease?ticket=opaque_ticket' },
+        cwd: 'file:///workspace/root', workspaceRoots: ['file:///workspace/root'],
+        toolPolicy: { allowedDomains: [], allowedTools: [] },
+      }
+    },
     async checkpoint() { throw new Error('provider URL contained a secret') },
   }
   const { server, port } = await fixture(service); t.after(() => server.close())
 
-  const success = await post(port, '/v1/agents/reconnect', '{}')
+  const success = await post(port, '/v1/agents/reconnect', JSON.stringify({ leaseId: 'lease', idempotencyKey: 'reconnect' }))
   assert.equal(success.status, 200)
   assert.equal(success.headers['cache-control'], 'no-store')
-  assert.deepEqual(JSON.parse(success.body), { ok: true })
+  assert.equal(JSON.parse(success.body).leaseId, 'lease')
 
-  const failure = await post(port, '/v1/agents/checkpoint', '{}')
+  const failure = await post(port, '/v1/agents/checkpoint', JSON.stringify({ leaseId: 'lease', idempotencyKey: 'checkpoint' }))
   assert.equal(failure.status, 503)
   assert.equal(failure.headers['cache-control'], 'no-store')
   assert.deepEqual(JSON.parse(failure.body), { error: 'service unavailable' })
@@ -84,4 +91,30 @@ test('HTTP requires paired TLS configuration unless development mode is explicit
   await assert.rejects(startServer(service, gateway, {
     host: '127.0.0.1', port: 0, bearerToken: 'token', tlsCertPath: '/tmp/cert', allowInsecureHttp: true,
   }), /configured together/)
+})
+
+test('HTTP strictly validates requests before dispatch and validates service responses', async t => {
+  let provisionCalls = 0
+  const service = {
+    async provision() { provisionCalls++; return { leaseId: 'lease-only' } },
+    async checkpoint() { return { snapshotId: 'snapshot', extra: 'invalid' } },
+  }
+  const { server, port } = await fixture(service); t.after(() => server.close())
+  const malformed = await post(port, '/v1/agents/provision', JSON.stringify({ extra: true }))
+  assert.equal(malformed.status, 400)
+  assert.equal(provisionCalls, 0)
+
+  const request = {
+    agentId: 'agent', ownerAgentId: null, agentType: 'default', sandboxTemplate: 'general-v1',
+    source: { type: 'rootWorkspace', cwd: 'file:///source', workspaceRoots: ['file:///source'] },
+    idempotencyKey: 'provision',
+  }
+  const invalidProvision = await post(port, '/v1/agents/provision', JSON.stringify(request))
+  assert.equal(invalidProvision.status, 503)
+  assert.deepEqual(JSON.parse(invalidProvision.body), { error: 'service unavailable' })
+  assert.equal(provisionCalls, 1)
+
+  const invalidCheckpoint = await post(port, '/v1/agents/checkpoint', JSON.stringify({ leaseId: 'lease', idempotencyKey: 'checkpoint' }))
+  assert.equal(invalidCheckpoint.status, 503)
+  assert.deepEqual(JSON.parse(invalidCheckpoint.body), { error: 'service unavailable' })
 })

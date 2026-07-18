@@ -307,6 +307,24 @@ multi-lease acquisition without deadlock. The existing control-plane methods
 still need to be refactored onto this API before the production persistence
 checklist and provider-mutation exit criterion are satisfied.
 
+### Strict control-plane wire validation
+
+The HTTP boundary now parses the four implemented operations as exact plain JSON
+objects before dispatch. It rejects unknown/missing properties, malformed union
+discriminants, invalid owner/source relationships, noncanonical or overlapping
+workspace `file:` URIs, invalid Unicode, and all identifier/name/root bounds with
+HTTP 400 before provider mutation. Bounds use UTF-8 bytes rather than JavaScript
+code-unit counts.
+
+Provision/reconnect responses are revalidated as exact bounded objects: distinct
+lease/environment identities, contained cwd/roots, canonical WSS endpoint with
+one lease-scoped opaque ticket and no userinfo/fragment/extra query, and unique
+bounded tool domains/tools. Checkpoint responses are exact snapshot identities.
+Invalid internal/provider responses and unexpected failures are returned as a
+generic 503, while safe client validation messages remain 4xx. Focused tests
+cover every request shape, extra fields, byte boundaries, URI canonicalization,
+tool policy, endpoint rules, pre-dispatch rejection, and response rejection.
+
 CubeSandbox was verified on 2026-07-18 through stock E2B TypeScript SDK 2.35.0.
 Provider code lives in the external TypeScript control plane under `e2b/src`, not
 in `codex-core`.
