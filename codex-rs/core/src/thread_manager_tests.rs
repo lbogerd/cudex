@@ -644,6 +644,30 @@ async fn hosted_patch_apply_rejects_missing_policy_stale_artifact_and_non_owner(
 }
 
 #[tokio::test]
+async fn finalized_hosted_agent_rejects_followup_turns() {
+    let (_temp_dir, config, manager, _hosted_service) = hosted_thread_manager_for_tests().await;
+    let (owner, agent) = start_hosted_owned_agent(&manager, &config).await;
+    manager
+        .state
+        .finalize_hosted_runtime(agent.thread_id, owner.thread_id)
+        .await
+        .expect("finalize hosted agent")
+        .expect("hosted patch artifact");
+
+    manager
+        .state
+        .ensure_hosted_runtime_active(owner.thread_id)
+        .await
+        .expect("active hosted owner can start another turn");
+    let error = manager
+        .state
+        .ensure_hosted_runtime_active(agent.thread_id)
+        .await
+        .expect_err("finalized hosted agent must reject a followup turn");
+    assert!(error.to_string().contains("spawn a new agent instead"));
+}
+
+#[tokio::test]
 async fn hosted_finalization_checkpoint_failure_preserves_pending_lease() {
     let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
     let mut patch_available = manager.subscribe_hosted_agent_patch_available();
@@ -831,10 +855,15 @@ async fn hosted_finalization_release_failure_is_durable_and_cleanup_retries() {
         record.lifecycle_state,
         codex_hosted_agent::HostedAgentLifecycleState::ReleasePending
     );
+    assert!(
+        manager
+            .hosted_runtime_cleanup_pending(agent.thread_id)
+            .await
+    );
     assert_eq!(hosted_service.active_lease_count(), 2);
 
     hosted_service.set_release_failure(None);
-    manager.state.release_hosted_runtime(agent.thread_id).await;
+    manager.retry_hosted_runtime_cleanup(agent.thread_id).await;
     let record = manager
         .state
         .thread_store
@@ -846,6 +875,30 @@ async fn hosted_finalization_release_failure_is_durable_and_cleanup_retries() {
         record.lifecycle_state,
         codex_hosted_agent::HostedAgentLifecycleState::Released
     );
+    assert!(
+        !manager
+            .hosted_runtime_cleanup_pending(agent.thread_id)
+            .await
+    );
+    assert_eq!(hosted_service.active_lease_count(), 1);
+}
+
+#[tokio::test]
+async fn hosted_cleanup_retry_does_not_remove_an_active_runtime_generation() {
+    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
+    let root = manager
+        .start_thread_with_options(start_thread_options(config))
+        .await
+        .expect("start hosted root");
+
+    manager.retry_hosted_runtime_cleanup(root.thread_id).await;
+
+    assert!(manager.get_thread(root.thread_id).await.is_ok());
+    manager
+        .state
+        .ensure_hosted_runtime_active(root.thread_id)
+        .await
+        .expect("cleanup retry must preserve active generation");
     assert_eq!(hosted_service.active_lease_count(), 1);
 }
 

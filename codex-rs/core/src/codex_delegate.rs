@@ -104,6 +104,10 @@ pub(crate) async fn run_codex_thread_interactive(
         crate::hosted_agent_telemetry::record_local_fallback_attempt(
             crate::hosted_agent_telemetry::LocalFallbackPath::Delegate,
         );
+        return Err(CodexErr::Fatal(
+            "hosted delegate provisioning returned no runtime; local fallback is disabled"
+                .to_string(),
+        ));
     }
     let (environment_selections, inherited_environments, inherited_exec_policy) =
         match pending_hosted_runtime.as_ref() {

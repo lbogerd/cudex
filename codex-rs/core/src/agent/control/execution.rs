@@ -45,6 +45,7 @@ impl AgentControl {
             return Ok(());
         }
         let state = self.upgrade()?;
+        state.ensure_hosted_runtime_active(thread_id).await?;
         let thread = state.get_thread(thread_id).await?;
         if thread.session.active_turn.lock().await.is_some() {
             return Ok(());

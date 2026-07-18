@@ -1106,6 +1106,37 @@ impl ThreadManager {
         self.state.remove_thread(thread_id).await
     }
 
+    /// Returns whether a hosted runtime is still retained for finalization or cleanup retry.
+    pub async fn hosted_runtime_cleanup_pending(&self, thread_id: ThreadId) -> bool {
+        self.state
+            .hosted_agent_runtimes
+            .read()
+            .await
+            .get(&thread_id)
+            .is_some_and(|runtime| {
+                matches!(
+                    runtime.snapshot().lifecycle_state,
+                    codex_hosted_agent::HostedAgentLifecycleState::PendingFinalization
+                        | codex_hosted_agent::HostedAgentLifecycleState::Completed
+                        | codex_hosted_agent::HostedAgentLifecycleState::ReleasePending
+                )
+            })
+    }
+
+    /// Retries only a retained hosted finalization or release, without removing a thread session.
+    pub async fn retry_hosted_runtime_cleanup(&self, thread_id: ThreadId) {
+        self.state.retry_hosted_runtime_cleanup(thread_id).await;
+    }
+
+    /// Returns whether the thread currently owns any hosted runtime generation.
+    pub async fn has_hosted_runtime(&self, thread_id: ThreadId) -> bool {
+        self.state
+            .hosted_agent_runtimes
+            .read()
+            .await
+            .contains_key(&thread_id)
+    }
+
     /// Tries to shut down all tracked threads concurrently within the provided timeout.
     /// Threads that complete shutdown are removed from the manager; incomplete shutdowns
     /// remain tracked so callers can retry or inspect them later.
@@ -1789,6 +1820,41 @@ impl ThreadManagerState {
             .await;
     }
 
+    async fn retry_hosted_runtime_cleanup(&self, thread_id: ThreadId) {
+        let hosted_runtime = {
+            let mut runtimes = self.hosted_agent_runtimes.write().await;
+            let should_retry = runtimes.get(&thread_id).is_some_and(|runtime| {
+                matches!(
+                    runtime.snapshot().lifecycle_state,
+                    codex_hosted_agent::HostedAgentLifecycleState::PendingFinalization
+                        | codex_hosted_agent::HostedAgentLifecycleState::Completed
+                        | codex_hosted_agent::HostedAgentLifecycleState::ReleasePending
+                )
+            });
+            should_retry.then(|| runtimes.remove(&thread_id)).flatten()
+        };
+        self.release_removed_hosted_runtime(thread_id, hosted_runtime)
+            .await;
+    }
+
+    pub(crate) async fn ensure_hosted_runtime_active(
+        &self,
+        thread_id: ThreadId,
+    ) -> CodexResult<()> {
+        let lifecycle_state = self
+            .hosted_agent_runtimes
+            .read()
+            .await
+            .get(&thread_id)
+            .map(|runtime| runtime.snapshot().lifecycle_state);
+        match lifecycle_state {
+            None | Some(codex_hosted_agent::HostedAgentLifecycleState::Active) => Ok(()),
+            Some(lifecycle_state) => Err(CodexErr::InvalidRequest(format!(
+                "hosted agent {thread_id} cannot start another turn from lifecycle state {lifecycle_state:?}; spawn a new agent instead"
+            ))),
+        }
+    }
+
     async fn release_removed_hosted_runtime(
         &self,
         thread_id: ThreadId,
@@ -2393,6 +2459,10 @@ impl ThreadManagerState {
             crate::hosted_agent_telemetry::record_local_fallback_attempt(
                 crate::hosted_agent_telemetry::LocalFallbackPath::ThreadStart,
             );
+            return Err(CodexErr::Fatal(
+                "hosted thread provisioning returned no runtime; local fallback is disabled"
+                    .to_string(),
+            ));
         }
         let (environments, inherited_environments, inherited_exec_policy) =
             match pending_hosted_runtime.as_ref() {
