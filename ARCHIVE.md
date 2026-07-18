@@ -325,6 +325,25 @@ generic 503, while safe client validation messages remain 4xx. Focused tests
 cover every request shape, extra fields, byte boundaries, URI canonicalization,
 tool policy, endpoint rules, pre-dispatch rejection, and response rejection.
 
+### Safe archive manifest capture
+
+Provider workspace tar bytes can now be parsed without filesystem extraction
+into the canonical manifest model. The parser requires the explicit `roots/`
+tree and rejects absolute/traversing/out-of-tree and duplicate paths,
+non-directory ancestors, hardlinks, devices, FIFOs, unknown types, escaping
+symlinks, invalid modes, checksum warnings, truncated bodies, and declared/body
+size mismatches. Archive, metadata-entry, entry/file, per-file/total, manifest,
+and decompression/extraction-ratio limits are enforced.
+
+Regular file bodies are hashed while read, written through the content-addressed
+object-store boundary, and verified against the returned object ID. Capture
+returns stable manifest bytes/checksum, sorted path-to-content-object identities,
+and total size without requiring Git. Tests construct raw tar headers to cover
+binary data, executable/directory modes, safe links, corruption, truncation,
+special/unknown types, conflicts, dishonest storage, and every quota. `tar`
+7.5.20 is now a direct dependency rather than an accidental transitive
+implementation detail.
+
 CubeSandbox was verified on 2026-07-18 through stock E2B TypeScript SDK 2.35.0.
 Provider code lives in the external TypeScript control plane under `e2b/src`, not
 in `codex-core`.

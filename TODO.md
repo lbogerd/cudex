@@ -75,6 +75,9 @@ tickets always fail, and secrets never enter durable or observable state.
 
 ## 4. Complete production lifecycle behavior
 
+- [x] Parse provider workspace archives without extraction into canonical
+  manifests/content blobs, rejecting unsafe tar types, paths, links, conflicts,
+  corruption, and quota excess.
 - [x] Strictly validate exact provision, reconnect, checkpoint, and release
   request shapes plus bounded provision/reconnect/checkpoint responses at HTTP.
 - [ ] Extend strict validation and authorization to patch requests, trusted
