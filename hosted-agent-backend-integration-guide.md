@@ -18,6 +18,65 @@ The Codex-side sources of truth are:
 - [`plan-for-hosted-full-agent-runtime.md`](plan-for-hosted-full-agent-runtime.md)
   for the completed Codex-side design.
 
+## Verified integration foundation (2026-07-18)
+
+The local CubeSandbox deployment is API-compatible with the E2B TypeScript SDK.
+The checked-in development pipeline now pins `e2b` 2.35.0 and proves the custom
+Codex fork can be packaged and reached through that SDK:
+
+- [`e2b/scripts/build-codex-artifact.sh`](e2b/scripts/build-codex-artifact.sh)
+  builds the fork with its pinned Rust toolchain for
+  `x86_64-unknown-linux-musl`, resolves the pinned V8 cargo environment, strips
+  the distributable, and records revision and checksum metadata;
+- [`e2b/scripts/build-template-image.sh`](e2b/scripts/build-template-image.sh)
+  replaces the upstream Codex binary in `cubesandbox-codex:0.1.0`, verifies its
+  checksum and `exec-server` command during the image build, and publishes the
+  image to the local registry;
+- [`e2b/scripts/publish-template.sh`](e2b/scripts/publish-template.sh) publishes
+  the image through `cubemastercli` and waits for every CubeSandbox node to
+  report the template ready;
+- [`e2b/scripts/verify-template.mjs`](e2b/scripts/verify-template.mjs) uses the
+  stock SDK to create a sandbox, verify the embedded provenance, start the
+  custom `codex exec-server`, execute a process over its proxied WSS endpoint,
+  and kill the sandbox.
+
+The verified development template is `tpl-e7bc8fcedb3c4dd8973c5e43`. It contains
+Codex revision `3780c42c66f904e610858c804bfed79f201bd204`, exposes envd on port
+`49983` and the exec server on port `22101`, and passed repeated canaries with
+the expected `cudex-template-ok` output. Template IDs are deployment artifacts,
+not configuration constants; rebuild and republish them for later revisions.
+
+The same SDK and CubeSandbox setup also exercised create, commands, files,
+snapshot creation, reconnect, pause, and kill. This proves the provider
+primitives, not yet the complete hosted-agent lifecycle contract.
+
+Operationally, the first static release build took about 17 minutes and produced
+roughly 13 GiB of target data because Codex includes V8 and release LTO. A cached
+rebuild completed in under a second before stripping. The unstripped binary was
+1.36 GiB; the checked-in artifact step reduces the distributable to about 309 MiB.
+Keep adequate build volume available. The pinned npm dependency tree currently
+reports one high-severity advisory; it is accepted for this private development
+setup and must be triaged before a broader deployment.
+
+Decisions established by this work:
+
+- keep the E2B SDK in an external TypeScript control plane; do not add it to
+  `codex-core`;
+- ship the exact custom Codex fork as a checksummed static artifact rather than
+  installing the upstream CLI in a sandbox;
+- start `codex exec-server` after sandbox creation, not as the image entrypoint;
+- map trusted Codex `sandboxTemplate` names to published provider template IDs
+  inside the control plane;
+- persist logical lease, environment, snapshot, and artifact IDs independently
+  from CubeSandbox IDs;
+- allow direct unauthenticated port exposure only for the current trusted local
+  spike. Production transport still requires the authenticated gateway described
+  below.
+
+See [`e2b/README.md`](e2b/README.md) for the verified build commands and
+[`e2b-spike-and-architecture-plan.md`](e2b-spike-and-architecture-plan.md) for
+the remaining spike and decision gates.
+
 ## What to build
 
 Do not add E2B SDK calls directly to `codex-core`. Codex already contains the
@@ -46,10 +105,10 @@ idempotency records, and cleanup. The exec gateway owns authentication and
 connectivity to the `codex exec-server` running inside a sandbox. These can be
 one deployment initially, but they are separate trust boundaries.
 
-## Resolve these integration gates first
+## Remaining integration gates
 
-Three details should be proven with a small E2B spike before building every
-endpoint.
+The packaging and basic SDK transport foundation is complete. Resolve these
+three product-level details before building every endpoint.
 
 ### 1. Initial workspace ingress
 
@@ -80,12 +139,12 @@ accepts today. It must be a `wss://` URL. The exec client does not accept arbitr
 headers, although query parameters are allowed and the complete URL remains
 transient.
 
-E2B exposes a sandbox port at a host such as
-`<port>-<sandbox-id>.e2b.app`. Current E2B APIs also return a traffic access token
-when public traffic is restricted. Confirm the supported authentication transport
-for WebSocket upgrades with the exact E2B SDK/API version you pin; the public docs
-describe the token but do not currently define a URL-only WebSocket handshake for
-this use case.
+CubeSandbox exposes a sandbox port at
+`<port>-<sandbox-id>.cube.app`. The development canary proved that the existing
+Codex exec client protocol works over that direct WSS route with E2B SDK 2.35.0,
+local CA trust, and `secure: false`. It did not prove a production authentication
+scheme. Confirm traffic-token behavior and URL-only WebSocket authentication
+against the production provider configuration.
 
 The recommended production design is a service-owned WSS gateway:
 
@@ -99,14 +158,16 @@ The recommended production design is a service-owned WSS gateway:
   service gateway or an in-sandbox authenticating proxy.
 
 For a proof of concept, an in-sandbox proxy may validate a per-lease query token
-and forward to `codex exec-server` on loopback. Do not expose the unauthenticated
-exec server directly, even temporarily in a shared environment.
+and forward to `codex exec-server` on loopback. The current direct port is accepted
+only on the trusted private development network; do not carry it into a shared
+environment.
 
 ### 3. Snapshot disconnect recovery
 
-E2B snapshots capture filesystem and memory state, but creating one briefly pauses
-the sandbox and drops WebSocket connections. Codex checkpoints after every
-successful hosted turn. Verify this sequence end to end:
+The stock SDK successfully created and restored CubeSandbox snapshots. The exact
+Codex recovery path remains unverified: snapshot creation can interrupt the
+WebSocket while Codex checkpoints after every successful hosted turn. Verify this
+sequence end to end:
 
 1. execute a command through the registered environment;
 2. call `checkpoint` and wait for E2B snapshot completion;
@@ -468,14 +529,17 @@ is a successful `200` response with `{ "type": "conflict", ... }`.
 
 ## E2B implementation mapping
 
-Pin a tested E2B SDK version. The examples below use TypeScript-shaped pseudocode;
-adapt names to the pinned version and keep provider calls behind a small internal
-adapter.
+The development integration pins the E2B TypeScript SDK at 2.35.0. Keep provider
+calls behind a small internal adapter so the HTTP contract, persistence model, and
+tests do not depend on SDK object shapes. The examples below remain
+TypeScript-shaped pseudocode.
 
 ### Template
 
-Build one E2B template for each trusted `sandboxTemplate`, or maintain an explicit
-mapping from Codex template name to E2B template ID. Each template should contain:
+Build one provider template for each trusted `sandboxTemplate`, or maintain an
+explicit mapping from Codex template name to provider template ID. The verified
+development path uses the latter and is documented in `e2b/README.md`. Each
+template should contain:
 
 - a `codex` binary built from a compatible revision and target platform;
 - role-specific compilers, package managers, and tools;
@@ -484,13 +548,16 @@ mapping from Codex template name to E2B template ID. Each template should contai
 - an exec gateway or proxy if it runs inside the sandbox;
 - health-check tooling.
 
-The instance must eventually run:
+The checked-in image exposes envd on `49983` and the development exec endpoint on
+`22101`. The control plane must start:
 
 ```sh
-codex exec-server --listen ws://127.0.0.1:22101
+codex exec-server --listen ws://0.0.0.0:22101
 ```
 
-and expose only an authenticated gateway on `0.0.0.0:22100`.
+after sandbox creation. Binding to all interfaces is acceptable only for the
+private CubeSandbox spike. For production, bind the raw server to loopback and
+expose only the authenticated service-owned gateway.
 
 E2B template start commands run during template build and the running process is
 captured in the template snapshot. Environment variables supplied to
@@ -603,18 +670,21 @@ from export.
 
 ## Build sequence
 
-### Chunk 1: E2B transport spike
+### Chunk 1: Custom template foundation — complete
 
-1. Build one E2B template containing the matching `codex` binary.
-2. Start `codex exec-server` and an authenticated proxy in one sandbox.
-3. Return a transient `wss://` URL that the existing
-   `HostedEnvironmentConnection` can open;
-4. run initialize, process, filesystem, disconnect, and reconnect canaries;
-5. create an E2B snapshot and prove the connection recovers afterward;
-6. decide and document the root workspace ingress design.
+Completed with the scripts under `e2b/`:
 
-Exit criterion: a stock Codex build can execute two commands with a checkpoint
-between them, without disabling transport authentication.
+1. build and checksum the matching custom Codex fork;
+2. build, push, and synchronously publish a CubeSandbox template;
+3. create the template through stock E2B SDK 2.35.0 configuration;
+4. start `codex exec-server`, open the direct development WSS route, and execute
+   a process through the protocol;
+5. verify provider create, commands, files, snapshot, reconnect, pause, and kill
+   primitives.
+
+The authenticated gateway, root workspace ingress, and snapshot-disconnect Codex
+recovery canaries remain in the focused spike plan. They are not implied by this
+completed foundation.
 
 ### Chunk 2: Provision, reconnect, and release
 
