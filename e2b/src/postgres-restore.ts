@@ -55,11 +55,17 @@ function bounded(label: string, value: string): string {
   return value
 }
 
-function deterministicId(prefix: 'lease' | 'env' | 'snapshot', identity: OperationIdentity): string {
+export function deterministicRestoreId(
+  prefix: 'lease' | 'env' | 'snapshot', identity: OperationIdentity,
+): string {
   return `${prefix}_${createHash('sha256')
     .update('hosted-agent-restore\0').update(prefix).update('\0')
     .update(identity.tenantId).update('\0').update(identity.idempotencyKey)
     .digest('hex').slice(0, 32)}`
+}
+
+export function restoreProviderSnapshotName(identity: OperationIdentity): string {
+  return `restore-${deterministicRestoreId('snapshot', identity)}`
 }
 
 function policy(value: unknown): ToolPolicy {
@@ -220,9 +226,9 @@ export class PostgresRestoreCoordinator {
         throw new ServiceError(503, 'durable restore source resolution mismatch')
       }
 
-      const leaseId = deterministicId('lease', identity)
-      const environmentId = deterministicId('env', identity)
-      const snapshotId = deterministicId('snapshot', identity)
+      const leaseId = deterministicRestoreId('lease', identity)
+      const environmentId = deterministicRestoreId('env', identity)
+      const snapshotId = deterministicRestoreId('snapshot', identity)
       const created = await this.withHeartbeat(fence, () => this.provider.create(role.providerTemplateId, {
         managedBy: this.managedBy,
         tenantId: this.tenantId,
@@ -246,7 +252,7 @@ export class PostgresRestoreCoordinator {
       const archive = await this.withHeartbeat(
         fence, () => this.provider.exportWorkspace(created.sandboxId))
       const providerSnapshotId = await this.withHeartbeat(fence, () => this.provider.snapshot(
-        created.sandboxId, { name: `restore-${snapshotId}` }))
+        created.sandboxId, { name: restoreProviderSnapshotName(identity) }))
       const snapshotResource = {
         kind: 'provider_snapshot' as const,
         resourceId: providerSnapshotId,

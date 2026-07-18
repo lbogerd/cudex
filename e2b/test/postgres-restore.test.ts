@@ -6,7 +6,12 @@ import { Header } from 'tar'
 import type { ObjectStore } from '../src/blob-store.js'
 import { runMigrations } from '../src/migrate.js'
 import { PostgresObjectReclaimer } from '../src/postgres-object-reclaimer.js'
-import { PostgresRestoreCoordinator } from '../src/postgres-restore.js'
+import { PostgresReconciler } from '../src/postgres-reconciler.js'
+import {
+  deterministicRestoreId,
+  PostgresRestoreCoordinator,
+  restoreProviderSnapshotName,
+} from '../src/postgres-restore.js'
 import { PostgresRestoreSourceResolver } from '../src/postgres-restore-source.js'
 import { PostgresDurableState } from '../src/postgres-state.js'
 import {
@@ -423,6 +428,169 @@ test('ambiguous final restore commit recovers the replacement without cleanup', 
     const replay = await context.coordinators[1].restore(context.request)
     assert.equal(replay.leaseId, restored.leaseId)
     assert.equal(context.provider.creates, 1)
+  } finally {
+    await close(context)
+  }
+})
+
+async function leavePreparedRestore(context: Fixture, idempotencyKey: string,
+  options: { ledgerSnapshot?: boolean } = {}): Promise<{
+    identity: { operation: string; idempotencyKey: string; tenantId: string }
+    sandboxId: string
+    providerSnapshotId: string
+    preparationId: string
+  }> {
+  const identity = { operation: 'provision', idempotencyKey, tenantId }
+  const claim = await context.journals[0].claimOperation({
+    ...identity,
+    requestHash: canonicalRequestHash({ ...context.request, idempotencyKey }),
+    workerId: 'dead-restore-worker',
+    primaryLeaseId: context.sourceLeaseId,
+  })
+  assert.equal(claim.kind, 'claimed')
+  if (claim.kind !== 'claimed') throw new Error('restore operation was not claimed')
+  const fence = { ...identity, generation: claim.generation, workerId: 'dead-restore-worker' }
+  const leaseId = deterministicRestoreId('lease', identity)
+  const created = await context.provider.create(role.providerTemplateId, {
+    managedBy: 'cudex', tenantId, leaseId, agentId: context.request.agentId,
+    sandboxTemplate: role.sandboxTemplate, restoreSourceLeaseId: context.sourceLeaseId,
+  })
+  await context.journals[0].recordAllocation(fence, fence.generation, fence.workerId, {
+    kind: 'sandbox', resourceId: created.sandboxId,
+    metadata: { managedBy: 'cudex', action: 'restore' },
+  })
+  const restoredArchive = archive(`stale-${idempotencyKey}`)
+  await context.provider.uploadArchive(created.sandboxId, restoredArchive)
+  const providerSnapshotId = await context.provider.snapshot(created.sandboxId, {
+    name: restoreProviderSnapshotName(identity),
+  })
+  if (options.ledgerSnapshot !== false) {
+    await context.journals[0].recordAllocation(fence, fence.generation, fence.workerId, {
+      kind: 'provider_snapshot', resourceId: providerSnapshotId,
+      metadata: { managedBy: 'cudex', action: 'restore' },
+    })
+  }
+  const prepared = await context.publishers[0].prepareDurableBase({
+    fence,
+    expectedSourceChecksum: null,
+    leaseId,
+    environmentId: deterministicRestoreId('env', identity),
+    tenantId,
+    agentId: context.request.agentId,
+    ownerAgentId: null,
+    ownerLeaseId: null,
+    sourceSnapshotId: null,
+    restoreSourceLeaseId: context.sourceLeaseId,
+    restoreSourceSnapshotId: context.sourceSnapshotId,
+    providerSandboxId: created.sandboxId,
+    sandboxTemplate: role.sandboxTemplate,
+    cwdUri: 'file:///workspace/roots/0/project',
+    workspaceRootUris: ['file:///workspace/roots/0/project'],
+    toolPolicy: structuredClone(role.toolPolicy),
+    policyVersion: role.policyVersion,
+    snapshot: {
+      snapshotId: deterministicRestoreId('snapshot', identity),
+      providerSnapshotId,
+      archive: restoredArchive,
+      expiresAt: null,
+    },
+  })
+  assert.equal(prepared.kind, 'prepared')
+  await context.pools[0].query(`
+    UPDATE hosted_agent_operations
+    SET heartbeat_at = now() - interval '1 hour'
+    WHERE operation = $1 AND idempotency_key = $2 AND tenant_id = $3
+  `, [identity.operation, identity.idempotencyKey, identity.tenantId])
+  return {
+    identity, sandboxId: created.sandboxId, providerSnapshotId,
+    preparationId: prepared.preparation.preparationId,
+  }
+}
+
+test('stale prepared restore reclaims its sandbox, snapshot, and workspace objects', {
+  skip: databaseUrl ? false : 'HOSTED_AGENT_TEST_DATABASE_URL is not set',
+}, async () => {
+  const context = await fixture()
+  try {
+    const baselineObjects = new Set(context.objects.values.keys())
+    const stale = await leavePreparedRestore(context, 'stale-prepared-restore')
+    assert.ok(context.provider.live().includes(stale.sandboxId))
+    assert.equal(context.provider.snapshots.has(stale.providerSnapshotId), true)
+    assert.ok(context.objects.values.size > baselineObjects.size)
+
+    const preparations = new PostgresWorkspacePreparations(context.pools[1])
+    const result = await new PostgresReconciler(
+      context.journals[1], context.states[1], context.provider,
+      {
+        managedBy: 'cudex', tenantId, workerId: 'restore-reconciler', staleAfterMs: 1,
+        workspaceRecovery: {
+          preparations,
+          reclaimer: new PostgresObjectReclaimer(context.pools[1], context.objects),
+        },
+      },
+    ).runOnce()
+
+    assert.equal(result.operationsClaimed, 1)
+    assert.equal(context.provider.live().includes(stale.sandboxId), false)
+    assert.equal(context.provider.snapshots.has(stale.providerSnapshotId), false)
+    assert.deepEqual(new Set(context.objects.values.keys()), baselineObjects)
+    assert.equal((await preparations.getForOperation(stale.identity))?.state, 'reclaimed')
+    const operation = await context.pools[0].query<{ state: string; error_code: string }>(`
+      SELECT state, error_code FROM hosted_agent_operations
+      WHERE operation = $1 AND idempotency_key = $2 AND tenant_id = $3
+    `, [stale.identity.operation, stale.identity.idempotencyKey, stale.identity.tenantId])
+    assert.deepEqual(operation.rows[0], {
+      state: 'failed_terminal', error_code: 'reconciled_abandoned',
+    })
+    const allocations = await context.journals[0].listAllocations(stale.identity)
+    assert.ok(allocations.length >= 4)
+    assert.ok(allocations.every(allocation => allocation.state === 'reclaimed'))
+  } finally {
+    await close(context)
+  }
+})
+
+test('stale restore discovers an unledgered deterministic snapshot before sandbox cleanup', {
+  skip: databaseUrl ? false : 'HOSTED_AGENT_TEST_DATABASE_URL is not set',
+}, async () => {
+  const context = await fixture()
+  try {
+    const stale = await leavePreparedRestore(context, 'stale-unledgered-snapshot', {
+      ledgerSnapshot: false,
+    })
+    const cleanupOrder: string[] = []
+    const deleteSnapshot = context.provider.deleteSnapshot.bind(context.provider)
+    const kill = context.provider.kill.bind(context.provider)
+    context.provider.deleteSnapshot = async snapshotId => {
+      cleanupOrder.push(`snapshot:${snapshotId}`)
+      return deleteSnapshot(snapshotId)
+    }
+    context.provider.kill = async sandboxId => {
+      cleanupOrder.push(`sandbox:${sandboxId}`)
+      return kill(sandboxId)
+    }
+    await new PostgresReconciler(
+      context.journals[1], context.states[1], context.provider,
+      {
+        managedBy: 'cudex', tenantId, workerId: 'restore-reconciler', staleAfterMs: 1,
+        workspaceRecovery: {
+          preparations: new PostgresWorkspacePreparations(context.pools[1]),
+          reclaimer: new PostgresObjectReclaimer(context.pools[1], context.objects),
+        },
+      },
+    ).runOnce()
+
+    assert.deepEqual(cleanupOrder, [
+      `snapshot:${stale.providerSnapshotId}`,
+      `sandbox:${stale.sandboxId}`,
+    ])
+    assert.equal(context.provider.snapshots.has(stale.providerSnapshotId), false)
+    assert.equal(context.provider.live().includes(stale.sandboxId), false)
+    const operation = await context.pools[0].query<{ state: string }>(`
+      SELECT state FROM hosted_agent_operations
+      WHERE operation = $1 AND idempotency_key = $2 AND tenant_id = $3
+    `, [stale.identity.operation, stale.identity.idempotencyKey, stale.identity.tenantId])
+    assert.equal(operation.rows[0]?.state, 'failed_terminal')
   } finally {
     await close(context)
   }

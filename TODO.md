@@ -42,6 +42,9 @@ production backend. Stable decisions, evidence, and wire schemas are in
 - [x] Add an unwired PostgreSQL clean-restore coordinator with source-bound
   journal claims, deterministic replacement identities, continuous fencing,
   clean-template allocation, exact lineage replay, and cleanup-safe commit.
+- [x] Reconcile stale restore preparations and deterministic provider snapshots
+  before sandbox teardown, including unledgered post-snapshot crash recovery,
+  bounded object reclamation, and fail-closed committed-result protection.
 - [x] Apply transactional per-lease locking to durable checkpoint capture and
   commit across service replicas.
 - [x] Apply transactional lease/provider locking to durable release across

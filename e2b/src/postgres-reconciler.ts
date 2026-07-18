@@ -3,6 +3,9 @@ import { ProviderSandboxMissingError } from './provider.js'
 import type { PoolClient } from 'pg'
 import type { Lease, PostgresDurableState } from './postgres-state.js'
 import { logicalReconnectFromLease } from './postgres-reconnect.js'
+import { deterministicRestoreId, restoreProviderSnapshotName } from './postgres-restore.js'
+import type { PostgresObjectReclaimer } from './postgres-object-reclaimer.js'
+import type { PostgresWorkspacePreparations } from './postgres-workspace-preparations.js'
 import {
   OperationOwnershipError,
   type OperationAllocation,
@@ -24,6 +27,11 @@ export interface PostgresReconcilerOptions {
   maxTicketsPerRun?: number
   ticketRetentionMs?: number
   connections?: { revoke(leaseId: string): void }
+  workspaceRecovery?: {
+    preparations: Pick<PostgresWorkspacePreparations, 'getForOperation' | 'beginAbort'>
+    reclaimer: Pick<PostgresObjectReclaimer,
+      'reclaimPreparationObjects' | 'reclaimOperationObjects'>
+  }
   onError?: (error: unknown) => void
 }
 
@@ -56,8 +64,9 @@ function positiveInteger(label: string, value: number, maximum: number): void {
 }
 
 export class PostgresReconciler {
-  private readonly options: Required<Omit<PostgresReconcilerOptions, 'connections' | 'onError'>>
-    & Pick<PostgresReconcilerOptions, 'connections' | 'onError'>
+  private readonly options: Required<Omit<PostgresReconcilerOptions,
+    'connections' | 'workspaceRecovery' | 'onError'>>
+    & Pick<PostgresReconcilerOptions, 'connections' | 'workspaceRecovery' | 'onError'>
   private timer: ReturnType<typeof setTimeout> | undefined
   private running: Promise<ReconcileRunResult> | undefined
   private stopped = true
@@ -150,6 +159,18 @@ export class PostgresReconciler {
       await this.reconcileReconnect(operation, allocations, result)
       return
     }
+    if (operation.operation === 'provision' && operation.primaryLeaseId) {
+      if (!this.options.workspaceRecovery) {
+        result.allocationsPending += 1
+        return
+      }
+      try {
+        await this.reconcileRestorePreparation(operation, allocations, result)
+      } catch {
+        result.allocationsPending += 1
+      }
+      return
+    }
     for (const allocation of allocations) {
       if (allocation.state === 'adopted' || allocation.state === 'reclaimed') continue
       if (allocation.allocationKind === 'sandbox' || allocation.allocationKind === 'capture_sandbox') {
@@ -175,6 +196,134 @@ export class PostgresReconciler {
         if (!(error instanceof OperationOwnershipError)) throw error
       }
     }
+  }
+
+  private async reconcileRestorePreparation(operation: StaleOperation,
+    allocations: OperationAllocation[], result: ReconcileRunResult): Promise<void> {
+    const identity: OperationIdentity = operation
+    const fence = { ...identity, generation: operation.generation, workerId: operation.workerId }
+    const recovery = this.options.workspaceRecovery!
+    const preparation = await recovery.preparations.getForOperation(identity)
+    const expectedResultLeaseId = deterministicRestoreId('lease', identity)
+    const sourceLease = await this.state.getLease(operation.tenantId, operation.primaryLeaseId!)
+    if (!sourceLease || !['lost', 'released'].includes(sourceLease.state)
+      || sourceLease.leaseId === expectedResultLeaseId) throw new OperationOwnershipError()
+    const resultLease = await this.state.getLease(operation.tenantId, expectedResultLeaseId)
+    if (resultLease) {
+      if (resultLease.restoreSourceLeaseId !== operation.primaryLeaseId
+        || !resultLease.restoreSourceSnapshotId || resultLease.state !== 'active'
+        || operation.resultLeaseId !== expectedResultLeaseId || preparation?.state !== 'committed'
+        || preparation.intent.restoreSourceLeaseId !== operation.primaryLeaseId
+        || preparation.intent.restoreSourceSnapshotId !== resultLease.restoreSourceSnapshotId
+        || preparation.leaseId !== resultLease.leaseId || allocations.length === 0
+        || allocations.some(item => item.state !== 'adopted'
+          || item.leaseId !== expectedResultLeaseId)) throw new OperationOwnershipError()
+      await this.recoverLogicalCompletion(identity, operation, allocations)
+      return
+    }
+    if (operation.resultLeaseId !== null) throw new OperationOwnershipError()
+    if (allocations.some(item => ['sandbox', 'provider_snapshot'].includes(item.allocationKind)
+      && item.metadata.action !== 'restore')) throw new OperationOwnershipError()
+    if (preparation) {
+      const intent = preparation.intent
+      if (intent.restoreSourceLeaseId !== operation.primaryLeaseId
+        || intent.restoreSourceSnapshotId === null || intent.sourceSnapshotId !== null
+        || intent.expectedSourceChecksum !== null || intent.expectedLatestSnapshotId !== null) {
+        throw new OperationOwnershipError()
+      }
+      if (preparation.leaseId !== expectedResultLeaseId || preparation.state === 'committed') {
+        throw new OperationOwnershipError()
+      }
+      const pending = await recovery.preparations.beginAbort(fence, preparation.preparationId)
+      if (pending.state !== 'reclaimed') {
+        const reclaimed = await recovery.reclaimer.reclaimPreparationObjects(
+          fence, preparation.preparationId, this.options.maxAllocationsPerOperation)
+        result.allocationsReclaimed += reclaimed.reclaimed
+        result.protectedResources += reclaimed.retained
+        if (reclaimed.claimed === this.options.maxAllocationsPerOperation) {
+          result.allocationsPending += 1
+          return
+        }
+      }
+    }
+
+    let current = await this.journal.listAllocations(
+      identity, this.options.maxAllocationsPerOperation + 1)
+    const objectAllocations = current.filter(item => item.allocationKind === 'object'
+      && item.state !== 'reclaimed')
+    if (objectAllocations.length > 0) {
+      const reclaimed = await recovery.reclaimer.reclaimOperationObjects(
+        identity, operation.generation, operation.workerId,
+        this.options.maxAllocationsPerOperation)
+      result.allocationsReclaimed += reclaimed.reclaimed
+      result.protectedResources += reclaimed.retained
+      current = await this.journal.listAllocations(
+        identity, this.options.maxAllocationsPerOperation + 1)
+      if (current.some(item => item.allocationKind === 'object' && item.state !== 'reclaimed')) {
+        result.allocationsPending += 1
+        return
+      }
+    }
+
+    const sandboxes = current.filter(item => item.allocationKind === 'sandbox'
+      && item.state !== 'reclaimed')
+    if (sandboxes.length > 1 || (preparation
+      && sandboxes.some(item => item.resourceId !== preparation.intent.providerSandboxId))) {
+      throw new OperationOwnershipError()
+    }
+    const providerSnapshots = current.filter(item => item.allocationKind === 'provider_snapshot'
+      && item.state !== 'reclaimed')
+    if (providerSnapshots.length > 1 || current.some(item => ![
+      'object', 'sandbox', 'provider_snapshot',
+    ].includes(item.allocationKind))) throw new OperationOwnershipError()
+
+    const expectedName = restoreProviderSnapshotName(identity)
+    const discovered = await this.provider.listSnapshots(sandboxes[0]
+      ? { sandboxId: sandboxes[0].resourceId, name: expectedName }
+      : { name: expectedName })
+    if (discovered.length > 1) throw new Error('ambiguous deterministic restore snapshot inventory')
+    const snapshot = discovered[0]
+    if (snapshot && !snapshot.names.includes(expectedName)) {
+      throw new Error('provider returned a mismatched restore snapshot')
+    }
+    const ledgeredSnapshot = snapshot && providerSnapshots.some(item => item.resourceId === snapshot.snapshotId)
+    if (snapshot && !ledgeredSnapshot) {
+      if (await this.state.findSnapshotByProviderIdForReconciliation(snapshot.snapshotId)
+        || await this.journal.hasUnreclaimedAllocation('provider_snapshot', snapshot.snapshotId)) {
+        throw new OperationOwnershipError()
+      }
+      await this.journal.withProviderResourceLock('provider_snapshot', snapshot.snapshotId, async client => {
+        if (!await this.journal.heartbeatOperation(
+          identity, operation.generation, operation.workerId, client)) throw new OperationOwnershipError()
+        if (await this.state.findSnapshotByProviderIdForReconciliation(snapshot.snapshotId, client)
+          || await this.journal.hasUnreclaimedAllocation('provider_snapshot', snapshot.snapshotId, client)) {
+          throw new OperationOwnershipError()
+        }
+        await this.provider.deleteSnapshot(snapshot.snapshotId)
+      })
+    }
+    for (const allocation of providerSnapshots) {
+      await this.reclaimSnapshot(identity, operation, allocation, result)
+    }
+    current = await this.journal.listAllocations(
+      identity, this.options.maxAllocationsPerOperation + 1)
+    if (current.some(item => item.allocationKind === 'provider_snapshot'
+      && item.state !== 'reclaimed')) {
+      result.allocationsPending += 1
+      return
+    }
+    for (const allocation of current.filter(item => item.allocationKind === 'sandbox'
+      && item.state !== 'reclaimed')) {
+      await this.reclaimSandbox(identity, operation, allocation, result)
+    }
+    const final = await this.journal.listAllocations(
+      identity, this.options.maxAllocationsPerOperation + 1)
+    if (final.some(item => item.state !== 'reclaimed')) {
+      result.allocationsPending += 1
+      return
+    }
+    await this.journal.failOperation(identity, operation.generation, operation.workerId,
+      'reconciled_abandoned', 'abandoned operation allocations were reclaimed')
   }
 
   private async reconcileReconnect(operation: StaleOperation, allocations: OperationAllocation[],

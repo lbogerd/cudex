@@ -939,9 +939,25 @@ ticket only after commit. Duplicate template-to-role mappings are rejected so a
 restore cannot switch policy through an ambiguous trusted role. Live PostgreSQL
 coverage proves exact archive overlay without runtime identity inheritance,
 mutation-free replay, pre-allocation authorization rejection, partial cleanup,
-and ambiguous-commit recovery; all 199 tests pass. Restore-specific stale
-preparation recovery and the planned provider-snapshot allocation boundary are
-still required before production wiring.
+and ambiguous-commit recovery; all 199 tests pass. At that stage,
+restore-specific stale preparation recovery and the provider-snapshot allocation
+window still blocked production wiring.
+
+Restore stale takeover is now explicit rather than falling through generic
+provision cleanup. A reconciler must be configured with the preparation ledger
+and object reclaimer before it will touch a source-bound provision operation.
+It verifies the terminal source and deterministic replacement identity, rejects
+mixed source modes or committed lineage without the exact durable result, moves
+publishing/prepared work to reclamation, and drains associated plus stray object
+allocations before any provider teardown. It then enumerates the exact
+operation-derived provider-snapshot name (sandbox-scoped when possible), deletes
+an unledgered orphan under the provider-resource lock, reclaims any ledgered
+snapshot, and kills the fresh sandbox last. Every destructive call rechecks the
+takeover generation. Live PostgreSQL coverage proves a prepared object graph is
+fully reclaimed and that a snapshot created immediately before allocation
+journaling is discovered and deleted before its sandbox; the suite is 201/201.
+This closes restore-specific stale cleanup, while the still-broader allocation
+boundary for an object-store put before its durable registration remains queued.
 
 ### Bounded PostgreSQL reconciliation foundation
 

@@ -323,6 +323,27 @@ const preparationColumns = `
 export class PostgresWorkspacePreparations {
   constructor(private readonly pool: Pool) {}
 
+  async getForOperation(identity: OperationIdentity,
+    executor: Pick<PoolClient, 'query'> = this.pool): Promise<WorkspacePreparation | null> {
+    id('operation', identity.operation, 128)
+    id('idempotency key', identity.idempotencyKey)
+    id('tenant ID', identity.tenantId)
+    const result = await executor.query<PreparationRow>(`
+      SELECT ${preparationColumns}
+      FROM hosted_agent_workspace_preparations AS preparation
+      WHERE preparation.operation = $1 AND preparation.idempotency_key = $2
+        AND preparation.tenant_id = $3
+    `, [identity.operation, identity.idempotencyKey, identity.tenantId])
+    if (!result.rows[0]) return null
+    const preparation = preparationFromRow(result.rows[0])
+    const canonical = canonicalWorkspacePreparationIntent(preparation.intent)
+    if (preparation.preparationId !== workspacePreparationId(identity)
+      || preparation.intentHash !== canonical.hash) {
+      throw new WorkspacePreparationConflictError('workspace preparation identity mismatch')
+    }
+    return preparation
+  }
+
   async createOrReplay(input: PreparationFence & {
     preparationId: string; intent: WorkspacePreparationIntent; expectedObjectCount: number
   }, executor?: PoolClient): Promise<WorkspacePreparation> {
