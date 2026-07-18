@@ -3,7 +3,7 @@ import type { Server as HttpServer } from 'node:http'
 import type { Server as HttpsServer } from 'node:https'
 import type { Duplex } from 'node:stream'
 import WebSocket, { WebSocketServer } from 'ws'
-import type { ProviderAdapter } from './provider.js'
+import { validateExecUpstream, type ProviderAdapter } from './provider.js'
 import type { TicketAuthority } from './tickets.js'
 
 export interface ActiveLeaseDirectory {
@@ -50,6 +50,7 @@ export class ExecGateway {
     private readonly leases: ActiveLeaseDirectory,
     private readonly provider: ProviderAdapter,
     limits: Partial<GatewayLimits> = {},
+    private readonly allowInsecureUpstream = false,
   ) {
     this.limits = { ...defaultLimits, ...limits }
     for (const [name, value] of Object.entries(this.limits)) {
@@ -78,7 +79,8 @@ export class ExecGateway {
       const url = new URL(request.url ?? '/', 'https://gateway.invalid')
       const match = /^\/leases\/([^/]+)$/.exec(url.pathname)
       leaseId = match?.[1] ? decodeURIComponent(match[1]) : ''
-      ticket = url.searchParams.get('ticket')
+      const parameters = [...url.searchParams]
+      ticket = parameters.length === 1 && parameters[0]?.[0] === 'ticket' ? parameters[0][1] : null
     } catch {
       reject(socket, 401, 'Unauthorized')
       return
@@ -144,8 +146,8 @@ export class ExecGateway {
       return
     }
     if (closed) return
-    let rawExecUrl: string
-    try { rawExecUrl = (await this.provider.connect(sandboxId)).rawExecUrl }
+    let upstreamConnection
+    try { upstreamConnection = validateExecUpstream(await this.provider.execUpstream(sandboxId), this.allowInsecureUpstream) }
     catch { cleanup(1013, 'gateway upstream unavailable'); return }
     if (closed) return
     if (await this.activeSandbox(leaseId) !== sandboxId) {
@@ -154,7 +156,12 @@ export class ExecGateway {
     }
     if (closed) return
 
-    try { upstream = new WebSocket(rawExecUrl, { maxPayload: this.limits.maxPayloadBytes }) }
+    try {
+      upstream = new WebSocket(upstreamConnection.url, {
+        headers: { 'X-Access-Token': upstreamConnection.accessToken },
+        maxPayload: this.limits.maxPayloadBytes,
+      })
+    }
     catch { cleanup(1013, 'gateway upstream unavailable'); return }
 
     client.on('message', (data, binary) => {

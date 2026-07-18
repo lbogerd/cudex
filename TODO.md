@@ -69,6 +69,9 @@ failed upload/extraction allocations without Git or shared host paths.
 - [x] Require HTTPS/WSS outside explicit development mode.
 - [ ] Bind raw exec-server to loopback/private networking and remove production
   reliance on direct 22101 and `secure:false`.
+- [x] Require the secured E2B traffic token on every gateway-to-exec WebSocket,
+  keep it out of URLs and durable state, and fail closed when it is absent,
+  malformed, or rejected.
 - [ ] Authorize every request by tenant, lease, agent, owner, snapshot, artifact,
   and trusted template.
 - [x] Add ticket purpose, single-use consumption, bounded TTL, rotation, and

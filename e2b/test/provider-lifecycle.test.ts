@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { ProviderCapabilityError } from '../src/provider.js'
+import { ProviderCapabilityError, validateExecUpstream } from '../src/provider.js'
 import { FakeProvider } from './fake-provider.js'
 
 test('exec health probe fails closed until the server is started', async () => {
@@ -42,4 +42,30 @@ test('failed provider cleanup remains observable for reconciliation retry', asyn
   assert.deepEqual(provider.live(), [sandbox.sandboxId])
   provider.failAt = 'deleteSnapshot'; await assert.rejects(provider.deleteSnapshot(snapshot), /injected deleteSnapshot/)
   assert.equal(provider.snapshots.has(snapshot), true)
+})
+
+test('exec upstream credentials are transient, exact, bounded, and WSS-only by default', async () => {
+  const provider = new FakeProvider(); const created = await provider.create()
+  assert.deepEqual(created, { sandboxId: created.sandboxId })
+  assert.equal(JSON.stringify(created).includes('token'), false)
+  assert.deepEqual(validateExecUpstream({ url: 'wss://raw.example/', accessToken: 'opaque-access-token' }), {
+    url: 'wss://raw.example/', accessToken: 'opaque-access-token',
+  })
+  assert.deepEqual(validateExecUpstream({ url: 'ws://127.0.0.1:1234/', accessToken: 'test-token' }, true), {
+    url: 'ws://127.0.0.1:1234/', accessToken: 'test-token',
+  })
+  const secret = 'secret-must-not-appear-in-errors'
+  for (const invalid of [
+    null,
+    { url: 'ws://raw.example/', accessToken: secret },
+    { url: 'ws://localhost:1234/', accessToken: secret },
+    { url: 'wss://raw.example/path', accessToken: secret },
+    { url: `wss://user:${secret}@raw.example/`, accessToken: secret },
+    { url: 'wss://raw.example/', accessToken: '' },
+    { url: 'wss://raw.example/', accessToken: `valid\n${secret}` },
+    { url: 'wss://raw.example/', accessToken: secret, headers: { authorization: secret } },
+  ]) {
+    assert.throws(() => validateExecUpstream(invalid), error => error instanceof Error
+      && error.message === 'invalid exec upstream' && !error.message.includes(secret))
+  }
 })

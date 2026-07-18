@@ -1,4 +1,4 @@
-import { ProviderCapabilityError, type CreatedSandbox, type ManagedSandbox, type ManagedSandboxQuery,
+import { ProviderCapabilityError, type CreatedSandbox, type ExecUpstream, type ManagedSandbox, type ManagedSandboxQuery,
   type ManagedSnapshot, type ProviderAdapter, type ProviderSnapshotOptions, type ProviderSnapshotQuery } from '../src/provider.js'
 
 interface FakeSandbox { bytes: Uint8Array; alive: boolean; execReady: boolean; metadata: Record<string, string>; templateId: string; startedAt: Date; endAt: Date }
@@ -6,12 +6,20 @@ interface FakeSnapshot { bytes: Uint8Array; sandboxId: string; names: string[] }
 export class FakeProvider implements ProviderAdapter {
   readonly sandboxes = new Map<string, FakeSandbox>(); readonly snapshots = new Map<string, FakeSnapshot>()
   creates = 0; kills = 0; connects = 0; failAt: string | undefined
-  rawExecUrl: string | undefined
+  rawExecUpstream: unknown
   private id = 0
   async create(templateId = 'fake-template', metadata: Record<string, string> = {}): Promise<CreatedSandbox> { this.failure('create'); this.creates++; return this.allocate(templateId, metadata) }
   async connect(sandboxId: string): Promise<CreatedSandbox> {
     this.failure('connect'); this.connects++; const sandbox = this.sandboxes.get(sandboxId)
-    if (!sandbox?.alive) throw new Error('missing'); return { sandboxId, rawExecUrl: this.rawExecUrl ?? `wss://raw.invalid/${sandboxId}` }
+    if (!sandbox?.alive) throw new Error('missing'); return { sandboxId }
+  }
+  async execUpstream(sandboxId: string): Promise<ExecUpstream> {
+    this.failure('execUpstream')
+    const sandbox = this.sandboxes.get(sandboxId)
+    if (!sandbox?.alive) throw new Error('missing')
+    return (this.rawExecUpstream ?? {
+      url: `wss://raw.invalid/`, accessToken: 'fake-traffic-access-token',
+    }) as ExecUpstream
   }
   async restore(snapshotId: string, metadata: Record<string, string> = {}): Promise<CreatedSandbox> {
     this.failure('restore'); const snapshot = this.snapshots.get(snapshotId); if (!snapshot) throw new Error('missing snapshot')
@@ -52,7 +60,7 @@ export class FakeProvider implements ProviderAdapter {
     const sandboxId = `sandbox-${++this.id}`
     this.sandboxes.set(sandboxId, { bytes: new Uint8Array(), alive: true, execReady: false, metadata: { ...metadata }, templateId,
       startedAt: new Date(), endAt: new Date(Date.now() + 60_000) })
-    return { sandboxId, rawExecUrl: `wss://raw.invalid/${sandboxId}` }
+    return { sandboxId }
   }
   private failure(point: string): void { if (this.failAt === point) throw new Error(`injected ${point}`) }
 }

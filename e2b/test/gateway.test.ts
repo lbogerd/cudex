@@ -26,11 +26,12 @@ async function rejectedStatus(url: string): Promise<number> {
 async function fixture(rawExecUrl: string, limits: Partial<GatewayLimits> = {}) {
   const directory = await mkdtemp(join(tmpdir(), 'cudex-gateway-'))
   const store = new JsonStore(join(directory, 'state.json')); await store.open()
-  const provider = new FakeProvider(); const created = await provider.create(); provider.rawExecUrl = rawExecUrl
+  const provider = new FakeProvider(); const created = await provider.create()
+  provider.rawExecUpstream = { url: rawExecUrl, accessToken: 'fake-traffic-access-token' }
   await store.transaction(database => { database.leases.lease_test = { leaseId: 'lease_test', environmentId: 'env_test', sandboxId: created.sandboxId,
     agentId: 'agent', ownerAgentId: null, template: 'general-v1', cwd: 'file:///workspace', workspaceRoots: ['file:///workspace'],
     baseSnapshotId: 'snapshot', latestSnapshotId: 'snapshot', state: 'active', toolPolicy: { allowedDomains: [], allowedTools: [] } } })
-  const tickets = new TicketIssuer(store, 'wss://gateway.example'); const gateway = new ExecGateway(tickets, store, provider, limits)
+  const tickets = new TicketIssuer(store, 'wss://gateway.example'); const gateway = new ExecGateway(tickets, store, provider, limits, true)
   const server = createServer(); gateway.attach(server); server.listen(0, '127.0.0.1'); await listening(server)
   const port = (server.address() as import('node:net').AddressInfo).port
   const issueUrl = async () => {
@@ -41,21 +42,47 @@ async function fixture(rawExecUrl: string, limits: Partial<GatewayLimits> = {}) 
 }
 
 async function echoServer() {
-  const server = createServer(); const websocket = new WebSocketServer({ server })
+  const server = createServer(); const websocket = new WebSocketServer({ noServer: true })
+  server.on('upgrade', (request, socket, head) => {
+    if (request.headers['x-access-token'] !== 'fake-traffic-access-token') {
+      socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')
+      return
+    }
+    websocket.handleUpgrade(request, socket, head, client => websocket.emit('connection', client, request))
+  })
   websocket.on('connection', socket => socket.on('message', data => socket.send(data)))
   server.listen(0, '127.0.0.1'); await listening(server)
   const port = (server.address() as import('node:net').AddressInfo).port
-  return { server, websocket, url: `ws://127.0.0.1:${port}` }
+  return { server, websocket, url: `ws://127.0.0.1:${port}/` }
 }
 
 test('gateway rejects missing tickets, proxies frames, and closes revoked leases', async t => {
   const upstream = await echoServer(); t.after(() => { upstream.websocket.close(); upstream.server.close() })
+  assert.equal(await rejectedStatus(upstream.url), 401)
   const context = await fixture(upstream.url); t.after(() => context.server.close())
   const client = new WebSocket(context.url); await opened(client)
   const echoed = new Promise<string>(resolve => client.once('message', data => resolve(data.toString())))
   client.send('{"id":1,"method":"initialize"}'); assert.equal(await echoed, '{"id":1,"method":"initialize"}')
   const close = closed(client); context.gateway.revoke('lease_test'); assert.equal(await close, 1008)
   assert.equal(await rejectedStatus(context.url.replace(/\?.*/, '')), 401)
+})
+
+test('gateway rejects duplicate or extra query parameters before ticket consumption', async t => {
+  const upstream = await echoServer(); t.after(() => { upstream.websocket.close(); upstream.server.close() })
+  const context = await fixture(upstream.url); t.after(() => context.server.close())
+  const issued = new URL(await context.issueUrl())
+  const ticket = issued.searchParams.get('ticket')!
+
+  issued.searchParams.append('ticket', ticket)
+  assert.equal(await rejectedStatus(issued.toString()), 401)
+  issued.searchParams.delete('ticket')
+  issued.searchParams.set('extra', 'value')
+  issued.searchParams.set('ticket', ticket)
+  assert.equal(await rejectedStatus(issued.toString()), 401)
+
+  const valid = new WebSocket(`${issued.origin}${issued.pathname}?ticket=${encodeURIComponent(ticket)}`)
+  await opened(valid)
+  const close = closed(valid); valid.close(); await close
 })
 
 test('gateway handles malformed lease paths without an unhandled upgrade failure', async t => {
@@ -89,19 +116,19 @@ test('gateway enforces WebSocket payload and pre-upstream pending-byte limits', 
   holdingServer.listen(0, '127.0.0.1'); await listening(holdingServer)
   t.after(() => { for (const socket of held) socket.destroy(); holdingServer.close() })
   const holdingPort = (holdingServer.address() as import('node:net').AddressInfo).port
-  const pendingContext = await fixture(`ws://127.0.0.1:${holdingPort}`, { maxPendingBytes: 4 }); t.after(() => pendingContext.server.close())
+  const pendingContext = await fixture(`ws://127.0.0.1:${holdingPort}/`, { maxPendingBytes: 4 }); t.after(() => pendingContext.server.close())
   const pending = new WebSocket(pendingContext.url); await opened(pending); await immediate()
   const pendingClosed = closed(pending); pending.send('12345'); assert.equal(await pendingClosed, 1009)
 })
 
 test('gateway revalidates active lease state after provider connection', async t => {
-  const context = await fixture('ws://127.0.0.1:1'); t.after(() => context.server.close())
-  const originalConnect = context.provider.connect.bind(context.provider)
+  const context = await fixture('ws://127.0.0.1:1/'); t.after(() => context.server.close())
+  const originalExecUpstream = context.provider.execUpstream.bind(context.provider)
   let releaseConnect!: () => void
   let connectEntered!: () => void
   const connectGate = new Promise<void>(resolve => { releaseConnect = resolve })
   const entered = new Promise<void>(resolve => { connectEntered = resolve })
-  context.provider.connect = async sandboxId => { connectEntered(); await connectGate; return originalConnect(sandboxId) }
+  context.provider.execUpstream = async sandboxId => { connectEntered(); await connectGate; return originalExecUpstream(sandboxId) }
 
   const client = new WebSocket(context.url); await opened(client); await entered
   const close = closed(client)
@@ -117,4 +144,37 @@ test('gateway closes an established connection after another replica durably rel
   const close = closed(client)
   await context.store.transaction(database => { database.leases.lease_test!.state = 'released' })
   assert.equal(await close, 1008)
+})
+
+test('gateway fails closed on missing, malformed, or rejected upstream authentication without leaking it', async t => {
+  const upstream = await echoServer(); t.after(() => { upstream.websocket.close(); upstream.server.close() })
+  const context = await fixture(upstream.url); t.after(() => context.server.close())
+  const secret = 'traffic-secret-that-must-not-leak'
+  const invalid: unknown[] = [
+    { url: upstream.url },
+    { url: upstream.url, accessToken: '' },
+    { url: `${upstream.url}?token=${secret}`, accessToken: secret },
+    { url: `ws://user:${secret}@127.0.0.1/`, accessToken: secret },
+    { url: upstream.url, accessToken: secret, extra: true },
+  ]
+  for (const value of invalid) {
+    context.provider.rawExecUpstream = value
+    const client = new WebSocket(await context.issueUrl())
+    const close = new Promise<{ code: number; reason: string }>(resolve => {
+      client.once('close', (code, reason) => resolve({ code, reason: reason.toString() }))
+    })
+    await opened(client)
+    assert.deepEqual(await close, { code: 1013, reason: 'gateway upstream unavailable' })
+  }
+
+  context.provider.rawExecUpstream = { url: upstream.url, accessToken: secret }
+  const rejected = new WebSocket(await context.issueUrl())
+  const rejectedClose = new Promise<{ code: number; reason: string }>(resolve => {
+    rejected.once('close', (code, reason) => resolve({ code, reason: reason.toString() }))
+  })
+  await opened(rejected)
+  assert.deepEqual(await rejectedClose, { code: 1013, reason: 'gateway upstream unavailable' })
+  const persisted = JSON.stringify(await context.store.read(database => database))
+  assert.equal(upstream.url.includes(secret), false)
+  assert.equal(persisted.includes(secret), false)
 })

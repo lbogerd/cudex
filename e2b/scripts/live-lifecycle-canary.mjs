@@ -6,7 +6,7 @@ if (!templateId) throw new Error('usage: node scripts/live-lifecycle-canary.mjs 
 if (!process.env.E2B_API_KEY || !process.env.E2B_API_URL) throw new Error('E2B_API_KEY and E2B_API_URL are required')
 const connection = { apiKey: process.env.E2B_API_KEY, apiUrl: process.env.E2B_API_URL, domain: process.env.E2B_DOMAIN ?? 'cube.app',
   validateApiKey: process.env.E2B_VALIDATE_API_KEY !== 'false', requestTimeoutMs: 120_000 }
-const options = { ...connection, timeoutMs: 120_000, secure: false, lifecycle: { onTimeout: 'pause', autoResume: false } }
+const options = { ...connection, timeoutMs: 120_000, secure: true, lifecycle: { onTimeout: 'pause', autoResume: false } }
 const sandboxes = []
 let snapshotId
 const run = async (sandbox, command) => {

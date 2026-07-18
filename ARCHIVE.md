@@ -249,6 +249,21 @@ buffer, and connection-limit tests increased the provider-independent suite to
 
 ### Provider lifecycle and reconciliation capabilities
 
+The production gateway now opens provider exec connections through E2B's
+secured public-traffic boundary. Provider create/restore and both live canaries
+use `secure:true`; the provider exposes a separate transient exec-upstream value
+containing only a canonical WSS root URL and the bounded traffic access token.
+The gateway independently revalidates that value, sends the token only as the
+`X-Access-Token` upstream header, and returns generic close reasons for missing,
+malformed, or rejected credentials. Created sandboxes, inventory, logical
+responses, URLs, and durable state contain no traffic token. Development-only
+plain WebSocket upstreams are restricted to numeric loopback addresses, and
+upgrade requests accept exactly one `ticket` query parameter before consuming
+it. Direct unauthenticated access is denied in focused tests. The exec-server
+still listens on `0.0.0.0:22101` inside the sandbox because E2B's public proxy
+cannot reach a loopback-only listener; replacing that route with provider-private
+networking remains an explicit production blocker.
+
 The provider boundary now supports a fail-closed loopback exec-server probe,
 managed sandbox inventory scoped by both service and tenant metadata, snapshot
 inventory scoped by a known source sandbox or deterministic name, idempotent

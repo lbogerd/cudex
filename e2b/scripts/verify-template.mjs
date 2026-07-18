@@ -19,9 +19,13 @@ const connection = {
   requestTimeoutMs: 120_000,
 }
 
-function openWebSocket(url) {
+function openWebSocket(url, accessToken) {
+  if (typeof accessToken !== 'string' || !accessToken || accessToken !== accessToken.trim()
+    || Buffer.byteLength(accessToken, 'utf8') > 4096 || /[\u0000-\u001f\u007f]/u.test(accessToken)) {
+    throw new Error('sandbox traffic access token is unavailable')
+  }
   return new Promise((resolve, reject) => {
-    const socket = new WebSocket(url)
+    const socket = new WebSocket(url, { headers: { 'X-Access-Token': accessToken } })
     socket.once('open', () => resolve(socket))
     socket.once('error', reject)
   })
@@ -48,7 +52,7 @@ try {
   sandbox = await Sandbox.create(expected.templateId, {
     ...connection,
     timeoutMs: 120_000,
-    secure: false,
+    secure: true,
     lifecycle: { onTimeout: 'kill', autoResume: false },
   })
 
@@ -70,8 +74,14 @@ try {
   })
   await new Promise(resolve => setTimeout(resolve, 500))
 
-  const url = `wss://22101-${sandbox.sandboxId}.${sandbox.sandboxDomain}`
-  const socket = await openWebSocket(url)
+  const host = sandbox.getHost(22101)
+  const url = `wss://${host}/`
+  const endpoint = new URL(url)
+  if (endpoint.protocol !== 'wss:' || endpoint.hostname !== host || endpoint.username || endpoint.password
+    || endpoint.search || endpoint.hash || endpoint.pathname !== '/' || endpoint.href !== url) {
+    throw new Error('sandbox exec endpoint is invalid')
+  }
+  const socket = await openWebSocket(url, sandbox.trafficAccessToken)
   const initialized = await rpc(socket, 1, 'initialize', { clientName: 'cudex-template-canary' })
   socket.send(JSON.stringify({ method: 'initialized', params: {} }))
   await rpc(socket, 2, 'process/start', {

@@ -2,12 +2,14 @@ import { Sandbox } from 'e2b'
 import {
   ProviderCapabilityError,
   type CreatedSandbox,
+  type ExecUpstream,
   type ManagedSandbox,
   type ManagedSandboxQuery,
   type ManagedSnapshot,
   type ProviderAdapter,
   type ProviderSnapshotOptions,
   type ProviderSnapshotQuery,
+  validateExecUpstream,
 } from './provider.js'
 
 interface Connection { apiKey: string; apiUrl?: string; domain?: string; validateApiKey?: boolean; requestTimeoutMs: number }
@@ -45,6 +47,13 @@ export class E2BProvider implements ProviderAdapter {
   async connect(sandboxId: string): Promise<CreatedSandbox> {
     const sandbox = await Sandbox.connect(sandboxId, { ...this.connection, timeoutMs: this.timeoutMs })
     this.sandboxes.set(sandboxId, sandbox); return this.describe(sandbox)
+  }
+  async execUpstream(sandboxId: string): Promise<ExecUpstream> {
+    const sandbox = await this.handle(sandboxId)
+    return validateExecUpstream({
+      url: `wss://${sandbox.getHost(22101)}/`,
+      accessToken: sandbox.trafficAccessToken,
+    })
   }
   async uploadArchive(sandboxId: string, archive: Uint8Array): Promise<void> {
     const sandbox = await this.handle(sandboxId)
@@ -131,6 +140,12 @@ export class E2BProvider implements ProviderAdapter {
     await Sandbox.kill(sandboxId, this.connection)
     this.sandboxes.delete(sandboxId)
   }
-  private describe(sandbox: Sandbox): CreatedSandbox { return { sandboxId: sandbox.sandboxId, rawExecUrl: `wss://${sandbox.getHost(22101)}` } }
-  private async handle(id: string): Promise<Sandbox> { return this.sandboxes.get(id) ?? Sandbox.connect(id, { ...this.connection, timeoutMs: this.timeoutMs }) }
+  private describe(sandbox: Sandbox): CreatedSandbox { return { sandboxId: sandbox.sandboxId } }
+  private async handle(id: string): Promise<Sandbox> {
+    const existing = this.sandboxes.get(id)
+    if (existing) return existing
+    const sandbox = await Sandbox.connect(id, { ...this.connection, timeoutMs: this.timeoutMs })
+    this.sandboxes.set(id, sandbox)
+    return sandbox
+  }
 }
