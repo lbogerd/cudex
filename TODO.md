@@ -61,13 +61,13 @@ connection material or allocation is leaked.
 - [x] Define an authenticated immutable source-snapshot lifecycle and opaque ID.
 - [x] Validate tenant ownership, trusted checksum, expiry, canonical roots/cwd,
   archive layout/types/links, and all archive quotas before durable publication.
-- [ ] Extend trusted deployment metadata or the provision contract so a remote
+- [x] Extend trusted deployment metadata or the provision contract so a remote
   control plane resolves that ID without client-host `file:` access:
   - [x] accept a strictly validated trusted source ID/checksum in hosted-agent
     configuration and emit the exact path-free `sourceSnapshot` provision wire;
   - [x] add a bounded authenticated binary creation/upload route that keeps
     tenant identity out of request data and archive bytes out of JSON;
-  - [ ] wire production startup to the PostgreSQL lifecycle/resolver and its
+  - [x] wire production startup to the PostgreSQL lifecycle/resolver and its
     reference-safe partial-publication reclaimer.
 - [x] Define the exact `sourceSnapshot` provision wire shape and authenticated
   create/resolve API adapter without accepting tenant identity or host paths from

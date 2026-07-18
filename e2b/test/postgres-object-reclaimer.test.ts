@@ -119,6 +119,16 @@ async function allocatedObject(context: Fixture, owner: Awaited<ReturnType<typeo
   return { object, storageId, allocationId: allocation.allocationId }
 }
 
+async function sourceArchive(context: Fixture, tenantId: string, objectId: string, body: string) {
+  const bytes = Buffer.from(body); const storageId = await context.objects.put(bytes)
+  const object: StoredObject = {
+    objectId, tenantId, kind: 'source_archive', ...context.objects.location(storageId),
+    checksum: `sha256:${storageId}`, sizeBytes: bytes.byteLength, state: 'available', expiresAt: null,
+  }
+  await context.state.registerObject(object)
+  return { object, storageId }
+}
+
 function preparationIntent(archiveChecksum: string, manifestChecksum: string,
   suffix: string): WorkspacePreparationIntent {
   return {
@@ -203,6 +213,53 @@ live('reclaims unreferenced objects in bounded batches and preserves deleted aud
     ['object-1', 'deleted', 'reclaimed'], ['object-2', 'deleted', 'reclaimed'],
   ])
   assert.ok(rows.rows.every(row => row.reclaimed_at instanceof Date))
+})
+
+live('source publication cleanup is reference-safe, shared-location-safe, and replica-serialized', async context => {
+  const orphanBytes = Buffer.from('put without registration')
+  const orphanStorageId = await context.objects.put(orphanBytes)
+  await context.reclaimer.reclaimUnreferencedSourceArchive('tenant-1', 'source-object-orphan', orphanStorageId)
+  assert.equal(context.objects.values.has(orphanStorageId), false)
+
+  const unreferenced = await sourceArchive(context, 'tenant-1', 'source-object-unreferenced', 'unreferenced')
+  const replica = new PostgresObjectReclaimer(context.pool, context.objects)
+  await Promise.all([context.reclaimer, replica].map(reclaimer => reclaimer.reclaimUnreferencedSourceArchive(
+    'tenant-1', unreferenced.object.objectId, unreferenced.storageId,
+  )))
+  assert.equal(context.objects.deletes.filter(id => id === unreferenced.storageId).length, 1)
+  assert.equal((await context.pool.query<{ state: string }>(`
+    SELECT state FROM hosted_agent_objects WHERE object_id = $1
+  `, [unreferenced.object.objectId])).rows[0]?.state, 'deleted')
+
+  const shared = await sourceArchive(context, 'tenant-1', 'source-object-shared-1', 'shared source')
+  await context.state.registerObject({ ...shared.object, objectId: 'source-object-shared-2', tenantId: 'tenant-2' })
+  await context.reclaimer.reclaimUnreferencedSourceArchive(
+    'tenant-1', shared.object.objectId, shared.storageId,
+  )
+  assert.equal(context.objects.values.has(shared.storageId), true)
+  const sharedRows = await context.pool.query<{ object_id: string; state: string }>(`
+    SELECT object_id, state FROM hosted_agent_objects
+    WHERE object_id IN ('source-object-shared-1', 'source-object-shared-2') ORDER BY object_id
+  `)
+  assert.deepEqual(sharedRows.rows.map(row => [row.object_id, row.state]), [
+    ['source-object-shared-1', 'deleted'], ['source-object-shared-2', 'available'],
+  ])
+
+  const referenced = await sourceArchive(context, 'tenant-1', 'source-object-referenced', 'referenced source')
+  await context.state.registerSourceSnapshot({
+    sourceSnapshotId: 'source-snapshot-referenced', tenantId: 'tenant-1',
+    archiveObjectId: referenced.object.objectId, checksum: referenced.object.checksum,
+    cwdUri: 'file:///workspace/roots/0/project',
+    workspaceRootUris: ['file:///workspace/roots/0/project'], state: 'available',
+    expiresAt: new Date('2030-01-01T00:00:00.000Z'),
+  })
+  await context.reclaimer.reclaimUnreferencedSourceArchive(
+    'tenant-1', referenced.object.objectId, referenced.storageId,
+  )
+  assert.equal(context.objects.values.has(referenced.storageId), true)
+  assert.equal((await context.pool.query<{ state: string }>(`
+    SELECT state FROM hosted_agent_objects WHERE object_id = $1
+  `, [referenced.object.objectId])).rows[0]?.state, 'available')
 })
 
 live('retains referenced objects and never deletes a locator shared by another tenant', async context => {

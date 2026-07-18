@@ -75,14 +75,18 @@ configuration is supplied through `HOSTED_AGENT_*`; see `e2b/src/main.ts` for th
 small required set. Architecture results and remaining production work are in
 [`../ARCHIVE.md`](../ARCHIVE.md) and [`../TODO.md`](../TODO.md).
 
-Production deployments must set `HOSTED_AGENT_OBJECT_BUCKET` and may set
+Production deployments must set `HOSTED_AGENT_OBJECT_BUCKET`,
+`HOSTED_AGENT_DATABASE_URL` (or `DATABASE_URL`), and the trusted single-tenant
+identity `HOSTED_AGENT_TENANT_ID`. They may set
 `HOSTED_AGENT_OBJECT_PREFIX`, `HOSTED_AGENT_OBJECT_REGION`, and
 `HOSTED_AGENT_OBJECT_ENDPOINT` for an S3-compatible service. The standard AWS
 credential provider chain supplies authenticated access; objects are encrypted
 server-side, addressed by SHA-256, and verified on read. `HOSTED_AGENT_BLOB_PATH`
 selects the development-only local store when no bucket is configured.
 
-Apply the PostgreSQL schema before starting production replicas:
+Production startup applies the checksummed PostgreSQL migrations under a
+database-scoped advisory lock. They can also be applied explicitly before a
+rollout:
 
 ```bash
 HOSTED_AGENT_DATABASE_URL=postgresql://... npm run migrate --prefix e2b
@@ -91,6 +95,16 @@ HOSTED_AGENT_DATABASE_URL=postgresql://... npm run migrate --prefix e2b
 Migrations are checksummed, serialized across replicas, and transactional. Set
 `HOSTED_AGENT_TEST_DATABASE_URL` to include the live constraint and concurrent
 migration test in `npm test`.
+
+Trusted deployment tooling creates immutable source IDs with
+`POST /v1/source-snapshots` and content type
+`application/vnd.codex.source-snapshot.v1`. Its body is a four-byte big-endian
+JSON metadata length, the metadata
+`{checksum,cwdUri,workspaceRootUris,expiresAt}`, then the tar bytes. The bearer
+maps to `HOSTED_AGENT_TENANT_ID`; tenant identity is never accepted in the body.
+Use the returned `sourceSnapshotId` and checksum in
+`[hosted_agents.source_snapshot]` so root provisioning contains no client-host
+path.
 
 Production mode requires a TLS certificate/key pair and a `wss:`
 `HOSTED_AGENT_GATEWAY_URL`. Plain HTTP and `ws:` are accepted only when

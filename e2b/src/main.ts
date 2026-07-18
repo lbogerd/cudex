@@ -9,6 +9,7 @@ import { startServer } from './http-server.js'
 import { BlobStore, S3BlobStore } from './blob-store.js'
 import { defaultArchiveManifestLimits, type ArchiveManifestLimits } from './archive-manifest.js'
 import type { WorkspaceTransferMetric } from './workspace-transfer.js'
+import { createSourceSnapshotRuntime } from './source-runtime.js'
 
 function required(name: string): string { const value = process.env[name]; if (!value) throw new Error(`${name} is required`); return value }
 function positiveInteger(name: string, fallback: number): number {
@@ -62,6 +63,16 @@ const archiveLimits: ArchiveManifestLimits = {
   maxPathDepth: withOverhead('HOSTED_AGENT_MAX_PATH_DEPTH', ingress.maxPathDepth, 3),
   maxExtractionRatio: ingress.maxExtractionRatio,
 }
+const sourceDatabaseUrl = process.env.HOSTED_AGENT_DATABASE_URL ?? process.env.DATABASE_URL
+const sourceRuntime = await createSourceSnapshotRuntime({
+  ...(sourceDatabaseUrl ? { databaseUrl: sourceDatabaseUrl } : {}),
+  ...(process.env.HOSTED_AGENT_TENANT_ID ? { tenantId: process.env.HOSTED_AGENT_TENANT_ID } : {}),
+  required: !development,
+  objects: blobs,
+  archiveLimits,
+  maxRoots: ingress.maxRoots,
+  maxTtlMs: positiveInteger('HOSTED_AGENT_SOURCE_MAX_TTL_MS', 24 * 60 * 60_000),
+})
 function observeWorkspaceTransfer(metric: WorkspaceTransferMetric): void {
   console.log(JSON.stringify({ event: 'workspace_transfer_phase', ...metric }))
 }
@@ -89,10 +100,19 @@ const gateway = new ExecGateway(tickets, store, provider, {
 })
 const service = new ControlPlane(store, provider, tickets, blobs, { templates, allowedRoots,
   ingress,
+  ...(sourceRuntime ? { sourceSnapshots: {
+    principal: sourceRuntime.principal,
+    resolver: sourceRuntime.lifecycle,
+  } } : {}),
   allowLocalIngress: development }, gateway)
 await service.reconcile()
 await startServer(service, gateway, { host, port, bearerToken: required('CODEX_HOSTED_AGENT_TOKEN'),
   ...(process.env.HOSTED_AGENT_TLS_CERT ? { tlsCertPath: process.env.HOSTED_AGENT_TLS_CERT } : {}),
   ...(process.env.HOSTED_AGENT_TLS_KEY ? { tlsKeyPath: process.env.HOSTED_AGENT_TLS_KEY } : {}),
+  ...(sourceRuntime ? { sourceSnapshots: {
+    principal: sourceRuntime.principal,
+    api: sourceRuntime.api,
+    maxArchiveBytes: archiveLimits.maxArchiveBytes,
+  } } : {}),
   allowInsecureHttp: development })
 console.log(JSON.stringify({ event: 'control_plane_started', host, port, tls: Boolean(process.env.HOSTED_AGENT_TLS_CERT) }))

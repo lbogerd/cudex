@@ -53,6 +53,74 @@ function validateOwnership(identity: OperationIdentity, generation: number, work
 export class PostgresObjectReclaimer {
   constructor(private readonly pool: Pool, private readonly objects: ObjectStore) {}
 
+  /** Safely removes a source archive whose durable publication never acquired a reference. */
+  async reclaimUnreferencedSourceArchive(tenantId: string, objectId: string, storageId: string): Promise<void> {
+    validId('tenant ID', tenantId); validId('object ID', objectId)
+    if (!/^[0-9a-f]{64}$/u.test(storageId)) throw new Error('invalid source archive storage ID')
+    const location = this.objects.location(storageId)
+    validId('storage bucket', location.storageBucket); validId('storage key', location.storageKey, 2048)
+    const client = await this.pool.connect()
+    const locationKey = this.locationKey(location.storageBucket, location.storageKey)
+    try {
+      await this.lockLocation(client, locationKey)
+      const action = await this.clientTransaction(client, async () => {
+        await client.query("SET LOCAL lock_timeout = '30s'")
+        const exact = await client.query<ObjectRow & { kind: string }>(`
+          SELECT object_id, tenant_id, kind, storage_bucket, storage_key, checksum, state
+          FROM hosted_agent_objects
+          WHERE object_id = $1 AND tenant_id = $2
+          FOR UPDATE
+        `, [objectId, tenantId])
+        const object = exact.rows[0]
+        if (object) {
+          if (object.kind !== 'source_archive' || object.checksum !== `sha256:${storageId}`
+            || object.storage_bucket !== location.storageBucket || object.storage_key !== location.storageKey) {
+            throw new Error('source archive registration does not match its physical object')
+          }
+          if (object.state === 'deleted') return 'complete' as const
+          if (object.state !== 'deleting' && await this.hasDurableReference(client, object.object_id)) {
+            return 'retained' as const
+          }
+        }
+        const shared = await client.query(`
+          SELECT 1 FROM hosted_agent_objects
+          WHERE object_id <> $1 AND storage_bucket = $2 AND storage_key = $3
+            AND state <> 'deleted'
+          LIMIT 1
+        `, [objectId, location.storageBucket, location.storageKey])
+        if (shared.rowCount === 1) {
+          if (object && object.state !== 'deleted') {
+            await client.query(`UPDATE hosted_agent_objects SET state = 'deleted' WHERE object_id = $1`, [objectId])
+          }
+          return 'shared' as const
+        }
+        if (object?.state !== 'deleting') {
+          if (object) await client.query(`UPDATE hosted_agent_objects SET state = 'deleting' WHERE object_id = $1`, [objectId])
+        }
+        return 'delete' as const
+      })
+      if (action !== 'delete') return
+      await this.objects.delete(storageId)
+      await this.clientTransaction(client, async () => {
+        const result = await client.query<ObjectRow>(`
+          SELECT object_id, tenant_id, storage_bucket, storage_key, checksum, state
+          FROM hosted_agent_objects
+          WHERE object_id = $1 AND tenant_id = $2
+          FOR UPDATE
+        `, [objectId, tenantId])
+        const object = result.rows[0]
+        if (!object) return
+        if (object.storage_bucket !== location.storageBucket || object.storage_key !== location.storageKey
+          || object.checksum !== `sha256:${storageId}`) {
+          throw new Error('source archive registration changed during reclamation')
+        }
+        if (object.state === 'deleting') {
+          await client.query(`UPDATE hosted_agent_objects SET state = 'deleted' WHERE object_id = $1`, [objectId])
+        } else if (object.state !== 'deleted') throw new Error('source archive left deleting state unexpectedly')
+      })
+    } finally { await this.releaseLocation(client, locationKey) }
+  }
+
   async reclaimOperationObjects(identity: OperationIdentity, generation: number, workerId: string,
     limit = 100): Promise<ObjectReclaimBatchResult> {
     validateOwnership(identity, generation, workerId, limit)
@@ -372,7 +440,11 @@ export class PostgresObjectReclaimer {
   }
 
   private locationLockKey(object: ObjectRow): string {
-    return `hosted-agent:object-location:${JSON.stringify([object.storage_bucket, object.storage_key])}`
+    return this.locationKey(object.storage_bucket, object.storage_key)
+  }
+
+  private locationKey(storageBucket: string, storageKey: string): string {
+    return `hosted-agent:object-location:${JSON.stringify([storageBucket, storageKey])}`
   }
 
   private async lockObject(client: PoolClient, expected: ObjectRow): Promise<ObjectRow> {

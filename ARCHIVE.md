@@ -433,9 +433,9 @@ the metadata retain the allowlisted `rootWorkspace` bridge. The in-memory fake
 can register immutable source metadata for deterministic root-selection tests.
 Exact serde, invalid-config, root-selection, and ownership-lineage tests passed;
 the broader lineage test requires the repository's 16 MiB Rust test stack.
-Production startup still needs to construct the PostgreSQL lifecycle/resolver
-and activate the authenticated creation route before deployment tooling can
-produce and resolve these IDs end to end.
+Production startup now constructs the PostgreSQL lifecycle/resolver and activates
+the authenticated creation route when durable database and trusted tenant
+configuration are present.
 
 The source creation HTTP boundary is now implemented behind explicit trusted
 principal/API injection. `POST /v1/source-snapshots` accepts only
@@ -447,9 +447,25 @@ UTF-8, empty/oversized archives, and streamed or declared overflow fail before
 lifecycle dispatch. Responses are validated non-secret references with no-store
 and nosniff headers. API root/archive bounds are deployment-injectable instead
 of hard-coded. The full 155-test TypeScript run passed with 118 passes, 37
-database-gated skips, and zero failures. Production startup composition and
-reference-safe PostgreSQL partial-publication cleanup remain to activate the
-route.
+database-gated skips, and zero failures.
+
+Outside explicit development mode, startup now requires
+`HOSTED_AGENT_DATABASE_URL` (or `DATABASE_URL`) and the single-tenant deployment
+identity `HOSTED_AGENT_TENANT_ID`, applies checksummed migrations, constructs the
+PostgreSQL durable source state, and injects the same principal/lifecycle into
+both upload and pre-allocation provision resolution. Development may omit both
+and retains the local bridge; partial configuration fails closed. Source TTL,
+root, archive, file, entry, path, and expansion bounds share deployment limits.
+
+The production source reclaimer uses the same physical-location advisory lock as
+publication. It safely covers object-store put before registration, exact
+registered-but-unreferenced objects, shared physical content across tenants,
+durable source/object references, concurrent replicas, and resumable `deleting`
+state. A PostgreSQL 17 run exercised the complete 158-test TypeScript suite with
+158 passes, no skips, and no failures. This completes remote immutable source ID
+creation and pre-allocation resolution without client-host `file:` access; the
+remaining JSON-to-PostgreSQL provision transaction cutover is tracked separately
+under production persistence.
 
 ### Connection-ticket lifecycle
 
