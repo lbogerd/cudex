@@ -6,14 +6,14 @@ build sequence, not a replacement for the provider's SDK documentation.
 
 The Codex-side sources of truth are:
 
-- [`codex-rs/hosted-agent/src/types.rs`](codex-rs/hosted-agent/src/types.rs) for
+- [`codex/codex-rs/hosted-agent/src/types.rs`](codex/codex-rs/hosted-agent/src/types.rs) for
   request, response, lifecycle, and service types;
-- [`codex-rs/hosted-agent/src/http.rs`](codex-rs/hosted-agent/src/http.rs) for
+- [`codex/codex-rs/hosted-agent/src/http.rs`](codex/codex-rs/hosted-agent/src/http.rs) for
   the HTTP routes, status mapping, authentication, and response limits;
-- [`codex-rs/hosted-agent/src/fake.rs`](codex-rs/hosted-agent/src/fake.rs) for a
+- [`codex/codex-rs/hosted-agent/src/fake.rs`](codex/codex-rs/hosted-agent/src/fake.rs) for a
   reference implementation of idempotency, snapshot isolation, patch export,
   three-way application, and release behavior;
-- [`codex-rs/core/src/hosted_agent_runtime.rs`](codex-rs/core/src/hosted_agent_runtime.rs)
+- [`codex/codex-rs/core/src/hosted_agent_runtime.rs`](codex/codex-rs/core/src/hosted_agent_runtime.rs)
   for Codex's provisioning, reconnect, restore, and tool-policy expectations;
 - [`plan-for-hosted-full-agent-runtime.md`](plan-for-hosted-full-agent-runtime.md)
   for the completed Codex-side design.
@@ -652,7 +652,7 @@ default anywhere.
 
 ## Contract and live test matrix
 
-Port the behavior in `codex-rs/hosted-agent/src/hosted_agent_tests.rs` to black-box
+Port the behavior in `codex/codex-rs/hosted-agent/src/hosted_agent_tests.rs` to black-box
 HTTP tests, then run these live E2B scenarios:
 
 | Scenario | Required assertion |
