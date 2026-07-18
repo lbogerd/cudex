@@ -32,6 +32,7 @@ fn durable_runtime_record_round_trips_without_transient_data() {
     let agent_id =
         ThreadId::from_string("00000000-0000-0000-0000-000000000123").expect("valid thread id");
     let record = HostedAgentRuntimeRecord {
+        owner_agent_id: Some(agent_id),
         agent_type: "reviewer".to_string(),
         sandbox_template: "review-v2".to_string(),
         lease_id: "lease-1".to_string(),
@@ -53,6 +54,7 @@ fn durable_runtime_record_round_trips_without_transient_data() {
     assert_eq!(
         json,
         json!({
+            "ownerAgentId": agent_id,
             "agentType": "reviewer",
             "sandboxTemplate": "review-v2",
             "leaseId": "lease-1",
@@ -75,6 +77,23 @@ fn durable_runtime_record_round_trips_without_transient_data() {
             .expect("record should deserialize"),
         record
     );
+}
+
+#[test]
+fn durable_runtime_record_defaults_missing_owner_for_legacy_records() {
+    let record = serde_json::from_value::<HostedAgentRuntimeRecord>(json!({
+        "agentType": "reviewer",
+        "sandboxTemplate": "review-v2",
+        "leaseId": "lease-1",
+        "environmentId": "environment-1",
+        "baseSnapshotId": "snapshot-base",
+        "latestSnapshotId": "snapshot-latest",
+        "lastExportedPatch": null,
+        "lifecycleState": "active",
+    }))
+    .expect("legacy record should deserialize");
+
+    assert_eq!(record.owner_agent_id, None);
 }
 
 #[tokio::test]

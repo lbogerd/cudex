@@ -191,6 +191,12 @@ pub enum HostedAgentLifecycleState {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HostedAgentRuntimeRecord {
+    /// The owning agent used for lifecycle and patch authorization.
+    ///
+    /// Older persisted records predate durable ownership, so a missing field is
+    /// treated as an unowned root runtime.
+    #[serde(default)]
+    pub owner_agent_id: Option<ThreadId>,
     pub agent_type: String,
     pub sandbox_template: String,
     pub lease_id: String,

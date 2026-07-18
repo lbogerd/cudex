@@ -111,7 +111,9 @@ const THREAD_CREATED_CHANNEL_CAPACITY: usize = 1024;
 const PATCH_AVAILABLE_CHANNEL_CAPACITY: usize = 1024;
 
 mod hosted_agent_lifecycle;
+mod hosted_agent_patch_apply;
 pub use hosted_agent_lifecycle::HostedAgentPatchAvailable;
+pub use hosted_agent_patch_apply::HostedAgentPatchApplyResult;
 /// Test-only override for enabling thread-manager behaviors used by integration
 /// tests.
 ///
@@ -1380,17 +1382,54 @@ impl ThreadManagerState {
                         resumed.conversation_id
                     ))
                 })?;
-            if record.lifecycle_state != codex_hosted_agent::HostedAgentLifecycleState::Active {
-                return Err(CodexErr::InvalidRequest(format!(
-                    "hosted-agent thread {} cannot resume from lifecycle state {:?}",
-                    resumed.conversation_id, record.lifecycle_state
-                )));
+            match record.lifecycle_state {
+                codex_hosted_agent::HostedAgentLifecycleState::Active
+                | codex_hosted_agent::HostedAgentLifecycleState::PendingFinalization => {
+                    return provisioner
+                        .reconnect_or_restore(thread_id, record)
+                        .await
+                        .map(Some)
+                        .map_err(|error| CodexErr::Fatal(error.to_string()));
+                }
+                codex_hosted_agent::HostedAgentLifecycleState::Completed
+                | codex_hosted_agent::HostedAgentLifecycleState::ReleasePending => {
+                    if record.last_exported_patch.is_none() {
+                        return Err(CodexErr::Fatal(format!(
+                            "hosted-agent thread {} is finalized without a patch artifact",
+                            resumed.conversation_id
+                        )));
+                    }
+                    let mut updated_record = record.clone();
+                    match provisioner.release_durable_record(thread_id, record).await {
+                        Ok(()) => {
+                            updated_record.lifecycle_state =
+                                codex_hosted_agent::HostedAgentLifecycleState::Released;
+                        }
+                        Err(error) => {
+                            updated_record.lifecycle_state =
+                                codex_hosted_agent::HostedAgentLifecycleState::ReleasePending;
+                            warn!(
+                                %error,
+                                %thread_id,
+                                "failed to retry hosted runtime cleanup during resume"
+                            );
+                        }
+                    }
+                    self.thread_store
+                        .set_hosted_agent_runtime(thread_id, updated_record)
+                        .await
+                        .map_err(|error| {
+                            CodexErr::Fatal(format!(
+                                "failed to persist hosted-agent cleanup state for thread {thread_id}: {error}"
+                            ))
+                        })?;
+                }
+                codex_hosted_agent::HostedAgentLifecycleState::Released => {}
             }
-            return provisioner
-                .reconnect_or_restore(thread_id, hosted_lineage.owner_agent_id, record)
-                .await
-                .map(Some)
-                .map_err(|error| CodexErr::Fatal(error.to_string()));
+            return Err(CodexErr::InvalidRequest(format!(
+                "hosted-agent thread {} is finalized and cannot be resumed",
+                resumed.conversation_id
+            )));
         }
         let agent_type = requested_agent_type
             .or_else(|| session_source.get_agent_role())

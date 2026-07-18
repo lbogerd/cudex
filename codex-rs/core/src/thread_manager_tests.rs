@@ -230,6 +230,29 @@ async fn start_hosted_owned_agent(
     (owner, agent)
 }
 
+async fn grant_hosted_patch_application(manager: &ThreadManager, thread_id: ThreadId) {
+    let runtime = manager
+        .state
+        .hosted_agent_runtimes
+        .read()
+        .await
+        .get(&thread_id)
+        .cloned()
+        .expect("hosted runtime");
+    let mut value = runtime.snapshot();
+    value
+        .tool_policy
+        .allowed_domains
+        .insert(codex_tools::ToolExecutionDomainKind::ControlPlane);
+    value
+        .tool_policy
+        .allowed_tools
+        .insert(codex_tools::ToolName::plain(
+            crate::thread_manager::hosted_agent_patch_apply::HOSTED_AGENT_PATCH_APPLY_TOOL_NAME,
+        ));
+    runtime.replace(value);
+}
+
 #[tokio::test]
 async fn hosted_runtime_is_durable_and_checkpoints_only_successful_turns() {
     let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
@@ -251,6 +274,7 @@ async fn hosted_runtime_is_durable_and_checkpoints_only_successful_turns() {
     assert_eq!(
         initial_record,
         codex_hosted_agent::HostedAgentRuntimeRecord {
+            owner_agent_id: request.owner_agent_id,
             agent_type: request.agent_type,
             sandbox_template: request.sandbox_template,
             lease_id: lease_id.clone(),
@@ -381,6 +405,7 @@ async fn hosted_finalization_persists_patch_notifies_owner_and_releases() {
         .await
         .expect("read initial agent runtime")
         .expect("initial agent runtime record");
+    assert_eq!(initial_record.owner_agent_id, Some(owner_thread_id));
     let environment_id = initial_record.environment_id.clone();
 
     let error = manager
@@ -441,6 +466,181 @@ async fn hosted_finalization_persists_patch_notifies_owner_and_releases() {
         .shutdown_all_threads_bounded(Duration::from_secs(10))
         .await;
     assert_eq!(report.completed.len(), 2);
+}
+
+#[tokio::test]
+async fn hosted_patch_apply_persists_checkpoint_and_retry_is_idempotent() {
+    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
+    let (owner, agent) = start_hosted_owned_agent(&manager, &config).await;
+    let artifact = manager
+        .state
+        .finalize_hosted_runtime(agent.thread_id, owner.thread_id)
+        .await
+        .expect("finalize hosted agent")
+        .expect("hosted patch artifact");
+    grant_hosted_patch_application(&manager, owner.thread_id).await;
+    let initial_record = manager
+        .state
+        .thread_store
+        .get_hosted_agent_runtime(owner.thread_id)
+        .await
+        .expect("read owner runtime")
+        .expect("owner runtime record");
+
+    assert_eq!(
+        manager
+            .apply_hosted_agent_patch(owner.thread_id, agent.thread_id, &artifact.artifact_id,)
+            .await
+            .expect("apply hosted patch"),
+        HostedAgentPatchApplyResult::Applied
+    );
+    let applied_record = manager
+        .state
+        .thread_store
+        .get_hosted_agent_runtime(owner.thread_id)
+        .await
+        .expect("read applied owner runtime")
+        .expect("applied owner runtime record");
+    assert_ne!(
+        applied_record.latest_snapshot_id,
+        initial_record.latest_snapshot_id
+    );
+    assert_eq!(
+        applied_record.latest_snapshot_id,
+        hosted_service.latest_snapshot_id(&applied_record.lease_id)
+    );
+    assert_eq!(
+        manager
+            .state
+            .hosted_agent_runtimes
+            .read()
+            .await
+            .get(&owner.thread_id)
+            .expect("owner runtime")
+            .snapshot()
+            .latest_snapshot_id,
+        applied_record.latest_snapshot_id
+    );
+
+    assert_eq!(
+        manager
+            .apply_hosted_agent_patch(owner.thread_id, agent.thread_id, &artifact.artifact_id,)
+            .await
+            .expect("retry hosted patch"),
+        HostedAgentPatchApplyResult::Applied
+    );
+    assert_eq!(
+        manager
+            .state
+            .thread_store
+            .get_hosted_agent_runtime(owner.thread_id)
+            .await
+            .expect("read retried owner runtime"),
+        Some(applied_record)
+    );
+}
+
+#[tokio::test]
+async fn hosted_patch_apply_conflict_leaves_owner_unchanged() {
+    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
+    let (owner, agent) = start_hosted_owned_agent(&manager, &config).await;
+    let artifact = manager
+        .state
+        .finalize_hosted_runtime(agent.thread_id, owner.thread_id)
+        .await
+        .expect("finalize hosted agent")
+        .expect("hosted patch artifact");
+    grant_hosted_patch_application(&manager, owner.thread_id).await;
+    let conflict_path = PathUri::parse("file:///workspace/conflicted.rs").expect("conflict path");
+    hosted_service.set_patch_conflict(&artifact.artifact_id, vec![conflict_path.clone()]);
+    let initial_record = manager
+        .state
+        .thread_store
+        .get_hosted_agent_runtime(owner.thread_id)
+        .await
+        .expect("read owner runtime")
+        .expect("owner runtime record");
+
+    assert_eq!(
+        manager
+            .apply_hosted_agent_patch(owner.thread_id, agent.thread_id, &artifact.artifact_id,)
+            .await
+            .expect("apply conflicting hosted patch"),
+        HostedAgentPatchApplyResult::Conflict {
+            paths: vec![conflict_path],
+        }
+    );
+    assert_eq!(
+        manager
+            .state
+            .thread_store
+            .get_hosted_agent_runtime(owner.thread_id)
+            .await
+            .expect("read owner runtime after conflict"),
+        Some(initial_record)
+    );
+}
+
+#[tokio::test]
+async fn hosted_patch_apply_rejects_missing_policy_stale_artifact_and_non_owner() {
+    let (_temp_dir, config, manager, _hosted_service) = hosted_thread_manager_for_tests().await;
+    let (owner, agent) = start_hosted_owned_agent(&manager, &config).await;
+    let artifact = manager
+        .state
+        .finalize_hosted_runtime(agent.thread_id, owner.thread_id)
+        .await
+        .expect("finalize hosted agent")
+        .expect("hosted patch artifact");
+    let owner_before = manager
+        .state
+        .thread_store
+        .get_hosted_agent_runtime(owner.thread_id)
+        .await
+        .expect("read owner runtime")
+        .expect("owner runtime record");
+
+    assert!(matches!(
+        manager
+            .apply_hosted_agent_patch(owner.thread_id, agent.thread_id, &artifact.artifact_id,)
+            .await
+            .expect("policy rejection"),
+        HostedAgentPatchApplyResult::Rejected { .. }
+    ));
+
+    grant_hosted_patch_application(&manager, owner.thread_id).await;
+    assert!(matches!(
+        manager
+            .apply_hosted_agent_patch(owner.thread_id, agent.thread_id, "stale-artifact")
+            .await
+            .expect("stale artifact rejection"),
+        HostedAgentPatchApplyResult::Rejected { .. }
+    ));
+
+    let unrelated_owner = manager
+        .start_thread_with_options(start_thread_options(config))
+        .await
+        .expect("start unrelated hosted owner");
+    grant_hosted_patch_application(&manager, unrelated_owner.thread_id).await;
+    assert!(matches!(
+        manager
+            .apply_hosted_agent_patch(
+                unrelated_owner.thread_id,
+                agent.thread_id,
+                &artifact.artifact_id,
+            )
+            .await
+            .expect("ownership rejection"),
+        HostedAgentPatchApplyResult::Rejected { .. }
+    ));
+    assert_eq!(
+        manager
+            .state
+            .thread_store
+            .get_hosted_agent_runtime(owner.thread_id)
+            .await
+            .expect("read unchanged owner runtime"),
+        Some(owner_before)
+    );
 }
 
 #[tokio::test]
@@ -729,6 +929,138 @@ async fn stopped_hosted_thread_reconnects_without_releasing_its_lease() {
         .await
         .expect("stop resumed thread");
     manager.remove_thread(&resumed.thread_id).await;
+}
+
+#[tokio::test]
+async fn pending_finalization_hosted_thread_reconnects_for_recovery() {
+    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
+    let root = manager
+        .start_thread_with_options(start_thread_options(config.clone()))
+        .await
+        .expect("start hosted root");
+    let mut record = manager
+        .state
+        .thread_store
+        .get_hosted_agent_runtime(root.thread_id)
+        .await
+        .expect("read hosted runtime")
+        .expect("hosted runtime record");
+    record.lifecycle_state = codex_hosted_agent::HostedAgentLifecycleState::PendingFinalization;
+    manager
+        .state
+        .thread_store
+        .set_hosted_agent_runtime(root.thread_id, record.clone())
+        .await
+        .expect("persist pending finalization");
+    root.thread
+        .shutdown_and_wait()
+        .await
+        .expect("stop hosted thread");
+
+    let resumed = manager
+        .resume_thread_with_history(
+            config,
+            InitialHistory::Resumed(ResumedHistory {
+                conversation_id: root.thread_id,
+                history: Arc::new(Vec::new()),
+                rollout_path: root.session_configured.rollout_path.clone(),
+            }),
+            manager.auth_manager(),
+            /*parent_trace*/ None,
+            /*supports_openai_form_elicitation*/ false,
+        )
+        .await
+        .expect("reconnect pending finalization");
+    let resumed_record = manager
+        .state
+        .thread_store
+        .get_hosted_agent_runtime(root.thread_id)
+        .await
+        .expect("read resumed hosted runtime")
+        .expect("resumed hosted runtime record");
+
+    assert_eq!(resumed_record, record);
+    assert_eq!(hosted_service.active_lease_count(), 1);
+    assert_eq!(hosted_service.provisioned_environment_ids().len(), 1);
+
+    resumed
+        .thread
+        .shutdown_and_wait()
+        .await
+        .expect("stop resumed thread");
+    manager.remove_thread(&resumed.thread_id).await;
+}
+
+#[tokio::test]
+async fn completed_hosted_thread_resume_retries_release_without_restoring() {
+    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
+    let root = manager
+        .start_thread_with_options(start_thread_options(config.clone()))
+        .await
+        .expect("start hosted root");
+    let mut record = manager
+        .state
+        .thread_store
+        .get_hosted_agent_runtime(root.thread_id)
+        .await
+        .expect("read hosted runtime")
+        .expect("hosted runtime record");
+    record.last_exported_patch = Some(codex_hosted_agent::AgentPatchArtifact {
+        artifact_id: "artifact-completed-resume".to_string(),
+        agent_id: root.thread_id,
+        base_snapshot_id: record.base_snapshot_id.clone(),
+        checksum: "sha256:completed-resume".to_string(),
+        changed_files: 1,
+        size_bytes: 128,
+    });
+    record.lifecycle_state = codex_hosted_agent::HostedAgentLifecycleState::Completed;
+    manager
+        .state
+        .thread_store
+        .set_hosted_agent_runtime(root.thread_id, record)
+        .await
+        .expect("persist completed runtime");
+    root.thread
+        .shutdown_and_wait()
+        .await
+        .expect("stop hosted thread");
+
+    let error = match manager
+        .resume_thread_with_history(
+            config,
+            InitialHistory::Resumed(ResumedHistory {
+                conversation_id: root.thread_id,
+                history: Arc::new(Vec::new()),
+                rollout_path: root.session_configured.rollout_path.clone(),
+            }),
+            manager.auth_manager(),
+            /*parent_trace*/ None,
+            /*supports_openai_form_elicitation*/ false,
+        )
+        .await
+    {
+        Ok(_) => panic!("completed hosted thread must not resume"),
+        Err(error) => error,
+    };
+    let released_record = manager
+        .state
+        .thread_store
+        .get_hosted_agent_runtime(root.thread_id)
+        .await
+        .expect("read released hosted runtime")
+        .expect("released hosted runtime record");
+
+    assert!(
+        error
+            .to_string()
+            .contains("is finalized and cannot be resumed")
+    );
+    assert_eq!(
+        released_record.lifecycle_state,
+        codex_hosted_agent::HostedAgentLifecycleState::Released
+    );
+    assert_eq!(hosted_service.active_lease_count(), 0);
+    assert_eq!(hosted_service.provisioned_environment_ids().len(), 1);
 }
 
 #[tokio::test]

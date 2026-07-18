@@ -7,6 +7,7 @@ use codex_exec_server::EnvironmentManager;
 use codex_exec_server::ExecServerError;
 use codex_hosted_agent::AgentCheckpoint;
 use codex_hosted_agent::AgentCheckpointRequest;
+use codex_hosted_agent::AgentPatchApplyRequest;
 use codex_hosted_agent::AgentPatchArtifact;
 use codex_hosted_agent::AgentPatchExportRequest;
 use codex_hosted_agent::AgentProvisionRequest;
@@ -17,6 +18,7 @@ use codex_hosted_agent::HostedAgentError;
 use codex_hosted_agent::HostedAgentLifecycleState;
 use codex_hosted_agent::HostedAgentRuntimeRecord;
 use codex_hosted_agent::HostedAgentService;
+use codex_hosted_agent::PatchApplyResult;
 use codex_hosted_agent::ProvisionedAgent;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_tools::ToolExecutionDomain;
@@ -81,6 +83,7 @@ impl HostedToolAuthorization {
 impl HostedAgentRuntime {
     pub(crate) fn durable_record(&self) -> HostedAgentRuntimeRecord {
         HostedAgentRuntimeRecord {
+            owner_agent_id: self.owner_agent_id,
             agent_type: self.agent_type.clone(),
             sandbox_template: self.sandbox_template.clone(),
             lease_id: self.lease_id.clone(),
@@ -121,6 +124,11 @@ trait ErasedHostedAgentService: Send + Sync {
         request: AgentPatchExportRequest,
     ) -> HostedServiceFuture<'_, AgentPatchArtifact>;
 
+    fn apply_patch(
+        &self,
+        request: AgentPatchApplyRequest,
+    ) -> HostedServiceFuture<'_, PatchApplyResult>;
+
     fn release(&self, request: AgentReleaseRequest) -> HostedServiceFuture<'_, ()>;
 }
 
@@ -154,6 +162,13 @@ where
         request: AgentPatchExportRequest,
     ) -> HostedServiceFuture<'_, AgentPatchArtifact> {
         Box::pin(HostedAgentService::export_patch(self, request))
+    }
+
+    fn apply_patch(
+        &self,
+        request: AgentPatchApplyRequest,
+    ) -> HostedServiceFuture<'_, PatchApplyResult> {
+        Box::pin(HostedAgentService::apply_patch(self, request))
     }
 
     fn release(&self, request: AgentReleaseRequest) -> HostedServiceFuture<'_, ()> {
@@ -255,9 +270,9 @@ impl HostedAgentProvisioner {
     pub(crate) async fn reconnect_or_restore(
         &self,
         agent_id: codex_protocol::ThreadId,
-        owner_agent_id: Option<codex_protocol::ThreadId>,
         record: HostedAgentRuntimeRecord,
     ) -> Result<PendingHostedAgentRuntime, HostedAgentRuntimeError> {
+        let owner_agent_id = record.owner_agent_id;
         let reconnect = self
             .service
             .reconnect(AgentReconnectRequest {
@@ -369,6 +384,32 @@ impl HostedAgentProvisioner {
         .await
     }
 
+    /// Retries cleanup from durable metadata without reconnecting or restoring a terminal lease.
+    pub(crate) async fn release_durable_record(
+        &self,
+        agent_id: codex_protocol::ThreadId,
+        record: HostedAgentRuntimeRecord,
+    ) -> Result<(), HostedAgentRuntimeError> {
+        cleanup_runtime(
+            agent_id,
+            HostedAgentRuntime {
+                owner_agent_id: record.owner_agent_id,
+                lease_id: record.lease_id,
+                environment_id: record.environment_id,
+                agent_type: record.agent_type,
+                sandbox_template: record.sandbox_template,
+                base_snapshot_id: record.base_snapshot_id,
+                latest_snapshot_id: record.latest_snapshot_id,
+                last_exported_patch: record.last_exported_patch,
+                lifecycle_state: record.lifecycle_state,
+                tool_policy: AgentToolPolicy::default(),
+            },
+            self.environment_manager.as_ref(),
+            self.service.as_ref(),
+        )
+        .await
+    }
+
     /// Creates a durable snapshot for one successfully completed turn.
     pub(crate) async fn checkpoint(
         &self,
@@ -433,6 +474,26 @@ impl HostedAgentProvisioner {
             )));
         }
         Ok(artifact)
+    }
+
+    /// Atomically applies one artifact to the requesting agent's current lease generation.
+    pub(crate) async fn apply_patch(
+        &self,
+        requesting_agent_id: codex_protocol::ThreadId,
+        artifact_id: &str,
+        runtime: &HostedAgentRuntime,
+    ) -> Result<PatchApplyResult, HostedAgentRuntimeError> {
+        self.service
+            .apply_patch(AgentPatchApplyRequest {
+                target_lease_id: runtime.lease_id.clone(),
+                artifact_id: artifact_id.to_string(),
+                idempotency_key: format!(
+                    "hosted-agent:{requesting_agent_id}:lease:{}:artifact:{artifact_id}:apply",
+                    runtime.lease_id
+                ),
+            })
+            .await
+            .map_err(HostedAgentRuntimeError::ApplyPatch)
     }
 }
 
@@ -514,6 +575,8 @@ pub(crate) enum HostedAgentRuntimeError {
     Checkpoint(HostedAgentError),
     #[error("failed to export hosted-agent patch: {0}")]
     ExportPatch(HostedAgentError),
+    #[error("failed to apply hosted-agent patch: {0}")]
+    ApplyPatch(HostedAgentError),
     #[error("failed to unregister hosted environment `{environment_id}`: {source}")]
     Unregister {
         environment_id: String,

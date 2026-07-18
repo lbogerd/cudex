@@ -13,6 +13,7 @@ use crate::local::test_support::test_config;
 
 fn runtime_record() -> HostedAgentRuntimeRecord {
     HostedAgentRuntimeRecord {
+        owner_agent_id: Some(ThreadId::new()),
         agent_type: "reviewer".to_string(),
         sandbox_template: "review-v2".to_string(),
         lease_id: "lease-1".to_string(),

@@ -170,7 +170,7 @@ async fn reconnect_rollback_unregisters_without_releasing_existing_lease() {
         .expect("detach stale environment");
 
     let pending = provisioner
-        .reconnect_or_restore(agent_id, /*owner_agent_id*/ None, record)
+        .reconnect_or_restore(agent_id, record)
         .await
         .expect("reconnect active lease");
     assert_eq!(pending.runtime.lease_id, runtime.lease_id);
@@ -199,7 +199,8 @@ async fn missing_lease_restores_original_record_and_rollback_releases_new_lease(
         .await
         .expect("provision runtime")
         .commit();
-    let original_record = runtime.durable_record();
+    let mut original_record = runtime.durable_record();
+    original_record.owner_agent_id = Some(owner_agent_id);
     environment_manager
         .remove_environment(&runtime.environment_id)
         .await
@@ -213,7 +214,7 @@ async fn missing_lease_restores_original_record_and_rollback_releases_new_lease(
         .expect("expire old lease");
 
     let pending = provisioner
-        .reconnect_or_restore(agent_id, Some(owner_agent_id), original_record.clone())
+        .reconnect_or_restore(agent_id, original_record.clone())
         .await
         .expect("restore missing lease");
     let restore_key = format!(
@@ -231,6 +232,7 @@ async fn missing_lease_restores_original_record_and_rollback_releases_new_lease(
         Some(owner_agent_id)
     );
     assert_ne!(pending.runtime.lease_id, original_record.lease_id);
+    assert_eq!(pending.runtime.owner_agent_id, Some(owner_agent_id));
     assert_eq!(
         pending.durable_record().agent_type,
         original_record.agent_type
@@ -265,8 +267,8 @@ async fn reconnect_or_restore_requires_a_durable_snapshot() {
     let error = match provisioner
         .reconnect_or_restore(
             agent_id,
-            /*owner_agent_id*/ None,
             HostedAgentRuntimeRecord {
+                owner_agent_id: None,
                 agent_type: "default".to_string(),
                 sandbox_template: "general-v1".to_string(),
                 lease_id: "missing".to_string(),
