@@ -48,8 +48,10 @@ failed upload/extraction allocations without Git or shared host paths.
   reliance on direct 22101 and `secure:false`.
 - [ ] Authorize every request by tenant, lease, agent, owner, snapshot, artifact,
   and trusted template.
-- [ ] Add ticket purpose/consumption policy, bounded TTL, rotation, revocation
-  propagation, and multi-replica lookup.
+- [x] Add ticket purpose, single-use consumption, bounded TTL, rotation, and
+  expired/revoked lookup cleanup without persisting bearer material.
+- [ ] Add multi-replica ticket lookup and active-connection revocation
+  propagation.
 - [x] Close every active connection on release.
 - [ ] Close stale connections on restore and reject inherited snapshot
   sessions/secrets.

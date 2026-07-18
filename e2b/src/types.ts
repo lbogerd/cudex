@@ -32,8 +32,10 @@ export interface OperationRecord {
   state: 'in_progress' | 'succeeded' | 'failed_terminal'; response?: unknown
   allocatedSandboxId?: string; error?: string
 }
+export type TicketPurpose = 'exec_gateway_connect' | 'exec_gateway_probe'
 export interface TicketRecord {
-  ticketHash: string; leaseId: string; expiresAt: number; revokedAt?: number
+  ticketHash: string; leaseId: string; purpose: TicketPurpose; issuedAt: number; expiresAt: number
+  consumedAt?: number; revokedAt?: number
 }
 export interface Database {
   leases: Record<string, LeaseRecord>; snapshots: Record<string, SnapshotRecord>

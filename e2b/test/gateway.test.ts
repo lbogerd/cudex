@@ -33,9 +33,11 @@ async function fixture(rawExecUrl: string, limits: Partial<GatewayLimits> = {}) 
   const tickets = new TicketIssuer(store, 'wss://gateway.example'); const gateway = new ExecGateway(tickets, store, provider, limits)
   const server = createServer(); gateway.attach(server); server.listen(0, '127.0.0.1'); await listening(server)
   const port = (server.address() as import('node:net').AddressInfo).port
-  const issued = new URL(await tickets.issue('lease_test'))
-  const url = `ws://127.0.0.1:${port}${issued.pathname}${issued.search}`
-  return { store, provider, gateway, server, url }
+  const issueUrl = async () => {
+    const issued = new URL(await tickets.issue('lease_test'))
+    return `ws://127.0.0.1:${port}${issued.pathname}${issued.search}`
+  }
+  return { store, provider, gateway, server, tickets, issueUrl, url: await issueUrl() }
 }
 
 async function echoServer() {
@@ -67,11 +69,12 @@ test('gateway bounds connections and removes empty active-lease entries', async 
   const upstream = await echoServer(); t.after(() => { upstream.websocket.close(); upstream.server.close() })
   const context = await fixture(upstream.url, { maxConnections: 1, maxConnectionsPerLease: 1 }); t.after(() => context.server.close())
   const first = new WebSocket(context.url); await opened(first)
-  assert.equal(await rejectedStatus(context.url), 429)
+  assert.equal(await rejectedStatus(context.url), 401)
+  assert.equal(await rejectedStatus(await context.issueUrl()), 429)
   const firstClosed = closed(first); first.close(); await firstClosed; await immediate()
   const active = (context.gateway as unknown as { active: Map<string, Set<WebSocket>> }).active
   assert.equal(active.size, 0)
-  const replacement = new WebSocket(context.url); await opened(replacement)
+  const replacement = new WebSocket(await context.issueUrl()); await opened(replacement)
   const replacementClosed = closed(replacement); replacement.close(); await replacementClosed
 })
 

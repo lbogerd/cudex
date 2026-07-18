@@ -253,6 +253,19 @@ per-file bytes, path depth, archive bytes, and extraction ratio before provider
 allocation. Focused tests inspect the extracted archive and exercise overlap,
 link, FIFO, and quota rejection.
 
+### Connection-ticket lifecycle
+
+Gateway tickets now carry an explicit persisted purpose and issuance time, have
+a positive TTL capped at five minutes, rotate prior lease tickets, and are
+atomically consumed on their first matching lease/purpose validation. Wrong
+lease or purpose does not burn a valid ticket; replay fails; issue, validate,
+and revoke prune expired/revoked lookup records. Validation accepts only the
+expected 256-bit base64url shape before hashing. Persistence tests prove that
+only SHA-256 lookup material—not the raw bearer, WSS URL, or query—is written.
+A follow-up migration aligns the PostgreSQL ticket-purpose constraint with the
+gateway/probe purposes. Cross-replica lookup and active-socket revocation still
+require the PostgreSQL store/event propagation integration.
+
 CubeSandbox was verified on 2026-07-18 through stock E2B TypeScript SDK 2.35.0.
 Provider code lives in the external TypeScript control plane under `e2b/src`, not
 in `codex-core`.
