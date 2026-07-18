@@ -169,9 +169,14 @@ skips; the broader exec-server run had 34 existing container filesystem-sandbox
 Configuration/app-server schemas, TypeScript fixtures, Bazel locks/queries, scoped
 fixes, and final formatting were regenerated or validated.
 
-Docker remote-executor validation was attempted on 2026-07-18 but the host Docker
-daemon was unreachable. The focused local app-server patch-route suite passed.
-The standard remote harness cannot synthesize the service-owned WSS lease; Wine
+Docker remote-executor validation was attempted again with passwordless `sudo`
+on 2026-07-18. The standard Ubuntu harness built the Codex CLI, provisioned its
+container, and reached a healthy remote exec-server. The focused `codex-core`
+test could not link: the system linker terminated with `SIGBUS` while the host
+root filesystem was 99% full with roughly 1.5 GiB free. No remote test assertion
+ran, so this remains an explicit acceptance gap until safe build capacity is
+restored. The focused local app-server patch-route suite passed. The standard
+remote harness also cannot yet synthesize the service-owned WSS lease; Wine
 coverage remains delegated to the repository Bazel CI matrix.
 
 ### Runtime success invariants and assumptions
@@ -343,6 +348,32 @@ binary data, executable/directory modes, safe links, corruption, truncation,
 special/unknown types, conflicts, dishonest storage, and every quota. `tar`
 7.5.20 is now a direct dependency rather than an accidental transitive
 implementation detail.
+
+### Tenant-scoped durable state repository
+
+A PostgreSQL durable-state repository now implements tenant-authorized object
+registration and references, immutable source snapshot registration and lookup,
+atomic lease/base-snapshot creation, checkpoint append, lease transitions and
+release, snapshot retention references, and purpose-bound ticket hash issue,
+single-use consumption, rotation, revocation, and cleanup. Lease and base
+snapshot records commit together; missing or cross-tenant objects roll the whole
+transaction back, and concurrent environment identity claims across separate
+connection pools yield one winner.
+
+Workspace metadata is revalidated at this repository boundary: file URIs must be
+canonical absolute local URIs, roots must be unique and non-overlapping, and cwd
+must be inside a declared root. Ticket purposes match the gateway wire vocabulary
+(`exec_gateway_connect` and `exec_gateway_probe`), hashes must be exactly 32
+bytes, and expiry is future-bounded to five minutes. Durable release revokes
+outstanding tickets without deleting snapshots or Codex retention references.
+
+The repository was exercised against PostgreSQL 17 in Docker with two independent
+pools. All four live suites passed, covering tenant isolation and immutable source
+identity, atomic rollback and concurrent uniqueness, checkpoint/reference survival
+after release, and ticket rotation/consumption/expiry/revocation/cleanup. This is a
+storage primitive; the control-plane lifecycle still needs to replace its JSON
+state paths with these transactions and the operation journal before production
+multi-replica persistence is complete.
 
 CubeSandbox was verified on 2026-07-18 through stock E2B TypeScript SDK 2.35.0.
 Provider code lives in the external TypeScript control plane under `e2b/src`, not

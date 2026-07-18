@@ -12,6 +12,9 @@ production backend. Stable decisions, evidence, and wire schemas are in
 - [x] Add atomic PostgreSQL operation claims, sanitized logical replay, worker/
   generation fencing, allocation ledgers, stale takeover, and sorted lease-lock
   primitives.
+- [x] Add tenant-scoped PostgreSQL repositories for immutable source snapshots,
+  leases, durable snapshots, object/snapshot references, and purpose-bound
+  single-use ticket hashes.
 - [ ] Persist canonical request hashes, operation state, logical responses, and
   all partial provider allocations.
 - [ ] Apply transactional per-lease locks and deterministic multi-lease lock
@@ -158,8 +161,11 @@ Port relevant behavior from
 `codex/codex-rs/hosted-agent/src/hosted_agent_tests.rs` to black-box HTTP tests,
 then run the complete app-server flow against live E2B.
 
-- [ ] Run Docker remote-executor coverage when the daemon is available, or add a
-  remote harness fixture capable of supplying the service-owned WSS lease.
+- [ ] Run Docker remote-executor coverage, or add a remote harness fixture capable
+  of supplying the service-owned WSS lease. The 2026-07-18 Docker attempt reached
+  a healthy remote exec-server, but linking the focused `codex-core` test failed
+  with linker `SIGBUS` while the host root filesystem was 99% full; retry after
+  restoring safe build capacity.
 - [ ] Confirm Windows/Wine path and type compatibility through the Bazel CI matrix;
   external-service behavior may be skipped only with a specific harness reason.
 
