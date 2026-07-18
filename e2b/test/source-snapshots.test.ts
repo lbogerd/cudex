@@ -42,6 +42,9 @@ class MemoryObjects implements ObjectStore {
     this.gets++; const value = this.values.get(id); if (!value) throw new Error('missing')
     return Uint8Array.from(value)
   }
+  location(id: string): { storageBucket: string; storageKey: string } {
+    return { storageBucket: 'source-test', storageKey: `source/v1/sha256/${id.slice(0, 2)}/${id}` }
+  }
   delete(id: string): void { this.values.delete(id) }
 }
 
@@ -76,7 +79,7 @@ function fixture() {
   const state = new MemoryState(); const objects = new MemoryObjects(); const reclaimed: string[] = []
   let currentTime = new Date('2030-01-01T00:00:00.000Z'); let failCleanup = false
   const lifecycle = new SourceSnapshotLifecycle(state, objects, {
-    storageBucket: 'source-test', storagePrefix: 'source/v1', maxTtlMs: 60_000,
+    maxTtlMs: 60_000,
     now: () => new Date(currentTime),
     reclaimer: { async reclaimUnreferencedSourceArchive(_tenantId, objectId, storageId) {
       reclaimed.push(objectId); if (failCleanup) throw new Error('cleanup outage'); objects.delete(storageId); state.objects.delete(objectId)

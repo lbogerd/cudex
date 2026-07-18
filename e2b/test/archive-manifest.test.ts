@@ -26,6 +26,9 @@ class MemoryObjectStore implements ObjectStore {
     if (!value) throw new Error('missing object')
     return Uint8Array.from(value)
   }
+  location(id: string): { storageBucket: string; storageKey: string } {
+    return { storageBucket: 'memory', storageKey: id }
+  }
 }
 
 function tar(entries: TarEntry[], end = true): Buffer {
@@ -148,7 +151,10 @@ test('enforces archive, entry, file, per-file, total, meta, and extraction-ratio
 
 test('requires the explicit roots directory and verifies content-addressed object IDs', async () => {
   await assert.rejects(captureArchiveManifest(tar([{ path: 'roots/file', type: 'File' }]), 'snapshot', new MemoryObjectStore()), /roots directory/)
-  const dishonest: ObjectStore = { put: async () => 'not-a-digest', get: async () => new Uint8Array() }
+  const dishonest: ObjectStore = {
+    put: async () => 'not-a-digest', get: async () => new Uint8Array(),
+    location: id => ({ storageBucket: 'memory', storageKey: id }),
+  }
   await assert.rejects(captureArchiveManifest(tar([
     { path: 'roots/', type: 'Directory' }, { path: 'roots/file', type: 'File', body: Buffer.from('x') },
   ]), 'snapshot', dishonest), /non-content-addressed/)

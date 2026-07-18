@@ -25,6 +25,8 @@ production backend. Stable decisions, evidence, and wire schemas are in
   order to every lifecycle mutation.
 - [x] Replace local blobs with authenticated object storage for workspace
   archives, manifests, content blobs, and patch artifacts.
+- [x] Make object stores report their exact durable bucket/key locator so
+  PostgreSQL registrations cannot drift from physical writes.
 - [ ] Add reference retention so snapshots/artifacts outlive lease release while
   Codex references them.
 - [ ] Reconcile abandoned operations, sandboxes, snapshots, capture sandboxes,

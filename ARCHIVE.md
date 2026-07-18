@@ -214,11 +214,13 @@ PostgreSQL fixture is unavailable.
 Production workspace archives and future manifests/content blobs/artifacts can
 now use an authenticated S3-compatible object store. Objects are addressed and
 verified by SHA-256, encrypted server-side, bounded on read/write, and obtained
-through the standard AWS credential chain. The filesystem implementation now
-validates identifiers and checksums and is explicitly development-only. The
-control plane still needs to move its operation protocol from the JSON journal
-onto this relational schema; adding the schema does not by itself satisfy
-multi-replica idempotency or recovery.
+through the standard AWS credential chain. Every store reports the exact durable
+bucket/key used for a content ID, so relational object registration consumes the
+physical locator instead of reconstructing it from parallel configuration. The
+filesystem implementation now validates identifiers and checksums and is
+explicitly development-only. The control plane still needs to move its operation
+protocol from the JSON journal onto this relational schema; adding the schema
+does not by itself satisfy multi-replica idempotency or recovery.
 
 The direct `ws` dependency was upgraded from 8.18.3 to 8.21.1, resolving the
 pinned tree's high-severity memory-disclosure/exhaustion advisories. The npm

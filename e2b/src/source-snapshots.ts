@@ -44,8 +44,6 @@ export interface SourceSnapshotReclaimer {
 }
 
 export interface SourceSnapshotLifecycleOptions {
-  storageBucket: string
-  storagePrefix?: string
   maxRoots?: number
   maxTtlMs?: number
   archiveLimits?: ArchiveManifestLimits
@@ -66,11 +64,14 @@ class StagingObjectStore implements ObjectStore {
     const value = this.values.get(id); if (!value) throw new Error('staged object missing')
     return Uint8Array.from(value)
   }
+  location(id: string): { storageBucket: string; storageKey: string } {
+    return { storageBucket: 'staging', storageKey: id }
+  }
   clear(): void { this.values.clear() }
 }
 
-function opaque(label: string, value: string): string {
-  if (typeof value !== 'string' || !value || value !== value.trim() || Buffer.byteLength(value, 'utf8') > 512
+function opaque(label: string, value: string, maxBytes = 512): string {
+  if (typeof value !== 'string' || !value || value !== value.trim() || Buffer.byteLength(value, 'utf8') > maxBytes
     || Buffer.from(value, 'utf8').toString('utf8') !== value || /[\u0000-\u001f\u007f]/.test(value)) {
     throw new ServiceError(400, `invalid ${label}`)
   }
@@ -171,16 +172,12 @@ export class SourceSnapshotLifecycle {
   private readonly maxTtlMs: number
   private readonly limits: ArchiveManifestLimits
   private readonly now: () => Date
-  private readonly storagePrefix: string
 
   constructor(
     private readonly state: DurableSourceState,
     private readonly objects: ObjectStore,
     private readonly options: SourceSnapshotLifecycleOptions,
   ) {
-    opaque('storage bucket', options.storageBucket)
-    this.storagePrefix = options.storagePrefix?.replace(/^\/+|\/+$/g, '') || 'hosted-agent/v1'
-    opaque('storage prefix', this.storagePrefix)
     this.maxRoots = options.maxRoots ?? 8
     this.maxTtlMs = options.maxTtlMs ?? 24 * 60 * 60_000
     if (!Number.isSafeInteger(this.maxRoots) || this.maxRoots <= 0 || this.maxRoots > 64
@@ -231,9 +228,11 @@ export class SourceSnapshotLifecycle {
       publicationStarted = true
       const storedId = await this.objects.put(input.archive)
       if (storedId !== physicalObjectId) throw new Error('object store returned a non-content-addressed identifier')
+      const location = this.objects.location(storedId)
+      const storageBucket = opaque('storage bucket', location.storageBucket)
+      const storageKey = opaque('storage key', location.storageKey, 2048)
       const object: StoredObject = {
-        objectId: durableObjectId, tenantId, kind: 'source_archive', storageBucket: this.options.storageBucket,
-        storageKey: `${this.storagePrefix}/sha256/${storedId.slice(0, 2)}/${storedId}`,
+        objectId: durableObjectId, tenantId, kind: 'source_archive', storageBucket, storageKey,
         checksum: input.checksum, sizeBytes: input.archive.byteLength, state: 'available', expiresAt: expiry,
       }
       const registeredObject = await this.state.registerObject(object)

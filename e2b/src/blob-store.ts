@@ -6,6 +6,7 @@ import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3
 export interface ObjectStore {
   put(bytes: Uint8Array): Promise<string>
   get(id: string): Promise<Uint8Array>
+  location(id: string): { storageBucket: string; storageKey: string }
 }
 
 const digest = (bytes: Uint8Array): string => createHash('sha256').update(bytes).digest('hex')
@@ -26,6 +27,10 @@ export class BlobStore implements ObjectStore {
     const bytes = await readFile(join(this.directory, id))
     if (digest(bytes) !== id) throw new Error('object checksum mismatch')
     return bytes
+  }
+  location(id: string): { storageBucket: string; storageKey: string } {
+    validateId(id)
+    return { storageBucket: 'development-filesystem', storageKey: id }
   }
 }
 
@@ -79,6 +84,11 @@ export class S3BlobStore implements ObjectStore {
     if (bytes.byteLength > this.maxObjectBytes) throw new Error('object exceeds storage limit')
     if (digest(bytes) !== id || (response.Metadata?.sha256 && response.Metadata.sha256 !== id)) throw new Error('object checksum mismatch')
     return bytes
+  }
+
+  location(id: string): { storageBucket: string; storageKey: string } {
+    validateId(id)
+    return { storageBucket: this.options.bucket, storageKey: this.key(id) }
   }
 
   private key(id: string): string {
