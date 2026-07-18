@@ -12,7 +12,6 @@ import {
 const utf8Encoder = new TextEncoder()
 const utf8Decoder = new TextDecoder('utf-8', { fatal: true })
 const checksumPattern = /^sha256:[0-9a-f]{64}$/
-const objectIdPattern = /^[0-9a-f]{64}$/
 
 export interface PatchArtifactLimits {
   maxArtifactBytes: number
@@ -121,7 +120,8 @@ export function serializePatchArtifact(
   if (!Array.isArray(input.contentObjects) || input.contentObjects.length > limits.workspace.maxChanges) throw quota('patch content reference limit exceeded')
   const contentByPath = new Map<string, string>()
   for (const reference of input.contentObjects) {
-    if (!reference || typeof reference.path !== 'string' || !objectIdPattern.test(reference.objectId)) throw invalid('invalid patch content reference')
+    if (!reference || typeof reference.path !== 'string') throw invalid('invalid patch content reference')
+    validateId('patch content object ID', reference.objectId)
     if (contentByPath.has(reference.path)) throw invalid('duplicate patch content path')
     contentByPath.set(reference.path, reference.objectId)
   }
@@ -132,7 +132,7 @@ export function serializePatchArtifact(
     let contentObjectId: string | null = null
     if (change.current?.type === 'file') {
       contentObjectId = contentByPath.get(change.path) ?? null
-      if (contentObjectId !== change.current.digest.slice('sha256:'.length)) throw invalid('changed file content object does not match its digest')
+      if (contentObjectId === null) throw invalid('changed file does not have a content object')
       usedContentPaths.add(change.path)
       sizeBytes += change.current.sizeBytes
       if (!Number.isSafeInteger(sizeBytes)) throw quota('patch size exceeds safe integer range')

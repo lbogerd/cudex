@@ -72,6 +72,7 @@ export interface SnapshotInput {
   workspaceArchiveObjectId: string
   manifestObjectId: string
   manifestChecksum: string
+  contentObjectIds?: string[]
   expiresAt?: Date | null
 }
 
@@ -567,6 +568,10 @@ export class PostgresDurableState {
       'snapshot', snapshot.snapshotId, 'workspace_archive', snapshot.expiresAt ?? null, 'workspace_archive')
     await this.addObjectReferenceWithClient(client, tenantId, snapshot.manifestObjectId,
       'snapshot', snapshot.snapshotId, 'manifest', snapshot.expiresAt ?? null, 'manifest')
+    for (const objectId of snapshot.contentObjectIds ?? []) {
+      await this.addObjectReferenceWithClient(client, tenantId, objectId,
+        'snapshot', snapshot.snapshotId, 'content_blob', snapshot.expiresAt ?? null, 'content_blob')
+    }
   }
 
   private async addObjectReferenceWithClient(client: PoolClient, tenantId: string, objectId: string,
@@ -576,13 +581,15 @@ export class PostgresDurableState {
       INSERT INTO hosted_agent_object_references
         (object_id, reference_kind, reference_id, purpose, retain_until)
       SELECT object_id, $3, $4, $5, $6 FROM hosted_agent_objects
-      WHERE object_id = $2 AND tenant_id = $1 AND ($7::text IS NULL OR kind = $7)
+      WHERE object_id = $2 AND tenant_id = $1 AND state = 'available'
+        AND ($7::text IS NULL OR kind = $7)
       ON CONFLICT (object_id, reference_kind, reference_id, purpose) DO NOTHING
     `, [tenantId, objectId, referenceKind, referenceId, purpose, retainUntil, expectedKind ?? null])
     if (result.rowCount !== 1) {
       const exists = await client.query(`
         SELECT 1 FROM hosted_agent_objects
-        WHERE object_id = $1 AND tenant_id = $2 AND ($3::text IS NULL OR kind = $3)
+        WHERE object_id = $1 AND tenant_id = $2 AND state = 'available'
+          AND ($3::text IS NULL OR kind = $3)
       `, [objectId, tenantId, expectedKind ?? null])
       if (exists.rowCount !== 1) throw new DurableStateNotFoundError('object was not found')
     }
@@ -606,6 +613,11 @@ function validateSnapshotInput(input: SnapshotInput): void {
   validateId('snapshot ID', input.snapshotId); validateId('workspace archive object ID', input.workspaceArchiveObjectId)
   validateId('manifest object ID', input.manifestObjectId); validateChecksum(input.manifestChecksum)
   if (input.providerSnapshotId !== null) validateId('provider snapshot ID', input.providerSnapshotId)
+  if (input.contentObjectIds !== undefined) {
+    if (!Array.isArray(input.contentObjectIds) || input.contentObjectIds.length > 100_000
+      || new Set(input.contentObjectIds).size !== input.contentObjectIds.length) throw new Error('invalid snapshot content object IDs')
+    for (const objectId of input.contentObjectIds) validateId('snapshot content object ID', objectId)
+  }
 }
 
 function validateLeaseInput(input: CreateLeaseInput): void {

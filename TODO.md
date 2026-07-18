@@ -111,6 +111,9 @@ tickets always fail, and secrets never enter durable or observable state.
   interaction per lease.
 - [ ] Persist checksummed base/current workspace manifests with snapshots and
   service archives.
+- [x] Add an unwired tenant-safe workspace snapshot publisher that validates
+  provider archives, stores exact archive/manifest/content objects, and retains
+  every content blob through the atomic base/checkpoint snapshot transaction.
 - [ ] On restore, verify and overlay workspace state, remove inherited runtime
   identity, restart exec, and rekey transport credentials.
 - [ ] On child creation, atomically snapshot the owner, use a temporary capture,
@@ -135,6 +138,9 @@ identity remains isolated, and lifecycle replay never duplicates resources.
 - [x] Build canonical sorted manifests with path, type, mode, link target or
   content digest, and immutable base/current identities.
 - [ ] Persist content-addressed blobs and the canonical artifact before returning.
+- [x] Use tenant-scoped logical content-object IDs throughout snapshot retention,
+  canonical artifact serialization, and PostgreSQL artifact validation while
+  safely sharing identical physical content across tenants.
 - [x] Compare the exact requested base snapshot with the latest checkpoint.
 - [x] Cover additions, modifications, deletions, binaries, executable modes,
   directories, and safe symlinks without requiring Git.

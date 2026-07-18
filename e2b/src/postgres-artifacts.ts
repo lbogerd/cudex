@@ -44,7 +44,7 @@ export interface CreatePatchArtifactInput {
   baseManifestObjectId: string
   currentManifestObjectId: string
   artifactObjectId: string
-  contentObjectIds: string[]
+  contentObjects: Array<{ path: string; objectId: string }>
   checksum: string
   changedFiles: number
   sizeBytes: number
@@ -125,7 +125,7 @@ function validatedInput(input: CreatePatchArtifactInput): {
   base: WorkspaceManifest
   current: WorkspaceManifest
   contentObjectIds: string[]
-  contentSizes: Map<string, number>
+  contentExpectations: Map<string, { checksum: string; sizeBytes: number }>
 } {
   for (const [label, value] of [
     ['artifact ID', input.artifactId], ['tenant ID', input.tenantId], ['agent ID', input.agentId],
@@ -140,31 +140,42 @@ function validatedInput(input: CreatePatchArtifactInput): {
   if (input.expiresAt.getTime() <= Date.now()) throw new Error('artifact expiry must be in the future')
   if (!Number.isSafeInteger(input.changedFiles) || input.changedFiles < 0 || input.changedFiles > 0x7fffffff) throw new Error('invalid changed-file count')
   if (!Number.isSafeInteger(input.sizeBytes) || input.sizeBytes < 0) throw new Error('invalid patch size')
-  if (!Array.isArray(input.contentObjectIds) || input.contentObjectIds.length > 100_000) throw new Error('invalid content object IDs')
-  for (const objectId of input.contentObjectIds) validateId('content object ID', objectId)
-  if (new Set(input.contentObjectIds).size !== input.contentObjectIds.length) throw new Error('duplicate content object ID')
+  if (!Array.isArray(input.contentObjects) || input.contentObjects.length > 100_000) throw new Error('invalid content objects')
+  const contentByPath = new Map<string, string>()
+  for (const content of input.contentObjects) {
+    if (!content || typeof content.path !== 'string') throw new Error('invalid content object')
+    validateId('content object ID', content.objectId)
+    if (contentByPath.has(content.path)) throw new Error('duplicate content object path')
+    contentByPath.set(content.path, content.objectId)
+  }
 
   const base = canonicalManifest(input.baseManifest, input.baseSnapshotId)
   const current = canonicalManifest(input.currentManifest, input.currentSnapshotId)
   const changes = diffWorkspaceManifests(base, current)
-  const contentSizes = new Map<string, number>()
+  const contentExpectations = new Map<string, { checksum: string; sizeBytes: number }>()
+  const usedPaths = new Set<string>()
   let sizeBytes = 0
   for (const change of changes) {
-    if (change.current?.type !== 'file') continue
+    if (change.current?.type !== 'file') {
+      if (contentByPath.has(change.path)) throw new Error('non-file change cannot reference content')
+      continue
+    }
     sizeBytes += change.current.sizeBytes
     if (!Number.isSafeInteger(sizeBytes)) throw new Error('artifact size is not a safe integer')
-    const objectId = change.current.digest.slice('sha256:'.length)
-    const priorSize = contentSizes.get(objectId)
-    if (priorSize !== undefined && priorSize !== change.current.sizeBytes) throw new Error('content digest has inconsistent file sizes')
-    contentSizes.set(objectId, change.current.sizeBytes)
+    const objectId = contentByPath.get(change.path)
+    if (!objectId) throw new Error('changed file does not have a content object')
+    usedPaths.add(change.path)
+    const expected = { checksum: change.current.digest, sizeBytes: change.current.sizeBytes }
+    const prior = contentExpectations.get(objectId)
+    if (prior && (prior.checksum !== expected.checksum || prior.sizeBytes !== expected.sizeBytes)) {
+      throw new Error('content object has inconsistent file identity')
+    }
+    contentExpectations.set(objectId, expected)
   }
+  if (usedPaths.size !== contentByPath.size) throw new Error('artifact contains an unused content object')
   if (changes.length !== input.changedFiles || sizeBytes !== input.sizeBytes) throw new Error('artifact count or size does not match its manifests')
-  const contentObjectIds = [...new Set(changes.flatMap(change => change.current?.type === 'file'
-    ? [change.current.digest.slice('sha256:'.length)] : []))].sort()
-  if (canonicalJson([...input.contentObjectIds].sort()) !== canonicalJson(contentObjectIds)) {
-    throw new Error('content objects do not match changed file digests')
-  }
-  return { base, current, contentObjectIds, contentSizes }
+  const contentObjectIds = [...contentExpectations.keys()].sort()
+  return { base, current, contentObjectIds, contentExpectations }
 }
 
 function fromRow(row: ArtifactRow): PatchArtifact {
@@ -336,7 +347,7 @@ export class PostgresPatchArtifactRepository {
     base: WorkspaceManifest
     current: WorkspaceManifest
     contentObjectIds: string[]
-    contentSizes: Map<string, number>
+    contentExpectations: Map<string, { checksum: string; sizeBytes: number }>
   }): Promise<void> {
     const ids = [input.baseManifestObjectId, input.currentManifestObjectId, input.artifactObjectId, ...manifests.contentObjectIds]
     const result = await client.query<ObjectRow>(`
@@ -361,8 +372,9 @@ export class PostgresPatchArtifactRepository {
       if (!object || object.tenant_id !== input.tenantId || object.kind !== 'content_blob' || object.state !== 'available') {
         throw new PatchArtifactNotFoundError('authorized content object was not found')
       }
-      if (object.checksum !== `sha256:${objectId}`) throw new PatchArtifactConflictError('content object checksum does not match its identifier')
-      if (Number(object.size_bytes) !== manifests.contentSizes.get(objectId)) throw new PatchArtifactConflictError('content object size does not match its manifest')
+      const expected = manifests.contentExpectations.get(objectId)!
+      if (object.checksum !== expected.checksum) throw new PatchArtifactConflictError('content object checksum does not match its manifest')
+      if (Number(object.size_bytes) !== expected.sizeBytes) throw new PatchArtifactConflictError('content object size does not match its manifest')
       if (object.expires_at && object.expires_at < input.expiresAt) throw new PatchArtifactConflictError('content object expires before its artifact')
     }
   }

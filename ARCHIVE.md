@@ -397,13 +397,44 @@ The canonical artifact format now bundles the exact base/current snapshot IDs
 and manifests, complete sorted changed paths, nullable content-object IDs for
 changed current regular files, changed count, and current-content byte total.
 It never embeds file bodies. Serialization reconstructs the diff, requires every
-changed file digest's content object exactly once, and returns deterministic
+changed current file's logical content object exactly once, and returns deterministic
 canonical bytes, SHA-256, and deduplicated content IDs for storage/repository
 registration. Parsing bounds bytes before decoding, requires exact UTF-8 JSON
 shape and byte-for-byte canonical encoding, verifies the checksum, then rebuilds
 the entire envelope from its manifests to reject altered order, paths, types,
 identities, counts, sizes, or references. Five focused tests cover deterministic
 binary/mode/directory/link/add/delete output and corruption/quota rejection.
+
+### Tenant-safe workspace snapshot publication
+
+An intentionally unwired `WorkspaceSnapshotPublisher` now parses a provider
+workspace archive once without extraction, builds its canonical manifest, and
+publishes the archive, manifest, and deduplicated file content through the
+authenticated content-addressed object store. Each physical write is checked
+against its SHA-256 identity and exact store-reported bucket/key before a
+tenant-owned logical object is registered. Logical IDs bind tenant, snapshot,
+kind, and checksum, so two tenants can safely retain identical physical bytes
+without colliding in PostgreSQL.
+
+Base-lease and checkpoint transactions now retain every content blob alongside
+the archive and manifest. Object references require an `available` object, so a
+future reclaimer cannot attach new durable state to an object already entering
+deletion. The publisher validates the durable lease/snapshot result before
+returning and invokes a reference-aware cleanup boundary only for confirmed
+physical puts; cleanup failure remains explicit for reconciliation. Ambiguous
+put failures and process crashes before registration still require an aged
+object-store inventory sweep.
+It remains unwired until the PostgreSQL lifecycle coordinator and the
+transactional physical/logical object reclaimer own these boundaries together.
+
+Canonical patch artifacts and their PostgreSQL repository now carry opaque
+tenant-scoped logical content IDs rather than assuming a raw digest is a global
+database identity. Repository creation binds each logical content row's trusted
+checksum and size back to the current manifest. Focused tests cover canonical
+binary/mode/link changes, partial publication failures, committed replay
+protection, deduplicated files, and cross-tenant physical sharing; PostgreSQL 17
+coverage proves six distinct logical objects and snapshot references over the
+shared archive/content locations for two tenants.
 
 ### Multi-replica operation journal primitives
 

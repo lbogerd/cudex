@@ -68,8 +68,8 @@ async function prepared(context: Fixture): Promise<CreatePatchArtifactInput> {
     storedObject('tenant-1', 'manifest-current', 'manifest', workspaceManifestChecksum(currentManifest)),
     storedObject('tenant-1', 'artifact-object', 'patch_artifact', digest('e'), 100),
     storedObject('tenant-1', 'artifact-object-other', 'patch_artifact', digest('f'), 101),
-    storedObject('tenant-1', 'c'.repeat(64), 'content_blob', digest('c'), 3),
-    storedObject('tenant-1', 'd'.repeat(64), 'content_blob', digest('d'), 5),
+    storedObject('tenant-1', 'workspace-object-modified', 'content_blob', digest('c'), 3),
+    storedObject('tenant-1', 'workspace-object-added', 'content_blob', digest('d'), 5),
   ]
   for (const object of objects) await context.state.registerObject(object)
   const lease: CreateLeaseInput = {
@@ -94,7 +94,10 @@ async function prepared(context: Fixture): Promise<CreatePatchArtifactInput> {
     ownerAgentId: 'agent-owner', sourceLeaseId: 'lease-child', baseSnapshotId: 'snapshot-base',
     currentSnapshotId: 'snapshot-current', baseManifestObjectId: 'manifest-base',
     currentManifestObjectId: 'manifest-current', artifactObjectId: 'artifact-object',
-    contentObjectIds: ['c'.repeat(64), 'd'.repeat(64)],
+    contentObjects: [
+      { path: 'roots/modified', objectId: 'workspace-object-modified' },
+      { path: 'roots/added', objectId: 'workspace-object-added' },
+    ],
     checksum: digest('e'), changedFiles: 3, sizeBytes: 8, state: 'available',
     expiresAt: new Date(Date.now() + 60_000), baseManifest, currentManifest,
   }
@@ -133,7 +136,8 @@ live('artifact identity is immutable across replicas and conflicting replay roll
     ...input, artifactObjectId: 'artifact-object-other', checksum: digest('f'),
   }), PatchArtifactConflictError)
   await assert.rejects(context.second.create({ ...input, artifactId: 'artifact-wrong-agent', agentId: 'other-agent' }), PatchArtifactConflictError)
-  await assert.rejects(context.second.create({ ...input, artifactId: 'artifact-wrong-base', baseSnapshotId: 'snapshot-current', baseManifest: input.currentManifest }), /count or size/)
+  await assert.rejects(context.second.create({ ...input, artifactId: 'artifact-wrong-base',
+    baseSnapshotId: 'snapshot-current', baseManifest: input.currentManifest }), /unused content object|count or size/)
   await assert.rejects(context.firstPool.query(`
     UPDATE hosted_agent_artifacts SET checksum = $2 WHERE artifact_id = $1
   `, [input.artifactId, digest('f')]))
@@ -161,7 +165,7 @@ test('repository validates canonical identity, checksums, count, size, expiry, a
     artifactId: 'artifact', tenantId: 'tenant', agentId: 'agent', ownerAgentId: 'owner', sourceLeaseId: 'lease',
     baseSnapshotId: 'base', currentSnapshotId: 'base', baseManifestObjectId: 'manifest-base',
     currentManifestObjectId: 'manifest-current', artifactObjectId: 'artifact-object', checksum: digest('a'),
-    contentObjectIds: [],
+    contentObjects: [],
     changedFiles: 0, sizeBytes: 0, state: 'available' as const,
     expiresAt: new Date(Date.now() + 60_000), baseManifest: manifest, currentManifest: manifest,
   }

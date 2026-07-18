@@ -103,10 +103,13 @@ live('checkpoint references and durable data survive release', async context => 
   const ids = await objects(context); const created = await context.first.createLeaseWithBaseSnapshot(leaseInput(ids))
   assert.equal(await context.second.activeSandbox(created.lease.leaseId), 'sandbox-1')
   const checkpointObjects = await objects(context, 'tenant-1', '-checkpoint')
+  const checkpointContent = object('tenant-1', 'content-checkpoint', 'content_blob', 'e')
+  await context.first.registerObject(checkpointContent)
   const checkpoint = await context.second.appendCheckpoint('tenant-1', created.lease.leaseId, {
     snapshotId: 'snapshot-checkpoint', providerSnapshotId: 'provider-checkpoint',
     workspaceArchiveObjectId: checkpointObjects.archive.objectId,
     manifestObjectId: checkpointObjects.manifest.objectId, manifestChecksum: checkpointObjects.manifest.checksum,
+    contentObjectIds: [checkpointContent.objectId],
   })
   await context.first.addSnapshotReference({ tenantId: 'tenant-1', snapshotId: checkpoint.snapshotId,
     referenceKind: 'codex_thread', referenceId: 'thread-1' })
@@ -120,6 +123,28 @@ live('checkpoint references and durable data survive release', async context => 
     WHERE snapshot_id = $1 AND reference_kind = 'codex_thread' AND reference_id = 'thread-1'
   `, [checkpoint.snapshotId])
   assert.equal(retained.rows[0]!.count, '1')
+  const contentReference = await context.firstPool.query<{ count: string }>(`
+    SELECT count(*)::text AS count FROM hosted_agent_object_references
+    WHERE object_id = $1 AND reference_kind = 'snapshot' AND reference_id = $2 AND purpose = 'content_blob'
+  `, [checkpointContent.objectId, checkpoint.snapshotId])
+  assert.equal(contentReference.rows[0]!.count, '1')
+})
+
+live('snapshot transactions reject content objects that are no longer available', async context => {
+  const ids = await objects(context)
+  const content = object('tenant-1', 'content-unavailable', 'content_blob', 'f')
+  await context.first.registerObject(content)
+  await context.firstPool.query(`UPDATE hosted_agent_objects SET state = 'deleting' WHERE object_id = $1`, [content.objectId])
+  await assert.rejects(context.first.createLeaseWithBaseSnapshot(leaseInput(ids, {
+    leaseId: 'lease-unavailable', environmentId: 'env-unavailable', providerSandboxId: 'sandbox-unavailable',
+    baseSnapshot: { ...leaseInput(ids).baseSnapshot, snapshotId: 'snapshot-unavailable',
+      providerSnapshotId: 'provider-unavailable', contentObjectIds: [content.objectId] },
+  })))
+  assert.equal(await context.first.getLease('tenant-1', 'lease-unavailable'), null)
+  const references = await context.firstPool.query<{ count: string }>(`
+    SELECT count(*)::text AS count FROM hosted_agent_object_references WHERE object_id = $1
+  `, [content.objectId])
+  assert.equal(references.rows[0]!.count, '0')
 })
 
 live('ticket hashes rotate, consume once, expire, revoke, and clean up across pools', async context => {

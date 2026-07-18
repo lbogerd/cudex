@@ -28,9 +28,9 @@ function fixture() {
     { path: 'roots/link', type: 'symlink', mode: 0o777, linkTarget: 'added' },
   ])
   const contentObjects: PatchContentObject[] = [
-    { path: 'roots/mode', objectId: 'b'.repeat(64) },
-    { path: 'roots/binary', objectId: 'e'.repeat(64) },
-    { path: 'roots/added', objectId: 'd'.repeat(64) },
+    { path: 'roots/mode', objectId: 'workspace_object_mode' },
+    { path: 'roots/binary', objectId: 'workspace_object_binary' },
+    { path: 'roots/added', objectId: 'workspace_object_added' },
   ]
   return { agentId: 'agent-1', baseSnapshotId: 'snapshot-base', currentSnapshotId: 'snapshot-current', baseManifest, currentManifest, contentObjects }
 }
@@ -51,7 +51,7 @@ test('serialization is deterministic and contains manifests and content IDs with
   assert.equal(first.checksum, second.checksum)
   assert.equal(first.changedFiles, 6)
   assert.equal(first.sizeBytes, 12)
-  assert.deepEqual(first.contentObjectIds, ['b'.repeat(64), 'd'.repeat(64), 'e'.repeat(64)])
+  assert.deepEqual(first.contentObjectIds, ['workspace_object_added', 'workspace_object_binary', 'workspace_object_mode'])
   assert.deepEqual(first.artifact.changes.map(change => change.path), [
     'roots/added', 'roots/binary', 'roots/deleted', 'roots/dir', 'roots/link', 'roots/mode',
   ])
@@ -59,16 +59,16 @@ test('serialization is deterministic and contains manifests and content IDs with
   assert.deepEqual(parsePatchArtifact(first.bytes, first.checksum).artifact, first.artifact)
 })
 
-test('serializer rejects missing, mismatched, duplicate, non-file, and unused content references', () => {
+test('serializer accepts opaque tenant-scoped IDs and rejects missing, invalid, duplicate, non-file, and unused references', () => {
   const input = fixture()
-  assert.throws(() => serializePatchArtifact({ ...input, contentObjects: input.contentObjects.slice(1) }), /does not match/)
+  assert.throws(() => serializePatchArtifact({ ...input, contentObjects: input.contentObjects.slice(1) }), /does not have/)
   assert.throws(() => serializePatchArtifact({ ...input, contentObjects: input.contentObjects.map(reference =>
-    reference.path === 'roots/binary' ? { ...reference, objectId: 'f'.repeat(64) } : reference) }), /does not match/)
+    reference.path === 'roots/binary' ? { ...reference, objectId: ' bad' } : reference) }), /object ID/)
   assert.throws(() => serializePatchArtifact({ ...input, contentObjects: [...input.contentObjects, input.contentObjects[0]!] }), /duplicate/)
   assert.throws(() => serializePatchArtifact({ ...input, contentObjects: [...input.contentObjects,
-    { path: 'roots/link', objectId: 'a'.repeat(64) }] }), /non-file/)
+    { path: 'roots/link', objectId: 'workspace_object_link' }] }), /non-file/)
   assert.throws(() => serializePatchArtifact({ ...input, contentObjects: [...input.contentObjects,
-    { path: 'roots/unchanged', objectId: 'a'.repeat(64) }] }), /unused/)
+    { path: 'roots/unchanged', objectId: 'workspace_object_unchanged' }] }), /unused/)
   assert.throws(() => serializePatchArtifact({ ...input, agentId: ' agent-1' }), /agent ID/)
   assert.throws(() => serializePatchArtifact({ ...input, agentId: '\ud800' }), /agent ID/)
   assert.throws(() => serializePatchArtifact(input, {
@@ -98,7 +98,7 @@ test('parser rejects extra shape and inconsistent identities, changes, counts, s
   cases.push({ ...structuredClone(serialized.artifact), baseSnapshotId: 'wrong-base' })
   const missing = structuredClone(serialized.artifact); missing.changes.pop(); cases.push(missing)
   const reordered = structuredClone(serialized.artifact); reordered.changes.reverse(); cases.push(reordered)
-  const wrongContent = structuredClone(serialized.artifact); wrongContent.changes[0]!.contentObjectId = 'f'.repeat(64); cases.push(wrongContent)
+  const wrongContent = structuredClone(serialized.artifact); wrongContent.changes[0]!.contentObjectId = null; cases.push(wrongContent)
   for (const artifact of cases) {
     const bytes = recanonicalize(artifact)
     assert.throws(() => parsePatchArtifact(bytes, checksum(bytes)))
