@@ -31,6 +31,9 @@ production backend. Stable decisions, evidence, and wire schemas are in
   Codex references them.
 - [ ] Reconcile abandoned operations, sandboxes, snapshots, capture sandboxes,
   tickets, archives, and expired blobs after crashes and timeouts.
+- [x] Add bounded, tenant-scoped PostgreSQL reclamation for registered object
+  allocations with operation fencing, reference/shared-locator protection,
+  retry-safe exact-key deletion, and cross-replica physical-location locking.
 - [x] Add the bounded tenant-scoped PostgreSQL reconciliation foundation for
   fenced stale takeover, sandbox/capture/snapshot reclaim or adoption,
   provision/checkpoint logical recovery, guarded provider inventory, and

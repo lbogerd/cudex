@@ -26,6 +26,7 @@ class MemoryObjectStore implements ObjectStore {
     if (!value) throw new Error('missing object')
     return Uint8Array.from(value)
   }
+  async delete(id: string): Promise<void> { this.objects.delete(id) }
   location(id: string): { storageBucket: string; storageKey: string } {
     return { storageBucket: 'memory', storageKey: id }
   }
@@ -153,6 +154,7 @@ test('requires the explicit roots directory and verifies content-addressed objec
   await assert.rejects(captureArchiveManifest(tar([{ path: 'roots/file', type: 'File' }]), 'snapshot', new MemoryObjectStore()), /roots directory/)
   const dishonest: ObjectStore = {
     put: async () => 'not-a-digest', get: async () => new Uint8Array(),
+    delete: async () => undefined,
     location: id => ({ storageBucket: 'memory', storageKey: id }),
   }
   await assert.rejects(captureArchiveManifest(tar([

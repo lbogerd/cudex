@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import test from 'node:test'
 import { Header, type HeaderData } from 'tar'
+import type { PoolClient } from 'pg'
 import type { ObjectStore } from '../src/blob-store.js'
 import type { SourceSnapshot, StoredObject } from '../src/postgres-state.js'
 import { SourceSnapshotLifecycle } from '../src/source-snapshots.js'
@@ -42,17 +43,19 @@ class MemoryObjects implements ObjectStore {
     this.gets++; const value = this.values.get(id); if (!value) throw new Error('missing')
     return Uint8Array.from(value)
   }
+  async delete(id: string): Promise<void> { this.values.delete(id) }
   location(id: string): { storageBucket: string; storageKey: string } {
     return { storageBucket: 'source-test', storageKey: `source/v1/sha256/${id.slice(0, 2)}/${id}` }
   }
-  delete(id: string): void { this.values.delete(id) }
 }
 
 class MemoryState {
   readonly objects = new Map<string, StoredObject>()
   readonly snapshots = new Map<string, SourceSnapshot>()
   registerObjectCalls = 0; registerSnapshotCalls = 0; failObject = false; failSnapshot = false
-  async registerObject(input: StoredObject): Promise<StoredObject> {
+  async withObjectLocationLock<T>(_storageBucket: string, _storageKey: string,
+    fn: (client: PoolClient) => Promise<T>): Promise<T> { return fn({} as PoolClient) }
+  async registerObject(input: StoredObject, _executor?: PoolClient): Promise<StoredObject> {
     this.registerObjectCalls++
     if (this.failObject) throw new Error('database object outage')
     this.objects.set(input.objectId, { ...input }); return { ...input }

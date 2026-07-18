@@ -205,13 +205,24 @@ function snapshotFromRow(row: SnapshotRow): Snapshot {
 export class PostgresDurableState {
   constructor(private readonly pool: Pool) {}
 
-  async registerObject(input: StoredObject): Promise<StoredObject> {
+  async withObjectLocationLock<T>(storageBucket: string, storageKey: string,
+    fn: (client: PoolClient) => Promise<T>): Promise<T> {
+    validateId('storage bucket', storageBucket); validateId('storage key', storageKey, 2048)
+    return this.transaction(async client => {
+      await client.query("SET LOCAL lock_timeout = '30s'")
+      await this.lockObjectLocation(client, storageBucket, storageKey)
+      return fn(client)
+    })
+  }
+
+  async registerObject(input: StoredObject, executor?: PoolClient): Promise<StoredObject> {
     validateId('object ID', input.objectId); validateId('tenant ID', input.tenantId)
     validateId('storage bucket', input.storageBucket); validateId('storage key', input.storageKey, 2048)
     validateChecksum(input.checksum)
     if (!Number.isSafeInteger(input.sizeBytes) || input.sizeBytes < 0) throw new Error('invalid object size')
     try {
-      return await this.transaction(async client => {
+      const register = async (client: PoolClient): Promise<StoredObject> => {
+        await this.lockObjectLocation(client, input.storageBucket, input.storageKey)
         await client.query(`
           INSERT INTO hosted_agent_objects
             (object_id, tenant_id, kind, storage_bucket, storage_key, checksum, size_bytes, state, expires_at)
@@ -231,26 +242,16 @@ export class PostgresDurableState {
           throw new DurableStateConflictError('object identity does not match its existing registration')
         }
         return objectFromRow(row)
-      })
+      }
+      return executor ? await register(executor) : await this.transaction(register)
     } catch (error) { return postgresError(error) }
   }
 
   async addObjectReference(input: { tenantId: string; objectId: string; referenceKind: string; referenceId: string; purpose: string; retainUntil?: Date | null }): Promise<void> {
     validateId('tenant ID', input.tenantId); validateId('object ID', input.objectId)
     validateId('reference ID', input.referenceId); validateId('reference purpose', input.purpose, 128)
-    const result = await this.pool.query(`
-      INSERT INTO hosted_agent_object_references
-        (object_id, reference_kind, reference_id, purpose, retain_until)
-      SELECT object_id, $3, $4, $5, $6
-      FROM hosted_agent_objects WHERE object_id = $2 AND tenant_id = $1
-      ON CONFLICT (object_id, reference_kind, reference_id, purpose)
-      DO UPDATE SET retain_until = CASE
-        WHEN hosted_agent_object_references.retain_until IS NULL OR EXCLUDED.retain_until IS NULL THEN NULL
-        ELSE GREATEST(hosted_agent_object_references.retain_until, EXCLUDED.retain_until)
-      END
-    `, [input.tenantId, input.objectId, input.referenceKind, input.referenceId,
-      input.purpose, input.retainUntil ?? null])
-    if (result.rowCount !== 1) throw new DurableStateNotFoundError('object was not found')
+    await this.transaction(async client => this.addObjectReferenceWithClient(client, input.tenantId, input.objectId,
+      input.referenceKind, input.referenceId, input.purpose, input.retainUntil ?? null))
   }
 
   async addSnapshotReference(input: { tenantId: string; snapshotId: string; referenceKind: string; referenceId: string; retainUntil?: Date | null }): Promise<void> {
@@ -276,6 +277,13 @@ export class PostgresDurableState {
     validateDate('source snapshot expiry', input.expiresAt)
     try {
       return await this.transaction(async client => {
+        const existingIdentity = await client.query<{ tenant_id: string }>(`
+          SELECT tenant_id FROM hosted_agent_source_snapshots WHERE source_snapshot_id = $1
+        `, [input.sourceSnapshotId])
+        if (existingIdentity.rows[0] && existingIdentity.rows[0].tenant_id !== input.tenantId) {
+          throw new DurableStateConflictError('source snapshot identity does not match its existing registration')
+        }
+        await this.lockAvailableObject(client, input.tenantId, input.archiveObjectId, 'source_archive')
         await client.query(`
           INSERT INTO hosted_agent_source_snapshots
             (source_snapshot_id, tenant_id, archive_object_id, checksum, cwd_uri,
@@ -349,8 +357,8 @@ export class PostgresDurableState {
           input.ownerAgentId ?? null, input.ownerLeaseId ?? null, input.sourceSnapshotId ?? null,
           input.providerSandboxId, input.sandboxTemplate, input.cwdUri,
           JSON.stringify(input.workspaceRootUris), JSON.stringify(input.toolPolicy), input.policyVersion])
-        await this.insertSnapshot(client, input.tenantId, input.leaseId, input.baseSnapshot)
         await this.referenceSnapshotObjects(client, input.tenantId, input.leaseId, input.baseSnapshot)
+        await this.insertSnapshot(client, input.tenantId, input.leaseId, input.baseSnapshot)
         await client.query(`
           INSERT INTO hosted_agent_snapshot_references (snapshot_id, reference_kind, reference_id)
           VALUES ($1, 'lease_base', $2), ($1, 'lease_latest', $2)
@@ -424,8 +432,8 @@ export class PostgresDurableState {
       return await this.transaction(async client => {
         const lease = await this.lockLease(client, tenantId, leaseId)
         if (!['active', 'paused'].includes(lease.state)) throw new DurableStateConflictError('lease cannot be checkpointed')
-        await this.insertSnapshot(client, tenantId, leaseId, snapshot)
         await this.referenceSnapshotObjects(client, tenantId, leaseId, snapshot)
+        await this.insertSnapshot(client, tenantId, leaseId, snapshot)
         await client.query(`
           DELETE FROM hosted_agent_snapshot_references
           WHERE reference_kind = 'lease_latest' AND reference_id = $1
@@ -577,22 +585,33 @@ export class PostgresDurableState {
   private async addObjectReferenceWithClient(client: PoolClient, tenantId: string, objectId: string,
     referenceKind: string, referenceId: string, purpose: string, retainUntil: Date | null,
     expectedKind?: StoredObject['kind']): Promise<void> {
-    const result = await client.query(`
+    await this.lockAvailableObject(client, tenantId, objectId, expectedKind)
+    await client.query(`
       INSERT INTO hosted_agent_object_references
         (object_id, reference_kind, reference_id, purpose, retain_until)
-      SELECT object_id, $3, $4, $5, $6 FROM hosted_agent_objects
-      WHERE object_id = $2 AND tenant_id = $1 AND state = 'available'
-        AND ($7::text IS NULL OR kind = $7)
-      ON CONFLICT (object_id, reference_kind, reference_id, purpose) DO NOTHING
-    `, [tenantId, objectId, referenceKind, referenceId, purpose, retainUntil, expectedKind ?? null])
-    if (result.rowCount !== 1) {
-      const exists = await client.query(`
-        SELECT 1 FROM hosted_agent_objects
-        WHERE object_id = $1 AND tenant_id = $2 AND state = 'available'
-          AND ($3::text IS NULL OR kind = $3)
-      `, [objectId, tenantId, expectedKind ?? null])
-      if (exists.rowCount !== 1) throw new DurableStateNotFoundError('object was not found')
-    }
+      VALUES ($1, $2, $3, $4, $5)
+      ON CONFLICT (object_id, reference_kind, reference_id, purpose)
+      DO UPDATE SET retain_until = CASE
+        WHEN hosted_agent_object_references.retain_until IS NULL OR EXCLUDED.retain_until IS NULL THEN NULL
+        ELSE GREATEST(hosted_agent_object_references.retain_until, EXCLUDED.retain_until)
+      END
+    `, [objectId, referenceKind, referenceId, purpose, retainUntil])
+  }
+
+  private async lockAvailableObject(client: PoolClient, tenantId: string, objectId: string,
+    expectedKind?: StoredObject['kind']): Promise<void> {
+    const result = await client.query(`
+      SELECT 1 FROM hosted_agent_objects
+      WHERE object_id = $1 AND tenant_id = $2 AND state = 'available'
+        AND ($3::text IS NULL OR kind = $3)
+      FOR UPDATE
+    `, [objectId, tenantId, expectedKind ?? null])
+    if (result.rowCount !== 1) throw new DurableStateNotFoundError('object was not found')
+  }
+
+  private async lockObjectLocation(client: PoolClient, storageBucket: string, storageKey: string): Promise<void> {
+    await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
+      [`hosted-agent:object-location:${JSON.stringify([storageBucket, storageKey])}`])
   }
 
   private async transaction<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {

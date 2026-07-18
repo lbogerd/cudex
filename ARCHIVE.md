@@ -222,6 +222,42 @@ explicitly development-only. The control plane still needs to move its operation
 protocol from the JSON journal onto this relational schema; adding the schema
 does not by itself satisfy multi-replica idempotency or recovery.
 
+The object store contract also supports idempotent exact-object deletion: the
+development store validates the content identifier before a forced unlink, and
+the S3 implementation issues `DeleteObject` for the same configured bucket/key
+that publication registered. A bounded `PostgresObjectReclaimer` can now reclaim
+registered object allocations owned by one in-progress operation generation. It
+retains anything referenced directly or through a source snapshot, workspace
+snapshot, or artifact; identical physical content owned by another logical
+object is kept while only the unreferenced logical audit row becomes
+`deleted`.
+
+Publication and registration use a transaction-scoped physical-locator lock;
+reclamation uses the same PostgreSQL-safe lock key at session scope across its
+committed phases, followed by logical-object and row locks. Reference creation
+locks the available logical-object row. This prevents a reclaimer from
+deleting content between a content-addressed put and tenant registration, makes
+reference creation lose safely once deletion starts, and serializes competing
+replicas. Distinct logical objects, including unchanged snapshots in the same
+tenant, may share one physical locator; the non-unique locator index supports
+lookup without making content identity a logical-ownership constraint.
+
+Reclamation commits `deleting` before external I/O while retaining a
+session-scoped locator lock, performs idempotent deletion outside any database
+transaction, then commits `deleted`/`reclaimed` audit state. If deletion succeeds
+but the worker or final commit is lost, a tenant-bounded recovery pass resumes
+the durable `deleting` row without relying on the original operation generation.
+It rechecks the physical locator after reacquiring the session lock, so content
+republished or registered by a sibling logical object during the crash window is
+retained while only the stale logical row is finalized. Per-object failures are
+counted without starving later rows in the bounded batch.
+PostgreSQL 17 coverage proves bounded batches, worker/generation fencing,
+retained references, same- and cross-tenant shared bytes, failure/crash retry,
+and competing replica claims. Allocations whose physical put
+succeeded before relational registration remain intentionally untouched because
+their logical allocation lacks a trustworthy physical locator; an aged,
+authenticated storage-inventory pass is still required for that crash window.
+
 The direct `ws` dependency was upgraded from 8.18.3 to 8.21.1, resolving the
 pinned tree's high-severity memory-disclosure/exhaustion advisories. The npm
 production audit reports zero known vulnerabilities after the upgrade.

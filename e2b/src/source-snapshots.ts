@@ -52,7 +52,8 @@ export interface SourceSnapshotLifecycleOptions {
 }
 
 type DurableSourceState = Pick<PostgresDurableState,
-  'registerObject' | 'registerSourceSnapshot' | 'findAuthorizedSourceSnapshot' | 'findAuthorizedSourceSnapshotByChecksum'>
+  'withObjectLocationLock' | 'registerObject' | 'registerSourceSnapshot' |
+  'findAuthorizedSourceSnapshot' | 'findAuthorizedSourceSnapshotByChecksum'>
 
 class StagingObjectStore implements ObjectStore {
   private readonly values = new Map<string, Uint8Array>()
@@ -64,6 +65,7 @@ class StagingObjectStore implements ObjectStore {
     const value = this.values.get(id); if (!value) throw new Error('staged object missing')
     return Uint8Array.from(value)
   }
+  async delete(id: string): Promise<void> { this.values.delete(id) }
   location(id: string): { storageBucket: string; storageKey: string } {
     return { storageBucket: 'staging', storageKey: id }
   }
@@ -225,17 +227,23 @@ export class SourceSnapshotLifecycle {
     const durableObjectId = tenantObjectId(tenantId, input.checksum)
     let publicationStarted = false
     try {
-      publicationStarted = true
-      const storedId = await this.objects.put(input.archive)
-      if (storedId !== physicalObjectId) throw new Error('object store returned a non-content-addressed identifier')
-      const location = this.objects.location(storedId)
-      const storageBucket = opaque('storage bucket', location.storageBucket)
-      const storageKey = opaque('storage key', location.storageKey, 2048)
-      const object: StoredObject = {
-        objectId: durableObjectId, tenantId, kind: 'source_archive', storageBucket, storageKey,
-        checksum: input.checksum, sizeBytes: input.archive.byteLength, state: 'available', expiresAt: expiry,
-      }
-      const registeredObject = await this.state.registerObject(object)
+      const expected = this.objects.location(physicalObjectId)
+      const storageBucket = opaque('storage bucket', expected.storageBucket)
+      const storageKey = opaque('storage key', expected.storageKey, 2048)
+      let registeredObject: StoredObject | undefined
+      const object: StoredObject = { objectId: durableObjectId, tenantId, kind: 'source_archive', storageBucket, storageKey,
+        checksum: input.checksum, sizeBytes: input.archive.byteLength, state: 'available', expiresAt: expiry }
+      await this.state.withObjectLocationLock(storageBucket, storageKey, async client => {
+        publicationStarted = true
+        const storedId = await this.objects.put(input.archive)
+        if (storedId !== physicalObjectId) throw new Error('object store returned a non-content-addressed identifier')
+        const location = this.objects.location(storedId)
+        if (location.storageBucket !== storageBucket || location.storageKey !== storageKey) {
+          throw new Error('object store location changed during publication')
+        }
+        registeredObject = await this.state.registerObject(object, client)
+      })
+      if (!registeredObject) throw new Error('durable object registration missing')
       if (registeredObject.objectId !== object.objectId || registeredObject.tenantId !== tenantId
         || registeredObject.kind !== 'source_archive' || registeredObject.checksum !== input.checksum
         || registeredObject.sizeBytes !== input.archive.byteLength || registeredObject.state !== 'available') {

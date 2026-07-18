@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { createHash, randomUUID } from 'node:crypto'
 import test from 'node:test'
-import { Pool } from 'pg'
+import { Pool, type PoolClient } from 'pg'
 import { Header, type HeaderData } from 'tar'
 import type { ObjectStore } from '../src/blob-store.js'
 import { runMigrations } from '../src/migrate.js'
@@ -73,6 +73,8 @@ class MemoryObjects implements ObjectStore {
     return Uint8Array.from(bytes)
   }
 
+  async delete(id: string): Promise<void> { this.values.delete(id) }
+
   location(id: string): { storageBucket: string; storageKey: string } {
     return { storageBucket: 'workspace-test', storageKey: `v1/sha256/${id.slice(0, 2)}/${id}` }
   }
@@ -121,7 +123,12 @@ class MemoryState {
   failBase = false
   failCheckpoint = false
 
-  async registerObject(input: StoredObject): Promise<StoredObject> {
+  async withObjectLocationLock<T>(_storageBucket: string, _storageKey: string,
+    fn: (client: PoolClient) => Promise<T>): Promise<T> {
+    return fn({} as PoolClient)
+  }
+
+  async registerObject(input: StoredObject, _executor?: PoolClient): Promise<StoredObject> {
     this.registerCalls += 1
     if (this.registerCalls === this.failRegisterAt) throw new Error('durable object outage')
     const existing = this.objects.get(input.objectId)
@@ -276,8 +283,11 @@ test('live PostgreSQL publication retains tenant-owned logical objects over shar
     })
     const first = await publisher.createBase(baseInput('tenant-a', 'snapshot-a', 'lease-a'))
     const second = await publisher.createBase(baseInput('tenant-b', 'snapshot-b', 'lease-b'))
+    const repeated = await publisher.createBase(baseInput('tenant-a', 'snapshot-c', 'lease-c'))
     assert.notEqual(first.contentObjects[0]!.objectId, second.contentObjects[0]!.objectId)
+    assert.notEqual(first.contentObjects[0]!.objectId, repeated.contentObjects[0]!.objectId)
     assert.equal(first.contentObjects[0]!.checksum, second.contentObjects[0]!.checksum)
+    assert.equal(first.contentObjects[0]!.checksum, repeated.contentObjects[0]!.checksum)
     const counts = await pool.query<{ objects: string; references: string; shared_locations: string }>(`
       SELECT
         (SELECT count(*)::text FROM hosted_agent_objects) AS objects,
@@ -287,7 +297,7 @@ test('live PostgreSQL publication retains tenant-owned logical objects over shar
           GROUP BY storage_bucket, storage_key HAVING count(*) > 1
         ) shared) AS shared_locations
     `)
-    assert.deepEqual(counts.rows[0], { objects: '6', references: '6', shared_locations: '2' })
+    assert.deepEqual(counts.rows[0], { objects: '9', references: '9', shared_locations: '2' })
   } finally {
     await pool.end(); await admin.query(`DROP SCHEMA ${schema} CASCADE`); await admin.end()
   }

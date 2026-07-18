@@ -68,7 +68,7 @@ export interface WorkspaceSnapshotPublisherOptions {
 }
 
 type DurableWorkspaceState = Pick<PostgresDurableState,
-  'registerObject' | 'createLeaseWithBaseSnapshot' | 'appendCheckpoint'>
+  'withObjectLocationLock' | 'registerObject' | 'createLeaseWithBaseSnapshot' | 'appendCheckpoint'>
 
 interface PlannedObject {
   bytes: Uint8Array
@@ -90,6 +90,8 @@ class StagingObjectStore implements ObjectStore {
     if (!value) throw new Error('staged workspace object is missing')
     return Uint8Array.from(value)
   }
+
+  async delete(id: string): Promise<void> { this.values.delete(id) }
 
   location(id: string): { storageBucket: string; storageKey: string } {
     return { storageBucket: 'staging', storageKey: id }
@@ -289,13 +291,21 @@ export class WorkspaceSnapshotPublisher {
 
   private async publishObjects(plans: PlannedObject[], published: PlannedObject[]): Promise<void> {
     for (const plan of plans) {
-      const storedId = await this.objects.put(plan.bytes)
-      published.push(plan)
-      if (storedId !== plan.physicalObjectId) throw new Error('object store returned a non-content-addressed identifier')
-      const location = this.objects.location(storedId)
-      plan.durable.storageBucket = opaque('storage bucket', location.storageBucket)
-      plan.durable.storageKey = opaque('storage key', location.storageKey, 2048)
-      verifyRegisteredObject(await this.state.registerObject(plan.durable), plan.durable)
+      const expected = this.objects.location(plan.physicalObjectId)
+      const storageBucket = opaque('storage bucket', expected.storageBucket)
+      const storageKey = opaque('storage key', expected.storageKey, 2048)
+      await this.state.withObjectLocationLock(storageBucket, storageKey, async client => {
+        const storedId = await this.objects.put(plan.bytes)
+        published.push(plan)
+        if (storedId !== plan.physicalObjectId) throw new Error('object store returned a non-content-addressed identifier')
+        const location = this.objects.location(storedId)
+        if (location.storageBucket !== storageBucket || location.storageKey !== storageKey) {
+          throw new Error('object store location changed during publication')
+        }
+        plan.durable.storageBucket = storageBucket
+        plan.durable.storageKey = storageKey
+        verifyRegisteredObject(await this.state.registerObject(plan.durable, client), plan.durable)
+      })
     }
   }
 

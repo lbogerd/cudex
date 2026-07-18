@@ -1,11 +1,13 @@
 import { createHash } from 'node:crypto'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3'
+import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3'
 
 export interface ObjectStore {
   put(bytes: Uint8Array): Promise<string>
   get(id: string): Promise<Uint8Array>
+  /** Idempotently removes the exact content-addressed object. */
+  delete(id: string): Promise<void>
   location(id: string): { storageBucket: string; storageKey: string }
 }
 
@@ -27,6 +29,10 @@ export class BlobStore implements ObjectStore {
     const bytes = await readFile(join(this.directory, id))
     if (digest(bytes) !== id) throw new Error('object checksum mismatch')
     return bytes
+  }
+  async delete(id: string): Promise<void> {
+    validateId(id)
+    await rm(join(this.directory, id), { force: true })
   }
   location(id: string): { storageBucket: string; storageKey: string } {
     validateId(id)
@@ -84,6 +90,11 @@ export class S3BlobStore implements ObjectStore {
     if (bytes.byteLength > this.maxObjectBytes) throw new Error('object exceeds storage limit')
     if (digest(bytes) !== id || (response.Metadata?.sha256 && response.Metadata.sha256 !== id)) throw new Error('object checksum mismatch')
     return bytes
+  }
+
+  async delete(id: string): Promise<void> {
+    validateId(id)
+    await this.client.send(new DeleteObjectCommand({ Bucket: this.options.bucket, Key: this.key(id) }))
   }
 
   location(id: string): { storageBucket: string; storageKey: string } {
