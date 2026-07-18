@@ -219,11 +219,14 @@ Port relevant behavior from
 `codex/codex-rs/hosted-agent/src/hosted_agent_tests.rs` to black-box HTTP tests,
 then run the complete app-server flow against live E2B.
 
-- [x] Run Docker remote-executor coverage. After restoring build capacity, the
-  standard Ubuntu harness reached a healthy remote exec-server and the focused
-  `codex-core` remote filesystem test passed. The standard harness still cannot
-  synthesize the service-owned WSS lease; that remains part of the final live
-  app-server acceptance flow.
+- [x] Run focused Docker remote-executor coverage. After restoring build capacity, the
+  standard Ubuntu harness reached a healthy remote exec-server and all 19
+  `codex-core` `remote_env` tests passed after aligning three explicit shell
+  fixtures with the executor's advertised Bash shell. The standard harness
+  still cannot synthesize the service-owned WSS lease; that remains part of the
+  final live app-server acceptance flow. The broad core run's host-local helper,
+  network/proxy, and nested-sandbox failures remain harness debt rather than a
+  green remote run.
 - [ ] Confirm Windows/Wine path and type compatibility through the Bazel CI matrix;
   external-service behavior may be skipped only with a specific harness reason.
 

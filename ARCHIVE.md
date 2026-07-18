@@ -171,13 +171,21 @@ fixes, and final formatting were regenerated or validated.
 
 Docker remote-executor validation was completed on 2026-07-18 after restoring
 safe host build capacity. The standard Ubuntu harness built the Codex CLI,
-provisioned its container, reached a healthy remote exec-server, and passed
-`remote_test_env_can_connect_and_use_filesystem` through the remote filesystem
-with one test and zero failures. This retry closed the earlier linker `SIGBUS`
-gap caused by the root filesystem being 99% full. The focused local app-server
-patch-route suite also passed. The standard remote harness still cannot
-synthesize the service-owned WSS lease; that remains part of the final live
-app-server acceptance flow, while Wine coverage remains delegated to the
+provisioned its container, reached a healthy remote exec-server, and first
+passed `remote_test_env_can_connect_and_use_filesystem`. A broad 964-test run
+then passed 874 tests and failed 90. Three failures were stale remote fixtures
+that requested `/bin/sh` even though the selected environment advertised Bash;
+the other failures retained the already recorded host-local helper,
+network/proxy, nested-sandbox, approval, and mock-server environment-sensitive
+signatures. Two remote opt-ins outside the focused module remain among that
+harness debt: a network-approval fixture and an unavailable
+`test_stdio_server` helper. The broad run is not recorded as green. After
+changing the three explicit shell fixtures to `/bin/bash`, all 19 `codex-core`
+`remote_env` tests passed with zero failures. This closed the earlier linker
+`SIGBUS` gap caused by the root filesystem being 99% full. The focused local
+app-server patch-route suite also passed. The standard remote harness still
+cannot synthesize the service-owned WSS lease; that remains part of the final
+live app-server acceptance flow, while Wine coverage remains delegated to the
 repository Bazel CI matrix.
 
 ### Runtime success invariants and assumptions
