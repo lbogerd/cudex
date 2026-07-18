@@ -6,6 +6,7 @@ use codex_connectors::AppToolPolicyInput;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_mcp::ToolInfo as McpToolInfo;
 use codex_mcp::tool_is_model_visible;
+use codex_tools::ToolExecutionDomain;
 use codex_tools::ToolExposure;
 use tracing::instrument;
 use tracing::warn;
@@ -14,6 +15,7 @@ use crate::config::Config;
 use crate::connectors;
 use crate::tools::handlers::McpHandler;
 use crate::tools::registry::CoreToolRuntime;
+use crate::tools::registry::override_tool_execution_domain;
 use crate::tools::registry::override_tool_exposure;
 
 #[instrument(level = "trace", skip_all)]
@@ -41,10 +43,30 @@ pub(crate) fn build_mcp_tool_runtimes(
         .into_iter()
         .filter_map(|tool| {
             let tool_name = tool.canonical_tool_name();
+            let execution_domain = config
+                .mcp_servers
+                .get()
+                .get(&tool.server_name)
+                .map(|server| {
+                    if server.is_local_environment() {
+                        ToolExecutionDomain::AmbientMcp {
+                            server: tool.server_name.clone(),
+                        }
+                    } else {
+                        ToolExecutionDomain::EnvironmentBoundMcp {
+                            server: tool.server_name.clone(),
+                            environment_id: server.environment_id.clone(),
+                        }
+                    }
+                })
+                .unwrap_or_else(|| ToolExecutionDomain::AmbientMcp {
+                    server: tool.server_name.clone(),
+                });
             match McpHandler::new(tool) {
                 Ok(handler) => {
                     let handler: Arc<dyn CoreToolRuntime> = Arc::new(handler);
-                    Some(override_tool_exposure(handler, exposure))
+                    let handler = override_tool_exposure(handler, exposure);
+                    Some(override_tool_execution_domain(handler, execution_domain))
                 }
                 Err(err) => {
                     warn!("Skipping MCP tool `{tool_name}`: failed to build tool spec: {err}");

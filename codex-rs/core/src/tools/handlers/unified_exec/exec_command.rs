@@ -2,6 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::function_tool::FunctionCallError;
+use crate::hosted_agent_runtime::HOSTED_EXTERNAL_SANDBOX_DENIAL_MESSAGE;
 use crate::maybe_emit_implicit_skill_invocation;
 use crate::tools::context::ExecCommandToolOutput;
 use crate::tools::context::ToolInvocation;
@@ -50,6 +51,7 @@ use super::shell_mode_for_environment;
 pub(crate) struct ExecCommandHandlerOptions {
     pub(crate) allow_login_shell: bool,
     pub(crate) exec_permission_approvals_enabled: bool,
+    pub(crate) allow_permission_escalation: bool,
     pub(crate) include_environment_id: bool,
     pub(crate) include_shell_parameter: bool,
 }
@@ -64,6 +66,7 @@ impl Default for ExecCommandHandler {
             options: ExecCommandHandlerOptions {
                 allow_login_shell: false,
                 exec_permission_approvals_enabled: false,
+                allow_permission_escalation: true,
                 include_environment_id: false,
                 include_shell_parameter: true,
             },
@@ -87,6 +90,7 @@ impl ToolExecutor<ToolInvocation> for ExecCommandHandler {
             CommandToolOptions {
                 allow_login_shell: self.options.allow_login_shell,
                 exec_permission_approvals_enabled: self.options.exec_permission_approvals_enabled,
+                allow_permission_escalation: self.options.allow_permission_escalation,
             },
             self.options.include_environment_id,
             self.options.include_shell_parameter,
@@ -189,6 +193,16 @@ impl ExecCommandHandler {
                 parse_arguments(&arguments)?
             }
         };
+        if !self.options.allow_permission_escalation
+            && (args.sandbox_permissions.requests_sandbox_override()
+                || args.additional_permissions.is_some()
+                || args.justification.is_some()
+                || args.prefix_rule.is_some())
+        {
+            return Err(FunctionCallError::RespondToModel(
+                "permission escalation is unavailable for this exec_command tool".to_string(),
+            ));
+        }
         let hook_command = args.cmd.clone();
         // TODO(anp) wire PathUri through implicit skills instead of skipping on foreign paths
         if let Some(native_cwd) = native_cwd.as_ref() {
@@ -374,7 +388,10 @@ impl ExecCommandHandler {
                 output_omitted_bytes,
                 ..
             }) => {
-                let output_text = output.aggregated_output.text;
+                let output_text = normalize_sandbox_denial_output(
+                    output.aggregated_output.text,
+                    context.turn.as_ref(),
+                )?;
                 let original_token_count =
                     original_token_count.unwrap_or_else(|| approx_token_count(&output_text));
                 Ok(boxed_tool_output(ExecCommandToolOutput {
@@ -397,6 +414,19 @@ impl ExecCommandHandler {
                 "exec_command failed for `{command_for_display}`: {err:?}"
             ))),
         }
+    }
+}
+
+pub(super) fn normalize_sandbox_denial_output(
+    output: String,
+    turn: &crate::session::turn_context::TurnContext,
+) -> Result<String, FunctionCallError> {
+    if turn.hosted_tool_authorization.is_some() {
+        Err(FunctionCallError::RespondToModel(
+            HOSTED_EXTERNAL_SANDBOX_DENIAL_MESSAGE.to_string(),
+        ))
+    } else {
+        Ok(output)
     }
 }
 

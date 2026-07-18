@@ -14,7 +14,7 @@ Keep parent/child relationships only for ownership, messaging, quotas, result de
 
 Implement this behind an experimental `hosted_agents` feature and split the work into reviewable stages under the repository’s 800-line guidance.
 
-## Implementation Status (2026-07-17)
+## Foundation Snapshot (2026-07-17)
 
 The first foundation branch, `feat/hosted-agents`, implements the service,
 configuration, and environment-lifecycle seams needed before thread orchestration
@@ -47,9 +47,64 @@ Completed:
     stale handles, cancels in-progress authenticated recovery, and prevents
     subsequent reconnect attempts;
   - local, default, and statically configured environments fail closed.
+- Hosted thread startup slice from Stages 2 and 3:
+  - added core-owned `HostedAgentRuntime` state and a provision/register
+    transaction boundary;
+  - preallocates thread IDs before session construction so provision requests and
+    Codex sessions share the same identity;
+  - centrally provisions both roots and thread-spawned agents, using the root
+    workspace or the owner's active lease as the snapshot source;
+  - binds hosted threads to exactly the service-returned environment and drops
+    inherited environment and exec-policy state;
+  - rejects environment-ID collisions without replacing existing environments;
+  - rolls back the environment registration and lease on registration or later
+    thread-startup failure.
+- Hosted runtime teardown slice from Stages 2 and 8:
+  - atomically removes committed runtime ownership alongside thread removal;
+  - unregisters and releases only the removed thread's environment and lease;
+  - releases successfully shut down threads during bounded manager-wide
+    shutdown without touching timed-out or submit-failed threads;
+  - retains opaque runtime metadata when cleanup fails so a later removal can
+    retry instead of forgetting the lease;
+  - scopes release idempotency keys to the lease generation so a future restored
+    lease for the same thread cannot collide with an earlier release.
 - Tool-domain foundation from Stage 5:
   - added `ToolExecutionDomain` and `ToolExecutionDomainKind` independently of
     `ToolExposure`.
+- Tool-domain authorization from Stage 5:
+  - carries the service-returned policy and exact environment binding as
+    immutable thread/turn runtime state;
+  - classifies all planned runtime and hosted tools independently of exposure,
+    filters unauthorized model specifications, and rechecks policy at dispatch;
+  - rejects ambient and mismatched-environment MCP tools even if their coarse
+    domain and exact tool name are granted;
+  - completely unregisters legacy shell, code mode, and permission escalation
+    tools for hosted threads while preserving existing non-hosted registries.
+- External-sandbox enforcement from Stage 4:
+  - centrally forces every hosted root and spawned thread to use an external
+    sandbox with unrestricted network access and approval policy `Never`;
+  - replaces configured permission-profile constraints with trusted hosted
+    runtime permissions and disables the Codex-managed network proxy before
+    session construction;
+  - keeps the provisioned environment, external-sandbox profile, and approval
+    policy immutable across later thread-setting and turn-setting updates;
+  - retains the existing hosted tool-plan behavior that omits permission
+    requests, legacy shell, code mode, and exec-permission escalation.
+- Root agent-role selection from Stage 3 and the app-server API foundation:
+  - added the experimental nullable `thread/start.agentType` field, with
+    omission selecting `hosted_agents.default_agent_type`;
+  - trims explicit selections, rejects blank values and hosted-disabled use,
+    and resolves the trusted role to its opaque sandbox template only inside
+    the centralized core provisioning boundary;
+  - keeps stable generated API fixtures free of the experimental field while
+    validating both stable and experimental schema generation.
+- Spawn runtime-isolation cleanup from Stage 3:
+  - hosted spawn and resume paths no longer inherit owner environment
+    snapshots, environment selections, or exec-policy instances;
+  - hosted spawn configuration no longer copies the live owner turn's cwd,
+    approval policy, or permission profile, including role reloads and agent
+    jobs;
+  - preserves the existing inheritance behavior for non-hosted agents.
 
 Validated in this branch:
 
@@ -58,6 +113,34 @@ Validated in this branch:
 - focused hosted-agent config tests in `codex-core`: 5 passed before the final
   URL-query and blank-default validation cases were appended;
 - focused active-recovery cancellation test in `codex-exec-server`: passed;
+- hosted runtime orchestration tests in `codex-core`: 3 passed;
+- hosted root/spawned thread startup test in `codex-core`: passed;
+- thread-manager tests after release integration in `codex-core`: 30 passed;
+- hosted runtime transaction tests after release integration in `codex-core`: 3 passed;
+- full `codex-core` run after release integration: 2,880 passed, 97 failed,
+  12 skipped; failures were in existing environment-sensitive sandbox,
+  approval/network, missing test-binary, and timing-sensitive integration tests,
+  while the hosted lifecycle and thread-manager coverage passed;
+- focused resumed root and subagent session tests in `codex-core`: 2 passed;
+- surrounding tool-spec, registry, and MCP exposure suites: 44 passed;
+- hosted external-sandbox root/child coverage: passed;
+- thread-manager tests after external-sandbox enforcement: 30 passed;
+- combined hosted tool-plan, unified-exec, shell-spec, and thread-manager
+  coverage after removing hosted escalation arguments: 79 passed;
+- hosted root role selection and root/child runtime-isolation coverage: 2
+  focused `codex-core` tests passed;
+- `thread/start.agentType` capability gating and hosted-runtime forwarding: 2
+  focused `codex-app-server` integration tests passed;
+- `codex-app-server-protocol`: 266 passed, including stable fixture parity and
+  the experimental field round trip;
+- normal and experimental `just write-app-server-schema` generation passed,
+  with the checked-in tree restored to the stable fixture set;
+- scoped `just fix` passed for `codex-core`, `codex-app-server-protocol`, and
+  `codex-app-server` after clearing the regenerable Rust incremental cache that
+  had filled the development volume;
+- environment-focused tests in `codex-exec-server`: 61 passed;
+- scoped `just fix -p codex-core`: passed after clearing regenerable build
+  artifacts that had exhausted the development volume;
 - `just write-config-schema`, `just bazel-lock-update`, the hosted-agent Bazel
   target query, and final `just fmt`: passed.
 
@@ -68,17 +151,59 @@ container.
 
 Still pending:
 
-- the remainder of Stage 2: `HostedAgentRuntime`, per-thread ownership, and
-  provision/register/startup rollback integration;
-- Stage 3 uniform root and spawned-agent creation;
-- Stage 4 external-sandbox runtime enforcement;
-- the remainder of Stage 5: model-spec filtering and dispatch-time policy
-  enforcement;
+- the remainder of Stage 4: normalize typed executor and remote-filesystem
+  denials as explicit external-sandbox failures without retry or escalation;
+- route direct `codex_delegate` review/guardian session creation through the
+  manager-owned hosted provisioning path;
+- separate ownership lineage from the active thread whose lease supplies a
+  fork or detached subagent's project snapshot;
 - Stages 6–8: persistence/restore, completion and explicit patch acceptance,
   lifecycle finalization, telemetry, app-server APIs, and end-to-end coverage.
 
-None of the success criteria below that depend on hosted thread orchestration
-should be considered complete yet.
+## Final Implementation Status (2026-07-18)
+
+All eight implementation stages are complete on `feat/hosted-agents`.
+
+The completed runtime now provides:
+
+- one centrally provisioned, independently leased hosted environment for every hosted root,
+  spawned agent, and direct review/guardian delegate;
+- fail-closed external-sandbox permissions, exact tool/domain authorization at specification and
+  dispatch time, normalized service denials, and explicit local-fallback invariant failures;
+- durable owner lineage, lease/snapshot/lifecycle metadata, completed-turn checkpoints,
+  reconnect-or-restore behavior, and automatic recovery of interrupted finalization;
+- checkpoint/export/persist/release completion ordering with durable `PendingFinalization` and
+  `ReleasePending` recovery;
+- explicit, idempotent, conflict-safe patch acceptance through the plain `apply_agent_patch`
+  collaboration tool and experimental app-server `agent/patchApply` API;
+- owner-scoped, guaranteed-delivery `agent/patchAvailable` notifications with bounded non-secret
+  artifact metadata;
+- deepest-first descendant shutdown, generation-safe asynchronous cleanup retries with bounded
+  backoff, deletion protection while cleanup is pending, and no terminal idle release of otherwise
+  resumable hosted threads;
+- bounded telemetry for provision/restore/checkpoint latency, active leases, patch size/conflicts,
+  denied domains, cleanup retries, and prevented local fallback;
+- a bounded fake filesystem that verifies snapshot isolation, checkpoint authority, clean
+  add/modify/delete application, and atomic three-way conflicts without partial mutation.
+
+Validation for the final stages includes the full 17-test `codex-hosted-agent` suite; focused core
+tests for provision rollback, checkpoint/finalization/release recovery, reconnect/restore, durable
+lineage, patch application, follow-up rejection after terminal release, cleanup generation safety,
+tool policy, and telemetry; app-server protocol/schema validation; and public app-server tests for
+experimental gating, request validation, ownership non-disclosure, notification scoping, response
+mapping, and subtree removal ordering. Scoped Clippy fixes and repository formatting passed after
+each landing chunk.
+
+The Docker remote-executor command was attempted on 2026-07-18, but the development host reported
+that its Docker daemon was unreachable. The focused app-server patch route suite then ran locally
+and passed. Hosted external-service execution is intentionally not skipped silently: the standard
+remote harness cannot synthesize the hosting service's service-owned WSS lease connection, and Wine
+coverage remains delegated to the repository's Bazel CI matrix.
+
+Deployment still owns the two explicit service-side assumptions from this plan: transactional
+cleanup of any lease that is created before `provision` returns an error, and TTL reaping after a
+Codex process crash. Codex persists only opaque identifiers and retries every cleanup operation for
+which it has obtained a lease identifier.
 
 ## Success Criteria
 

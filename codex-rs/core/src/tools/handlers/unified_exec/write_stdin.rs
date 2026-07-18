@@ -1,4 +1,5 @@
 use crate::function_tool::FunctionCallError;
+use crate::hosted_agent_runtime::HOSTED_EXTERNAL_SANDBOX_DENIAL_MESSAGE;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
@@ -7,6 +8,7 @@ use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::PostToolUsePayload;
 use crate::tools::registry::PreToolUsePayload;
 use crate::tools::registry::ToolExecutor;
+use crate::unified_exec::UnifiedExecError;
 use crate::unified_exec::WriteStdinRequest;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::TerminalInteractionEvent;
@@ -82,9 +84,7 @@ impl WriteStdinHandler {
                 truncation_policy: turn.model_info.truncation_policy.into(),
             })
             .await
-            .map_err(|err| {
-                FunctionCallError::RespondToModel(format!("write_stdin failed: {err}"))
-            })?;
+            .map_err(|err| map_write_stdin_error(turn.as_ref(), err))?;
 
         // Empty stdin is a background poll, so emit it only while there is
         // still a live process for the UI to wait on. Non-empty stdin is a real
@@ -103,6 +103,19 @@ impl WriteStdinHandler {
         }
 
         Ok(boxed_tool_output(response))
+    }
+}
+
+pub(super) fn map_write_stdin_error(
+    turn: &crate::session::turn_context::TurnContext,
+    err: UnifiedExecError,
+) -> FunctionCallError {
+    if turn.hosted_tool_authorization.is_some()
+        && matches!(err, UnifiedExecError::SandboxDenied { .. })
+    {
+        FunctionCallError::RespondToModel(HOSTED_EXTERNAL_SANDBOX_DENIAL_MESSAGE.to_string())
+    } else {
+        FunctionCallError::RespondToModel(format!("write_stdin failed: {err}"))
     }
 }
 

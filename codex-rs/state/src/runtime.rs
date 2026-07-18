@@ -64,6 +64,7 @@ mod agent_jobs;
 mod backfill;
 mod external_agent_config_imports;
 mod goals;
+mod hosted_agent;
 mod logs;
 mod memories;
 mod recovery;

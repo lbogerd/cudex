@@ -85,7 +85,7 @@ async fn handle_spawn_agent(
         args.service_tier.as_deref(),
     )
     .await?;
-    apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
+    apply_non_hosted_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
 
     let spawn_source = thread_spawn_source(
         session.thread_id,
@@ -118,7 +118,8 @@ async fn handle_spawn_agent(
                     fork_parent_spawn_call_id: fork_mode.as_ref().map(|_| call_id.clone()),
                     fork_mode,
                     parent_thread_id: Some(session.thread_id),
-                    environments: Some(turn.environments.to_selections()),
+                    environments: (!turn.config.hosted_agents.enabled)
+                        .then(|| turn.environments.to_selections()),
                 },
             ),
     )

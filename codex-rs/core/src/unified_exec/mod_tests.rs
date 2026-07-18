@@ -99,6 +99,27 @@ async fn exec_command_with_tty(
     workdir: Option<PathBuf>,
     tty: bool,
 ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
+    exec_command_with_tty_and_sandbox(
+        session,
+        turn,
+        cmd,
+        yield_time_ms,
+        workdir,
+        tty,
+        SandboxType::None,
+    )
+    .await
+}
+
+async fn exec_command_with_tty_and_sandbox(
+    session: &Arc<Session>,
+    turn: &Arc<TurnContext>,
+    cmd: &str,
+    yield_time_ms: u64,
+    workdir: Option<PathBuf>,
+    tty: bool,
+    sandbox_type: SandboxType,
+) -> Result<ExecCommandToolOutput, UnifiedExecError> {
     let manager = &session.services.unified_exec_manager;
     let process_id = manager.allocate_process_id().await;
     #[allow(deprecated)]
@@ -106,7 +127,8 @@ async fn exec_command_with_tty(
         .as_ref()
         .map_or_else(|| turn.cwd.clone(), |workdir| turn.cwd.join(workdir));
     let command = vec!["bash".to_string(), "-lc".to_string(), cmd.to_string()];
-    let request = test_exec_request(turn, command.clone(), cwd.clone(), shell_env());
+    let mut request = test_exec_request(turn, command.clone(), cwd.clone(), shell_env());
+    request.sandbox = sandbox_type;
 
     let process = Arc::new(
         manager
@@ -401,6 +423,49 @@ async fn unified_exec_persists_across_requests() -> anyhow::Result<()> {
     assert!(session.terminate_background_terminal(process_id).await);
     assert!(!session.terminate_background_terminal(process_id).await);
     assert!(session.list_background_terminals().await.is_empty());
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_stdin_reports_sandbox_denial_when_background_process_exits() -> anyhow::Result<()> {
+    skip_if_sandbox!(Ok(()));
+
+    let (session, turn) = test_session_and_turn().await;
+    let started = exec_command_with_tty_and_sandbox(
+        &session,
+        &turn,
+        "sleep 0.4; echo 'operation not permitted' >&2; exit 1",
+        /*yield_time_ms*/ 10,
+        /*workdir*/ None,
+        /*tty*/ false,
+        SandboxType::LinuxSeccomp,
+    )
+    .await?;
+    let process_id = started
+        .process_id
+        .expect("denied command should still be running after the initial yield");
+
+    let err = write_stdin(&session, process_id, "", /*yield_time_ms*/ 5_000)
+        .await
+        .expect_err("background sandbox denial should be terminal");
+    let UnifiedExecError::SandboxDenied {
+        output,
+        original_token_count,
+        ..
+    } = err
+    else {
+        panic!("expected typed sandbox denial, got {err:?}");
+    };
+    assert_eq!(output.exit_code, 1);
+    assert!(
+        output
+            .aggregated_output
+            .text
+            .contains("operation not permitted")
+    );
+    assert!(original_token_count.is_some());
 
     Ok(())
 }

@@ -13,6 +13,9 @@ use serde::Serialize;
 
 pub type Result<T> = std::result::Result<T, HostedAgentError>;
 
+/// Maximum UTF-8 byte length for opaque service identifiers retained by Codex.
+pub const MAX_OPAQUE_ID_BYTES: usize = 512;
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentProvisionRequest {
@@ -69,7 +72,7 @@ impl HostedEnvironmentConnection {
     ) -> std::result::Result<(), ExecServerError> {
         self.validate()
             .map_err(|error| ExecServerError::Protocol(error.to_string()))?;
-        manager.upsert_environment(
+        manager.register_environment(
             environment_id.into(),
             self.exec_server_url.clone(),
             Some(timeout),
@@ -170,6 +173,40 @@ pub struct AgentPatchArtifact {
     pub size_bytes: u64,
 }
 
+/// Durable lifecycle state for a hosted-agent runtime.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum HostedAgentLifecycleState {
+    Active,
+    PendingFinalization,
+    Completed,
+    ReleasePending,
+    Released,
+}
+
+/// Durable, non-secret metadata needed to restore and finalize a hosted agent.
+///
+/// Transient connection data, service credentials, and tool policy are
+/// intentionally excluded and must be reacquired from the hosting service.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostedAgentRuntimeRecord {
+    /// The owning agent used for lifecycle and patch authorization.
+    ///
+    /// Older persisted records predate durable ownership, so a missing field is
+    /// treated as an unowned root runtime.
+    #[serde(default)]
+    pub owner_agent_id: Option<ThreadId>,
+    pub agent_type: String,
+    pub sandbox_template: String,
+    pub lease_id: String,
+    pub environment_id: String,
+    pub base_snapshot_id: String,
+    pub latest_snapshot_id: Option<String>,
+    pub last_exported_patch: Option<AgentPatchArtifact>,
+    pub lifecycle_state: HostedAgentLifecycleState,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(
     rename_all = "camelCase",
@@ -177,7 +214,7 @@ pub struct AgentPatchArtifact {
     tag = "type"
 )]
 pub enum PatchApplyResult {
-    Applied,
+    Applied { checkpoint: AgentCheckpoint },
     Conflict { paths: Vec<PathUri> },
     Rejected { reason: String },
 }
@@ -188,6 +225,7 @@ pub enum HostedAgentErrorCategory {
     Unavailable,
     Unauthorized,
     InvalidTemplate,
+    LeaseMissing,
     SnapshotMissing,
     QuotaExceeded,
     ConnectionFailed,

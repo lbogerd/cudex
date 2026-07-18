@@ -20,6 +20,9 @@ use serde_json::Value;
 
 pub const JSONRPC_VERSION: &str = "2.0";
 
+/// Exec-server error code for filesystem operations denied by the active sandbox or host.
+pub const FILE_SYSTEM_PERMISSION_DENIED_ERROR_CODE: i64 = -32011;
+
 // A maximum-size fs/walk response has at most 50,000 entries and needs roughly
 // 150,000 JSON values. Keep ample headroom for legitimate protocol messages
 // while preventing compact arrays from expanding into millions of heap values.

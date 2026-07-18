@@ -7,6 +7,7 @@ use std::sync::MutexGuard;
 use std::sync::OnceLock;
 
 use chrono::Utc;
+use codex_hosted_agent::HostedAgentRuntimeRecord;
 use codex_protocol::ThreadId;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
@@ -350,6 +351,10 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+#[path = "in_memory_hosted_agent_tests.rs"]
+mod hosted_agent_tests;
+
 fn stores_guard() -> MutexGuard<'static, HashMap<String, Arc<InMemoryThreadStore>>> {
     match stores().lock() {
         Ok(guard) => guard,
@@ -397,6 +402,7 @@ struct InMemoryThreadStoreState {
     metadata_updates: HashMap<ThreadId, ThreadMetadataPatch>,
     names: HashMap<ThreadId, Option<String>>,
     rollout_paths: HashMap<PathBuf, ThreadId>,
+    hosted_agent_runtimes: HashMap<ThreadId, HostedAgentRuntimeRecord>,
 }
 
 impl InMemoryThreadStore {
@@ -608,6 +614,7 @@ impl InMemoryThreadStore {
         state.created_threads.remove(&params.thread_id);
         state.names.remove(&params.thread_id);
         state.metadata_updates.remove(&params.thread_id);
+        state.hosted_agent_runtimes.remove(&params.thread_id);
         state
             .rollout_paths
             .retain(|_, thread_id| *thread_id != params.thread_id);
@@ -662,6 +669,34 @@ impl ThreadStore for InMemoryThreadStore {
     fn discard_thread(&self, _thread_id: ThreadId) -> ThreadStoreFuture<'_, ()> {
         Box::pin(async move {
             self.state.lock().await.calls.discard_thread += 1;
+            Ok(())
+        })
+    }
+
+    fn get_hosted_agent_runtime(
+        &self,
+        thread_id: ThreadId,
+    ) -> ThreadStoreFuture<'_, Option<HostedAgentRuntimeRecord>> {
+        Box::pin(async move {
+            let state = self.state.lock().await;
+            if !state.histories.contains_key(&thread_id) {
+                return Err(ThreadStoreError::ThreadNotFound { thread_id });
+            }
+            Ok(state.hosted_agent_runtimes.get(&thread_id).cloned())
+        })
+    }
+
+    fn set_hosted_agent_runtime(
+        &self,
+        thread_id: ThreadId,
+        record: HostedAgentRuntimeRecord,
+    ) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async move {
+            let mut state = self.state.lock().await;
+            if !state.histories.contains_key(&thread_id) {
+                return Err(ThreadStoreError::ThreadNotFound { thread_id });
+            }
+            state.hosted_agent_runtimes.insert(thread_id, record);
             Ok(())
         })
     }

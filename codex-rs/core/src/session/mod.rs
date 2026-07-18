@@ -41,6 +41,7 @@ use crate::parse_turn_item;
 use crate::realtime_conversation::RealtimeConversationManager;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnEnvironment;
+use crate::session_prefix::append_hosted_patch_metadata;
 use crate::session_prefix::format_inter_agent_completion_message;
 use crate::skills::SkillRenderSideEffects;
 use crate::skills_load_input_from_config;
@@ -403,6 +404,7 @@ pub(crate) struct SessionIo {
 pub(crate) type SessionLoopTermination = Shared<BoxFuture<'static, ()>>;
 
 pub(crate) struct SessionSpawnArgs {
+    pub(crate) thread_id: ThreadId,
     pub(crate) config: Config,
     pub(crate) allow_provider_model_fallback: bool,
     pub(crate) user_instructions: LoadedUserInstructions,
@@ -424,6 +426,8 @@ pub(crate) struct SessionSpawnArgs {
     pub(crate) originator: String,
     pub(crate) agent_control: AgentControl,
     pub(crate) dynamic_tools: Vec<DynamicToolSpec>,
+    pub(crate) hosted_tool_authorization:
+        Option<crate::hosted_agent_runtime::HostedToolAuthorization>,
     pub(crate) metrics_service_name: Option<String>,
     pub(crate) inherited_exec_policy: Option<Arc<ExecPolicyManager>>,
     pub(crate) inherited_environments: Option<TurnEnvironmentSnapshot>,
@@ -495,6 +499,7 @@ impl Session {
 
     async fn spawn_internal(args: SessionSpawnArgs) -> CodexResult<(Arc<Self>, SessionIo)> {
         let SessionSpawnArgs {
+            thread_id,
             mut config,
             allow_provider_model_fallback,
             user_instructions,
@@ -516,6 +521,7 @@ impl Session {
             originator,
             agent_control,
             dynamic_tools,
+            hosted_tool_authorization,
             metrics_service_name,
             user_shell_override,
             inherited_exec_policy,
@@ -666,6 +672,7 @@ impl Session {
             thread_source,
             originator,
             dynamic_tools,
+            hosted_tool_authorization,
             user_shell_override,
         };
 
@@ -674,6 +681,7 @@ impl Session {
         let (agent_status_tx, agent_status_rx) = watch::channel(AgentStatus::PendingInit);
 
         let session = Box::pin(Session::new(
+            thread_id,
             session_configuration,
             config.clone(),
             user_instructions,
@@ -1728,8 +1736,55 @@ impl Session {
     }
 
     /// Persist the event to rollout and send it to clients.
-    pub(crate) async fn send_event(&self, turn_context: &TurnContext, msg: EventMsg) {
+    pub(crate) async fn send_event(&self, turn_context: &TurnContext, mut msg: EventMsg) {
+        let mut hosted_runtime_finalized = false;
+        if let EventMsg::TurnComplete(event) = &mut msg
+            && event.error.is_none()
+            && let Some(owner_thread_id) = turn_context.parent_thread_id
+        {
+            match self
+                .services
+                .agent_control
+                .finalize_hosted_runtime(self.thread_id, owner_thread_id)
+                .await
+            {
+                Ok(Some(artifact)) => {
+                    append_hosted_patch_metadata(&mut event.last_agent_message, &artifact);
+                    hosted_runtime_finalized = true;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let error = ErrorEvent {
+                        message: format!("failed to finalize hosted agent: {error}"),
+                        codex_error_info: None,
+                    };
+                    self.send_event_after_hosted_finalization(
+                        turn_context,
+                        EventMsg::Error(error.clone()),
+                        /*hosted_runtime_finalized*/ false,
+                    )
+                    .await;
+                    event.error = Some(error);
+                }
+            }
+        }
+        self.send_event_after_hosted_finalization(turn_context, msg, hosted_runtime_finalized)
+            .await;
+    }
+
+    async fn send_event_after_hosted_finalization(
+        &self,
+        turn_context: &TurnContext,
+        msg: EventMsg,
+        hosted_runtime_finalized: bool,
+    ) {
         let legacy_source = msg.clone();
+        let completed_turn_id = match &legacy_source {
+            EventMsg::TurnComplete(event) if event.error.is_none() && !hosted_runtime_finalized => {
+                Some(event.turn_id.as_str())
+            }
+            _ => None,
+        };
         if let EventMsg::Error(error) = &legacy_source
             && error
                 .codex_error_info
@@ -1753,6 +1808,20 @@ impl Session {
             msg,
         };
         self.send_event_raw(event).await;
+        if let Some(turn_id) = completed_turn_id
+            && let Err(error) = self
+                .services
+                .agent_control
+                .checkpoint_hosted_runtime(self.thread_id, turn_id)
+                .await
+        {
+            warn!(
+                %error,
+                thread_id = %self.thread_id,
+                %turn_id,
+                "failed to checkpoint hosted runtime after completed turn"
+            );
+        }
         self.maybe_notify_parent_of_terminal_turn(turn_context, &legacy_source)
             .await;
         self.maybe_mirror_event_text_to_realtime(&legacy_source)

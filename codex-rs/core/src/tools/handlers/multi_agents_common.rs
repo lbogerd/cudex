@@ -165,11 +165,10 @@ pub(crate) fn parse_collab_input(
 
 /// Builds the base config snapshot for a newly spawned sub-agent.
 ///
-/// The returned config starts from the parent's effective config and then refreshes the
-/// runtime-owned fields carried on `turn`, including model selection, reasoning settings,
-/// approval policy, sandbox, and cwd. Role-specific overrides are layered after this step;
-/// skipping this helper and cloning stale config state directly can send the child agent out with
-/// the wrong provider or runtime policy.
+/// The returned config starts from the parent's effective config and then refreshes model and
+/// reasoning settings carried on `turn`. Non-hosted children also retain the legacy runtime
+/// inheritance behavior for approval policy, sandboxing, and cwd. Hosted children receive those
+/// values from their provisioned runtime instead.
 pub(crate) fn build_agent_spawn_config(
     base_instructions: &BaseInstructions,
     turn: &TurnContext,
@@ -197,7 +196,7 @@ fn build_agent_shared_config(turn: &TurnContext) -> Result<Config, FunctionCallE
         .or_else(|| turn.model_info.default_reasoning_level.clone());
     config.model_reasoning_summary = Some(turn.reasoning_summary);
     config.developer_instructions = turn.developer_instructions.clone();
-    apply_spawn_agent_runtime_overrides(&mut config, turn)?;
+    apply_non_hosted_spawn_agent_runtime_overrides(&mut config, turn)?;
 
     Ok(config)
 }
@@ -213,14 +212,17 @@ pub(crate) fn reject_full_fork_agent_type_override(
     Ok(())
 }
 
-/// Copies runtime-only turn state onto a child config before it is handed to `AgentControl`.
+/// Preserves legacy runtime inheritance for children that execute in the owner's runtime.
 ///
-/// These values are chosen by the live turn rather than persisted config, so leaving them stale
-/// can make a child agent disagree with its parent about approval policy, cwd, or sandboxing.
-pub(crate) fn apply_spawn_agent_runtime_overrides(
+/// Hosted children are provisioned independently, so owner cwd, approval, and permission state
+/// must not be copied into their config.
+pub(crate) fn apply_non_hosted_spawn_agent_runtime_overrides(
     config: &mut Config,
     turn: &TurnContext,
 ) -> Result<(), FunctionCallError> {
+    if config.hosted_agents.enabled {
+        return Ok(());
+    }
     config
         .permissions
         .approval_policy

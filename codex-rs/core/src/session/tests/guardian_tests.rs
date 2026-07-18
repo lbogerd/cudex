@@ -725,6 +725,7 @@ async fn guardian_subagent_does_not_inherit_parent_exec_policy_rules() {
     ));
 
     let (session, io) = Session::spawn(SessionSpawnArgs {
+        thread_id: ThreadId::new(),
         config,
         allow_provider_model_fallback: false,
         user_instructions: Default::default(),
@@ -748,6 +749,7 @@ async fn guardian_subagent_does_not_inherit_parent_exec_policy_rules() {
         originator: "test_originator".to_string(),
         agent_control: AgentControl::default(),
         dynamic_tools: Vec::new(),
+        hosted_tool_authorization: None,
         metrics_service_name: None,
         inherited_environments: None,
         inherited_exec_policy: Some(Arc::new(parent_exec_policy)),

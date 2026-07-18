@@ -83,6 +83,59 @@ async fn post_tool_use_payload_uses_patch_input_and_tool_output() {
     );
 }
 
+#[tokio::test]
+async fn hosted_permission_denials_during_verification_use_the_stable_diagnostic() {
+    let (_, mut turn) = make_session_and_context().await;
+    turn.hosted_tool_authorization =
+        Some(crate::hosted_agent_runtime::HostedToolAuthorization::new(
+            "hosted-environment".to_string(),
+            codex_hosted_agent::AgentToolPolicy::default(),
+        ));
+    let error = codex_apply_patch::ApplyPatchError::from(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "service-specific denial details",
+    ));
+
+    assert_eq!(
+        apply_patch_verification_error(&turn, error),
+        FunctionCallError::RespondToModel(
+            crate::hosted_agent_runtime::HOSTED_EXTERNAL_SANDBOX_DENIAL_MESSAGE.to_string()
+        )
+    );
+}
+
+#[tokio::test]
+async fn non_hosted_permission_denials_keep_the_existing_verification_context() {
+    let (_, turn) = make_session_and_context().await;
+    let error = codex_apply_patch::ApplyPatchError::from(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "filesystem denial details",
+    ));
+
+    assert_eq!(
+        apply_patch_verification_error(&turn, error),
+        FunctionCallError::RespondToModel(
+            "apply_patch verification failed: I/O error: filesystem denial details".to_string()
+        )
+    );
+}
+
+#[tokio::test]
+async fn hosted_runtime_denials_are_identified_for_final_normalization() {
+    let (_, mut turn) = make_session_and_context().await;
+    turn.hosted_tool_authorization =
+        Some(crate::hosted_agent_runtime::HostedToolAuthorization::new(
+            "hosted-environment".to_string(),
+            codex_hosted_agent::AgentToolPolicy::default(),
+        ));
+    let out = Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied {
+        output: Box::default(),
+        network_policy_decision: None,
+    })));
+
+    assert!(is_hosted_apply_patch_denial(&turn, &out));
+}
+
 #[test]
 fn diff_consumer_streams_apply_patch_changes() {
     let mut consumer = ApplyPatchArgumentDiffConsumer::default();

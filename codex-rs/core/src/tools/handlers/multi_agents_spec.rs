@@ -244,6 +244,37 @@ pub fn create_followup_task_tool() -> ToolSpec {
     })
 }
 
+pub fn create_apply_agent_patch_tool() -> ToolSpec {
+    let properties = BTreeMap::from([
+        (
+            "agent_id".to_string(),
+            JsonSchema::string(Some(
+                "Hosted descendant agent that produced the patch artifact.".to_string(),
+            )),
+        ),
+        (
+            "artifact_id".to_string(),
+            JsonSchema::string(Some(
+                "Patch artifact id reported when the hosted agent completed.".to_string(),
+            )),
+        ),
+    ]);
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "apply_agent_patch".to_string(),
+        description: "Atomically apply a completed hosted descendant's patch to your current sandbox. Conflicts leave your sandbox unchanged."
+            .to_string(),
+        strict: false,
+        defer_loading: None,
+        parameters: JsonSchema::object(
+            properties,
+            Some(vec!["agent_id".to_string(), "artifact_id".to_string()]),
+            Some(false.into()),
+        ),
+        output_schema: None,
+    })
+}
+
 pub fn create_resume_agent_tool() -> ToolSpec {
     let properties = BTreeMap::from([(
         "id".to_string(),

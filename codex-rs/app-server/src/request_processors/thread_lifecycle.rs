@@ -409,6 +409,13 @@ pub(super) async fn unload_thread_without_subscribers(
 ) {
     info!("thread {thread_id} has no subscribers and is idle; shutting down");
 
+    // Releasing an active hosted lease is terminal. Keep idle hosted threads resident so a later
+    // subscriber can safely reuse the same runtime generation.
+    if thread_manager.has_hosted_runtime(thread_id).await {
+        pending_thread_unloads.lock().await.remove(&thread_id);
+        return;
+    }
+
     // Any pending app-server -> client requests for this thread can no longer be
     // answered; cancel their callbacks before shutdown/unload.
     outgoing

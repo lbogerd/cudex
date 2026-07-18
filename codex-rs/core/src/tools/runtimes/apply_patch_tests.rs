@@ -1,4 +1,5 @@
 use super::*;
+use crate::session::tests::make_session_and_context;
 use crate::tools::sandboxing::SandboxAttempt;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::AdditionalPermissionProfile;
@@ -47,6 +48,28 @@ fn wants_no_sandbox_approval_granular_respects_sandbox_flag() {
             mcp_elicitations: true,
         }))
     );
+}
+
+#[tokio::test]
+async fn only_hosted_permission_denials_are_external_sandbox_denials() {
+    let (_, mut turn) = make_session_and_context().await;
+    let denied = codex_apply_patch::ApplyPatchError::from(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "service-specific denial details",
+    ));
+
+    assert!(!is_hosted_file_system_denial(&turn, &denied));
+
+    turn.hosted_tool_authorization =
+        Some(crate::hosted_agent_runtime::HostedToolAuthorization::new(
+            "hosted-environment".to_string(),
+            codex_hosted_agent::AgentToolPolicy::default(),
+        ));
+    assert!(is_hosted_file_system_denial(&turn, &denied));
+
+    let other_error =
+        codex_apply_patch::ApplyPatchError::from(std::io::Error::other("unrelated failure"));
+    assert!(!is_hosted_file_system_denial(&turn, &other_error));
 }
 
 #[tokio::test]

@@ -1,4 +1,5 @@
 use super::*;
+use crate::codex_thread::CodexThreadSettingsOverrides;
 use crate::config::test_config;
 use crate::init_state_db;
 use crate::installation_id::INSTALLATION_ID_FILENAME;
@@ -9,6 +10,7 @@ use crate::session::tests::make_session_and_context;
 use crate::tasks::InterruptedTurnHistoryMarker;
 use crate::tasks::interrupted_turn_history_marker;
 use codex_extension_api::empty_extension_registry;
+use codex_hosted_agent::HostedAgentService;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_protocol::ResponseItemId;
 use codex_protocol::capabilities::CapabilityRootLocation;
@@ -25,6 +27,9 @@ use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadSource;
+use codex_protocol::protocol::TurnAbortReason;
+use codex_protocol::protocol::TurnAbortedEvent;
+use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::UserMessageEvent;
 use codex_utils_path_uri::PathUri;
@@ -34,6 +39,7 @@ use core_test_support::responses::mount_models_once;
 use pretty_assertions::assert_eq;
 use std::time::Duration;
 use tempfile::tempdir;
+use tokio_util::sync::CancellationToken;
 use wiremock::MockServer;
 
 const TEST_INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
@@ -112,6 +118,1845 @@ fn contextual_user_interrupted_marker() -> ResponseItem {
 fn developer_interrupted_marker() -> ResponseItem {
     interrupted_turn_history_marker(InterruptedTurnHistoryMarker::Developer)
         .expect("developer interrupted marker should be enabled")
+}
+
+fn start_thread_options(config: Config) -> StartThreadOptions {
+    StartThreadOptions {
+        config,
+        allow_provider_model_fallback: false,
+        initial_history: InitialHistory::New,
+        history_mode: None,
+        session_source: None,
+        thread_source: None,
+        dynamic_tools: Vec::new(),
+        metrics_service_name: None,
+        parent_trace: None,
+        environments: Vec::new(),
+        thread_extension_init: ExtensionDataInit::default(),
+        supports_openai_form_elicitation: false,
+    }
+}
+
+async fn hosted_thread_manager_for_tests() -> (
+    tempfile::TempDir,
+    Config,
+    ThreadManager,
+    Arc<codex_hosted_agent::FakeHostedAgentService>,
+) {
+    hosted_thread_manager_with_durable_store_for_tests(/*durable_store*/ true).await
+}
+
+async fn hosted_thread_manager_with_durable_store_for_tests(
+    durable_store: bool,
+) -> (
+    tempfile::TempDir,
+    Config,
+    ThreadManager,
+    Arc<codex_hosted_agent::FakeHostedAgentService>,
+) {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = temp_dir.path().join("workspace").abs();
+    config.workspace_roots = vec![config.cwd.clone()];
+    config.hosted_agents = crate::config::HostedAgentsConfig {
+        enabled: true,
+        service_url: Some("https://hosted.invalid".to_string()),
+        default_agent_type: "default".to_string(),
+    };
+    config.agent_roles.insert(
+        "default".to_string(),
+        crate::config::AgentRoleConfig {
+            description: Some("Hosted test agent".to_string()),
+            sandbox_template: Some("general-v1".to_string()),
+            ..Default::default()
+        },
+    );
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+    std::fs::create_dir_all(&config.cwd).expect("create workspace");
+
+    let environment_manager = Arc::new(EnvironmentManager::without_environments());
+    let mut manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::clone(&environment_manager),
+    );
+    let hosted_service = Arc::new(codex_hosted_agent::FakeHostedAgentService::default());
+    let provisioner = Arc::new(HostedAgentProvisioner::new(
+        Arc::clone(&hosted_service),
+        environment_manager,
+    ));
+    let manager_state =
+        Arc::get_mut(&mut manager.state).expect("new thread manager state must be unshared");
+    manager_state.hosted_agent_provisioner = Ok(Some(provisioner));
+    if durable_store {
+        let state_db = codex_state::StateRuntime::init(
+            config.sqlite_home.clone(),
+            config.model_provider_id.clone(),
+        )
+        .await
+        .expect("state db should initialize");
+        manager_state.thread_store = Arc::new(LocalThreadStore::new(
+            LocalThreadStoreConfig::from_config(&config),
+            Some(state_db),
+        ));
+    }
+
+    (temp_dir, config, manager, hosted_service)
+}
+
+fn hosted_provision_request(
+    service: &codex_hosted_agent::FakeHostedAgentService,
+    thread_id: ThreadId,
+) -> codex_hosted_agent::AgentProvisionRequest {
+    service
+        .provision_request(&format!("hosted-agent:{thread_id}:provision"))
+        .expect("hosted provision request")
+}
+
+async fn start_hosted_owned_agent(
+    manager: &ThreadManager,
+    config: &Config,
+) -> (NewThread, NewThread) {
+    let owner = manager
+        .start_thread_with_options(start_thread_options(config.clone()))
+        .await
+        .expect("start hosted owner");
+    let agent = manager
+        .spawn_subagent(owner.thread_id, start_thread_options(config.clone()))
+        .await
+        .expect("spawn hosted owned agent");
+    (owner, agent)
+}
+
+async fn grant_hosted_patch_application(manager: &ThreadManager, thread_id: ThreadId) {
+    let runtime = manager
+        .state
+        .hosted_agent_runtimes
+        .read()
+        .await
+        .get(&thread_id)
+        .cloned()
+        .expect("hosted runtime");
+    let mut value = runtime.snapshot();
+    value
+        .tool_policy
+        .allowed_domains
+        .insert(codex_tools::ToolExecutionDomainKind::ControlPlane);
+    value
+        .tool_policy
+        .allowed_tools
+        .insert(codex_tools::ToolName::plain(
+            crate::thread_manager::hosted_agent_patch_apply::HOSTED_AGENT_PATCH_APPLY_TOOL_NAME,
+        ));
+    runtime.replace(value);
+}
+
+#[tokio::test]
+async fn hosted_runtime_is_durable_and_checkpoints_only_successful_turns() {
+    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
+    let root = manager
+        .start_thread_with_options(start_thread_options(config))
+        .await
+        .expect("start hosted root");
+    let request = hosted_provision_request(&hosted_service, root.thread_id);
+    let lease_id = hosted_service
+        .provisioned_lease_id(&request.idempotency_key)
+        .expect("hosted lease");
+    let initial_record = manager
+        .state
+        .thread_store
+        .get_hosted_agent_runtime(root.thread_id)
+        .await
+        .expect("read initial hosted runtime")
+        .expect("initial hosted runtime record");
+    assert_eq!(
+        initial_record,
+        codex_hosted_agent::HostedAgentRuntimeRecord {
+            owner_agent_id: request.owner_agent_id,
+            agent_type: request.agent_type,
+            sandbox_template: request.sandbox_template,
+            lease_id: lease_id.clone(),
+            environment_id: hosted_service.provisioned_environment_ids()[0].clone(),
+            base_snapshot_id: initial_record.base_snapshot_id.clone(),
+            latest_snapshot_id: Some(initial_record.base_snapshot_id.clone()),
+            last_exported_patch: None,
+            lifecycle_state: codex_hosted_agent::HostedAgentLifecycleState::Active,
+        }
+    );
+
+    hosted_service.set_checkpoint_failure(Some(codex_hosted_agent::HostedAgentError::new(
+        codex_hosted_agent::HostedAgentErrorCategory::Unavailable,
+        "checkpoint unavailable",
+    )));
+    let failed_turn = root
+        .thread
+        .session
+        .new_default_turn_with_sub_id("failed-checkpoint-turn".to_string())
+        .await;
+    root.thread
+        .session
+        .send_event(
+            &failed_turn,
+            EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: failed_turn.sub_id.clone(),
+                last_agent_message: Some("done".to_string()),
+                error: None,
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            }),
+        )
+        .await;
+    assert_eq!(
+        manager
+            .state
+            .thread_store
+            .get_hosted_agent_runtime(root.thread_id)
+            .await
+            .expect("read hosted runtime after failed checkpoint"),
+        Some(initial_record.clone())
+    );
+
+    hosted_service.set_checkpoint_failure(None);
+    let completed_turn = root
+        .thread
+        .session
+        .new_default_turn_with_sub_id("completed-turn".to_string())
+        .await;
+    root.thread
+        .session
+        .send_event(
+            &completed_turn,
+            EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: completed_turn.sub_id.clone(),
+                last_agent_message: Some("done".to_string()),
+                error: None,
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            }),
+        )
+        .await;
+    let checkpointed_record = manager
+        .state
+        .thread_store
+        .get_hosted_agent_runtime(root.thread_id)
+        .await
+        .expect("read checkpointed hosted runtime")
+        .expect("checkpointed hosted runtime record");
+    assert_eq!(
+        checkpointed_record.latest_snapshot_id,
+        hosted_service.latest_snapshot_id(&lease_id)
+    );
+    assert_ne!(checkpointed_record, initial_record);
+
+    let aborted_turn = root
+        .thread
+        .session
+        .new_default_turn_with_sub_id("aborted-turn".to_string())
+        .await;
+    root.thread
+        .session
+        .send_event(
+            &aborted_turn,
+            EventMsg::TurnAborted(TurnAbortedEvent {
+                turn_id: Some(aborted_turn.sub_id.clone()),
+                reason: TurnAbortReason::Interrupted,
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
+            }),
+        )
+        .await;
+    assert_eq!(
+        manager
+            .state
+            .thread_store
+            .get_hosted_agent_runtime(root.thread_id)
+            .await
+            .expect("read hosted runtime after aborted turn"),
+        Some(checkpointed_record)
+    );
+
+    let report = manager
+        .shutdown_all_threads_bounded(Duration::from_secs(10))
+        .await;
+    assert_eq!(report.completed, vec![root.thread_id]);
+}
+
+#[tokio::test]
+async fn hosted_finalization_persists_patch_notifies_owner_and_releases() {
+    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
+    let mut patch_available = manager.subscribe_hosted_agent_patch_available();
+    let (owner, agent) = start_hosted_owned_agent(&manager, &config).await;
+    let owner_thread_id = owner.thread_id;
+    let request = hosted_provision_request(&hosted_service, agent.thread_id);
+    let lease_id = hosted_service
+        .provisioned_lease_id(&request.idempotency_key)
+        .expect("hosted lease");
+    let initial_record = manager
+        .state
+        .thread_store
+        .get_hosted_agent_runtime(agent.thread_id)
+        .await
+        .expect("read initial agent runtime")
+        .expect("initial agent runtime record");
+    assert_eq!(initial_record.owner_agent_id, Some(owner_thread_id));
+    let environment_id = initial_record.environment_id.clone();
+
+    let error = manager
+        .state
+        .finalize_hosted_runtime(agent.thread_id, ThreadId::new())
+        .await
+        .expect_err("non-owner must not finalize hosted agent");
+    assert!(error.to_string().contains("does not own hosted agent"));
+    assert_eq!(
+        manager
+            .state
+            .thread_store
+            .get_hosted_agent_runtime(agent.thread_id)
+            .await
+            .expect("read runtime after unauthorized finalization"),
+        Some(initial_record)
+    );
+
+    let artifact = manager
+        .state
+        .finalize_hosted_runtime(agent.thread_id, owner_thread_id)
+        .await
+        .expect("finalize hosted agent")
+        .expect("hosted patch artifact");
+    assert_eq!(
+        patch_available.recv().await.expect("patch notification"),
+        HostedAgentPatchAvailable {
+            owner_thread_id,
+            artifact: artifact.clone(),
+        }
+    );
+    let record = manager
+        .state
+        .thread_store
+        .get_hosted_agent_runtime(agent.thread_id)
+        .await
+        .expect("read finalized runtime")
+        .expect("finalized runtime record");
+    assert_eq!(record.last_exported_patch, Some(artifact));
+    assert_eq!(
+        record.lifecycle_state,
+        codex_hosted_agent::HostedAgentLifecycleState::Released
+    );
+    assert_eq!(
+        record.latest_snapshot_id,
+        hosted_service.latest_snapshot_id(&lease_id)
+    );
+    assert_eq!(hosted_service.active_lease_count(), 1);
+    assert!(
+        manager
+            .state
+            .environment_manager
+            .get_environment(&environment_id)
+            .is_none()
+    );
+
+    let report = manager
+        .shutdown_all_threads_bounded(Duration::from_secs(10))
+        .await;
+    assert_eq!(report.completed.len(), 2);
+}
+
+#[tokio::test]
+async fn hosted_patch_apply_persists_checkpoint_and_retry_is_idempotent() {
+    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
+    let (owner, agent) = start_hosted_owned_agent(&manager, &config).await;
+    let artifact = manager
+        .state
+        .finalize_hosted_runtime(agent.thread_id, owner.thread_id)
+        .await
+        .expect("finalize hosted agent")
+        .expect("hosted patch artifact");
+    grant_hosted_patch_application(&manager, owner.thread_id).await;
+    let initial_record = manager
+        .state
+        .thread_store
+        .get_hosted_agent_runtime(owner.thread_id)
+        .await
+        .expect("read owner runtime")
+        .expect("owner runtime record");
+
+    assert_eq!(
+        manager
+            .apply_hosted_agent_patch(owner.thread_id, agent.thread_id, &artifact.artifact_id,)
+            .await
+            .expect("apply hosted patch"),
+        HostedAgentPatchApplyResult::Applied
+    );
+    let applied_record = manager
+        .state
+        .thread_store
+        .get_hosted_agent_runtime(owner.thread_id)
+        .await
+        .expect("read applied owner runtime")
+        .expect("applied owner runtime record");
+    assert_ne!(
+        applied_record.latest_snapshot_id,
+        initial_record.latest_snapshot_id
+    );
+    assert_eq!(
+        applied_record.latest_snapshot_id,
+        hosted_service.latest_snapshot_id(&applied_record.lease_id)
+    );
+    assert_eq!(
+        manager
+            .state
+            .hosted_agent_runtimes
+            .read()
+            .await
+            .get(&owner.thread_id)
+            .expect("owner runtime")
+            .snapshot()
+            .latest_snapshot_id,
+        applied_record.latest_snapshot_id
+    );
+
+    assert_eq!(
+        manager
+            .apply_hosted_agent_patch(owner.thread_id, agent.thread_id, &artifact.artifact_id,)
+            .await
+            .expect("retry hosted patch"),
+        HostedAgentPatchApplyResult::Applied
+    );
+    assert_eq!(
+        manager
+            .state
+            .thread_store
+            .get_hosted_agent_runtime(owner.thread_id)
+            .await
+            .expect("read retried owner runtime"),
+        Some(applied_record)
+    );
+}
+
+#[tokio::test]
+async fn hosted_patch_apply_conflict_leaves_owner_unchanged() {
+    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
+    let (owner, agent) = start_hosted_owned_agent(&manager, &config).await;
+    let artifact = manager
+        .state
+        .finalize_hosted_runtime(agent.thread_id, owner.thread_id)
+        .await
+        .expect("finalize hosted agent")
+        .expect("hosted patch artifact");
+    grant_hosted_patch_application(&manager, owner.thread_id).await;
+    let conflict_path = PathUri::parse("file:///workspace/conflicted.rs").expect("conflict path");
+    hosted_service.set_patch_conflict(&artifact.artifact_id, vec![conflict_path.clone()]);
+    let initial_record = manager
+        .state
+        .thread_store
+        .get_hosted_agent_runtime(owner.thread_id)
+        .await
+        .expect("read owner runtime")
+        .expect("owner runtime record");
+
+    assert_eq!(
+        manager
+            .apply_hosted_agent_patch(owner.thread_id, agent.thread_id, &artifact.artifact_id,)
+            .await
+            .expect("apply conflicting hosted patch"),
+        HostedAgentPatchApplyResult::Conflict {
+            paths: vec![conflict_path],
+        }
+    );
+    assert_eq!(
+        manager
+            .state
+            .thread_store
+            .get_hosted_agent_runtime(owner.thread_id)
+            .await
+            .expect("read owner runtime after conflict"),
+        Some(initial_record)
+    );
+}
+
+#[tokio::test]
+async fn hosted_patch_apply_rejects_missing_policy_stale_artifact_and_non_owner() {
+    let (_temp_dir, config, manager, _hosted_service) = hosted_thread_manager_for_tests().await;
+    let (owner, agent) = start_hosted_owned_agent(&manager, &config).await;
+    let artifact = manager
+        .state
+        .finalize_hosted_runtime(agent.thread_id, owner.thread_id)
+        .await
+        .expect("finalize hosted agent")
+        .expect("hosted patch artifact");
+    let owner_before = manager
+        .state
+        .thread_store
+        .get_hosted_agent_runtime(owner.thread_id)
+        .await
+        .expect("read owner runtime")
+        .expect("owner runtime record");
+
+    assert!(matches!(
+        manager
+            .apply_hosted_agent_patch(owner.thread_id, agent.thread_id, &artifact.artifact_id,)
+            .await
+            .expect("policy rejection"),
+        HostedAgentPatchApplyResult::Rejected { .. }
+    ));
+
+    grant_hosted_patch_application(&manager, owner.thread_id).await;
+    assert!(matches!(
+        manager
+            .apply_hosted_agent_patch(owner.thread_id, agent.thread_id, "stale-artifact")
+            .await
+            .expect("stale artifact rejection"),
+        HostedAgentPatchApplyResult::Rejected { .. }
+    ));
+
+    let unrelated_owner = manager
+        .start_thread_with_options(start_thread_options(config))
+        .await
+        .expect("start unrelated hosted owner");
+    grant_hosted_patch_application(&manager, unrelated_owner.thread_id).await;
+    assert!(matches!(
+        manager
+            .apply_hosted_agent_patch(
+                unrelated_owner.thread_id,
+                agent.thread_id,
+                &artifact.artifact_id,
+            )
+            .await
+            .expect("ownership rejection"),
+        HostedAgentPatchApplyResult::Rejected { .. }
+    ));
+    assert_eq!(
+        manager
+            .state
+            .thread_store
+            .get_hosted_agent_runtime(owner.thread_id)
+            .await
+            .expect("read unchanged owner runtime"),
+        Some(owner_before)
+    );
+}
+
+#[tokio::test]
+async fn finalized_hosted_agent_rejects_followup_turns() {
+    let (_temp_dir, config, manager, _hosted_service) = hosted_thread_manager_for_tests().await;
+    let (owner, agent) = start_hosted_owned_agent(&manager, &config).await;
+    manager
+        .state
+        .finalize_hosted_runtime(agent.thread_id, owner.thread_id)
+        .await
+        .expect("finalize hosted agent")
+        .expect("hosted patch artifact");
+
+    manager
+        .state
+        .ensure_hosted_runtime_active(owner.thread_id)
+        .await
+        .expect("active hosted owner can start another turn");
+    let error = manager
+        .state
+        .ensure_hosted_runtime_active(agent.thread_id)
+        .await
+        .expect_err("finalized hosted agent must reject a followup turn");
+    assert!(error.to_string().contains("spawn a new agent instead"));
+}
+
+#[tokio::test]
+async fn hosted_finalization_checkpoint_failure_preserves_pending_lease() {
+    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
+    let mut patch_available = manager.subscribe_hosted_agent_patch_available();
+    let (owner, agent) = start_hosted_owned_agent(&manager, &config).await;
+    hosted_service.set_checkpoint_failure(Some(codex_hosted_agent::HostedAgentError::new(
+        codex_hosted_agent::HostedAgentErrorCategory::Unavailable,
+        "checkpoint unavailable",
+    )));
+
+    let error = manager
+        .state
+        .finalize_hosted_runtime(agent.thread_id, owner.thread_id)
+        .await
+        .expect_err("failed checkpoint must keep completion pending");
+    assert!(
+        error
+            .to_string()
+            .contains("failed to checkpoint hosted-agent lease")
+    );
+    let record = manager
+        .state
+        .thread_store
+        .get_hosted_agent_runtime(agent.thread_id)
+        .await
+        .expect("read pending runtime")
+        .expect("pending runtime record");
+    assert_eq!(
+        record.lifecycle_state,
+        codex_hosted_agent::HostedAgentLifecycleState::PendingFinalization
+    );
+    assert_eq!(record.last_exported_patch, None);
+    assert_eq!(hosted_service.active_lease_count(), 2);
+    assert!(matches!(
+        patch_available.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+
+    let report = manager
+        .shutdown_all_threads_bounded(Duration::from_secs(10))
+        .await;
+    assert_eq!(report.completed.len(), 2);
+    assert_eq!(hosted_service.active_lease_count(), 1);
+}
+
+#[tokio::test]
+async fn hosted_finalization_export_failure_persists_checkpoint_and_preserves_lease() {
+    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
+    let mut patch_available = manager.subscribe_hosted_agent_patch_available();
+    let (owner, agent) = start_hosted_owned_agent(&manager, &config).await;
+    let request = hosted_provision_request(&hosted_service, agent.thread_id);
+    let lease_id = hosted_service
+        .provisioned_lease_id(&request.idempotency_key)
+        .expect("hosted lease");
+    hosted_service.set_export_failure(Some(codex_hosted_agent::HostedAgentError::new(
+        codex_hosted_agent::HostedAgentErrorCategory::Unavailable,
+        "export unavailable",
+    )));
+
+    let error = manager
+        .state
+        .finalize_hosted_runtime(agent.thread_id, owner.thread_id)
+        .await
+        .expect_err("failed export must keep completion pending");
+    assert!(
+        error
+            .to_string()
+            .contains("failed to export hosted-agent patch")
+    );
+    let record = manager
+        .state
+        .thread_store
+        .get_hosted_agent_runtime(agent.thread_id)
+        .await
+        .expect("read pending runtime")
+        .expect("pending runtime record");
+    assert_eq!(
+        record.lifecycle_state,
+        codex_hosted_agent::HostedAgentLifecycleState::PendingFinalization
+    );
+    assert_eq!(
+        record.latest_snapshot_id,
+        hosted_service.latest_snapshot_id(&lease_id)
+    );
+    assert_ne!(record.latest_snapshot_id, Some(record.base_snapshot_id));
+    assert_eq!(record.last_exported_patch, None);
+    assert_eq!(hosted_service.active_lease_count(), 2);
+    assert!(matches!(
+        patch_available.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+}
+
+#[tokio::test]
+async fn hosted_finalization_failure_persists_error_before_failed_completion() {
+    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
+    let (owner, agent) = start_hosted_owned_agent(&manager, &config).await;
+    hosted_service.set_export_failure(Some(codex_hosted_agent::HostedAgentError::new(
+        codex_hosted_agent::HostedAgentErrorCategory::Unavailable,
+        "export unavailable",
+    )));
+    let mut turn = agent
+        .thread
+        .session
+        .new_default_turn_with_sub_id("hosted-finalization-failure".to_string())
+        .await;
+    Arc::get_mut(&mut turn)
+        .expect("new turn context must be uniquely owned")
+        .parent_thread_id = Some(owner.thread_id);
+
+    agent
+        .thread
+        .session
+        .send_event(
+            &turn,
+            EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: turn.sub_id.clone(),
+                last_agent_message: Some("done".to_string()),
+                error: None,
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            }),
+        )
+        .await;
+    let mut terminal_events = Vec::new();
+    while terminal_events.len() < 2 {
+        let event = tokio::time::timeout(Duration::from_secs(5), agent.thread.next_event())
+            .await
+            .expect("timed out waiting for finalization events")
+            .expect("read finalization event");
+        match event.msg {
+            EventMsg::Error(error) if error.message.contains("failed to finalize hosted agent") => {
+                terminal_events.push(EventMsg::Error(error));
+            }
+            EventMsg::TurnComplete(event) if event.turn_id == turn.sub_id => {
+                terminal_events.push(EventMsg::TurnComplete(event));
+            }
+            _ => {}
+        }
+    }
+    let [EventMsg::Error(error), EventMsg::TurnComplete(completion)] = terminal_events.as_slice()
+    else {
+        panic!("expected Error followed by TurnComplete, got {terminal_events:?}");
+    };
+    assert_eq!(completion.error.as_ref(), Some(error));
+    assert!(matches!(
+        agent.thread.agent_status().await,
+        codex_protocol::protocol::AgentStatus::Errored(_)
+    ));
+}
+
+#[tokio::test]
+async fn hosted_finalization_release_failure_is_durable_and_cleanup_retries() {
+    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
+    let mut patch_available = manager.subscribe_hosted_agent_patch_available();
+    let (owner, agent) = start_hosted_owned_agent(&manager, &config).await;
+    hosted_service.set_release_failure(Some(codex_hosted_agent::HostedAgentError::new(
+        codex_hosted_agent::HostedAgentErrorCategory::Unavailable,
+        "release unavailable",
+    )));
+
+    let artifact = manager
+        .state
+        .finalize_hosted_runtime(agent.thread_id, owner.thread_id)
+        .await
+        .expect("durable artifact makes finalization successful")
+        .expect("hosted patch artifact");
+    assert_eq!(
+        patch_available
+            .recv()
+            .await
+            .expect("patch notification")
+            .artifact,
+        artifact
+    );
+    let record = manager
+        .state
+        .thread_store
+        .get_hosted_agent_runtime(agent.thread_id)
+        .await
+        .expect("read release-pending runtime")
+        .expect("release-pending runtime record");
+    assert_eq!(
+        record.lifecycle_state,
+        codex_hosted_agent::HostedAgentLifecycleState::ReleasePending
+    );
+    assert!(
+        manager
+            .hosted_runtime_cleanup_pending(agent.thread_id)
+            .await
+    );
+    assert_eq!(hosted_service.active_lease_count(), 2);
+
+    hosted_service.set_release_failure(None);
+    manager.retry_hosted_runtime_cleanup(agent.thread_id).await;
+    let record = manager
+        .state
+        .thread_store
+        .get_hosted_agent_runtime(agent.thread_id)
+        .await
+        .expect("read released runtime")
+        .expect("released runtime record");
+    assert_eq!(
+        record.lifecycle_state,
+        codex_hosted_agent::HostedAgentLifecycleState::Released
+    );
+    assert!(
+        !manager
+            .hosted_runtime_cleanup_pending(agent.thread_id)
+            .await
+    );
+    assert_eq!(hosted_service.active_lease_count(), 1);
+}
+
+#[tokio::test]
+async fn hosted_cleanup_retry_does_not_remove_an_active_runtime_generation() {
+    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
+    let root = manager
+        .start_thread_with_options(start_thread_options(config))
+        .await
+        .expect("start hosted root");
+
+    manager.retry_hosted_runtime_cleanup(root.thread_id).await;
+
+    assert!(manager.get_thread(root.thread_id).await.is_ok());
+    manager
+        .state
+        .ensure_hosted_runtime_active(root.thread_id)
+        .await
+        .expect("cleanup retry must preserve active generation");
+    assert_eq!(hosted_service.active_lease_count(), 1);
+}
+
+#[tokio::test]
+async fn removing_pending_finalization_retries_before_releasing_the_runtime() {
+    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
+    let (owner, agent) = start_hosted_owned_agent(&manager, &config).await;
+    hosted_service.set_checkpoint_failure(Some(codex_hosted_agent::HostedAgentError::new(
+        codex_hosted_agent::HostedAgentErrorCategory::Unavailable,
+        "checkpoint unavailable",
+    )));
+    manager
+        .state
+        .finalize_hosted_runtime(agent.thread_id, owner.thread_id)
+        .await
+        .expect_err("initial finalization must remain pending");
+    agent
+        .thread
+        .shutdown_and_wait()
+        .await
+        .expect("stop pending hosted agent");
+    let mut patch_available = manager.subscribe_hosted_agent_patch_available();
+
+    assert!(manager.remove_thread(&agent.thread_id).await.is_some());
+    let still_pending_record = manager
+        .state
+        .thread_store
+        .get_hosted_agent_runtime(agent.thread_id)
+        .await
+        .expect("read still-pending runtime")
+        .expect("still-pending runtime record");
+    assert_eq!(
+        still_pending_record.lifecycle_state,
+        codex_hosted_agent::HostedAgentLifecycleState::PendingFinalization
+    );
+    assert_eq!(hosted_service.active_lease_count(), 2);
+    assert!(matches!(
+        patch_available.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+
+    hosted_service.set_checkpoint_failure(None);
+    assert!(manager.remove_thread(&agent.thread_id).await.is_none());
+    let released_record = manager
+        .state
+        .thread_store
+        .get_hosted_agent_runtime(agent.thread_id)
+        .await
+        .expect("read finalized runtime")
+        .expect("finalized runtime record");
+    let notification = patch_available.recv().await.expect("patch notification");
+
+    assert_eq!(notification.owner_thread_id, owner.thread_id);
+    assert_eq!(
+        released_record.last_exported_patch,
+        Some(notification.artifact)
+    );
+    assert_eq!(
+        released_record.lifecycle_state,
+        codex_hosted_agent::HostedAgentLifecycleState::Released
+    );
+    assert!(
+        manager
+            .state
+            .hosted_agent_runtimes
+            .read()
+            .await
+            .get(&agent.thread_id)
+            .is_none()
+    );
+    assert_eq!(hosted_service.active_lease_count(), 1);
+}
+
+#[tokio::test]
+async fn hosted_startup_rolls_back_when_runtime_metadata_cannot_be_stored() {
+    let (_temp_dir, config, manager, hosted_service) =
+        hosted_thread_manager_with_durable_store_for_tests(/*durable_store*/ false).await;
+    let error = match manager
+        .start_thread_with_options(start_thread_options(config))
+        .await
+    {
+        Ok(_) => panic!("hosted startup must require durable runtime storage"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("failed to persist hosted-agent runtime")
+    );
+    assert_eq!(hosted_service.active_lease_count(), 0);
+    for environment_id in hosted_service.provisioned_environment_ids() {
+        assert!(
+            manager
+                .state
+                .environment_manager
+                .get_environment(&environment_id)
+                .is_none()
+        );
+    }
+    assert!(manager.state.hosted_agent_runtimes.read().await.is_empty());
+}
+
+#[tokio::test]
+async fn hosted_provision_failure_leaves_no_thread_runtime_environment_or_lease() {
+    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
+    hosted_service.set_provision_failure(Some(codex_hosted_agent::HostedAgentError::new(
+        codex_hosted_agent::HostedAgentErrorCategory::QuotaExceeded,
+        "test quota exhausted",
+    )));
+    let initial_thread_ids = manager.list_thread_ids().await;
+
+    let error = match manager
+        .start_thread_with_options(start_thread_options(config))
+        .await
+    {
+        Ok(_) => panic!("hosted provision failure must prevent thread startup"),
+        Err(error) => error,
+    };
+
+    assert!(error.to_string().contains("test quota exhausted"));
+    assert_eq!(manager.list_thread_ids().await, initial_thread_ids);
+    assert!(manager.state.hosted_agent_runtimes.read().await.is_empty());
+    assert_eq!(
+        manager.state.environment_manager.default_environment_ids(),
+        Vec::<String>::new()
+    );
+    assert_eq!(hosted_service.active_lease_count(), 0);
+    assert!(hosted_service.provisioned_environment_ids().is_empty());
+}
+
+#[tokio::test]
+async fn stopped_hosted_thread_reconnects_without_releasing_its_lease() {
+    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
+    let root = manager
+        .start_thread_with_options(start_thread_options(config.clone()))
+        .await
+        .expect("start hosted root");
+    let original_record = manager
+        .state
+        .thread_store
+        .get_hosted_agent_runtime(root.thread_id)
+        .await
+        .expect("read hosted runtime")
+        .expect("hosted runtime record");
+    root.thread
+        .shutdown_and_wait()
+        .await
+        .expect("stop hosted thread");
+
+    let resumed = manager
+        .resume_thread_with_history(
+            config,
+            InitialHistory::Resumed(ResumedHistory {
+                conversation_id: root.thread_id,
+                history: Arc::new(Vec::new()),
+                rollout_path: root.session_configured.rollout_path.clone(),
+            }),
+            manager.auth_manager(),
+            /*parent_trace*/ None,
+            /*supports_openai_form_elicitation*/ false,
+        )
+        .await
+        .expect("resume hosted thread");
+    let resumed_runtime = manager
+        .state
+        .hosted_agent_runtimes
+        .read()
+        .await
+        .get(&root.thread_id)
+        .expect("resumed runtime")
+        .snapshot();
+    assert_eq!(resumed_runtime.lease_id, original_record.lease_id);
+    assert_eq!(hosted_service.active_lease_count(), 1);
+    assert_eq!(hosted_service.provisioned_environment_ids().len(), 1);
+
+    resumed
+        .thread
+        .shutdown_and_wait()
+        .await
+        .expect("stop resumed thread");
+    manager.remove_thread(&resumed.thread_id).await;
+}
+
+#[tokio::test]
+async fn pending_finalization_resume_finishes_without_starting_a_new_turn() {
+    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
+    let (owner, agent) = start_hosted_owned_agent(&manager, &config).await;
+    hosted_service.set_export_failure(Some(codex_hosted_agent::HostedAgentError::new(
+        codex_hosted_agent::HostedAgentErrorCategory::Unavailable,
+        "export unavailable",
+    )));
+    manager
+        .state
+        .finalize_hosted_runtime(agent.thread_id, owner.thread_id)
+        .await
+        .expect_err("initial finalization must remain pending");
+    let pending_record = manager
+        .state
+        .thread_store
+        .get_hosted_agent_runtime(agent.thread_id)
+        .await
+        .expect("read pending runtime")
+        .expect("pending runtime record");
+    assert_eq!(
+        pending_record.lifecycle_state,
+        codex_hosted_agent::HostedAgentLifecycleState::PendingFinalization
+    );
+    agent
+        .thread
+        .shutdown_and_wait()
+        .await
+        .expect("stop pending hosted agent");
+    hosted_service.set_export_failure(None);
+    let mut patch_available = manager.subscribe_hosted_agent_patch_available();
+
+    let error = match manager
+        .resume_thread_with_history(
+            config,
+            InitialHistory::Resumed(ResumedHistory {
+                conversation_id: agent.thread_id,
+                history: Arc::new(Vec::new()),
+                rollout_path: agent.session_configured.rollout_path.clone(),
+            }),
+            manager.auth_manager(),
+            /*parent_trace*/ None,
+            /*supports_openai_form_elicitation*/ false,
+        )
+        .await
+    {
+        Ok(_) => panic!("finalized hosted agent must not start another turn"),
+        Err(error) => error,
+    };
+    let released_record = manager
+        .state
+        .thread_store
+        .get_hosted_agent_runtime(agent.thread_id)
+        .await
+        .expect("read recovered runtime")
+        .expect("recovered runtime record");
+    let notification = patch_available.recv().await.expect("patch notification");
+
+    assert!(
+        error
+            .to_string()
+            .contains("is finalized and cannot be resumed")
+    );
+    assert_eq!(
+        released_record.lifecycle_state,
+        codex_hosted_agent::HostedAgentLifecycleState::Released
+    );
+    assert_eq!(notification.owner_thread_id, owner.thread_id);
+    assert_eq!(
+        released_record.last_exported_patch,
+        Some(notification.artifact)
+    );
+    assert!(manager.get_thread(agent.thread_id).await.is_err());
+    assert_eq!(hosted_service.active_lease_count(), 1);
+    assert_eq!(hosted_service.provisioned_environment_ids().len(), 2);
+}
+
+#[tokio::test]
+async fn completed_hosted_thread_resume_retries_release_without_restoring() {
+    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
+    let root = manager
+        .start_thread_with_options(start_thread_options(config.clone()))
+        .await
+        .expect("start hosted root");
+    let mut record = manager
+        .state
+        .thread_store
+        .get_hosted_agent_runtime(root.thread_id)
+        .await
+        .expect("read hosted runtime")
+        .expect("hosted runtime record");
+    record.last_exported_patch = Some(codex_hosted_agent::AgentPatchArtifact {
+        artifact_id: "artifact-completed-resume".to_string(),
+        agent_id: root.thread_id,
+        base_snapshot_id: record.base_snapshot_id.clone(),
+        checksum: "sha256:completed-resume".to_string(),
+        changed_files: 1,
+        size_bytes: 128,
+    });
+    record.lifecycle_state = codex_hosted_agent::HostedAgentLifecycleState::Completed;
+    manager
+        .state
+        .thread_store
+        .set_hosted_agent_runtime(root.thread_id, record)
+        .await
+        .expect("persist completed runtime");
+    root.thread
+        .shutdown_and_wait()
+        .await
+        .expect("stop hosted thread");
+
+    let error = match manager
+        .resume_thread_with_history(
+            config,
+            InitialHistory::Resumed(ResumedHistory {
+                conversation_id: root.thread_id,
+                history: Arc::new(Vec::new()),
+                rollout_path: root.session_configured.rollout_path.clone(),
+            }),
+            manager.auth_manager(),
+            /*parent_trace*/ None,
+            /*supports_openai_form_elicitation*/ false,
+        )
+        .await
+    {
+        Ok(_) => panic!("completed hosted thread must not resume"),
+        Err(error) => error,
+    };
+    let released_record = manager
+        .state
+        .thread_store
+        .get_hosted_agent_runtime(root.thread_id)
+        .await
+        .expect("read released hosted runtime")
+        .expect("released hosted runtime record");
+
+    assert!(
+        error
+            .to_string()
+            .contains("is finalized and cannot be resumed")
+    );
+    assert_eq!(
+        released_record.lifecycle_state,
+        codex_hosted_agent::HostedAgentLifecycleState::Released
+    );
+    assert_eq!(hosted_service.active_lease_count(), 0);
+    assert_eq!(hosted_service.provisioned_environment_ids().len(), 1);
+}
+
+#[tokio::test]
+async fn stopped_hosted_thread_restores_a_missing_lease_and_persists_it() {
+    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
+    let root = manager
+        .start_thread_with_options(start_thread_options(config.clone()))
+        .await
+        .expect("start hosted root");
+    let original_record = manager
+        .state
+        .thread_store
+        .get_hosted_agent_runtime(root.thread_id)
+        .await
+        .expect("read hosted runtime")
+        .expect("hosted runtime record");
+    root.thread
+        .shutdown_and_wait()
+        .await
+        .expect("stop hosted thread");
+    hosted_service
+        .release(codex_hosted_agent::AgentReleaseRequest {
+            lease_id: original_record.lease_id.clone(),
+            idempotency_key: format!("hosted-agent:{}:expire-before-restore", root.thread_id),
+        })
+        .await
+        .expect("expire lease before restore");
+
+    let resumed = manager
+        .resume_thread_with_history(
+            config,
+            InitialHistory::Resumed(ResumedHistory {
+                conversation_id: root.thread_id,
+                history: Arc::new(Vec::new()),
+                rollout_path: root.session_configured.rollout_path.clone(),
+            }),
+            manager.auth_manager(),
+            /*parent_trace*/ None,
+            /*supports_openai_form_elicitation*/ false,
+        )
+        .await
+        .expect("restore hosted thread");
+    let restored_record = manager
+        .state
+        .thread_store
+        .get_hosted_agent_runtime(root.thread_id)
+        .await
+        .expect("read restored runtime")
+        .expect("restored runtime record");
+    assert_ne!(restored_record.lease_id, original_record.lease_id);
+    assert_ne!(
+        restored_record.environment_id,
+        original_record.environment_id
+    );
+    assert_eq!(
+        restored_record.base_snapshot_id,
+        original_record.base_snapshot_id
+    );
+    assert_eq!(
+        restored_record.latest_snapshot_id,
+        original_record.latest_snapshot_id
+    );
+    assert_eq!(hosted_service.active_lease_count(), 1);
+    assert_eq!(hosted_service.provisioned_environment_ids().len(), 2);
+
+    resumed
+        .thread
+        .shutdown_and_wait()
+        .await
+        .expect("stop restored thread");
+    manager.remove_thread(&resumed.thread_id).await;
+}
+
+#[tokio::test]
+async fn hosted_resume_without_snapshot_fails_without_reprovisioning() {
+    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
+    let root = manager
+        .start_thread_with_options(start_thread_options(config.clone()))
+        .await
+        .expect("start hosted root");
+    let mut record = manager
+        .state
+        .thread_store
+        .get_hosted_agent_runtime(root.thread_id)
+        .await
+        .expect("read hosted runtime")
+        .expect("hosted runtime record");
+    record.latest_snapshot_id = None;
+    let lease_id = record.lease_id.clone();
+    manager
+        .state
+        .thread_store
+        .set_hosted_agent_runtime(root.thread_id, record)
+        .await
+        .expect("remove durable snapshot");
+    root.thread
+        .shutdown_and_wait()
+        .await
+        .expect("stop hosted thread");
+    hosted_service
+        .release(codex_hosted_agent::AgentReleaseRequest {
+            lease_id,
+            idempotency_key: format!("hosted-agent:{}:expire-before-resume", root.thread_id),
+        })
+        .await
+        .expect("expire lease before resume");
+
+    let error = match manager
+        .resume_thread_with_history(
+            config,
+            InitialHistory::Resumed(ResumedHistory {
+                conversation_id: root.thread_id,
+                history: Arc::new(Vec::new()),
+                rollout_path: root.session_configured.rollout_path.clone(),
+            }),
+            manager.auth_manager(),
+            /*parent_trace*/ None,
+            /*supports_openai_form_elicitation*/ false,
+        )
+        .await
+    {
+        Ok(_) => panic!("resume without a durable snapshot must fail"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("hosted-agent runtime has no durable snapshot")
+    );
+    assert_eq!(hosted_service.active_lease_count(), 0);
+    assert_eq!(hosted_service.provisioned_environment_ids().len(), 1);
+    assert!(
+        manager
+            .state
+            .hosted_agent_runtimes
+            .read()
+            .await
+            .get(&root.thread_id)
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn hosted_provisioning_separates_ownership_from_snapshot_lineage() {
+    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
+    let root = manager
+        .start_thread_with_options(start_thread_options(config.clone()))
+        .await
+        .expect("start hosted root");
+    let root_request = hosted_provision_request(&hosted_service, root.thread_id);
+    assert_eq!(root_request.owner_agent_id, None);
+    assert_eq!(
+        root_request.source,
+        ProjectSnapshotSource::RootWorkspace {
+            cwd: PathUri::from_abs_path(&config.cwd),
+            workspace_roots: vec![PathUri::from_abs_path(&config.cwd)],
+        }
+    );
+    let root_lease_id = hosted_service
+        .provisioned_lease_id(&root_request.idempotency_key)
+        .expect("root lease");
+
+    let detached = manager
+        .spawn_subagent(root.thread_id, start_thread_options(config.clone()))
+        .await
+        .expect("spawn hosted detached subagent");
+    let detached_request = hosted_provision_request(&hosted_service, detached.thread_id);
+    assert_eq!(detached_request.owner_agent_id, Some(root.thread_id));
+    assert_eq!(
+        detached_request.source,
+        ProjectSnapshotSource::AgentEnvironment {
+            owner_lease_id: root_lease_id.clone(),
+        }
+    );
+
+    root.thread.ensure_rollout_materialized().await;
+    root.thread
+        .flush_rollout()
+        .await
+        .expect("flush hosted root");
+    let fork = manager
+        .fork_thread(
+            ForkSnapshot::Interrupted,
+            config.clone(),
+            root.thread.rollout_path().expect("root rollout path"),
+            Some(ThreadSource::User),
+            /*parent_trace*/ None,
+        )
+        .await
+        .expect("fork hosted root");
+    let fork_request = hosted_provision_request(&hosted_service, fork.thread_id);
+    assert_eq!(fork_request.owner_agent_id, None);
+    assert_eq!(
+        fork_request.source,
+        ProjectSnapshotSource::AgentEnvironment {
+            owner_lease_id: root_lease_id,
+        }
+    );
+
+    let mut non_hosted_config = config;
+    non_hosted_config.hosted_agents.enabled = false;
+    let non_hosted = manager
+        .start_thread_with_options(start_thread_options(non_hosted_config))
+        .await
+        .expect("start non-hosted root");
+    assert!(
+        hosted_service
+            .provision_request(&format!("hosted-agent:{}:provision", non_hosted.thread_id))
+            .is_none()
+    );
+    assert!(
+        manager
+            .state
+            .hosted_agent_runtimes
+            .read()
+            .await
+            .get(&non_hosted.thread_id)
+            .is_none()
+    );
+
+    let report = manager
+        .shutdown_all_threads_bounded(Duration::from_secs(10))
+        .await;
+    assert_eq!(report.completed.len(), 4);
+}
+
+#[tokio::test]
+async fn hosted_codex_delegate_owns_and_releases_an_isolated_runtime() {
+    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
+    let root = manager
+        .start_thread_with_options(start_thread_options(config.clone()))
+        .await
+        .expect("start hosted root");
+    let root_request = hosted_provision_request(&hosted_service, root.thread_id);
+    let root_lease_id = hosted_service
+        .provisioned_lease_id(&root_request.idempotency_key)
+        .expect("root lease");
+    let parent_turn = root.thread.session.new_default_turn().await;
+    let (delegate, delegate_io) = crate::codex_delegate::run_codex_thread_interactive(
+        config,
+        Arc::clone(&root.thread.session.services.auth_manager),
+        Arc::clone(&root.thread.session.services.models_manager),
+        Arc::clone(&root.thread.session),
+        Arc::clone(&parent_turn),
+        CancellationToken::new(),
+        SubAgentSource::Review,
+        /*initial_history*/ None,
+    )
+    .await
+    .expect("start hosted delegate");
+    let delegate_id = delegate.thread_id();
+    let delegate_request = hosted_provision_request(&hosted_service, delegate_id);
+    assert_eq!(delegate_request.owner_agent_id, Some(root.thread_id));
+    assert_eq!(
+        delegate_request.source,
+        ProjectSnapshotSource::AgentEnvironment {
+            owner_lease_id: root_lease_id,
+        }
+    );
+    assert_eq!(manager.list_thread_ids().await, vec![root.thread_id]);
+    assert!(matches!(
+        manager.get_thread(delegate_id).await,
+        Err(CodexErr::ThreadNotFound(thread_id)) if thread_id == delegate_id
+    ));
+
+    let delegate_snapshot = delegate.thread_config_snapshot().await;
+    assert_eq!(delegate_snapshot.approval_policy, AskForApproval::Never);
+    assert!(matches!(
+        delegate_snapshot.permission_profile,
+        PermissionProfile::External { .. }
+    ));
+    assert_ne!(
+        delegate_snapshot.environments.environments,
+        parent_turn.environments.to_selections()
+    );
+    assert!(!Arc::ptr_eq(
+        &delegate.services.exec_policy,
+        &root.thread.session.services.exec_policy
+    ));
+    let delegate_lease_id = hosted_service
+        .provisioned_lease_id(&delegate_request.idempotency_key)
+        .expect("delegate lease");
+
+    delegate_io
+        .shutdown_and_wait()
+        .await
+        .expect("shut down hosted delegate");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while manager
+            .state
+            .hosted_agent_runtimes
+            .read()
+            .await
+            .contains_key(&delegate_id)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("delegate runtime release timed out");
+    hosted_service
+        .reconnect(codex_hosted_agent::AgentReconnectRequest {
+            lease_id: delegate_lease_id,
+            idempotency_key: format!("hosted-agent:{delegate_id}:delegate-release-check"),
+        })
+        .await
+        .expect_err("delegate lease must be released after shutdown");
+}
+
+#[tokio::test]
+async fn non_hosted_codex_delegate_preserves_parent_runtime_inheritance() {
+    let (_temp_dir, mut config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
+    config.hosted_agents.enabled = false;
+    let root = manager
+        .start_thread_with_options(start_thread_options(config.clone()))
+        .await
+        .expect("start non-hosted root");
+    let parent_turn = root.thread.session.new_default_turn().await;
+    let parent_environments = parent_turn.environments.to_selections();
+    let (delegate, delegate_io) = crate::codex_delegate::run_codex_thread_interactive(
+        config,
+        Arc::clone(&root.thread.session.services.auth_manager),
+        Arc::clone(&root.thread.session.services.models_manager),
+        Arc::clone(&root.thread.session),
+        Arc::clone(&parent_turn),
+        CancellationToken::new(),
+        SubAgentSource::Review,
+        /*initial_history*/ None,
+    )
+    .await
+    .expect("start non-hosted delegate");
+
+    assert_eq!(
+        delegate
+            .thread_config_snapshot()
+            .await
+            .environments
+            .environments,
+        parent_environments
+    );
+    assert!(Arc::ptr_eq(
+        &delegate.services.exec_policy,
+        &root.thread.session.services.exec_policy
+    ));
+    assert!(
+        hosted_service
+            .provision_request(&format!("hosted-agent:{}:provision", delegate.thread_id()))
+            .is_none()
+    );
+    delegate_io
+        .shutdown_and_wait()
+        .await
+        .expect("shut down non-hosted delegate");
+}
+
+#[tokio::test]
+async fn hosted_root_and_spawned_threads_own_distinct_provisioned_environments() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = temp_dir.path().join("workspace").abs();
+    config.workspace_roots = vec![config.cwd.clone()];
+    config.permissions.approval_policy =
+        crate::config::Constrained::allow_any(AskForApproval::OnRequest);
+    config
+        .set_legacy_sandbox_policy(codex_protocol::protocol::SandboxPolicy::ReadOnly {
+            network_access: false,
+        })
+        .expect("set restrictive local sandbox policy");
+    config.permissions.network = Some(
+        crate::config::NetworkProxySpec::from_config_and_constraints(
+            codex_network_proxy::NetworkProxyConfig::default(),
+            Some(codex_config::NetworkConstraints {
+                enabled: Some(true),
+                ..Default::default()
+            }),
+            config.permissions.permission_profile(),
+        )
+        .expect("create managed network proxy spec"),
+    );
+    config.hosted_agents = crate::config::HostedAgentsConfig {
+        enabled: true,
+        service_url: Some("https://hosted.invalid".to_string()),
+        default_agent_type: "default".to_string(),
+    };
+    config.agent_roles.insert(
+        "default".to_string(),
+        crate::config::AgentRoleConfig {
+            description: Some("Hosted test agent".to_string()),
+            sandbox_template: Some("general-v1".to_string()),
+            ..Default::default()
+        },
+    );
+    config.agent_roles.insert(
+        "researcher".to_string(),
+        crate::config::AgentRoleConfig {
+            description: Some("Hosted research agent".to_string()),
+            sandbox_template: Some("research-v1".to_string()),
+            ..Default::default()
+        },
+    );
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+    std::fs::create_dir_all(&config.cwd).expect("create workspace");
+
+    let environment_manager = Arc::new(EnvironmentManager::without_environments());
+    let mut manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::clone(&environment_manager),
+    );
+    let hosted_service = Arc::new(codex_hosted_agent::FakeHostedAgentService::default());
+    let provisioner = Arc::new(HostedAgentProvisioner::new(
+        Arc::clone(&hosted_service),
+        Arc::clone(&environment_manager),
+    ));
+    let manager_state =
+        Arc::get_mut(&mut manager.state).expect("new thread manager state must be unshared");
+    manager_state.hosted_agent_provisioner = Ok(Some(provisioner));
+    manager_state.thread_store = InMemoryThreadStore::for_id(format!(
+        "hosted-role-selection-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+
+    let blank_agent_type_error = manager
+        .start_thread_with_options_and_agent_type(
+            start_thread_options(config.clone()),
+            "  ".to_string(),
+        )
+        .await
+        .err()
+        .expect("blank root agent type must fail");
+    assert_eq!(
+        blank_agent_type_error.to_string(),
+        "agentType must not be blank"
+    );
+
+    let mut non_hosted_config = config.clone();
+    non_hosted_config.hosted_agents.enabled = false;
+    let non_hosted_agent_type_error = manager
+        .start_thread_with_options_and_agent_type(
+            start_thread_options(non_hosted_config),
+            "researcher".to_string(),
+        )
+        .await
+        .err()
+        .expect("non-hosted root agent type must fail");
+    assert_eq!(
+        non_hosted_agent_type_error.to_string(),
+        "agentType requires hosted agents to be enabled"
+    );
+
+    let new_thread = manager
+        .start_thread_with_options_and_agent_type(
+            start_thread_options(config.clone()),
+            " researcher ".to_string(),
+        )
+        .await
+        .expect("start hosted thread");
+    let snapshot = new_thread.thread.config_snapshot().await;
+    assert_eq!(snapshot.approval_policy, AskForApproval::Never);
+    assert_eq!(
+        snapshot.permission_profile,
+        PermissionProfile::External {
+            network: NetworkSandboxPolicy::Enabled,
+        }
+    );
+    assert_eq!(snapshot.active_permission_profile, None);
+    assert!(
+        new_thread
+            .thread
+            .config()
+            .await
+            .permissions
+            .network
+            .is_none()
+    );
+    let approval_override_error = new_thread
+        .thread
+        .preview_thread_settings_overrides(CodexThreadSettingsOverrides {
+            approval_policy: Some(AskForApproval::OnRequest),
+            ..Default::default()
+        })
+        .await
+        .expect_err("hosted approval policy must be immutable");
+    assert!(
+        approval_override_error
+            .to_string()
+            .contains("approval_policy")
+    );
+    let sandbox_override_error = new_thread
+        .thread
+        .preview_thread_settings_overrides(CodexThreadSettingsOverrides {
+            sandbox_policy: Some(codex_protocol::protocol::SandboxPolicy::ReadOnly {
+                network_access: false,
+            }),
+            ..Default::default()
+        })
+        .await
+        .expect_err("hosted sandbox policy must be immutable");
+    assert!(
+        sandbox_override_error
+            .to_string()
+            .contains("sandbox_policy")
+    );
+    let mut mismatched_environments = snapshot.environments.clone();
+    mismatched_environments.environments[0].environment_id = "other-environment".to_string();
+    let environment_override_error = new_thread
+        .thread
+        .preview_thread_settings_overrides(CodexThreadSettingsOverrides {
+            environments: Some(mismatched_environments),
+            ..Default::default()
+        })
+        .await
+        .expect_err("hosted environment selection must be immutable");
+    assert!(
+        environment_override_error
+            .to_string()
+            .contains("environments")
+    );
+    let permission_profile_override_error = new_thread
+        .thread
+        .preview_thread_settings_overrides(CodexThreadSettingsOverrides {
+            permission_profile: Some(PermissionProfile::Disabled),
+            ..Default::default()
+        })
+        .await
+        .expect_err("hosted permission profile must be immutable");
+    assert!(
+        permission_profile_override_error
+            .to_string()
+            .contains("permission_profile")
+    );
+    let active_profile_override_error = new_thread
+        .thread
+        .preview_thread_settings_overrides(CodexThreadSettingsOverrides {
+            active_permission_profile: Some(
+                codex_protocol::models::ActivePermissionProfile::read_only(),
+            ),
+            ..Default::default()
+        })
+        .await
+        .expect_err("hosted active permission profile must remain unset");
+    assert!(
+        active_profile_override_error
+            .to_string()
+            .contains("active_permission_profile")
+    );
+    let profile_roots_override_error = new_thread
+        .thread
+        .preview_thread_settings_overrides(CodexThreadSettingsOverrides {
+            profile_workspace_roots: Some(snapshot.workspace_roots.clone()),
+            ..Default::default()
+        })
+        .await
+        .expect_err("hosted profile workspace roots must remain unset");
+    assert!(
+        profile_roots_override_error
+            .to_string()
+            .contains("profile_workspace_roots")
+    );
+    let [selection] = snapshot.environments.environments.as_slice() else {
+        panic!("hosted thread must select exactly one environment");
+    };
+    {
+        let runtime = manager
+            .state
+            .hosted_agent_runtimes
+            .read()
+            .await
+            .get(&new_thread.thread_id)
+            .cloned()
+            .expect("thread must own a hosted runtime");
+        let runtime = runtime.snapshot();
+        assert_eq!(selection.environment_id, runtime.environment_id);
+        assert_eq!(runtime.agent_type, "researcher");
+        assert_eq!(runtime.sandbox_template, "research-v1");
+    }
+    assert!(environment_manager.try_local_environment().is_none());
+
+    let child_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        parent_thread_id: new_thread.thread_id,
+        depth: 1,
+        agent_path: None,
+        agent_nickname: None,
+        agent_role: Some("default".to_string()),
+    });
+    let inherited_environments = new_thread
+        .thread
+        .session
+        .services
+        .turn_environments
+        .snapshot()
+        .await;
+    let inherited_exec_policy = Arc::clone(&new_thread.thread.session.services.exec_policy);
+    let inherited_environment_selections = inherited_environments.to_selections();
+    let child = manager
+        .state
+        .spawn_new_thread_with_source(
+            config,
+            manager.agent_control(),
+            child_source,
+            /*history_mode*/ None,
+            /*parent_thread_id*/ Some(new_thread.thread_id),
+            /*forked_from_thread_id*/ None,
+            /*thread_source*/ Some(ThreadSource::Subagent),
+            /*metrics_service_name*/ None,
+            /*inherited_environments*/ Some(inherited_environments),
+            /*inherited_exec_policy*/ Some(Arc::clone(&inherited_exec_policy)),
+            /*environments*/ Some(inherited_environment_selections),
+        )
+        .await
+        .expect("start hosted child thread");
+    let child_snapshot = child.thread.config_snapshot().await;
+    assert_eq!(child_snapshot.approval_policy, AskForApproval::Never);
+    assert_eq!(
+        child_snapshot.permission_profile,
+        PermissionProfile::External {
+            network: NetworkSandboxPolicy::Enabled,
+        }
+    );
+    assert_eq!(child_snapshot.active_permission_profile, None);
+    assert!(child.thread.config().await.permissions.network.is_none());
+    assert!(!Arc::ptr_eq(
+        &child.thread.session.services.exec_policy,
+        &inherited_exec_policy
+    ));
+    let [child_selection] = child_snapshot.environments.environments.as_slice() else {
+        panic!("hosted child must select exactly one environment");
+    };
+    let (root_environment_id, root_lease_id, child_environment_id, child_lease_id) = {
+        let runtimes = manager.state.hosted_agent_runtimes.read().await;
+        let root_runtime = runtimes
+            .get(&new_thread.thread_id)
+            .cloned()
+            .expect("root hosted runtime");
+        let child_runtime = runtimes
+            .get(&child.thread_id)
+            .cloned()
+            .expect("child hosted runtime");
+        drop(runtimes);
+        let root_runtime = root_runtime.snapshot();
+        let child_runtime = child_runtime.snapshot();
+
+        assert_eq!(child_selection.environment_id, child_runtime.environment_id);
+        assert_ne!(child_runtime.lease_id, root_runtime.lease_id);
+        assert_ne!(child_runtime.environment_id, root_runtime.environment_id);
+        (
+            root_runtime.environment_id.clone(),
+            root_runtime.lease_id,
+            child_runtime.environment_id.clone(),
+            child_runtime.lease_id,
+        )
+    };
+
+    child
+        .thread
+        .shutdown_and_wait()
+        .await
+        .expect("shut down hosted child");
+    assert!(manager.remove_thread(&child.thread_id).await.is_some());
+
+    assert!(
+        manager
+            .state
+            .hosted_agent_runtimes
+            .read()
+            .await
+            .get(&child.thread_id)
+            .is_none()
+    );
+    assert!(
+        manager
+            .state
+            .hosted_agent_runtimes
+            .read()
+            .await
+            .get(&new_thread.thread_id)
+            .is_some()
+    );
+    assert!(
+        environment_manager
+            .get_environment(&child_environment_id)
+            .is_none()
+    );
+    assert!(
+        environment_manager
+            .get_environment(&root_environment_id)
+            .is_some()
+    );
+    hosted_service
+        .reconnect(codex_hosted_agent::AgentReconnectRequest {
+            lease_id: child_lease_id,
+            idempotency_key: format!("hosted-agent:{}:removed-child-reconnect", child.thread_id),
+        })
+        .await
+        .expect_err("removed child lease must be released");
+    hosted_service
+        .reconnect(codex_hosted_agent::AgentReconnectRequest {
+            lease_id: root_lease_id.clone(),
+            idempotency_key: format!(
+                "hosted-agent:{}:remaining-root-reconnect",
+                new_thread.thread_id
+            ),
+        })
+        .await
+        .expect("removing a child must not release its root lease");
+
+    let shutdown_report = manager
+        .shutdown_all_threads_bounded(Duration::from_secs(10))
+        .await;
+    assert_eq!(shutdown_report.completed, vec![new_thread.thread_id]);
+    assert!(manager.state.hosted_agent_runtimes.read().await.is_empty());
+    assert!(
+        environment_manager
+            .get_environment(&root_environment_id)
+            .is_none()
+    );
+    hosted_service
+        .reconnect(codex_hosted_agent::AgentReconnectRequest {
+            lease_id: root_lease_id,
+            idempotency_key: format!(
+                "hosted-agent:{}:shutdown-root-reconnect",
+                new_thread.thread_id
+            ),
+        })
+        .await
+        .expect_err("manager shutdown must release the root lease");
 }
 
 #[test]

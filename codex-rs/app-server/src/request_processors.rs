@@ -504,7 +504,6 @@ use tokio_util::sync::DropGuard;
 use tokio_util::task::TaskTracker;
 use toml::Value as TomlValue;
 use tracing::Instrument;
-use tracing::error;
 use tracing::info;
 use tracing::warn;
 use uuid::Uuid;
@@ -513,6 +512,7 @@ use uuid::Uuid;
 use codex_app_server_protocol::ServerRequest;
 
 mod account_processor;
+mod agent_processor;
 mod apps_processor;
 mod bedrock_auth;
 mod catalog_processor;
@@ -537,6 +537,7 @@ mod turn_processor;
 mod windows_sandbox_processor;
 
 pub(crate) use account_processor::AccountRequestProcessor;
+pub(crate) use agent_processor::AgentRequestProcessor;
 pub(crate) use apps_processor::AppsRequestProcessor;
 pub(crate) use catalog_processor::CatalogRequestProcessor;
 pub(crate) use command_exec_processor::CommandExecRequestProcessor;

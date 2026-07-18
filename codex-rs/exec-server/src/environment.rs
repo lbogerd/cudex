@@ -423,6 +423,46 @@ impl EnvironmentManager {
         Ok(())
     }
 
+    /// Registers a new dynamic remote environment without replacing an existing one.
+    ///
+    /// Hosted runtimes use this stricter lifecycle API so a service response can never
+    /// overwrite a local, default, statically configured, or previously leased environment.
+    pub fn register_environment(
+        &self,
+        environment_id: String,
+        exec_server_url: String,
+        connect_timeout: Option<std::time::Duration>,
+    ) -> Result<(), ExecServerError> {
+        validate_environment_id(&environment_id)?;
+        let exec_server_url = validate_remote_exec_server_url(exec_server_url)?;
+        let environment = Arc::new(Environment::remote_with_transport(
+            ExecServerTransportParams::websocket_url(
+                exec_server_url,
+                connect_timeout.unwrap_or(DEFAULT_REMOTE_EXEC_SERVER_CONNECT_TIMEOUT),
+            ),
+            self.local_runtime_paths.clone(),
+        ));
+        {
+            let mut environments = self
+                .environments
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if environments.contains_key(&environment_id) {
+                return Err(ExecServerError::Protocol(format!(
+                    "environment `{environment_id}` is already registered"
+                )));
+            }
+            let mut dynamic_environment_ids = self
+                .dynamic_environment_ids
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            environments.insert(environment_id.clone(), Arc::clone(&environment));
+            dynamic_environment_ids.insert(environment_id);
+        }
+        environment.start_connecting();
+        Ok(())
+    }
+
     /// Adds or replaces a Noise rendezvous environment that will become ready later.
     pub fn register_deferred_noise_environment(
         &self,

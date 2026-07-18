@@ -1,7 +1,10 @@
 use super::*;
+use crate::function_tool::FunctionCallError;
 use crate::shell::ShellType;
 use crate::shell::default_user_shell;
 use codex_exec_server::Environment;
+use codex_protocol::exec_output::ExecToolCallOutput;
+use codex_tools::ToolExecutor;
 use codex_tools::UnifiedExecShellMode;
 use codex_tools::ZshForkConfig;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -18,6 +21,7 @@ use crate::tools::context::ToolPayload;
 use crate::tools::hook_names::HookToolName;
 use crate::tools::registry::CoreToolRuntime;
 use crate::turn_diff_tracker::TurnDiffTracker;
+use crate::unified_exec::UnifiedExecError;
 use tokio::sync::Mutex;
 
 const TEST_TRUNCATION_POLICY: TruncationPolicy = TruncationPolicy::Tokens(10_000);
@@ -283,6 +287,88 @@ async fn exec_command_pre_tool_use_payload_skips_write_stdin() {
             payload,
         }),
         None
+    );
+}
+
+#[tokio::test]
+async fn exec_command_rejects_forged_escalation_when_disabled() {
+    let invocation = invocation_for_payload(
+        "exec_command",
+        "call-no-escalation",
+        ToolPayload::Function {
+            arguments: serde_json::json!({
+                "cmd": "echo should-not-run",
+                "sandbox_permissions": "require_escalated",
+                "justification": "forged escalation"
+            })
+            .to_string(),
+        },
+    )
+    .await;
+    let handler = ExecCommandHandler::new(ExecCommandHandlerOptions {
+        allow_login_shell: true,
+        exec_permission_approvals_enabled: false,
+        allow_permission_escalation: false,
+        include_environment_id: false,
+        include_shell_parameter: true,
+    });
+
+    let Err(error) = handler.handle(invocation).await else {
+        panic!("forged permission escalation must be rejected");
+    };
+    assert_eq!(
+        error,
+        FunctionCallError::RespondToModel(
+            "permission escalation is unavailable for this exec_command tool".to_string()
+        )
+    );
+}
+
+#[tokio::test]
+async fn hosted_exec_command_normalizes_sandbox_denial_output() {
+    let (_, mut turn) = make_session_and_context().await;
+    turn.hosted_tool_authorization =
+        Some(crate::hosted_agent_runtime::HostedToolAuthorization::new(
+            "hosted-environment".to_string(),
+            codex_hosted_agent::AgentToolPolicy::default(),
+        ));
+
+    assert_eq!(
+        exec_command::normalize_sandbox_denial_output(
+            "service-specific denial details".to_string(),
+            &turn,
+        ),
+        Err(FunctionCallError::RespondToModel(
+            crate::hosted_agent_runtime::HOSTED_EXTERNAL_SANDBOX_DENIAL_MESSAGE.to_string()
+        ))
+    );
+    turn.hosted_tool_authorization = None;
+    assert_eq!(
+        exec_command::normalize_sandbox_denial_output("local sandbox details".to_string(), &turn,),
+        Ok("local sandbox details".to_string())
+    );
+}
+
+#[tokio::test]
+async fn hosted_write_stdin_normalizes_sandbox_denial_without_a_tool_prefix() {
+    let (_, mut turn) = make_session_and_context().await;
+    turn.hosted_tool_authorization =
+        Some(crate::hosted_agent_runtime::HostedToolAuthorization::new(
+            "hosted-environment".to_string(),
+            codex_hosted_agent::AgentToolPolicy::default(),
+        ));
+
+    assert_eq!(
+        write_stdin::map_write_stdin_error(
+            &turn,
+            UnifiedExecError::sandbox_denied(
+                "service-specific denial details".to_string(),
+                ExecToolCallOutput::default(),
+            ),
+        ),
+        FunctionCallError::RespondToModel(
+            crate::hosted_agent_runtime::HOSTED_EXTERNAL_SANDBOX_DENIAL_MESSAGE.to_string()
+        )
     );
 }
 

@@ -285,6 +285,91 @@ async fn thread_start_mock_field_requires_experimental_api_capability() -> Resul
 }
 
 #[tokio::test]
+async fn thread_start_agent_type_requires_experimental_api_capability() -> Result<()> {
+    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    let init = mcp
+        .initialize_with_capabilities(
+            default_client_info(),
+            Some(InitializeCapabilities {
+                experimental_api: false,
+                request_attestation: false,
+                opt_out_notification_methods: None,
+                mcp_server_openai_form_elicitation: false,
+            }),
+        )
+        .await?;
+    let JSONRPCMessage::Response(_) = init else {
+        anyhow::bail!("expected initialize response, got {init:?}");
+    };
+
+    let request_id = mcp
+        .send_thread_start_request(ThreadStartParams {
+            agent_type: Some("researcher".to_string()),
+            ..Default::default()
+        })
+        .await?;
+
+    let error = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    assert_experimental_capability_error(error, "thread/start.agentType");
+    Ok(())
+}
+
+#[tokio::test]
+async fn thread_start_agent_type_reaches_hosted_runtime_validation() -> Result<()> {
+    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    let init = mcp
+        .initialize_with_capabilities(
+            default_client_info(),
+            Some(InitializeCapabilities {
+                experimental_api: true,
+                request_attestation: false,
+                opt_out_notification_methods: None,
+                mcp_server_openai_form_elicitation: false,
+            }),
+        )
+        .await?;
+    let JSONRPCMessage::Response(_) = init else {
+        anyhow::bail!("expected initialize response, got {init:?}");
+    };
+
+    let request_id = mcp
+        .send_thread_start_request(ThreadStartParams {
+            agent_type: Some("researcher".to_string()),
+            ..Default::default()
+        })
+        .await?;
+
+    let error = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    assert_eq!(
+        error.error.message,
+        "agentType requires hosted agents to be enabled"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn thread_start_without_dynamic_tools_allows_without_experimental_api_capability()
 -> Result<()> {
     let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;

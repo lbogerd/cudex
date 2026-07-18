@@ -1,4 +1,5 @@
 mod account;
+mod agent_patch_apply;
 mod analytics;
 mod app_installed;
 mod app_list;

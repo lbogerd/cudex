@@ -1,0 +1,658 @@
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::Duration;
+use std::time::Instant;
+
+use codex_exec_server::EnvironmentManager;
+use codex_exec_server::ExecServerError;
+use codex_hosted_agent::AgentCheckpoint;
+use codex_hosted_agent::AgentCheckpointRequest;
+use codex_hosted_agent::AgentPatchApplyRequest;
+use codex_hosted_agent::AgentPatchArtifact;
+use codex_hosted_agent::AgentPatchExportRequest;
+use codex_hosted_agent::AgentProvisionRequest;
+use codex_hosted_agent::AgentReconnectRequest;
+use codex_hosted_agent::AgentReleaseRequest;
+use codex_hosted_agent::AgentToolPolicy;
+use codex_hosted_agent::HostedAgentError;
+use codex_hosted_agent::HostedAgentLifecycleState;
+use codex_hosted_agent::HostedAgentRuntimeRecord;
+use codex_hosted_agent::HostedAgentService;
+use codex_hosted_agent::PatchApplyResult;
+use codex_hosted_agent::ProvisionedAgent;
+use codex_protocol::protocol::TurnEnvironmentSelection;
+use codex_tools::ToolExecutionDomain;
+use codex_tools::ToolName;
+use thiserror::Error;
+
+use crate::hosted_agent_telemetry;
+use crate::hosted_agent_telemetry::CheckpointKind;
+use crate::hosted_agent_telemetry::ProvisionKind;
+
+const HOSTED_ENVIRONMENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Stable model-facing diagnostic for hosted service and authorization denials.
+pub(crate) const HOSTED_EXTERNAL_SANDBOX_DENIAL_MESSAGE: &str =
+    "external sandbox denied: operation rejected by the hosted environment";
+
+/// Durable, non-secret state owned by one thread using a hosted environment.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HostedAgentRuntime {
+    pub(crate) owner_agent_id: Option<codex_protocol::ThreadId>,
+    pub(crate) lease_id: String,
+    pub(crate) environment_id: String,
+    pub(crate) agent_type: String,
+    pub(crate) sandbox_template: String,
+    pub(crate) base_snapshot_id: String,
+    pub(crate) latest_snapshot_id: Option<String>,
+    pub(crate) last_exported_patch: Option<codex_hosted_agent::AgentPatchArtifact>,
+    pub(crate) lifecycle_state: HostedAgentLifecycleState,
+    pub(crate) tool_policy: AgentToolPolicy,
+}
+
+/// Immutable tool authorization returned with a hosted thread's lease.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HostedToolAuthorization {
+    environment_id: String,
+    policy: AgentToolPolicy,
+}
+
+impl HostedToolAuthorization {
+    pub(crate) fn new(environment_id: String, policy: AgentToolPolicy) -> Self {
+        Self {
+            environment_id,
+            policy,
+        }
+    }
+
+    pub(crate) fn allows(&self, tool_name: &ToolName, domain: &ToolExecutionDomain) -> bool {
+        let environment_matches = match domain {
+            ToolExecutionDomain::EnvironmentBoundMcp { environment_id, .. } => {
+                environment_id == &self.environment_id
+            }
+            ToolExecutionDomain::AmbientMcp { .. } => false,
+            ToolExecutionDomain::AgentEnvironment
+            | ToolExecutionDomain::ControlPlane
+            | ToolExecutionDomain::ProviderHosted
+            | ToolExecutionDomain::ClientCallback
+            | ToolExecutionDomain::Extension
+            | ToolExecutionDomain::OrchestratorProcess => true,
+        };
+        environment_matches
+            && self.policy.allowed_domains.contains(&domain.kind())
+            && self.policy.allowed_tools.contains(tool_name)
+    }
+}
+
+impl HostedAgentRuntime {
+    pub(crate) fn durable_record(&self) -> HostedAgentRuntimeRecord {
+        HostedAgentRuntimeRecord {
+            owner_agent_id: self.owner_agent_id,
+            agent_type: self.agent_type.clone(),
+            sandbox_template: self.sandbox_template.clone(),
+            lease_id: self.lease_id.clone(),
+            environment_id: self.environment_id.clone(),
+            base_snapshot_id: self.base_snapshot_id.clone(),
+            latest_snapshot_id: self.latest_snapshot_id.clone(),
+            last_exported_patch: self.last_exported_patch.clone(),
+            lifecycle_state: self.lifecycle_state,
+        }
+    }
+}
+
+type HostedServiceFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, HostedAgentError>> + Send + 'a>>;
+
+/// Object-safe bridge used to retain any hosted service implementation in the thread manager.
+///
+/// Implementations delegate to the public native-RPITIT service contract and must preserve its
+/// idempotency and secret-handling guarantees.
+trait ErasedHostedAgentService: Send + Sync {
+    fn provision(
+        &self,
+        request: AgentProvisionRequest,
+    ) -> HostedServiceFuture<'_, ProvisionedAgent>;
+
+    fn reconnect(
+        &self,
+        request: AgentReconnectRequest,
+    ) -> HostedServiceFuture<'_, ProvisionedAgent>;
+
+    fn checkpoint(
+        &self,
+        request: AgentCheckpointRequest,
+    ) -> HostedServiceFuture<'_, AgentCheckpoint>;
+
+    fn export_patch(
+        &self,
+        request: AgentPatchExportRequest,
+    ) -> HostedServiceFuture<'_, AgentPatchArtifact>;
+
+    fn apply_patch(
+        &self,
+        request: AgentPatchApplyRequest,
+    ) -> HostedServiceFuture<'_, PatchApplyResult>;
+
+    fn release(&self, request: AgentReleaseRequest) -> HostedServiceFuture<'_, ()>;
+}
+
+impl<Service> ErasedHostedAgentService for Service
+where
+    Service: HostedAgentService,
+{
+    fn provision(
+        &self,
+        request: AgentProvisionRequest,
+    ) -> HostedServiceFuture<'_, ProvisionedAgent> {
+        Box::pin(HostedAgentService::provision(self, request))
+    }
+
+    fn reconnect(
+        &self,
+        request: AgentReconnectRequest,
+    ) -> HostedServiceFuture<'_, ProvisionedAgent> {
+        Box::pin(HostedAgentService::reconnect(self, request))
+    }
+
+    fn checkpoint(
+        &self,
+        request: AgentCheckpointRequest,
+    ) -> HostedServiceFuture<'_, AgentCheckpoint> {
+        Box::pin(HostedAgentService::checkpoint(self, request))
+    }
+
+    fn export_patch(
+        &self,
+        request: AgentPatchExportRequest,
+    ) -> HostedServiceFuture<'_, AgentPatchArtifact> {
+        Box::pin(HostedAgentService::export_patch(self, request))
+    }
+
+    fn apply_patch(
+        &self,
+        request: AgentPatchApplyRequest,
+    ) -> HostedServiceFuture<'_, PatchApplyResult> {
+        Box::pin(HostedAgentService::apply_patch(self, request))
+    }
+
+    fn release(&self, request: AgentReleaseRequest) -> HostedServiceFuture<'_, ()> {
+        Box::pin(HostedAgentService::release(self, request))
+    }
+}
+
+/// Coordinates hosted service leases with dynamic exec-server registrations.
+pub(crate) struct HostedAgentProvisioner {
+    service: Arc<dyn ErasedHostedAgentService>,
+    environment_manager: Arc<EnvironmentManager>,
+}
+
+impl HostedAgentProvisioner {
+    pub(crate) fn new<Service>(
+        service: Arc<Service>,
+        environment_manager: Arc<EnvironmentManager>,
+    ) -> Self
+    where
+        Service: HostedAgentService + 'static,
+    {
+        Self {
+            service,
+            environment_manager,
+        }
+    }
+
+    /// Provisions and registers one environment, returning a pending startup transaction.
+    ///
+    /// The caller must either commit after thread startup succeeds or roll back on failure.
+    pub(crate) async fn provision(
+        &self,
+        request: AgentProvisionRequest,
+    ) -> Result<PendingHostedAgentRuntime, HostedAgentRuntimeError> {
+        let agent_type = request.agent_type.clone();
+        let sandbox_template = request.sandbox_template.clone();
+        let agent_id = request.agent_id;
+        let owner_agent_id = request.owner_agent_id;
+        let started_at = Instant::now();
+        let provision_result = self.service.provision(request).await;
+        hosted_agent_telemetry::record_provision_duration(
+            ProvisionKind::Fresh,
+            started_at.elapsed(),
+            provision_result.is_ok(),
+        );
+        let provisioned = provision_result.map_err(HostedAgentRuntimeError::Provision)?;
+        let runtime = HostedAgentRuntime {
+            owner_agent_id,
+            lease_id: provisioned.lease_id,
+            environment_id: provisioned.environment_id,
+            agent_type,
+            sandbox_template,
+            base_snapshot_id: provisioned.base_snapshot_id.clone(),
+            latest_snapshot_id: Some(provisioned.base_snapshot_id),
+            last_exported_patch: None,
+            lifecycle_state: HostedAgentLifecycleState::Active,
+            tool_policy: provisioned.tool_policy,
+        };
+        let environment_selection = TurnEnvironmentSelection {
+            environment_id: runtime.environment_id.clone(),
+            cwd: provisioned.cwd,
+            workspace_roots: provisioned.workspace_roots,
+        };
+
+        if let Err(source) = provisioned.connection.register(
+            self.environment_manager.as_ref(),
+            runtime.environment_id.clone(),
+            HOSTED_ENVIRONMENT_CONNECT_TIMEOUT,
+        ) {
+            let release_result = self
+                .service
+                .release(AgentReleaseRequest {
+                    lease_id: runtime.lease_id.clone(),
+                    idempotency_key: release_idempotency_key(agent_id, &runtime.lease_id),
+                })
+                .await;
+            if let Err(release_error) = release_result {
+                tracing::warn!(
+                    error = %release_error,
+                    agent_id = %agent_id,
+                    "failed to release hosted lease after environment registration failed"
+                );
+            }
+            return Err(HostedAgentRuntimeError::Register {
+                environment_id: runtime.environment_id,
+                source,
+            });
+        }
+
+        Ok(PendingHostedAgentRuntime {
+            agent_id,
+            runtime,
+            environment_selection,
+            service: Arc::clone(&self.service),
+            environment_manager: Arc::clone(&self.environment_manager),
+            rollback: PendingRuntimeRollback::ReleaseLease,
+        })
+    }
+
+    /// Reconnects an active lease, restoring it from its latest durable snapshot only when the
+    /// service reports that the lease is missing.
+    pub(crate) async fn reconnect_or_restore(
+        &self,
+        agent_id: codex_protocol::ThreadId,
+        record: HostedAgentRuntimeRecord,
+    ) -> Result<PendingHostedAgentRuntime, HostedAgentRuntimeError> {
+        let owner_agent_id = record.owner_agent_id;
+        let reconnect = self
+            .service
+            .reconnect(AgentReconnectRequest {
+                lease_id: record.lease_id.clone(),
+                idempotency_key: format!(
+                    "hosted-agent:{agent_id}:lease:{}:reconnect",
+                    record.lease_id
+                ),
+            })
+            .await;
+        let (provisioned, rollback) = match reconnect {
+            Ok(provisioned) => {
+                if provisioned.lease_id != record.lease_id {
+                    return Err(HostedAgentRuntimeError::Reconnect(HostedAgentError::new(
+                        codex_hosted_agent::HostedAgentErrorCategory::InvalidResponse,
+                        "reconnect returned a different lease",
+                    )));
+                }
+                (provisioned, PendingRuntimeRollback::KeepLease)
+            }
+            Err(error)
+                if error.category == codex_hosted_agent::HostedAgentErrorCategory::LeaseMissing =>
+            {
+                let latest_snapshot_id = record.latest_snapshot_id.clone().ok_or_else(|| {
+                    HostedAgentRuntimeError::RestoreUnavailable(
+                        "hosted-agent runtime has no durable snapshot".to_string(),
+                    )
+                })?;
+                let request = AgentProvisionRequest {
+                    agent_id,
+                    owner_agent_id,
+                    agent_type: record.agent_type.clone(),
+                    sandbox_template: record.sandbox_template.clone(),
+                    source: codex_hosted_agent::ProjectSnapshotSource::DurableSnapshot {
+                        snapshot_id: latest_snapshot_id.clone(),
+                    },
+                    idempotency_key: format!(
+                        "hosted-agent:{agent_id}:snapshot:{latest_snapshot_id}:restore"
+                    ),
+                };
+                let started_at = Instant::now();
+                let restore_result = self.service.provision(request).await;
+                hosted_agent_telemetry::record_provision_duration(
+                    ProvisionKind::Restore,
+                    started_at.elapsed(),
+                    restore_result.is_ok(),
+                );
+                hosted_agent_telemetry::record_restore(restore_result.is_ok());
+                (
+                    restore_result.map_err(HostedAgentRuntimeError::Provision)?,
+                    PendingRuntimeRollback::ReleaseLease,
+                )
+            }
+            Err(error) => return Err(HostedAgentRuntimeError::Reconnect(error)),
+        };
+        let runtime = HostedAgentRuntime {
+            owner_agent_id,
+            lease_id: provisioned.lease_id,
+            environment_id: provisioned.environment_id,
+            agent_type: record.agent_type,
+            sandbox_template: record.sandbox_template,
+            base_snapshot_id: record.base_snapshot_id,
+            latest_snapshot_id: record.latest_snapshot_id,
+            last_exported_patch: record.last_exported_patch,
+            lifecycle_state: record.lifecycle_state,
+            tool_policy: provisioned.tool_policy,
+        };
+        let environment_selection = TurnEnvironmentSelection {
+            environment_id: runtime.environment_id.clone(),
+            cwd: provisioned.cwd,
+            workspace_roots: provisioned.workspace_roots,
+        };
+        if let Err(source) = provisioned.connection.register(
+            self.environment_manager.as_ref(),
+            runtime.environment_id.clone(),
+            HOSTED_ENVIRONMENT_CONNECT_TIMEOUT,
+        ) {
+            if rollback == PendingRuntimeRollback::ReleaseLease {
+                let _ = self
+                    .service
+                    .release(AgentReleaseRequest {
+                        lease_id: runtime.lease_id.clone(),
+                        idempotency_key: release_idempotency_key(agent_id, &runtime.lease_id),
+                    })
+                    .await;
+            }
+            return Err(HostedAgentRuntimeError::Register {
+                environment_id: runtime.environment_id,
+                source,
+            });
+        }
+        Ok(PendingHostedAgentRuntime {
+            agent_id,
+            runtime,
+            environment_selection,
+            service: Arc::clone(&self.service),
+            environment_manager: Arc::clone(&self.environment_manager),
+            rollback,
+        })
+    }
+
+    /// Unregisters and releases a runtime committed to a thread.
+    pub(crate) async fn release(
+        &self,
+        agent_id: codex_protocol::ThreadId,
+        runtime: HostedAgentRuntime,
+    ) -> Result<(), HostedAgentRuntimeError> {
+        let is_cleanup_retry = runtime.lifecycle_state == HostedAgentLifecycleState::ReleasePending;
+        let cleanup_result = cleanup_runtime(
+            agent_id,
+            runtime,
+            self.environment_manager.as_ref(),
+            self.service.as_ref(),
+        )
+        .await;
+        if is_cleanup_retry {
+            hosted_agent_telemetry::record_cleanup_retry(cleanup_result.is_ok());
+        }
+        cleanup_result
+    }
+
+    /// Retries cleanup from durable metadata without reconnecting or restoring a terminal lease.
+    pub(crate) async fn release_durable_record(
+        &self,
+        agent_id: codex_protocol::ThreadId,
+        record: HostedAgentRuntimeRecord,
+    ) -> Result<(), HostedAgentRuntimeError> {
+        let cleanup_result = cleanup_runtime(
+            agent_id,
+            HostedAgentRuntime {
+                owner_agent_id: record.owner_agent_id,
+                lease_id: record.lease_id,
+                environment_id: record.environment_id,
+                agent_type: record.agent_type,
+                sandbox_template: record.sandbox_template,
+                base_snapshot_id: record.base_snapshot_id,
+                latest_snapshot_id: record.latest_snapshot_id,
+                last_exported_patch: record.last_exported_patch,
+                lifecycle_state: record.lifecycle_state,
+                tool_policy: AgentToolPolicy::default(),
+            },
+            self.environment_manager.as_ref(),
+            self.service.as_ref(),
+        )
+        .await;
+        hosted_agent_telemetry::record_cleanup_retry(cleanup_result.is_ok());
+        cleanup_result
+    }
+
+    /// Creates a durable snapshot for one successfully completed turn.
+    pub(crate) async fn checkpoint(
+        &self,
+        agent_id: codex_protocol::ThreadId,
+        turn_id: &str,
+        runtime: &HostedAgentRuntime,
+    ) -> Result<AgentCheckpoint, HostedAgentRuntimeError> {
+        let started_at = Instant::now();
+        let checkpoint_result = self
+            .service
+            .checkpoint(AgentCheckpointRequest {
+                lease_id: runtime.lease_id.clone(),
+                idempotency_key: format!("hosted-agent:{agent_id}:turn:{turn_id}:checkpoint"),
+            })
+            .await;
+        hosted_agent_telemetry::record_checkpoint_duration(
+            CheckpointKind::Turn,
+            started_at.elapsed(),
+            checkpoint_result.is_ok(),
+        );
+        checkpoint_result.map_err(HostedAgentRuntimeError::Checkpoint)
+    }
+
+    /// Creates the final durable snapshot for an owned agent's lease generation.
+    pub(crate) async fn checkpoint_for_completion(
+        &self,
+        agent_id: codex_protocol::ThreadId,
+        runtime: &HostedAgentRuntime,
+    ) -> Result<AgentCheckpoint, HostedAgentRuntimeError> {
+        let started_at = Instant::now();
+        let checkpoint_result = self
+            .service
+            .checkpoint(AgentCheckpointRequest {
+                lease_id: runtime.lease_id.clone(),
+                idempotency_key: format!(
+                    "hosted-agent:{agent_id}:lease:{}:finalize-checkpoint",
+                    runtime.lease_id
+                ),
+            })
+            .await;
+        hosted_agent_telemetry::record_checkpoint_duration(
+            CheckpointKind::Completion,
+            started_at.elapsed(),
+            checkpoint_result.is_ok(),
+        );
+        checkpoint_result.map_err(HostedAgentRuntimeError::Checkpoint)
+    }
+
+    /// Exports the agent's final patch after its completion snapshot is durable.
+    pub(crate) async fn export_patch(
+        &self,
+        agent_id: codex_protocol::ThreadId,
+        snapshot_id: &str,
+        runtime: &HostedAgentRuntime,
+    ) -> Result<AgentPatchArtifact, HostedAgentRuntimeError> {
+        let artifact = self
+            .service
+            .export_patch(AgentPatchExportRequest {
+                lease_id: runtime.lease_id.clone(),
+                agent_id,
+                base_snapshot_id: runtime.base_snapshot_id.clone(),
+                idempotency_key: format!(
+                    "hosted-agent:{agent_id}:snapshot:{snapshot_id}:export-patch"
+                ),
+            })
+            .await
+            .map_err(HostedAgentRuntimeError::ExportPatch)?;
+        if artifact.agent_id != agent_id
+            || artifact.base_snapshot_id != runtime.base_snapshot_id
+            || artifact.artifact_id.trim().is_empty()
+            || artifact.artifact_id.len() > codex_hosted_agent::MAX_OPAQUE_ID_BYTES
+        {
+            return Err(HostedAgentRuntimeError::ExportPatch(HostedAgentError::new(
+                codex_hosted_agent::HostedAgentErrorCategory::InvalidResponse,
+                "patch artifact does not match the finalized agent",
+            )));
+        }
+        hosted_agent_telemetry::record_patch_size(artifact.size_bytes);
+        Ok(artifact)
+    }
+
+    /// Atomically applies one artifact to the requesting agent's current lease generation.
+    pub(crate) async fn apply_patch(
+        &self,
+        requesting_agent_id: codex_protocol::ThreadId,
+        artifact_id: &str,
+        runtime: &HostedAgentRuntime,
+    ) -> Result<PatchApplyResult, HostedAgentRuntimeError> {
+        self.service
+            .apply_patch(AgentPatchApplyRequest {
+                target_lease_id: runtime.lease_id.clone(),
+                artifact_id: artifact_id.to_string(),
+                idempotency_key: format!(
+                    "hosted-agent:{requesting_agent_id}:lease:{}:artifact:{artifact_id}:apply",
+                    runtime.lease_id
+                ),
+            })
+            .await
+            .map_err(HostedAgentRuntimeError::ApplyPatch)
+    }
+}
+
+/// A registered lease that has not yet been committed to a successfully started thread.
+pub(crate) struct PendingHostedAgentRuntime {
+    agent_id: codex_protocol::ThreadId,
+    runtime: HostedAgentRuntime,
+    environment_selection: TurnEnvironmentSelection,
+    service: Arc<dyn ErasedHostedAgentService>,
+    environment_manager: Arc<EnvironmentManager>,
+    rollback: PendingRuntimeRollback,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingRuntimeRollback {
+    KeepLease,
+    ReleaseLease,
+}
+
+impl PendingHostedAgentRuntime {
+    pub(crate) fn environment_selection(&self) -> &TurnEnvironmentSelection {
+        &self.environment_selection
+    }
+
+    pub(crate) fn tool_authorization(&self) -> HostedToolAuthorization {
+        HostedToolAuthorization::new(
+            self.runtime.environment_id.clone(),
+            self.runtime.tool_policy.clone(),
+        )
+    }
+
+    pub(crate) fn commit(self) -> HostedAgentRuntime {
+        self.runtime
+    }
+
+    pub(crate) fn durable_record(&self) -> HostedAgentRuntimeRecord {
+        self.runtime.durable_record()
+    }
+
+    pub(crate) async fn rollback(self) -> Result<(), HostedAgentRuntimeError> {
+        match self.rollback {
+            PendingRuntimeRollback::KeepLease => self
+                .environment_manager
+                .remove_environment(&self.runtime.environment_id)
+                .await
+                .map(|_| ())
+                .map_err(|source| HostedAgentRuntimeError::Unregister {
+                    environment_id: self.runtime.environment_id,
+                    source,
+                }),
+            PendingRuntimeRollback::ReleaseLease => {
+                cleanup_runtime(
+                    self.agent_id,
+                    self.runtime,
+                    self.environment_manager.as_ref(),
+                    self.service.as_ref(),
+                )
+                .await
+            }
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum HostedAgentRuntimeError {
+    #[error("hosted-agent provisioning failed: {0}")]
+    Provision(HostedAgentError),
+    #[error("hosted-agent reconnect failed: {0}")]
+    Reconnect(HostedAgentError),
+    #[error("hosted-agent restore unavailable: {0}")]
+    RestoreUnavailable(String),
+    #[error("failed to register hosted environment `{environment_id}`: {source}")]
+    Register {
+        environment_id: String,
+        #[source]
+        source: ExecServerError,
+    },
+    #[error("failed to checkpoint hosted-agent lease: {0}")]
+    Checkpoint(HostedAgentError),
+    #[error("failed to export hosted-agent patch: {0}")]
+    ExportPatch(HostedAgentError),
+    #[error("failed to apply hosted-agent patch: {0}")]
+    ApplyPatch(HostedAgentError),
+    #[error("failed to unregister hosted environment `{environment_id}`: {source}")]
+    Unregister {
+        environment_id: String,
+        #[source]
+        source: ExecServerError,
+    },
+    #[error("failed to release hosted-agent lease: {0}")]
+    Release(HostedAgentError),
+}
+
+async fn cleanup_runtime(
+    agent_id: codex_protocol::ThreadId,
+    runtime: HostedAgentRuntime,
+    environment_manager: &EnvironmentManager,
+    service: &dyn ErasedHostedAgentService,
+) -> Result<(), HostedAgentRuntimeError> {
+    let release_idempotency_key = release_idempotency_key(agent_id, &runtime.lease_id);
+    let unregister_result = environment_manager
+        .remove_environment(&runtime.environment_id)
+        .await;
+    let release_result = service
+        .release(AgentReleaseRequest {
+            lease_id: runtime.lease_id,
+            idempotency_key: release_idempotency_key,
+        })
+        .await;
+
+    match (unregister_result, release_result) {
+        (Err(source), _) => Err(HostedAgentRuntimeError::Unregister {
+            environment_id: runtime.environment_id,
+            source,
+        }),
+        (Ok(_), Err(error)) => Err(HostedAgentRuntimeError::Release(error)),
+        (Ok(_), Ok(())) => Ok(()),
+    }
+}
+
+fn release_idempotency_key(agent_id: codex_protocol::ThreadId, lease_id: &str) -> String {
+    format!("hosted-agent:{agent_id}:lease:{lease_id}:release")
+}
+
+#[cfg(test)]
+#[path = "hosted_agent_runtime_tests.rs"]
+mod tests;

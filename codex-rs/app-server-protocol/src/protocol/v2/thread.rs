@@ -54,6 +54,11 @@ pub enum ThreadStartSource {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ThreadStartParams {
+    /// Hosted agent role to use for this root thread. Omission selects the
+    /// configured `hosted_agents.default_agent_type`.
+    #[experimental("thread/start.agentType")]
+    #[ts(optional = nullable)]
+    pub agent_type: Option<String>,
     #[ts(optional = nullable)]
     pub model: Option<String>,
     #[ts(optional = nullable)]

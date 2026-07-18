@@ -12,6 +12,13 @@ use codex_protocol::protocol::ThreadHistoryMode;
 const THREAD_LIST_DEFAULT_LIMIT: usize = 25;
 const THREAD_LIST_MAX_LIMIT: usize = 100;
 const CODEX_TUI_CLIENT_NAME: &str = "codex-tui";
+const HOSTED_RELEASE_RETRY_DELAYS: [Duration; 5] = [
+    Duration::from_secs(1),
+    Duration::from_secs(5),
+    Duration::from_secs(30),
+    Duration::from_secs(120),
+    Duration::from_secs(300),
+];
 const THREAD_ROLLBACK_DEPRECATION_SUMMARY: &str =
     "thread/rollback is deprecated and will be removed soon";
 
@@ -23,6 +30,38 @@ struct ThreadListFilters {
     search_term: Option<String>,
     use_state_db_only: bool,
     relation_filter: Option<StoreThreadRelationFilter>,
+}
+
+pub(super) fn thread_removal_order(thread_ids: &[ThreadId]) -> Vec<ThreadId> {
+    let Some((root_thread_id, descendant_thread_ids)) = thread_ids.split_first() else {
+        return Vec::new();
+    };
+    descendant_thread_ids
+        .iter()
+        .rev()
+        .copied()
+        .chain(std::iter::once(*root_thread_id))
+        .collect()
+}
+
+fn schedule_hosted_cleanup_retries(thread_manager: &Arc<ThreadManager>, thread_id: ThreadId) {
+    let thread_manager = Arc::downgrade(thread_manager);
+    tokio::spawn(async move {
+        for delay in HOSTED_RELEASE_RETRY_DELAYS {
+            tokio::time::sleep(delay).await;
+            let Some(thread_manager) = thread_manager.upgrade() else {
+                return;
+            };
+            thread_manager.retry_hosted_runtime_cleanup(thread_id).await;
+            if !thread_manager
+                .hosted_runtime_cleanup_pending(thread_id)
+                .await
+            {
+                return;
+            }
+        }
+        warn!(%thread_id, "hosted cleanup remains pending after asynchronous retries");
+    });
 }
 
 fn collect_resume_override_mismatches(
@@ -862,27 +901,47 @@ impl ThreadRequestProcessor {
         Ok(ThreadUnsubscribeResponse { status })
     }
 
-    async fn prepare_thread_for_archive(&self, thread_id: ThreadId) {
-        self.prepare_thread_for_removal(thread_id, "archive").await;
-    }
-
-    pub(super) async fn prepare_thread_for_removal(&self, thread_id: ThreadId, operation: &str) {
-        let removed_conversation = self.thread_manager.remove_thread(&thread_id).await;
-        if let Some(conversation) = removed_conversation {
+    pub(super) async fn prepare_threads_for_removal(
+        &self,
+        thread_ids: &[ThreadId],
+        operation: &str,
+    ) -> Result<(), JSONRPCErrorError> {
+        // Keep every runtime registered until all descendants have stopped. In hosted mode,
+        // removing a thread also releases its lease, so removal must be a distinct second phase.
+        for thread_id in thread_ids.iter().copied() {
+            let Ok(conversation) = self.thread_manager.get_thread(thread_id).await else {
+                continue;
+            };
             info!("thread {thread_id} was active; shutting down");
             match wait_for_thread_shutdown(&conversation).await {
                 ThreadShutdownResult::Complete => {}
                 ThreadShutdownResult::SubmitFailed => {
-                    error!(
-                        "failed to submit Shutdown to thread {thread_id}; proceeding with {operation}"
-                    );
+                    return Err(internal_error(format!(
+                        "failed to shut down thread {thread_id} before {operation}"
+                    )));
                 }
                 ThreadShutdownResult::TimedOut => {
-                    warn!("thread {thread_id} shutdown timed out; proceeding with {operation}");
+                    return Err(internal_error(format!(
+                        "thread {thread_id} shutdown timed out before {operation}"
+                    )));
                 }
             }
         }
-        self.finalize_thread_teardown(thread_id).await;
+        for thread_id in thread_ids.iter().copied() {
+            self.finalize_thread_teardown(thread_id).await;
+        }
+        for thread_id in thread_ids {
+            let thread_id = *thread_id;
+            self.thread_manager.remove_thread(&thread_id).await;
+            if self
+                .thread_manager
+                .hosted_runtime_cleanup_pending(thread_id)
+                .await
+            {
+                schedule_hosted_cleanup_retries(&self.thread_manager, thread_id);
+            }
+        }
+        Ok(())
     }
 
     fn listener_task_context(&self) -> ListenerTaskContext {
@@ -939,6 +998,7 @@ impl ThreadRequestProcessor {
         request_context: RequestContext,
     ) -> Result<(), JSONRPCErrorError> {
         let ThreadStartParams {
+            agent_type,
             model,
             model_provider,
             allow_provider_model_fallback,
@@ -1028,6 +1088,7 @@ impl ThreadRequestProcessor {
                 history_mode.map(Into::into),
                 session_start_source,
                 thread_source.map(Into::into),
+                agent_type,
                 environments,
                 service_name,
                 allow_provider_model_fallback,
@@ -1105,6 +1166,7 @@ impl ThreadRequestProcessor {
         history_mode: Option<ThreadHistoryMode>,
         session_start_source: Option<codex_app_server_protocol::ThreadStartSource>,
         thread_source: Option<codex_protocol::protocol::ThreadSource>,
+        agent_type: Option<String>,
         environment_selections: Option<Vec<TurnEnvironmentSelection>>,
         service_name: Option<String>,
         allow_provider_model_fallback: bool,
@@ -1220,43 +1282,57 @@ impl ThreadRequestProcessor {
             thread_extension_init.insert(selected_capability_roots);
         }
         let create_thread_started_at = std::time::Instant::now();
+        let start_options = StartThreadOptions {
+            config,
+            allow_provider_model_fallback,
+            initial_history: match session_start_source
+                .unwrap_or(codex_app_server_protocol::ThreadStartSource::Startup)
+            {
+                codex_app_server_protocol::ThreadStartSource::Startup => InitialHistory::New,
+                codex_app_server_protocol::ThreadStartSource::Clear => InitialHistory::Cleared,
+            },
+            history_mode,
+            session_source: None,
+            thread_source,
+            dynamic_tools,
+            metrics_service_name: service_name,
+            parent_trace: request_trace,
+            environments,
+            thread_extension_init,
+            supports_openai_form_elicitation,
+        };
+        let start_thread = async {
+            match agent_type {
+                Some(agent_type) => {
+                    listener_task_context
+                        .thread_manager
+                        .start_thread_with_options_and_agent_type(start_options, agent_type)
+                        .await
+                }
+                None => {
+                    listener_task_context
+                        .thread_manager
+                        .start_thread_with_options(start_options)
+                        .await
+                }
+            }
+        }
+        .instrument(tracing::info_span!(
+            "app_server.thread_start.create_thread",
+            otel.name = "app_server.thread_start.create_thread",
+            thread_start.dynamic_tool_count = dynamic_tool_count,
+        ))
+        .await;
         let NewThread {
             thread_id,
             thread,
             session_configured,
             ..
-        } = listener_task_context
-            .thread_manager
-            .start_thread_with_options(StartThreadOptions {
-                config,
-                allow_provider_model_fallback,
-                initial_history: match session_start_source
-                    .unwrap_or(codex_app_server_protocol::ThreadStartSource::Startup)
-                {
-                    codex_app_server_protocol::ThreadStartSource::Startup => InitialHistory::New,
-                    codex_app_server_protocol::ThreadStartSource::Clear => InitialHistory::Cleared,
-                },
-                history_mode,
-                session_source: None,
-                thread_source,
-                dynamic_tools,
-                metrics_service_name: service_name,
-                parent_trace: request_trace,
-                environments,
-                thread_extension_init,
-                supports_openai_form_elicitation,
-            })
-            .instrument(tracing::info_span!(
-                "app_server.thread_start.create_thread",
-                otel.name = "app_server.thread_start.create_thread",
-                thread_start.dynamic_tool_count = dynamic_tool_count,
-            ))
-            .await
-            .map_err(|err| match err {
-                CodexErr::InvalidRequest(message) => invalid_request(message),
-                CodexErr::UnsupportedOperation(message) => method_not_found(message),
-                err => internal_error(format!("error creating thread: {err}")),
-            })?;
+        } = start_thread.map_err(|err| match err {
+            CodexErr::InvalidRequest(message) => invalid_request(message),
+            CodexErr::UnsupportedOperation(message) => method_not_found(message),
+            err => internal_error(format!("error creating thread: {err}")),
+        })?;
         let session_telemetry = thread.session_telemetry();
         session_telemetry.record_startup_phase(
             "thread_start_create_thread",
@@ -1474,7 +1550,9 @@ impl ThreadRequestProcessor {
             return Ok((ThreadArchiveResponse {}, archived_thread_ids));
         };
 
-        self.prepare_thread_for_archive(*parent_thread_id).await;
+        let removal_order = thread_removal_order(&archive_thread_ids);
+        self.prepare_threads_for_removal(&removal_order, "archive")
+            .await?;
         match self
             .thread_store
             .archive_thread(StoreArchiveThreadParams {
@@ -1489,7 +1567,6 @@ impl ThreadRequestProcessor {
         }
 
         for descendant_thread_id in descendant_thread_ids.iter().rev().copied() {
-            self.prepare_thread_for_archive(descendant_thread_id).await;
             match self
                 .thread_store
                 .archive_thread(StoreArchiveThreadParams {

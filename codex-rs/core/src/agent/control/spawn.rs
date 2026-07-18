@@ -6,6 +6,7 @@ use codex_extension_api::ExtensionDataInit;
 
 const AGENT_NAMES: &str = include_str!("../agent_names.txt");
 
+#[derive(Default)]
 struct SpawnAgentThreadInheritance {
     environments: Option<TurnEnvironmentSnapshot>,
     exec_policy: Option<Arc<crate::exec_policy::ExecPolicyManager>>,
@@ -124,6 +125,26 @@ async fn load_agent_model_context(
 }
 
 impl AgentControl {
+    async fn spawn_agent_thread_inheritance(
+        &self,
+        state: &Arc<ThreadManagerState>,
+        session_source: Option<&SessionSource>,
+        child_config: &Config,
+    ) -> SpawnAgentThreadInheritance {
+        if child_config.hosted_agents.enabled {
+            return SpawnAgentThreadInheritance::default();
+        }
+
+        SpawnAgentThreadInheritance {
+            environments: self
+                .inherited_environments_for_source(state, session_source)
+                .await,
+            exec_policy: self
+                .inherited_exec_policy_for_source(state, session_source, child_config)
+                .await,
+        }
+    }
+
     /// Restore persisted V2 agent identities without reopening their runtimes.
     pub(crate) async fn restore_v2_agent_metadata(
         &self,
@@ -285,40 +306,51 @@ impl AgentControl {
             .get_resumed_session_sources()
             .unwrap_or((stored_source, None));
         if let Some(role_name) = session_source.get_agent_role() {
-            let runtime_approval_policy = config.permissions.approval_policy.value();
-            let runtime_approvals_reviewer = config.approvals_reviewer;
-            let runtime_cwd = config.cwd.clone();
-            let runtime_permission_profile = match config.permissions.active_permission_profile() {
-                Some(active_permission_profile) => {
-                    PermissionProfileSnapshot::active_with_profile_workspace_roots(
+            let runtime_overrides = if config.hosted_agents.enabled {
+                None
+            } else {
+                let permission_profile = match config.permissions.active_permission_profile() {
+                    Some(active_permission_profile) => {
+                        PermissionProfileSnapshot::active_with_profile_workspace_roots(
+                            config.permissions.permission_profile().clone(),
+                            active_permission_profile,
+                            config.permissions.profile_workspace_roots().to_vec(),
+                        )
+                    }
+                    None => PermissionProfileSnapshot::legacy(
                         config.permissions.permission_profile().clone(),
-                        active_permission_profile,
-                        config.permissions.profile_workspace_roots().to_vec(),
-                    )
-                }
-                None => PermissionProfileSnapshot::legacy(
-                    config.permissions.permission_profile().clone(),
-                ),
+                    ),
+                };
+                Some((
+                    config.permissions.approval_policy.value(),
+                    config.approvals_reviewer,
+                    config.cwd.clone(),
+                    permission_profile,
+                ))
             };
 
             apply_role_to_config(&mut config, Some(&role_name))
                 .await
                 .map_err(CodexErr::InvalidRequest)?;
-            config
-                .permissions
-                .approval_policy
-                .set(runtime_approval_policy)
-                .map_err(|err| {
-                    CodexErr::InvalidRequest(format!("approval_policy is invalid: {err}"))
-                })?;
-            config.approvals_reviewer = runtime_approvals_reviewer;
-            config.cwd = runtime_cwd;
-            config
-                .permissions
-                .set_permission_profile_from_session_snapshot(runtime_permission_profile)
-                .map_err(|err| {
-                    CodexErr::InvalidRequest(format!("permission_profile is invalid: {err}"))
-                })?;
+            if let Some((approval_policy, approvals_reviewer, cwd, permission_profile)) =
+                runtime_overrides
+            {
+                config
+                    .permissions
+                    .approval_policy
+                    .set(approval_policy)
+                    .map_err(|err| {
+                        CodexErr::InvalidRequest(format!("approval_policy is invalid: {err}"))
+                    })?;
+                config.approvals_reviewer = approvals_reviewer;
+                config.cwd = cwd;
+                config
+                    .permissions
+                    .set_permission_profile_from_session_snapshot(permission_profile)
+                    .map_err(|err| {
+                        CodexErr::InvalidRequest(format!("permission_profile is invalid: {err}"))
+                    })?;
+            }
         }
         let residency_slot = self
             .reserve_v2_residency_slot(&state, &config, Some(thread_id))
@@ -327,11 +359,11 @@ impl AgentControl {
         let parent_thread_id = initial_history
             .get_resumed_parent_thread_id()
             .or(stored_parent_thread_id);
-        let inherited_environments = self
-            .inherited_environments_for_source(&state, Some(&session_source))
-            .await;
-        let inherited_exec_policy = self
-            .inherited_exec_policy_for_source(&state, Some(&session_source), &config)
+        let SpawnAgentThreadInheritance {
+            environments: inherited_environments,
+            exec_policy: inherited_exec_policy,
+        } = self
+            .spawn_agent_thread_inheritance(&state, Some(&session_source), &config)
             .await;
 
         match state
@@ -401,14 +433,9 @@ impl AgentControl {
             agent_max_threads
         };
         let mut reservation = self.state.reserve_spawn_slot(reservation_max_threads)?;
-        let inheritance = SpawnAgentThreadInheritance {
-            environments: self
-                .inherited_environments_for_source(&state, session_source.as_ref())
-                .await,
-            exec_policy: self
-                .inherited_exec_policy_for_source(&state, session_source.as_ref(), &config)
-                .await,
-        };
+        let inheritance = self
+            .spawn_agent_thread_inheritance(&state, session_source.as_ref(), &config)
+            .await;
         let (session_source, mut agent_metadata) = match session_source {
             Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
                 parent_thread_id,
@@ -457,6 +484,11 @@ impl AgentControl {
                 } else {
                     None
                 };
+                let environment_selections = if config.hosted_agents.enabled {
+                    None
+                } else {
+                    options.environments.clone()
+                };
                 Box::pin(state.spawn_new_thread_with_source(
                     config.clone(),
                     self.clone(),
@@ -468,7 +500,7 @@ impl AgentControl {
                     /*metrics_service_name*/ None,
                     inheritance.environments,
                     inheritance.exec_policy,
-                    options.environments.clone(),
+                    environment_selections,
                 ))
                 .await?
             }
@@ -715,6 +747,11 @@ impl AgentControl {
         }
         let mut thread_extension_init = ExtensionDataInit::new();
         thread_extension_init.insert(selected_capability_roots);
+        let environment_selections = if config.hosted_agents.enabled {
+            None
+        } else {
+            options.environments.clone()
+        };
 
         state
             .fork_thread_with_source(
@@ -728,7 +765,7 @@ impl AgentControl {
                 /*forked_from_thread_id*/ Some(parent_thread_id),
                 inherited_environments,
                 inherited_exec_policy,
-                options.environments.clone(),
+                environment_selections,
                 thread_extension_init,
             )
             .await
@@ -871,11 +908,11 @@ impl AgentControl {
             other => (other, AgentMetadata::default()),
         };
         let notification_source = session_source.clone();
-        let inherited_environments = self
-            .inherited_environments_for_source(&state, Some(&session_source))
-            .await;
-        let inherited_exec_policy = self
-            .inherited_exec_policy_for_source(&state, Some(&session_source), &config)
+        let SpawnAgentThreadInheritance {
+            environments: inherited_environments,
+            exec_policy: inherited_exec_policy,
+        } = self
+            .spawn_agent_thread_inheritance(&state, Some(&session_source), &config)
             .await;
 
         let resumed_thread = state

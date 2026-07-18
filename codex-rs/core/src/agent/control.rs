@@ -10,11 +10,14 @@ use crate::codex_thread::ThreadConfigSnapshot;
 use crate::config::Config;
 use crate::config::RolloutBudgetConfig;
 use crate::environment_selection::TurnEnvironmentSnapshot;
+use crate::hosted_agent_runtime::PendingHostedAgentRuntime;
 use crate::rollout_budget::RolloutBudget;
 use crate::session::emit_subagent_session_started;
 use crate::session_prefix::format_inter_agent_completion_message;
 use crate::session_prefix::format_subagent_context_line;
 use crate::session_prefix::format_subagent_notification_message;
+use crate::thread_manager::HostedAgentPatchApplyResult;
+use crate::thread_manager::HostedAgentProvisioningLineage;
 use crate::thread_manager::ResumeThreadWithHistoryOptions;
 use crate::thread_manager::ThreadManagerState;
 use crate::thread_rollout_truncation::truncate_rollout_to_last_n_fork_turns;
@@ -135,6 +138,123 @@ impl AgentControl {
 
     pub(crate) fn rollout_budget(&self) -> &RolloutBudget {
         self.rollout_budget.as_ref()
+    }
+
+    pub(crate) async fn prepare_hosted_delegate_runtime(
+        &self,
+        thread_id: ThreadId,
+        config: &mut Config,
+        initial_history: &InitialHistory,
+        session_source: &SessionSource,
+        parent_thread_id: ThreadId,
+    ) -> CodexResult<Option<PendingHostedAgentRuntime>> {
+        if !config.hosted_agents.enabled {
+            return Ok(None);
+        }
+        self.upgrade()?
+            .prepare_hosted_runtime(
+                thread_id,
+                config,
+                initial_history,
+                session_source,
+                /*requested_agent_type*/ None,
+                HostedAgentProvisioningLineage::owned_by(parent_thread_id),
+            )
+            .await
+    }
+
+    pub(crate) async fn commit_hosted_delegate_runtime(
+        &self,
+        thread_id: ThreadId,
+        pending: PendingHostedAgentRuntime,
+    ) -> CodexResult<()> {
+        let state = match self.upgrade() {
+            Ok(state) => state,
+            Err(error) => {
+                if let Err(cleanup_error) = pending.rollback().await {
+                    warn!(
+                        error = %cleanup_error,
+                        %thread_id,
+                        "failed to roll back hosted delegate runtime after manager shutdown"
+                    );
+                }
+                return Err(error);
+            }
+        };
+        state.commit_hosted_runtime(thread_id, pending).await
+    }
+
+    pub(crate) async fn checkpoint_hosted_runtime(
+        &self,
+        thread_id: ThreadId,
+        turn_id: &str,
+    ) -> CodexResult<()> {
+        let Some(state) = self.manager.upgrade() else {
+            return Ok(());
+        };
+        state.checkpoint_hosted_runtime(thread_id, turn_id).await
+    }
+
+    /// Finalizes an owned hosted runtime before its successful terminal event is published.
+    pub(crate) async fn finalize_hosted_runtime(
+        &self,
+        agent_id: ThreadId,
+        owner_thread_id: ThreadId,
+    ) -> CodexResult<Option<codex_hosted_agent::AgentPatchArtifact>> {
+        let state = self.upgrade()?;
+        state
+            .finalize_hosted_runtime(agent_id, owner_thread_id)
+            .await
+    }
+
+    /// Applies a finalized descendant's patch to this session's own hosted sandbox.
+    pub(crate) async fn apply_hosted_agent_patch(
+        &self,
+        requesting_agent_id: ThreadId,
+        source_agent_id: ThreadId,
+        artifact_id: &str,
+    ) -> CodexResult<HostedAgentPatchApplyResult> {
+        const UNAVAILABLE_PATCH_REASON: &str = "patch is not available to the requesting agent";
+
+        if requesting_agent_id == source_agent_id {
+            return Ok(HostedAgentPatchApplyResult::Rejected {
+                reason: UNAVAILABLE_PATCH_REASON.to_string(),
+            });
+        }
+
+        let state = self.upgrade()?;
+        let persisted_descendants = match state.agent_graph_store() {
+            Some(agent_graph_store) => agent_graph_store
+                .list_thread_spawn_descendants(requesting_agent_id, /*status_filter*/ None)
+                .await
+                .map_err(|error| {
+                    CodexErr::Fatal(format!("failed to load thread-spawn descendants: {error}"))
+                })?,
+            None => Vec::new(),
+        };
+        let source_is_owned = persisted_descendants.contains(&source_agent_id)
+            || self
+                .list_live_agent_subtree_thread_ids(requesting_agent_id)
+                .await?
+                .contains(&source_agent_id)
+            || state
+                .is_hosted_agent_descendant(requesting_agent_id, source_agent_id)
+                .await?;
+        if !source_is_owned {
+            return Ok(HostedAgentPatchApplyResult::Rejected {
+                reason: UNAVAILABLE_PATCH_REASON.to_string(),
+            });
+        }
+
+        state
+            .apply_hosted_agent_patch(requesting_agent_id, source_agent_id, artifact_id)
+            .await
+    }
+
+    pub(crate) async fn release_hosted_delegate_runtime(&self, thread_id: ThreadId) {
+        if let Ok(state) = self.upgrade() {
+            state.release_hosted_runtime(thread_id).await;
+        }
     }
 
     /// Send rich user input items to an existing agent thread.

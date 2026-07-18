@@ -6,6 +6,7 @@ use async_channel::Sender;
 use codex_analytics::GuardianApprovalRequestSource;
 use codex_async_utils::OrCancelExt;
 use codex_extension_api::LoadedUserInstructions;
+use codex_protocol::ThreadId;
 use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
@@ -73,7 +74,7 @@ struct PendingMcpInvocation {
 /// Its submission channel accepts additional `Op`s for the sub-agent.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_codex_thread_interactive(
-    config: Config,
+    mut config: Config,
     auth_manager: Arc<AuthManager>,
     models_manager: SharedModelsManager,
     parent_session: Arc<Session>,
@@ -86,11 +87,50 @@ pub(crate) async fn run_codex_thread_interactive(
     let (tx_ops, rx_ops) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
     let conversation_history = initial_history.unwrap_or(InitialHistory::New);
     let forked_from_thread_id = conversation_history.forked_from_id();
+    let thread_id = ThreadId::new();
+    let session_source = SessionSource::SubAgent(subagent_source.clone());
+    let mut pending_hosted_runtime = parent_session
+        .services
+        .agent_control
+        .prepare_hosted_delegate_runtime(
+            thread_id,
+            &mut config,
+            &conversation_history,
+            &session_source,
+            parent_session.thread_id,
+        )
+        .await?;
+    if config.hosted_agents.enabled && pending_hosted_runtime.is_none() {
+        crate::hosted_agent_telemetry::record_local_fallback_attempt(
+            crate::hosted_agent_telemetry::LocalFallbackPath::Delegate,
+        );
+        return Err(CodexErr::Fatal(
+            "hosted delegate provisioning returned no runtime; local fallback is disabled"
+                .to_string(),
+        ));
+    }
+    let (environment_selections, inherited_environments, inherited_exec_policy) =
+        match pending_hosted_runtime.as_ref() {
+            Some(pending) => (
+                vec![pending.environment_selection().clone()],
+                /*inherited_environments*/ None,
+                /*inherited_exec_policy*/ None,
+            ),
+            None => (
+                parent_ctx.environments.to_selections(),
+                Some(parent_ctx.environments.clone()),
+                Some(Arc::clone(&parent_session.services.exec_policy)),
+            ),
+        };
+    let hosted_tool_authorization = pending_hosted_runtime
+        .as_ref()
+        .map(crate::hosted_agent_runtime::PendingHostedAgentRuntime::tool_authorization);
     let user_instructions = LoadedUserInstructions {
         instructions: parent_session.user_instructions().await,
         warnings: Vec::new(),
     };
-    let (session, io) = Box::pin(Session::spawn(SessionSpawnArgs {
+    let session_result = Box::pin(Session::spawn(SessionSpawnArgs {
+        thread_id,
         config,
         allow_provider_model_fallback: false,
         user_instructions,
@@ -108,20 +148,21 @@ pub(crate) async fn run_codex_thread_interactive(
         extensions: Arc::clone(&parent_session.services.extensions),
         conversation_history,
         requested_history_mode: None,
-        session_source: SessionSource::SubAgent(subagent_source.clone()),
+        session_source,
         forked_from_thread_id,
         parent_thread_id: Some(parent_session.thread_id),
         thread_source: Some(ThreadSource::Subagent),
         originator: parent_ctx.originator.clone(),
         agent_control: parent_session.services.agent_control.clone(),
         dynamic_tools: Vec::new(),
+        hosted_tool_authorization,
         metrics_service_name: None,
         user_shell_override: None,
-        inherited_environments: Some(parent_ctx.environments.clone()),
-        inherited_exec_policy: Some(Arc::clone(&parent_session.services.exec_policy)),
+        inherited_environments,
+        inherited_exec_policy,
         parent_rollout_thread_trace: codex_rollout_trace::ThreadTraceContext::disabled(),
         parent_trace: None,
-        environment_selections: parent_ctx.environments.to_selections(),
+        environment_selections,
         thread_extension_init: codex_extension_api::ExtensionDataInit::default(),
         supports_openai_form_elicitation: parent_session
             .services
@@ -134,7 +175,60 @@ pub(crate) async fn run_codex_thread_interactive(
         inherited_multi_agent_version: Some(MultiAgentVersion::Disabled),
     }))
     .or_cancel(&cancel_token)
-    .await??;
+    .await;
+    let (session, io) = match session_result {
+        Ok(Ok(session)) => session,
+        result => {
+            if let Some(pending) = pending_hosted_runtime.take()
+                && let Err(cleanup_error) = pending.rollback().await
+            {
+                tracing::warn!(
+                    error = %cleanup_error,
+                    %thread_id,
+                    "failed to roll back hosted delegate runtime after session startup failed"
+                );
+            }
+            return match result {
+                Ok(Err(error)) => Err(error),
+                Err(error) => Err(error.into()),
+                Ok(Ok(_)) => unreachable!(),
+            };
+        }
+    };
+    if let Some(pending) = pending_hosted_runtime.take() {
+        if let Err(error) = session.try_ensure_rollout_materialized().await {
+            if let Err(shutdown_error) = io.shutdown_and_wait().await {
+                tracing::warn!(
+                    error = %shutdown_error,
+                    %thread_id,
+                    "failed to shut down hosted delegate after persistence failed"
+                );
+            }
+            if let Err(cleanup_error) = pending.rollback().await {
+                tracing::warn!(
+                    error = %cleanup_error,
+                    %thread_id,
+                    "failed to roll back hosted delegate runtime after persistence failed"
+                );
+            }
+            return Err(CodexErr::Fatal(format!(
+                "failed to materialize hosted delegate {thread_id}: {error}"
+            )));
+        }
+        parent_session
+            .services
+            .agent_control
+            .commit_hosted_delegate_runtime(thread_id, pending)
+            .await?;
+        let session_loop_termination = io.session_loop_termination.clone();
+        let agent_control = parent_session.services.agent_control.clone();
+        tokio::spawn(async move {
+            session_loop_termination.await;
+            agent_control
+                .release_hosted_delegate_runtime(thread_id)
+                .await;
+        });
+    }
     let thread_config = session.thread_config_snapshot().await;
     let client_metadata = parent_session.app_server_client_metadata().await;
     emit_subagent_session_started(

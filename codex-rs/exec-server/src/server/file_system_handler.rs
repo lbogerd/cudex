@@ -40,6 +40,7 @@ use crate::protocol::FsWalkParams;
 use crate::protocol::FsWalkResponse;
 use crate::protocol::FsWriteFileParams;
 use crate::protocol::FsWriteFileResponse;
+use crate::rpc::file_system_permission_denied;
 use crate::rpc::internal_error;
 use crate::rpc::invalid_request;
 use crate::rpc::not_found;
@@ -280,9 +281,8 @@ fn validate_file_read_handle_id(handle_id: &str) -> Result<(), JSONRPCErrorError
 fn map_fs_error(err: io::Error) -> JSONRPCErrorError {
     match err.kind() {
         io::ErrorKind::NotFound => not_found(err.to_string()),
-        io::ErrorKind::InvalidInput | io::ErrorKind::PermissionDenied => {
-            invalid_request(err.to_string())
-        }
+        io::ErrorKind::InvalidInput => invalid_request(err.to_string()),
+        io::ErrorKind::PermissionDenied => file_system_permission_denied(err.to_string()),
         _ => internal_error(err.to_string()),
     }
 }
@@ -298,6 +298,23 @@ mod tests {
     use crate::FileSystemSandboxContext;
     use crate::protocol::FsReadFileParams;
     use crate::protocol::FsWriteFileParams;
+
+    #[test]
+    fn permission_denied_errors_keep_a_typed_wire_code() {
+        let error = map_fs_error(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "hosted sandbox rejected the operation",
+        ));
+
+        assert_eq!(
+            error,
+            JSONRPCErrorError {
+                code: codex_exec_server_protocol::FILE_SYSTEM_PERMISSION_DENIED_ERROR_CODE,
+                data: None,
+                message: "hosted sandbox rejected the operation".to_string(),
+            }
+        );
+    }
 
     #[tokio::test]
     async fn no_platform_sandbox_policies_do_not_require_configured_sandbox_helper() {

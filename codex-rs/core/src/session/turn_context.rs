@@ -1,5 +1,6 @@
 use super::*;
 use crate::environment_selection::TurnEnvironmentSnapshot;
+use crate::hosted_agent_runtime::HostedToolAuthorization;
 use crate::shell_snapshot::ShellSnapshotFile;
 use codex_core_skills::HostSkillsSnapshot;
 use codex_file_system::FileSystemSandboxContext;
@@ -147,6 +148,7 @@ pub struct TurnContext {
     pub(crate) unified_exec_shell_mode: UnifiedExecShellMode,
     pub(crate) final_output_json_schema: Option<Value>,
     pub(crate) dynamic_tools: Vec<DynamicToolSpec>,
+    pub(crate) hosted_tool_authorization: Option<HostedToolAuthorization>,
     pub(crate) turn_metadata_state: Arc<TurnMetadataState>,
     pub(crate) extension_data: Arc<codex_extension_api::ExtensionData>,
     pub(crate) turn_skills: TurnSkillsContext,
@@ -309,6 +311,7 @@ impl TurnContext {
             unified_exec_shell_mode: self.unified_exec_shell_mode.clone(),
             final_output_json_schema: self.final_output_json_schema.clone(),
             dynamic_tools: self.dynamic_tools.clone(),
+            hosted_tool_authorization: self.hosted_tool_authorization.clone(),
             turn_metadata_state: self.turn_metadata_state.clone(),
             extension_data: Arc::clone(&self.extension_data),
             turn_skills: self.turn_skills.clone(),
@@ -588,6 +591,7 @@ impl Session {
             unified_exec_shell_mode,
             final_output_json_schema: None,
             dynamic_tools: session_configuration.dynamic_tools.clone(),
+            hosted_tool_authorization: session_configuration.hosted_tool_authorization.clone(),
             turn_metadata_state,
             extension_data,
             turn_skills: TurnSkillsContext::new(skills_snapshot),

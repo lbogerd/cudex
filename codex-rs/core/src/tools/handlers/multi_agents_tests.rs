@@ -11,6 +11,7 @@ use crate::session::turn_context::TurnContext;
 use crate::session_prefix::format_inter_agent_completion_message;
 use crate::thread_manager::thread_store_from_config;
 use crate::tools::context::ToolOutput;
+use crate::tools::handlers::multi_agents_v2::ApplyAgentPatchHandler;
 use crate::tools::handlers::multi_agents_v2::FollowupTaskHandler as FollowupTaskHandlerV2;
 use crate::tools::handlers::multi_agents_v2::InterruptAgentHandler;
 use crate::tools::handlers::multi_agents_v2::ListAgentsHandler as ListAgentsHandlerV2;
@@ -2550,6 +2551,84 @@ async fn send_input_rejects_invalid_id() {
 }
 
 #[tokio::test]
+async fn apply_agent_patch_rejects_invalid_agent_id() {
+    let (session, turn) = make_session_and_context().await;
+    let invocation = invocation(
+        Arc::new(session),
+        Arc::new(turn),
+        "apply_agent_patch",
+        function_payload(json!({
+            "agent_id": "not-a-uuid",
+            "artifact_id": "artifact-1"
+        })),
+    );
+
+    let err = ApplyAgentPatchHandler
+        .handle(invocation)
+        .await
+        .err()
+        .expect("invalid agent id should be rejected");
+    let FunctionCallError::RespondToModel(message) = err else {
+        panic!("expected respond-to-model error");
+    };
+    assert!(message.starts_with("invalid agent id not-a-uuid:"));
+}
+
+#[tokio::test]
+async fn apply_agent_patch_targets_the_calling_session() {
+    let (mut session, turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    session.services.agent_control = manager.agent_control();
+    let requesting_agent_id = session.thread_id;
+    let output = ApplyAgentPatchHandler
+        .handle(invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "apply_agent_patch",
+            function_payload(json!({
+                "agent_id": requesting_agent_id.to_string(),
+                "artifact_id": "artifact-1"
+            })),
+        ))
+        .await
+        .expect("same-agent patch request should return a bounded rejection");
+
+    let (content, success) = expect_text_output(output);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&content)
+            .expect("patch apply result should be json"),
+        json!({
+            "type": "rejected",
+            "reason": "patch is not available to the requesting agent"
+        })
+    );
+    assert_eq!(success, Some(true));
+}
+
+#[tokio::test]
+async fn apply_agent_patch_does_not_accept_a_target_thread() {
+    let (session, turn) = make_session_and_context().await;
+    let err = ApplyAgentPatchHandler
+        .handle(invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "apply_agent_patch",
+            function_payload(json!({
+                "agent_id": ThreadId::new().to_string(),
+                "artifact_id": "artifact-1",
+                "thread_id": ThreadId::new().to_string()
+            })),
+        ))
+        .await
+        .err()
+        .expect("target override should be rejected");
+    let FunctionCallError::RespondToModel(message) = err else {
+        panic!("expected respond-to-model error");
+    };
+    assert!(message.contains("unknown field `thread_id`"));
+}
+
+#[tokio::test]
 async fn send_input_reports_missing_agent() {
     let (mut session, turn) = make_session_and_context().await;
     let manager = thread_manager();
@@ -4487,6 +4566,49 @@ async fn build_agent_spawn_config_uses_turn_context_values() {
         .set_permission_profile(permission_profile)
         .expect("permission profile set");
     assert_eq!(config, expected);
+}
+
+#[tokio::test]
+async fn build_hosted_agent_spawn_config_does_not_inherit_turn_runtime_values() {
+    let (_session, mut turn) = make_session_and_context().await;
+    let base_instructions = BaseInstructions {
+        text: "base".to_string(),
+    };
+    let mut base_config = (*turn.config).clone();
+    base_config.hosted_agents.enabled = true;
+    let configured_cwd = base_config.cwd.clone();
+    let configured_approval_policy = base_config.permissions.approval_policy.value();
+    let configured_permission_profile = base_config.permissions.permission_profile().clone();
+    turn.config = Arc::new(base_config);
+
+    let turn_cwd = tempfile::tempdir().expect("turn cwd").abs();
+    #[allow(deprecated)]
+    {
+        turn.cwd = turn_cwd;
+    }
+    let turn_approval_policy = if configured_approval_policy == AskForApproval::Never {
+        AskForApproval::OnRequest
+    } else {
+        AskForApproval::Never
+    };
+    turn.approval_policy
+        .set(turn_approval_policy)
+        .expect("approval policy set");
+    turn.permission_profile = PermissionProfile::Disabled;
+    assert_ne!(turn.approval_policy.value(), configured_approval_policy);
+    assert_ne!(turn.permission_profile(), configured_permission_profile);
+
+    let config = build_agent_spawn_config(&base_instructions, &turn).expect("spawn config");
+
+    assert_eq!(config.cwd, configured_cwd);
+    assert_eq!(
+        config.permissions.approval_policy.value(),
+        configured_approval_policy
+    );
+    assert_eq!(
+        config.permissions.permission_profile(),
+        &configured_permission_profile
+    );
 }
 
 #[tokio::test]

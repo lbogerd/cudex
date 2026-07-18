@@ -1,3 +1,4 @@
+use codex_hosted_agent::HostedAgentRuntimeRecord;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::ThreadHistoryMode;
 use std::any::Any;
@@ -70,6 +71,31 @@ pub trait ThreadStore: Any + Send + Sync {
     /// Implementations should release any live writer resources for the thread while preserving
     /// already-durable thread data.
     fn discard_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()>;
+
+    /// Returns the durable hosted-agent runtime record for an existing thread.
+    fn get_hosted_agent_runtime(
+        &self,
+        _thread_id: ThreadId,
+    ) -> ThreadStoreFuture<'_, Option<HostedAgentRuntimeRecord>> {
+        Box::pin(async {
+            Err(ThreadStoreError::Unsupported {
+                operation: "get_hosted_agent_runtime",
+            })
+        })
+    }
+
+    /// Replaces the durable hosted-agent runtime record for an existing thread.
+    fn set_hosted_agent_runtime(
+        &self,
+        _thread_id: ThreadId,
+        _record: HostedAgentRuntimeRecord,
+    ) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(async {
+            Err(ThreadStoreError::Unsupported {
+                operation: "set_hosted_agent_runtime",
+            })
+        })
+    }
 
     /// Loads persisted history for resume, fork, rollback, and memory jobs.
     fn load_history(

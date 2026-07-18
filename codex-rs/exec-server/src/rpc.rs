@@ -580,6 +580,14 @@ pub(crate) fn not_found(message: String) -> JSONRPCErrorError {
     }
 }
 
+pub(crate) fn file_system_permission_denied(message: String) -> JSONRPCErrorError {
+    JSONRPCErrorError {
+        code: codex_exec_server_protocol::FILE_SYSTEM_PERMISSION_DENIED_ERROR_CODE,
+        data: None,
+        message,
+    }
+}
+
 pub(crate) fn internal_error(message: String) -> JSONRPCErrorError {
     JSONRPCErrorError {
         code: -32603,

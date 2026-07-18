@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_mcp::ToolInfo;
+use codex_tools::ToolExecutionDomain;
 use codex_tools::ToolExposure;
 use codex_tools::ToolName;
 use pretty_assertions::assert_eq;
@@ -97,6 +98,15 @@ fn runtimes_by_name(runtimes: &[Arc<dyn CoreToolRuntime>]) -> HashMap<ToolName, 
         .collect()
 }
 
+fn runtime_domains_by_name(
+    runtimes: &[Arc<dyn CoreToolRuntime>],
+) -> HashMap<ToolName, ToolExecutionDomain> {
+    runtimes
+        .iter()
+        .map(|runtime| (runtime.tool_name(), runtime.execution_domain()))
+        .collect()
+}
+
 fn with_visibility(mut tool: ToolInfo, visibility: &[&str]) -> ToolInfo {
     tool.tool.meta = Some(Meta(
         serde_json::json!({ "ui": { "visibility": visibility } })
@@ -119,6 +129,46 @@ async fn directly_exposes_effective_tool_sets_when_search_is_unavailable() {
     assert_eq!(
         runtimes_by_name(&runtimes),
         expected_runtimes(&mcp_tools, ToolExposure::Direct)
+    );
+}
+
+#[tokio::test]
+async fn classifies_mcp_tools_by_their_exact_environment_binding() {
+    let codex_home = tempdir().expect("tempdir should succeed");
+    std::fs::write(
+        codex_home.path().join(CONFIG_TOML_FILE),
+        r#"
+[mcp_servers.remote]
+command = "remote-server"
+environment_id = "hosted-environment"
+"#,
+    )
+    .expect("write config");
+    let config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .build()
+        .await
+        .expect("config should build");
+    let remote = make_mcp_tool(
+        "remote", "read", "remote", "read", /*connector_id*/ None,
+        /*connector_name*/ None,
+    );
+    let runtimes = build_mcp_tool_runtimes(
+        std::slice::from_ref(&remote),
+        /*connectors*/ None,
+        &config,
+        /*search_tool_enabled*/ false,
+    );
+
+    assert_eq!(
+        runtime_domains_by_name(&runtimes),
+        HashMap::from([(
+            remote.canonical_tool_name(),
+            ToolExecutionDomain::EnvironmentBoundMcp {
+                server: "remote".to_string(),
+                environment_id: "hosted-environment".to_string(),
+            },
+        )])
     );
 }
 

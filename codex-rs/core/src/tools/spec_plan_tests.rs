@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use codex_features::Feature;
+use codex_hosted_agent::AgentToolPolicy;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_mcp::ToolInfo;
@@ -22,6 +23,8 @@ use codex_tools::DiscoverableTool;
 use codex_tools::ResponsesApiNamespaceTool;
 use codex_tools::ResponsesApiTool;
 use codex_tools::ToolCall as ExtensionToolCall;
+use codex_tools::ToolExecutionDomain;
+use codex_tools::ToolExecutionDomainKind;
 use codex_tools::ToolExecutor;
 use codex_tools::ToolExposure;
 use codex_tools::ToolName;
@@ -32,6 +35,7 @@ use serde_json::json;
 
 use crate::config::CurrentTimeReminderConfig;
 use crate::environment_selection::TurnEnvironmentState;
+use crate::hosted_agent_runtime::HostedToolAuthorization;
 use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
 use crate::session::turn_context::TurnContext;
@@ -39,6 +43,7 @@ use crate::tools::handlers::McpHandler;
 use crate::tools::handlers::ToolSearchHandlerCache;
 use crate::tools::handlers::multi_agents_spec::MULTI_AGENT_V1_NAMESPACE;
 use crate::tools::registry::CoreToolRuntime;
+use crate::tools::registry::override_tool_execution_domain;
 use crate::tools::registry::override_tool_exposure;
 use crate::tools::router::ToolRouter;
 use crate::tools::router::ToolRouterParams;
@@ -224,6 +229,21 @@ fn set_features(turn: &mut TurnContext, features: &[Feature]) {
     for feature in features {
         set_feature(turn, *feature, /*enabled*/ true);
     }
+}
+
+fn set_hosted_tool_policy(
+    turn: &mut TurnContext,
+    environment_id: &str,
+    allowed_domains: impl IntoIterator<Item = ToolExecutionDomainKind>,
+    allowed_tools: impl IntoIterator<Item = ToolName>,
+) {
+    turn.hosted_tool_authorization = Some(HostedToolAuthorization::new(
+        environment_id.to_string(),
+        AgentToolPolicy {
+            allowed_domains: allowed_domains.into_iter().collect(),
+            allowed_tools: allowed_tools.into_iter().collect(),
+        },
+    ));
 }
 
 fn zsh_fork_config_for_spec_plan_tests() -> codex_tools::ZshForkConfig {
@@ -503,6 +523,138 @@ async fn shell_family_registers_visible_unified_exec_and_hidden_legacy_shell() {
     plan.assert_registered_contains(&["exec_command", "write_stdin", "shell_command"]);
     assert_eq!(plan.exposure("shell_command"), ToolExposure::Hidden);
     assert!(has_parameter(plan.visible_spec("exec_command"), "shell"));
+}
+
+#[tokio::test]
+async fn hosted_policy_filters_specs_and_unregisters_unsafe_runtime_tools() {
+    let plan = probe_with(
+        |turn| {
+            set_features(
+                turn,
+                &[
+                    Feature::ShellTool,
+                    Feature::UnifiedExec,
+                    Feature::CodeMode,
+                    Feature::RequestPermissionsTool,
+                ],
+            );
+            turn.model_info.shell_type = ConfigShellToolType::ShellCommand;
+            set_web_search_mode(turn, WebSearchMode::Live);
+            set_hosted_tool_policy(
+                turn,
+                "local",
+                [
+                    ToolExecutionDomainKind::AgentEnvironment,
+                    ToolExecutionDomainKind::ControlPlane,
+                ],
+                [
+                    ToolName::plain("exec_command"),
+                    ToolName::plain("write_stdin"),
+                    ToolName::plain("view_image"),
+                    ToolName::plain("update_plan"),
+                ],
+            );
+        },
+        ToolPlanInputs {
+            extension_tool_executors: vec![Arc::new(DeferredExtensionTool)],
+            dynamic_tools: vec![dynamic_tool(
+                None,
+                "client_echo",
+                /*defer_loading*/ false,
+            )],
+            ..Default::default()
+        },
+    )
+    .await;
+
+    plan.assert_visible_contains(&["exec_command", "write_stdin", "view_image", "update_plan"]);
+    plan.assert_visible_lacks(&[
+        "shell_command",
+        "request_permissions",
+        "extension_echo",
+        "client_echo",
+        "web_search",
+        codex_code_mode::PUBLIC_TOOL_NAME,
+        codex_code_mode::WAIT_TOOL_NAME,
+    ]);
+    plan.assert_registered_contains(&["extension_echo", "client_echo"]);
+    plan.assert_registered_lacks(&[
+        "shell_command",
+        "request_permissions",
+        codex_code_mode::PUBLIC_TOOL_NAME,
+        codex_code_mode::WAIT_TOOL_NAME,
+    ]);
+    let exec_spec = plan.visible_spec("exec_command");
+    for parameter in ["additional_permissions", "justification", "prefix_rule"] {
+        assert!(!has_parameter(exec_spec, parameter));
+    }
+    assert_eq!(
+        serde_json::to_value(exec_spec)
+            .expect("exec_command spec should serialize")
+            .pointer("/parameters/properties/sandbox_permissions/enum")
+            .cloned(),
+        Some(serde_json::json!(["use_default"]))
+    );
+}
+
+#[tokio::test]
+async fn hosted_policy_requires_exact_mcp_environment_binding() {
+    let exact_tool_name = ToolName::namespaced("exact", "read");
+    let mismatched_tool_name = ToolName::namespaced("mismatched", "read");
+    let ambient_tool_name = ToolName::namespaced("ambient", "read");
+    let plan = probe_with(
+        |turn| {
+            set_hosted_tool_policy(
+                turn,
+                "hosted-environment",
+                [
+                    ToolExecutionDomainKind::EnvironmentBoundMcp,
+                    ToolExecutionDomainKind::AmbientMcp,
+                ],
+                [
+                    exact_tool_name.clone(),
+                    mismatched_tool_name.clone(),
+                    ambient_tool_name.clone(),
+                ],
+            );
+        },
+        ToolPlanInputs {
+            tool_runtimes: vec![
+                override_tool_execution_domain(
+                    mcp_runtime("exact-server", "exact", "read", ToolExposure::Direct),
+                    ToolExecutionDomain::EnvironmentBoundMcp {
+                        server: "exact-server".to_string(),
+                        environment_id: "hosted-environment".to_string(),
+                    },
+                ),
+                override_tool_execution_domain(
+                    mcp_runtime(
+                        "mismatched-server",
+                        "mismatched",
+                        "read",
+                        ToolExposure::Direct,
+                    ),
+                    ToolExecutionDomain::EnvironmentBoundMcp {
+                        server: "mismatched-server".to_string(),
+                        environment_id: "other-environment".to_string(),
+                    },
+                ),
+                override_tool_execution_domain(
+                    mcp_runtime("ambient-server", "ambient", "read", ToolExposure::Direct),
+                    ToolExecutionDomain::AmbientMcp {
+                        server: "ambient-server".to_string(),
+                    },
+                ),
+            ],
+            ..Default::default()
+        },
+    )
+    .await;
+
+    assert_eq!(plan.namespace_function_names("exact"), &["read"]);
+    assert!(plan.namespace_function_names("mismatched").is_empty());
+    assert!(plan.namespace_function_names("ambient").is_empty());
+    plan.assert_registered_contains(&["exactread", "mismatchedread", "ambientread"]);
 }
 
 #[tokio::test]
@@ -1343,6 +1495,85 @@ async fn multi_agent_v2_message_schemas_are_encrypted() {
             Some(true)
         );
     }
+}
+
+#[tokio::test]
+async fn hosted_multi_agent_v2_exposes_plain_patch_apply_only_when_authorized() {
+    let non_hosted = probe(|turn| {
+        set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
+    })
+    .await;
+    non_hosted.assert_visible_lacks(&["apply_agent_patch"]);
+    non_hosted.assert_registered_lacks(&["apply_agent_patch"]);
+
+    let hosted = probe(|turn| {
+        set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
+        update_config(turn, |config| {
+            config.hosted_agents.enabled = true;
+            config.multi_agent_v2.tool_namespace = Some("agents".to_string());
+        });
+        set_hosted_tool_policy(
+            turn,
+            "hosted",
+            [ToolExecutionDomainKind::ControlPlane],
+            [ToolName::plain("apply_agent_patch")],
+        );
+    })
+    .await;
+    hosted.assert_visible_contains(&["apply_agent_patch"]);
+    hosted.assert_registered_contains(&["apply_agent_patch"]);
+    assert!(
+        !hosted
+            .registered_names
+            .contains(&ToolName::namespaced("agents", "apply_agent_patch").to_string())
+    );
+    let ToolSpec::Function(ResponsesApiTool { parameters, .. }) =
+        hosted.visible_spec("apply_agent_patch")
+    else {
+        panic!("expected plain apply_agent_patch function tool");
+    };
+    assert_eq!(
+        parameters.required.as_ref(),
+        Some(&vec!["agent_id".to_string(), "artifact_id".to_string()])
+    );
+    assert_eq!(
+        parameters
+            .properties
+            .as_ref()
+            .expect("patch apply should use object params")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec!["agent_id".to_string(), "artifact_id".to_string()]
+    );
+
+    let denied = probe(|turn| {
+        set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
+        update_config(turn, |config| config.hosted_agents.enabled = true);
+        set_hosted_tool_policy(
+            turn,
+            "hosted",
+            [ToolExecutionDomainKind::ControlPlane],
+            [ToolName::plain("update_plan")],
+        );
+    })
+    .await;
+    denied.assert_visible_lacks(&["apply_agent_patch"]);
+    denied.assert_registered_contains(&["apply_agent_patch"]);
+
+    let allowed = probe(|turn| {
+        set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
+        update_config(turn, |config| config.hosted_agents.enabled = true);
+        set_hosted_tool_policy(
+            turn,
+            "hosted",
+            [ToolExecutionDomainKind::ControlPlane],
+            [ToolName::plain("apply_agent_patch")],
+        );
+    })
+    .await;
+    allowed.assert_visible_contains(&["apply_agent_patch"]);
+    allowed.assert_registered_contains(&["apply_agent_patch"]);
 }
 
 #[tokio::test]

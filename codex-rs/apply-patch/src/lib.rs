@@ -59,6 +59,16 @@ pub enum ApplyPatchError {
     ImplicitInvocation,
 }
 
+impl ApplyPatchError {
+    /// Returns whether patch verification or application was denied by the executor filesystem.
+    pub fn is_permission_denied(&self) -> bool {
+        matches!(
+            self,
+            Self::IoError(error) if error.source.kind() == io::ErrorKind::PermissionDenied
+        )
+    }
+}
+
 impl From<std::io::Error> for ApplyPatchError {
     fn from(err: std::io::Error) -> Self {
         ApplyPatchError::IoError(IoError {

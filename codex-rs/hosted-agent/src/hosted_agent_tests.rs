@@ -27,6 +27,84 @@ fn root_request(key: &str) -> AgentProvisionRequest {
     }
 }
 
+fn child_request(key: &str, owner_lease_id: &str) -> AgentProvisionRequest {
+    AgentProvisionRequest {
+        source: ProjectSnapshotSource::AgentEnvironment {
+            owner_lease_id: owner_lease_id.to_string(),
+        },
+        ..root_request(key)
+    }
+}
+
+#[test]
+fn durable_runtime_record_round_trips_without_transient_data() {
+    let agent_id =
+        ThreadId::from_string("00000000-0000-0000-0000-000000000123").expect("valid thread id");
+    let record = HostedAgentRuntimeRecord {
+        owner_agent_id: Some(agent_id),
+        agent_type: "reviewer".to_string(),
+        sandbox_template: "review-v2".to_string(),
+        lease_id: "lease-1".to_string(),
+        environment_id: "environment-1".to_string(),
+        base_snapshot_id: "snapshot-base".to_string(),
+        latest_snapshot_id: Some("snapshot-latest".to_string()),
+        last_exported_patch: Some(AgentPatchArtifact {
+            artifact_id: "artifact-1".to_string(),
+            agent_id,
+            base_snapshot_id: "snapshot-base".to_string(),
+            checksum: "sha256:1234".to_string(),
+            changed_files: 2,
+            size_bytes: 512,
+        }),
+        lifecycle_state: HostedAgentLifecycleState::Completed,
+    };
+
+    let json = serde_json::to_value(&record).expect("record should serialize");
+    assert_eq!(
+        json,
+        json!({
+            "ownerAgentId": agent_id,
+            "agentType": "reviewer",
+            "sandboxTemplate": "review-v2",
+            "leaseId": "lease-1",
+            "environmentId": "environment-1",
+            "baseSnapshotId": "snapshot-base",
+            "latestSnapshotId": "snapshot-latest",
+            "lastExportedPatch": {
+                "artifactId": "artifact-1",
+                "agentId": agent_id,
+                "baseSnapshotId": "snapshot-base",
+                "checksum": "sha256:1234",
+                "changedFiles": 2,
+                "sizeBytes": 512,
+            },
+            "lifecycleState": "completed",
+        })
+    );
+    assert_eq!(
+        serde_json::from_value::<HostedAgentRuntimeRecord>(json)
+            .expect("record should deserialize"),
+        record
+    );
+}
+
+#[test]
+fn durable_runtime_record_defaults_missing_owner_for_legacy_records() {
+    let record = serde_json::from_value::<HostedAgentRuntimeRecord>(json!({
+        "agentType": "reviewer",
+        "sandboxTemplate": "review-v2",
+        "leaseId": "lease-1",
+        "environmentId": "environment-1",
+        "baseSnapshotId": "snapshot-base",
+        "latestSnapshotId": "snapshot-latest",
+        "lastExportedPatch": null,
+        "lifecycleState": "active",
+    }))
+    .expect("legacy record should deserialize");
+
+    assert_eq!(record.owner_agent_id, None);
+}
+
 #[tokio::test]
 async fn fake_lifecycle_is_idempotent_and_restorable() {
     let service = FakeHostedAgentService::default();
@@ -72,7 +150,89 @@ async fn fake_lifecycle_is_idempotent_and_restorable() {
 }
 
 #[tokio::test]
-async fn fake_patch_conflict_is_atomic_and_clean_apply_can_be_checkpointed() {
+async fn fake_reports_missing_and_released_leases() {
+    let service = FakeHostedAgentService::default();
+    let unknown_lease_id = "unknown-lease".to_string();
+    assert_lease_missing(
+        service
+            .reconnect(AgentReconnectRequest {
+                lease_id: unknown_lease_id.clone(),
+                idempotency_key: "reconnect-unknown".to_string(),
+            })
+            .await,
+    );
+    assert_lease_missing(
+        service
+            .checkpoint(AgentCheckpointRequest {
+                lease_id: unknown_lease_id.clone(),
+                idempotency_key: "checkpoint-unknown".to_string(),
+            })
+            .await,
+    );
+    assert_lease_missing(
+        service
+            .export_patch(AgentPatchExportRequest {
+                lease_id: unknown_lease_id.clone(),
+                agent_id: ThreadId::new(),
+                base_snapshot_id: "snapshot-unknown".to_string(),
+                idempotency_key: "export-unknown".to_string(),
+            })
+            .await,
+    );
+    assert_lease_missing(
+        service
+            .apply_patch(AgentPatchApplyRequest {
+                target_lease_id: unknown_lease_id.clone(),
+                artifact_id: "artifact-unknown".to_string(),
+                idempotency_key: "apply-unknown".to_string(),
+            })
+            .await,
+    );
+    assert_lease_missing(
+        service
+            .release(AgentReleaseRequest {
+                lease_id: unknown_lease_id,
+                idempotency_key: "release-unknown".to_string(),
+            })
+            .await,
+    );
+
+    let provisioned = service
+        .provision(root_request("released"))
+        .await
+        .expect("provision succeeds");
+    service
+        .release(AgentReleaseRequest {
+            lease_id: provisioned.lease_id.clone(),
+            idempotency_key: "release".to_string(),
+        })
+        .await
+        .expect("release succeeds");
+    assert_lease_missing(
+        service
+            .reconnect(AgentReconnectRequest {
+                lease_id: provisioned.lease_id.clone(),
+                idempotency_key: "reconnect-released".to_string(),
+            })
+            .await,
+    );
+    assert_lease_missing(
+        service
+            .checkpoint(AgentCheckpointRequest {
+                lease_id: provisioned.lease_id,
+                idempotency_key: "checkpoint-released".to_string(),
+            })
+            .await,
+    );
+}
+
+fn assert_lease_missing<T: std::fmt::Debug>(result: crate::types::Result<T>) {
+    let error = result.expect_err("lease lookup must fail");
+    assert_eq!(error.category, HostedAgentErrorCategory::LeaseMissing);
+}
+
+#[tokio::test]
+async fn fake_patch_conflict_is_atomic_and_clean_apply_returns_checkpoint() {
     let service = FakeHostedAgentService::default();
     let source = service
         .provision(root_request("source"))
@@ -125,24 +285,219 @@ async fn fake_patch_conflict_is_atomic_and_clean_apply_can_be_checkpointed() {
         .provision(root_request("clean-target"))
         .await
         .expect("clean target provision succeeds");
+    let apply_request = AgentPatchApplyRequest {
+        target_lease_id: clean_target.lease_id.clone(),
+        artifact_id: artifact.artifact_id,
+        idempotency_key: "apply-clean".to_string(),
+    };
+    let result = service
+        .apply_patch(apply_request.clone())
+        .await
+        .expect("apply succeeds");
+    let PatchApplyResult::Applied { checkpoint } = &result else {
+        panic!("clean apply must succeed");
+    };
+    assert_eq!(
+        service.latest_snapshot_id(&clean_target.lease_id),
+        Some(checkpoint.snapshot_id.clone())
+    );
+    assert_eq!(
+        service
+            .apply_patch(apply_request)
+            .await
+            .expect("apply retry succeeds"),
+        result
+    );
+    assert_eq!(
+        service.latest_snapshot_id(&clean_target.lease_id),
+        Some(checkpoint.snapshot_id.clone())
+    );
+}
+
+#[tokio::test]
+async fn fake_patch_exports_and_applies_isolated_file_changes() {
+    let service = FakeHostedAgentService::default();
+    let owner = service
+        .provision(root_request("file-owner"))
+        .await
+        .expect("owner provision succeeds");
+    let modified = PathUri::parse("file:///workspace/modified.txt").unwrap();
+    let deleted = PathUri::parse("file:///workspace/deleted.txt").unwrap();
+    let added = PathUri::parse("file:///workspace/added.txt").unwrap();
+    service
+        .write_lease_file(&owner.lease_id, modified.clone(), b"old".to_vec())
+        .unwrap();
+    service
+        .write_lease_file(&owner.lease_id, deleted.clone(), b"remove".to_vec())
+        .unwrap();
+    service
+        .checkpoint(AgentCheckpointRequest {
+            lease_id: owner.lease_id.clone(),
+            idempotency_key: "owner-files".to_string(),
+        })
+        .await
+        .unwrap();
+
+    let child = service
+        .provision(child_request("file-child", &owner.lease_id))
+        .await
+        .expect("child provision succeeds");
+    service
+        .write_lease_file(&child.lease_id, modified.clone(), b"new".to_vec())
+        .unwrap();
+    service
+        .write_lease_file(&child.lease_id, added.clone(), b"added".to_vec())
+        .unwrap();
+    service
+        .remove_lease_file(&child.lease_id, &deleted)
+        .unwrap();
+    service
+        .checkpoint(AgentCheckpointRequest {
+            lease_id: child.lease_id.clone(),
+            idempotency_key: "child-files".to_string(),
+        })
+        .await
+        .unwrap();
+    service
+        .write_lease_file(
+            &child.lease_id,
+            modified.clone(),
+            b"uncheckpointed".to_vec(),
+        )
+        .unwrap();
+    let artifact = service
+        .export_patch(AgentPatchExportRequest {
+            lease_id: child.lease_id,
+            agent_id: ThreadId::new(),
+            base_snapshot_id: child.base_snapshot_id,
+            idempotency_key: "export-files".to_string(),
+        })
+        .await
+        .expect("file patch exports");
+    assert_eq!(artifact.changed_files, 3);
+    assert_eq!(artifact.size_bytes, 8);
+    assert_eq!(
+        service.read_lease_file(&owner.lease_id, &modified).unwrap(),
+        Some(b"old".to_vec())
+    );
+
+    let result = service
+        .apply_patch(AgentPatchApplyRequest {
+            target_lease_id: owner.lease_id.clone(),
+            artifact_id: artifact.artifact_id,
+            idempotency_key: "apply-files".to_string(),
+        })
+        .await
+        .expect("file patch applies");
+    assert!(matches!(result, PatchApplyResult::Applied { .. }));
+    assert_eq!(
+        service.read_lease_file(&owner.lease_id, &modified).unwrap(),
+        Some(b"new".to_vec())
+    );
+    assert_eq!(
+        service.read_lease_file(&owner.lease_id, &added).unwrap(),
+        Some(b"added".to_vec())
+    );
+    assert_eq!(
+        service.read_lease_file(&owner.lease_id, &deleted).unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn fake_three_way_conflict_leaves_every_target_file_unchanged() {
+    let service = FakeHostedAgentService::default();
+    let owner = service
+        .provision(root_request("atomic-owner"))
+        .await
+        .expect("owner provision succeeds");
+    let conflicted = PathUri::parse("file:///workspace/conflicted.txt").unwrap();
+    let clean = PathUri::parse("file:///workspace/clean.txt").unwrap();
+    for path in [&conflicted, &clean] {
+        service
+            .write_lease_file(&owner.lease_id, path.clone(), b"base".to_vec())
+            .unwrap();
+    }
+    service
+        .checkpoint(AgentCheckpointRequest {
+            lease_id: owner.lease_id.clone(),
+            idempotency_key: "atomic-base".to_string(),
+        })
+        .await
+        .unwrap();
+    let child = service
+        .provision(child_request("atomic-child", &owner.lease_id))
+        .await
+        .unwrap();
+    service
+        .write_lease_file(&child.lease_id, conflicted.clone(), b"agent".to_vec())
+        .unwrap();
+    service
+        .write_lease_file(&child.lease_id, clean.clone(), b"agent".to_vec())
+        .unwrap();
+    service
+        .checkpoint(AgentCheckpointRequest {
+            lease_id: child.lease_id.clone(),
+            idempotency_key: "atomic-child-checkpoint".to_string(),
+        })
+        .await
+        .unwrap();
+    let artifact = service
+        .export_patch(AgentPatchExportRequest {
+            lease_id: child.lease_id,
+            agent_id: ThreadId::new(),
+            base_snapshot_id: child.base_snapshot_id,
+            idempotency_key: "atomic-export".to_string(),
+        })
+        .await
+        .unwrap();
+    service
+        .write_lease_file(&owner.lease_id, conflicted.clone(), b"owner".to_vec())
+        .unwrap();
+    let snapshot_before = service.latest_snapshot_id(&owner.lease_id);
+
     assert_eq!(
         service
             .apply_patch(AgentPatchApplyRequest {
-                target_lease_id: clean_target.lease_id.clone(),
+                target_lease_id: owner.lease_id.clone(),
                 artifact_id: artifact.artifact_id,
-                idempotency_key: "apply-clean".to_string(),
+                idempotency_key: "atomic-apply".to_string(),
             })
             .await
-            .expect("apply succeeds"),
-        PatchApplyResult::Applied
+            .unwrap(),
+        PatchApplyResult::Conflict {
+            paths: vec![conflicted.clone()],
+        }
     );
-    service
-        .checkpoint(AgentCheckpointRequest {
-            lease_id: clean_target.lease_id,
-            idempotency_key: "post-apply-checkpoint".to_string(),
-        })
+    assert_eq!(service.latest_snapshot_id(&owner.lease_id), snapshot_before);
+    assert_eq!(
+        service
+            .read_lease_file(&owner.lease_id, &conflicted)
+            .unwrap(),
+        Some(b"owner".to_vec())
+    );
+    assert_eq!(
+        service.read_lease_file(&owner.lease_id, &clean).unwrap(),
+        Some(b"base".to_vec())
+    );
+}
+
+#[tokio::test]
+async fn fake_lease_files_are_bounded() {
+    let service = FakeHostedAgentService::default();
+    let lease = service
+        .provision(root_request("bounded-files"))
         .await
-        .expect("applied snapshot remains checkpointable");
+        .unwrap();
+    let error = service
+        .write_lease_file(
+            &lease.lease_id,
+            PathUri::parse("file:///workspace/too-large.bin").unwrap(),
+            vec![0; 1024 * 1024 + 1],
+        )
+        .expect_err("oversized fake file must be rejected");
+
+    assert_eq!(error.category, HostedAgentErrorCategory::QuotaExceeded);
 }
 
 #[tokio::test]
@@ -321,6 +676,41 @@ async fn http_client_rejects_duplicate_lease_or_environment_ids() {
 }
 
 #[tokio::test]
+async fn http_client_distinguishes_missing_leases_and_snapshots() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/agents/reconnect"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/agents/provision"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&server)
+        .await;
+    let client = HttpHostedAgentService::for_test(&server.uri(), "secret").unwrap();
+
+    assert_lease_missing(
+        client
+            .reconnect(AgentReconnectRequest {
+                lease_id: "lease-missing".to_string(),
+                idempotency_key: "reconnect".to_string(),
+            })
+            .await,
+    );
+
+    let mut restore = root_request("restore");
+    restore.source = ProjectSnapshotSource::DurableSnapshot {
+        snapshot_id: "snapshot-missing".to_string(),
+    };
+    let error = client
+        .provision(restore)
+        .await
+        .expect_err("missing snapshot must fail");
+    assert_eq!(error.category, HostedAgentErrorCategory::SnapshotMissing);
+}
+
+#[tokio::test]
 async fn http_client_validates_checkpoint_response() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -336,5 +726,57 @@ async fn http_client_validates_checkpoint_response() {
         })
         .await
         .expect_err("empty snapshot ID must fail");
+    assert_eq!(error.category, HostedAgentErrorCategory::InvalidResponse);
+}
+
+#[tokio::test]
+async fn http_client_rejects_oversized_artifact_ids() {
+    let server = MockServer::start().await;
+    let agent_id = ThreadId::new();
+    Mock::given(method("POST"))
+        .and(path("/v1/agents/patch/export"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "artifactId": "a".repeat(513),
+            "agentId": agent_id,
+            "baseSnapshotId": "snapshot-base",
+            "checksum": "sha256:abcd",
+            "changedFiles": 1,
+            "sizeBytes": 10
+        })))
+        .mount(&server)
+        .await;
+    let client = HttpHostedAgentService::for_test(&server.uri(), "secret").unwrap();
+    let error = client
+        .export_patch(AgentPatchExportRequest {
+            lease_id: "lease-1".to_string(),
+            agent_id,
+            base_snapshot_id: "snapshot-base".to_string(),
+            idempotency_key: "export".to_string(),
+        })
+        .await
+        .expect_err("oversized artifact ID must fail");
+    assert_eq!(error.category, HostedAgentErrorCategory::InvalidResponse);
+}
+
+#[tokio::test]
+async fn http_client_validates_applied_patch_checkpoint() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/agents/patch/apply"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "type": "applied",
+            "checkpoint": { "snapshotId": "" }
+        })))
+        .mount(&server)
+        .await;
+    let client = HttpHostedAgentService::for_test(&server.uri(), "secret").unwrap();
+    let error = client
+        .apply_patch(AgentPatchApplyRequest {
+            target_lease_id: "lease-1".to_string(),
+            artifact_id: "artifact-1".to_string(),
+            idempotency_key: "apply".to_string(),
+        })
+        .await
+        .expect_err("empty applied snapshot ID must fail");
     assert_eq!(error.category, HostedAgentErrorCategory::InvalidResponse);
 }

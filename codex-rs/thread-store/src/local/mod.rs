@@ -2,6 +2,7 @@ mod archive_thread;
 mod create_thread;
 mod delete_thread;
 mod helpers;
+mod hosted_agent;
 mod list_threads;
 mod live_writer;
 mod model_context;
@@ -311,6 +312,23 @@ impl ThreadStore for LocalThreadStore {
 
     fn discard_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()> {
         Box::pin(async move { live_writer::discard_thread(self, thread_id).await })
+    }
+
+    fn get_hosted_agent_runtime(
+        &self,
+        thread_id: ThreadId,
+    ) -> ThreadStoreFuture<'_, Option<codex_hosted_agent::HostedAgentRuntimeRecord>> {
+        Box::pin(async move { hosted_agent::get_hosted_agent_runtime(self, thread_id).await })
+    }
+
+    fn set_hosted_agent_runtime(
+        &self,
+        thread_id: ThreadId,
+        record: codex_hosted_agent::HostedAgentRuntimeRecord,
+    ) -> ThreadStoreFuture<'_, ()> {
+        Box::pin(
+            async move { hosted_agent::set_hosted_agent_runtime(self, thread_id, record).await },
+        )
     }
 
     fn load_history(

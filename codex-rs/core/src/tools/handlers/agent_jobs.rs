@@ -218,7 +218,8 @@ async fn run_agent_job_loop(
                         )))),
                         SpawnAgentOptions {
                             parent_thread_id: Some(session.thread_id),
-                            environments: Some(turn.environments.to_selections()),
+                            environments: (!turn.config.hosted_agents.enabled)
+                                .then(|| turn.environments.to_selections()),
                             ..Default::default()
                         },
                     )

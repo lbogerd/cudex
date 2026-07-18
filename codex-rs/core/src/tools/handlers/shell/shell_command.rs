@@ -146,6 +146,7 @@ impl ToolExecutor<ToolInvocation> for ShellCommandHandler {
         create_shell_command_tool(CommandToolOptions {
             allow_login_shell: self.options.allow_login_shell,
             exec_permission_approvals_enabled: self.options.exec_permission_approvals_enabled,
+            allow_permission_escalation: true,
         })
     }
 

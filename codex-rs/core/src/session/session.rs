@@ -4,6 +4,7 @@ use crate::agents_md_manager::AgentsMdManager;
 use crate::config::ConstraintError;
 use crate::environment_selection::ThreadEnvironments;
 use crate::environment_selection::TurnEnvironmentSnapshot;
+use crate::hosted_agent_runtime::HostedToolAuthorization;
 use crate::shell_snapshot::ShellSnapshot;
 use crate::skills::SkillError;
 use crate::state::ActiveTurn;
@@ -16,6 +17,7 @@ use codex_protocol::config_types::ServiceTier;
 use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::protocol::MultiAgentVersion;
+use codex_protocol::protocol::NetworkAccess;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TurnEnvironmentSelections;
@@ -104,6 +106,7 @@ pub(crate) struct SessionConfiguration {
     /// Effective originator used for this thread's Responses requests and analytics events.
     pub(super) originator: String,
     pub(super) dynamic_tools: Vec<DynamicToolSpec>,
+    pub(super) hosted_tool_authorization: Option<HostedToolAuthorization>,
     pub(super) user_shell_override: Option<shell::Shell>,
 }
 
@@ -217,6 +220,81 @@ impl SessionConfiguration {
     }
 
     pub(crate) fn apply(&self, updates: &SessionSettingsUpdate) -> ConstraintResult<Self> {
+        if self.hosted_tool_authorization.is_some() {
+            if updates
+                .environments
+                .as_ref()
+                .is_some_and(|environments| environments != &self.environments)
+            {
+                return Err(ConstraintError::InvalidValue {
+                    field_name: "environments",
+                    candidate: "hosted environment override".to_string(),
+                    allowed: "the environment provisioned for this hosted thread".to_string(),
+                    requirement_source: codex_config::RequirementSource::Unknown,
+                });
+            }
+            if updates
+                .approval_policy
+                .is_some_and(|policy| policy != AskForApproval::Never)
+            {
+                return Err(ConstraintError::InvalidValue {
+                    field_name: "approval_policy",
+                    candidate: format!("{:?}", updates.approval_policy),
+                    allowed: format!("[{:?}]", AskForApproval::Never),
+                    requirement_source: codex_config::RequirementSource::Unknown,
+                });
+            }
+            let hosted_permission_profile = PermissionProfile::External {
+                network: NetworkSandboxPolicy::Enabled,
+            };
+            if updates
+                .permission_profile
+                .as_ref()
+                .is_some_and(|profile| profile != &hosted_permission_profile)
+            {
+                return Err(ConstraintError::InvalidValue {
+                    field_name: "permission_profile",
+                    candidate: format!("{:?}", updates.permission_profile),
+                    allowed: format!("[{hosted_permission_profile:?}]"),
+                    requirement_source: codex_config::RequirementSource::Unknown,
+                });
+            }
+            let hosted_sandbox_policy = SandboxPolicy::ExternalSandbox {
+                network_access: NetworkAccess::Enabled,
+            };
+            if updates
+                .sandbox_policy
+                .as_ref()
+                .is_some_and(|policy| policy != &hosted_sandbox_policy)
+            {
+                return Err(ConstraintError::InvalidValue {
+                    field_name: "sandbox_policy",
+                    candidate: format!("{:?}", updates.sandbox_policy),
+                    allowed: format!("[{hosted_sandbox_policy:?}]"),
+                    requirement_source: codex_config::RequirementSource::Unknown,
+                });
+            }
+            if updates.active_permission_profile.is_some() {
+                return Err(ConstraintError::InvalidValue {
+                    field_name: "active_permission_profile",
+                    candidate: format!("{:?}", updates.active_permission_profile),
+                    allowed: "[None]".to_string(),
+                    requirement_source: codex_config::RequirementSource::Unknown,
+                });
+            }
+            if updates
+                .profile_workspace_roots
+                .as_ref()
+                .is_some_and(|roots| !roots.is_empty())
+            {
+                return Err(ConstraintError::InvalidValue {
+                    field_name: "profile_workspace_roots",
+                    candidate: format!("{:?}", updates.profile_workspace_roots),
+                    allowed: "[]".to_string(),
+                    requirement_source: codex_config::RequirementSource::Unknown,
+                });
+            }
+        }
         let mut next_configuration = self.clone();
         let current_sandbox_policy = self.sandbox_policy();
         let current_file_system_sandbox_policy = self.file_system_sandbox_policy();
@@ -474,6 +552,7 @@ impl Session {
     #[instrument(name = "session_init", level = "info", skip_all)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn new(
+        thread_id: ThreadId,
         mut session_configuration: SessionConfiguration,
         config: Arc<Config>,
         user_instructions: Option<codex_extension_api::UserInstructions>,
@@ -534,12 +613,14 @@ impl Session {
         let multi_agent_version = multi_agent_version.map(OnceLock::from).unwrap_or_default();
         let initial_multi_agent_version = multi_agent_version.get().copied();
 
-        let thread_id = match &initial_history {
-            InitialHistory::New | InitialHistory::Cleared | InitialHistory::Forked(_) => {
-                ThreadId::default()
-            }
-            InitialHistory::Resumed(resumed_history) => resumed_history.conversation_id,
-        };
+        if let InitialHistory::Resumed(resumed_history) = &initial_history
+            && thread_id != resumed_history.conversation_id
+        {
+            anyhow::bail!(
+                "preallocated thread ID {thread_id} does not match resumed thread ID {}",
+                resumed_history.conversation_id
+            );
+        }
         let resumed_session_id = match &initial_history {
             InitialHistory::Resumed(resumed) => {
                 resumed.history.iter().find_map(|item| match item {
