@@ -109,3 +109,12 @@ test('gateway revalidates active lease state after provider connection', async t
   releaseConnect()
   assert.equal(await close, 1008)
 })
+
+test('gateway closes an established connection after another replica durably releases its lease', async t => {
+  const upstream = await echoServer(); t.after(() => { upstream.websocket.close(); upstream.server.close() })
+  const context = await fixture(upstream.url, { leaseRevalidationMs: 5 }); t.after(() => context.server.close())
+  const client = new WebSocket(context.url); await opened(client)
+  const close = closed(client)
+  await context.store.transaction(database => { database.leases.lease_test!.state = 'released' })
+  assert.equal(await close, 1008)
+})

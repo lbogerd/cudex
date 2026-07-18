@@ -17,6 +17,7 @@ export interface GatewayLimits {
   maxPendingMessages: number
   maxPendingBytes: number
   maxBufferedBytes: number
+  leaseRevalidationMs: number
 }
 
 const defaultLimits: GatewayLimits = {
@@ -26,6 +27,7 @@ const defaultLimits: GatewayLimits = {
   maxPendingMessages: 64,
   maxPendingBytes: 1024 * 1024,
   maxBufferedBytes: 1024 * 1024,
+  leaseRevalidationMs: 5_000,
 }
 
 function bytes(data: WebSocket.RawData): number {
@@ -53,6 +55,7 @@ export class ExecGateway {
     for (const [name, value] of Object.entries(this.limits)) {
       if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`invalid gateway limit: ${name}`)
     }
+    if (this.limits.leaseRevalidationMs > 60_000) throw new Error('invalid gateway limit: leaseRevalidationMs')
     this.server = new WebSocketServer({ noServer: true, maxPayload: this.limits.maxPayloadBytes })
   }
 
@@ -108,11 +111,14 @@ export class ExecGateway {
 
     let upstream: WebSocket | undefined
     let closed = false
+    let revalidation: NodeJS.Timeout | undefined
+    let revalidationPending = false
     let pendingBytes = 0
     const pending: Array<{ data: WebSocket.RawData; binary: boolean }> = []
     const cleanup = (code?: number, reason?: string) => {
       if (closed) return
       closed = true
+      if (revalidation) clearInterval(revalidation)
       pending.splice(0)
       pendingBytes = 0
       connections.delete(client)
@@ -121,6 +127,15 @@ export class ExecGateway {
       if (upstream?.readyState === WebSocket.OPEN) upstream.close()
       else if (upstream?.readyState === WebSocket.CONNECTING) upstream.terminate()
     }
+    revalidation = setInterval(() => {
+      if (closed || revalidationPending) return
+      revalidationPending = true
+      void this.activeSandbox(leaseId)
+        .then(active => { if (active !== sandboxId) cleanup(1008, 'lease inactive') })
+        .catch(() => cleanup(1013, 'gateway unavailable'))
+        .finally(() => { revalidationPending = false })
+    }, this.limits.leaseRevalidationMs)
+    revalidation.unref()
     client.on('close', () => cleanup())
     client.on('error', () => cleanup())
 

@@ -331,8 +331,12 @@ check is also storage-neutral now; PostgreSQL supplies the active provider
 sandbox directly and the two-pool test proves another replica stops resolving it
 immediately after durable release. Production startup still needs to select
 these implementations as part of the full PostgreSQL control-plane cutover, and
-active sockets already accepted by other gateway replicas still need revocation
-event propagation.
+active sockets already accepted by other gateway replicas periodically
+revalidate the same durable directory and close on release/restore or lookup
+failure. Process-local release still closes immediately; the bounded polling
+interval supplies cross-replica propagation without relying on lossy events.
+Focused gateway coverage proves an established connection closes after a
+separate durable-state writer releases its lease.
 
 ### Canonical workspace comparison foundation
 

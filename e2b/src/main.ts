@@ -51,6 +51,7 @@ const gateway = new ExecGateway(tickets, store, provider, {
   maxPendingMessages: positiveInteger('HOSTED_AGENT_GATEWAY_MAX_PENDING_MESSAGES', 64),
   maxPendingBytes: positiveInteger('HOSTED_AGENT_GATEWAY_MAX_PENDING_BYTES', 1024 * 1024),
   maxBufferedBytes: positiveInteger('HOSTED_AGENT_GATEWAY_MAX_BUFFERED_BYTES', 1024 * 1024),
+  leaseRevalidationMs: positiveInteger('HOSTED_AGENT_GATEWAY_LEASE_REVALIDATION_MS', 5_000),
 })
 const service = new ControlPlane(store, provider, tickets, blobs, { templates, allowedRoots,
   ingress: {
