@@ -205,7 +205,7 @@ pub struct HostedAgentRuntimeRecord {
     tag = "type"
 )]
 pub enum PatchApplyResult {
-    Applied,
+    Applied { checkpoint: AgentCheckpoint },
     Conflict { paths: Vec<PathUri> },
     Rejected { reason: String },
 }

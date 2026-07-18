@@ -327,6 +327,9 @@ impl HostedAgentService for HttpHostedAgentService {
     async fn apply_patch(&self, request: AgentPatchApplyRequest) -> Result<PatchApplyResult> {
         let result: PatchApplyResult = self.post("v1/agents/patch/apply", &request).await?;
         match &result {
+            PatchApplyResult::Applied { checkpoint } => {
+                validate_opaque_id(&checkpoint.snapshot_id, "snapshot")?;
+            }
             PatchApplyResult::Conflict { paths } if paths.len() > MAX_CONFLICT_PATHS => {
                 return Err(HostedAgentError::invalid_response(
                     "service returned too many conflict paths",
@@ -337,9 +340,7 @@ impl HostedAgentService for HttpHostedAgentService {
                     "service returned an oversized rejection",
                 ));
             }
-            PatchApplyResult::Applied
-            | PatchApplyResult::Conflict { .. }
-            | PatchApplyResult::Rejected { .. } => {}
+            PatchApplyResult::Conflict { .. } | PatchApplyResult::Rejected { .. } => {}
         }
         Ok(result)
     }

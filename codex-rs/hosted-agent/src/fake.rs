@@ -383,8 +383,10 @@ impl HostedAgentService for FakeHostedAgentService {
                     })?;
                 state.snapshots.insert(snapshot_id.clone(), snapshot);
                 let lease = state.active_lease_mut(&request.target_lease_id)?;
-                lease.latest_snapshot_id = snapshot_id;
-                PatchApplyResult::Applied
+                lease.latest_snapshot_id = snapshot_id.clone();
+                PatchApplyResult::Applied {
+                    checkpoint: AgentCheckpoint { snapshot_id },
+                }
             }
         };
         state

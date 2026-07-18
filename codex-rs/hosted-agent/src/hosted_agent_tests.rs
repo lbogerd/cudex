@@ -204,7 +204,7 @@ fn assert_lease_missing<T: std::fmt::Debug>(result: crate::types::Result<T>) {
 }
 
 #[tokio::test]
-async fn fake_patch_conflict_is_atomic_and_clean_apply_can_be_checkpointed() {
+async fn fake_patch_conflict_is_atomic_and_clean_apply_returns_checkpoint() {
     let service = FakeHostedAgentService::default();
     let source = service
         .provision(root_request("source"))
@@ -257,24 +257,33 @@ async fn fake_patch_conflict_is_atomic_and_clean_apply_can_be_checkpointed() {
         .provision(root_request("clean-target"))
         .await
         .expect("clean target provision succeeds");
+    let apply_request = AgentPatchApplyRequest {
+        target_lease_id: clean_target.lease_id.clone(),
+        artifact_id: artifact.artifact_id,
+        idempotency_key: "apply-clean".to_string(),
+    };
+    let result = service
+        .apply_patch(apply_request.clone())
+        .await
+        .expect("apply succeeds");
+    let PatchApplyResult::Applied { checkpoint } = &result else {
+        panic!("clean apply must succeed");
+    };
+    assert_eq!(
+        service.latest_snapshot_id(&clean_target.lease_id),
+        Some(checkpoint.snapshot_id.clone())
+    );
     assert_eq!(
         service
-            .apply_patch(AgentPatchApplyRequest {
-                target_lease_id: clean_target.lease_id.clone(),
-                artifact_id: artifact.artifact_id,
-                idempotency_key: "apply-clean".to_string(),
-            })
+            .apply_patch(apply_request)
             .await
-            .expect("apply succeeds"),
-        PatchApplyResult::Applied
+            .expect("apply retry succeeds"),
+        result
     );
-    service
-        .checkpoint(AgentCheckpointRequest {
-            lease_id: clean_target.lease_id,
-            idempotency_key: "post-apply-checkpoint".to_string(),
-        })
-        .await
-        .expect("applied snapshot remains checkpointable");
+    assert_eq!(
+        service.latest_snapshot_id(&clean_target.lease_id),
+        Some(checkpoint.snapshot_id.clone())
+    );
 }
 
 #[tokio::test]
@@ -503,5 +512,28 @@ async fn http_client_validates_checkpoint_response() {
         })
         .await
         .expect_err("empty snapshot ID must fail");
+    assert_eq!(error.category, HostedAgentErrorCategory::InvalidResponse);
+}
+
+#[tokio::test]
+async fn http_client_validates_applied_patch_checkpoint() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/agents/patch/apply"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "type": "applied",
+            "checkpoint": { "snapshotId": "" }
+        })))
+        .mount(&server)
+        .await;
+    let client = HttpHostedAgentService::for_test(&server.uri(), "secret").unwrap();
+    let error = client
+        .apply_patch(AgentPatchApplyRequest {
+            target_lease_id: "lease-1".to_string(),
+            artifact_id: "artifact-1".to_string(),
+            idempotency_key: "apply".to_string(),
+        })
+        .await
+        .expect_err("empty applied snapshot ID must fail");
     assert_eq!(error.category, HostedAgentErrorCategory::InvalidResponse);
 }
