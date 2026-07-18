@@ -169,15 +169,16 @@ skips; the broader exec-server run had 34 existing container filesystem-sandbox
 Configuration/app-server schemas, TypeScript fixtures, Bazel locks/queries, scoped
 fixes, and final formatting were regenerated or validated.
 
-Docker remote-executor validation was attempted again with passwordless `sudo`
-on 2026-07-18. The standard Ubuntu harness built the Codex CLI, provisioned its
-container, and reached a healthy remote exec-server. The focused `codex-core`
-test could not link: the system linker terminated with `SIGBUS` while the host
-root filesystem was 99% full with roughly 1.5 GiB free. No remote test assertion
-ran, so this remains an explicit acceptance gap until safe build capacity is
-restored. The focused local app-server patch-route suite passed. The standard
-remote harness also cannot yet synthesize the service-owned WSS lease; Wine
-coverage remains delegated to the repository Bazel CI matrix.
+Docker remote-executor validation was completed on 2026-07-18 after restoring
+safe host build capacity. The standard Ubuntu harness built the Codex CLI,
+provisioned its container, reached a healthy remote exec-server, and passed
+`remote_test_env_can_connect_and_use_filesystem` through the remote filesystem
+with one test and zero failures. This retry closed the earlier linker `SIGBUS`
+gap caused by the root filesystem being 99% full. The focused local app-server
+patch-route suite also passed. The standard remote harness still cannot
+synthesize the service-owned WSS lease; that remains part of the final live
+app-server acceptance flow, while Wine coverage remains delegated to the
+repository Bazel CI matrix.
 
 ### Runtime success invariants and assumptions
 
