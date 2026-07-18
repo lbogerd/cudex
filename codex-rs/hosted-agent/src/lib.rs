@@ -18,6 +18,8 @@ pub use types::AgentReleaseRequest;
 pub use types::AgentToolPolicy;
 pub use types::HostedAgentError;
 pub use types::HostedAgentErrorCategory;
+pub use types::HostedAgentLifecycleState;
+pub use types::HostedAgentRuntimeRecord;
 pub use types::HostedAgentService;
 pub use types::HostedEnvironmentConnection;
 pub use types::PatchApplyResult;

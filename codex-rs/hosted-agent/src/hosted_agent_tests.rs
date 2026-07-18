@@ -27,6 +27,56 @@ fn root_request(key: &str) -> AgentProvisionRequest {
     }
 }
 
+#[test]
+fn durable_runtime_record_round_trips_without_transient_data() {
+    let agent_id =
+        ThreadId::from_string("00000000-0000-0000-0000-000000000123").expect("valid thread id");
+    let record = HostedAgentRuntimeRecord {
+        agent_type: "reviewer".to_string(),
+        sandbox_template: "review-v2".to_string(),
+        lease_id: "lease-1".to_string(),
+        environment_id: "environment-1".to_string(),
+        base_snapshot_id: "snapshot-base".to_string(),
+        latest_snapshot_id: Some("snapshot-latest".to_string()),
+        last_exported_patch: Some(AgentPatchArtifact {
+            artifact_id: "artifact-1".to_string(),
+            agent_id,
+            base_snapshot_id: "snapshot-base".to_string(),
+            checksum: "sha256:1234".to_string(),
+            changed_files: 2,
+            size_bytes: 512,
+        }),
+        lifecycle_state: HostedAgentLifecycleState::Completed,
+    };
+
+    let json = serde_json::to_value(&record).expect("record should serialize");
+    assert_eq!(
+        json,
+        json!({
+            "agentType": "reviewer",
+            "sandboxTemplate": "review-v2",
+            "leaseId": "lease-1",
+            "environmentId": "environment-1",
+            "baseSnapshotId": "snapshot-base",
+            "latestSnapshotId": "snapshot-latest",
+            "lastExportedPatch": {
+                "artifactId": "artifact-1",
+                "agentId": agent_id,
+                "baseSnapshotId": "snapshot-base",
+                "checksum": "sha256:1234",
+                "changedFiles": 2,
+                "sizeBytes": 512,
+            },
+            "lifecycleState": "completed",
+        })
+    );
+    assert_eq!(
+        serde_json::from_value::<HostedAgentRuntimeRecord>(json)
+            .expect("record should deserialize"),
+        record
+    );
+}
+
 #[tokio::test]
 async fn fake_lifecycle_is_idempotent_and_restorable() {
     let service = FakeHostedAgentService::default();
