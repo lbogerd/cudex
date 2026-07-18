@@ -315,12 +315,18 @@ Partial sandboxes, capture sandboxes, provider snapshots, tickets, and objects
 can be recorded immediately in a deduplicated allocation ledger and moved
 through adopted/reclaim states. Transaction-scoped advisory locks hash
 tenant/lease identities only after sorting and deduplicating lease IDs, then lock
-the corresponding rows. Docker-backed PostgreSQL 17 tests use independent pools
-to prove one concurrent claim, changed-request rejection, terminal replay and
-redaction, uniqueness, allocation fencing, one stale reconciler, and reversed
-multi-lease acquisition without deadlock. The existing control-plane methods
-still need to be refactored onto this API before the production persistence
-checklist and provider-mutation exit criterion are satisfied.
+the corresponding rows. After durable lease creation, the winning worker can now
+atomically bind that lease as the operation result and adopt an explicit set of
+allocations; an omitted, foreign, reclaimed, or stale-generation allocation
+rolls the entire binding back.
+
+Docker-backed PostgreSQL 17 tests use independent pools to prove one concurrent
+claim, changed-request rejection, terminal replay and redaction, uniqueness,
+allocation fencing, atomic lease binding/selected adoption, one stale
+reconciler, and reversed multi-lease acquisition without deadlock. The existing
+control-plane methods still need to be refactored onto this API before the
+production persistence checklist and provider-mutation exit criterion are
+satisfied.
 
 ### Strict control-plane wire validation
 

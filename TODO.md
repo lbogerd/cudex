@@ -12,6 +12,8 @@ production backend. Stable decisions, evidence, and wire schemas are in
 - [x] Add atomic PostgreSQL operation claims, sanitized logical replay, worker/
   generation fencing, allocation ledgers, stale takeover, and sorted lease-lock
   primitives.
+- [x] Atomically bind a committed lease to its owned operation and adopt only
+  explicitly selected allocations under worker/generation fencing.
 - [x] Add tenant-scoped PostgreSQL repositories for immutable source snapshots,
   leases, durable snapshots, object/snapshot references, and purpose-bound
   single-use ticket hashes.

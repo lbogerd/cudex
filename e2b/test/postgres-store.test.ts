@@ -152,6 +152,49 @@ live('allocation ledger and stale claiming use generation fencing across replica
   assert.equal(reclaimed.state, 'reclaimed'); assert.ok(reclaimed.reclaimedAt)
 })
 
+live('lease binding atomically adopts only selected allocations under generation ownership', async context => {
+  const identity = { operation: 'provision', idempotencyKey: 'bind-1', tenantId: 'tenant-1' }
+  const claim = await context.first.claimOperation({ ...identity, requestHash: canonicalRequestHash(identity), workerId: 'worker-1' })
+  assert.equal(claim.kind, 'claimed')
+  if (claim.kind !== 'claimed') return
+  const sandbox = await context.first.recordAllocation(identity, claim.generation, 'worker-1', {
+    kind: 'sandbox', resourceId: 'sandbox-1',
+  })
+  const temporary = await context.first.recordAllocation(identity, claim.generation, 'worker-1', {
+    kind: 'capture_sandbox', resourceId: 'capture-1',
+  })
+  await context.firstPool.query(`
+    INSERT INTO hosted_agent_leases
+      (lease_id, environment_id, tenant_id, agent_id, provider_sandbox_id, sandbox_template,
+       cwd_uri, workspace_root_uris, state, tool_policy, policy_version)
+    VALUES ('lease-1', 'env-1', 'tenant-1', 'agent-1', 'sandbox-1', 'general-v1',
+      'file:///workspace/root', '["file:///workspace/root"]'::jsonb,
+      'provisioning', '{}'::jsonb, 1)
+  `)
+  await assert.rejects(
+    context.second.bindLeaseAndAdoptAllocations(identity, claim.generation, 'worker-2', 'lease-1', [sandbox.allocationId]),
+    OperationOwnershipError,
+  )
+  const before = await context.firstPool.query<{ primary_lease_id: string | null }>(`
+    SELECT primary_lease_id FROM hosted_agent_operations WHERE operation = $1 AND idempotency_key = $2
+  `, [identity.operation, identity.idempotencyKey])
+  assert.equal(before.rows[0]!.primary_lease_id, null)
+  const adopted = await context.first.bindLeaseAndAdoptAllocations(
+    identity, claim.generation, 'worker-1', 'lease-1', [sandbox.allocationId],
+  )
+  assert.equal(adopted[0]!.leaseId, 'lease-1'); assert.equal(adopted[0]!.state, 'adopted')
+  assert.equal((await context.second.listAllocations(identity)).find(item => item.allocationId === temporary.allocationId)!.state, 'allocated')
+  await context.first.bindLeaseAndAdoptAllocations(identity, claim.generation, 'worker-1', 'lease-1', [sandbox.allocationId])
+  await assert.rejects(
+    context.first.bindLeaseAndAdoptAllocations(identity, claim.generation, 'worker-1', 'lease-1', [temporary.allocationId, '999999']),
+    OperationOwnershipError,
+  )
+  const after = await context.firstPool.query<{ primary_lease_id: string }>(`
+    SELECT primary_lease_id FROM hosted_agent_operations WHERE operation = $1 AND idempotency_key = $2
+  `, [identity.operation, identity.idempotencyKey])
+  assert.equal(after.rows[0]!.primary_lease_id, 'lease-1')
+})
+
 live('sorted multi-lease advisory locks avoid reversed-order deadlock', async context => {
   await context.firstPool.query(`
     INSERT INTO hosted_agent_leases

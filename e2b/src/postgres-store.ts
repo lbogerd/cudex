@@ -301,6 +301,44 @@ export class PostgresJournal {
     return result.rows.map(allocationFromRow)
   }
 
+  async bindLeaseAndAdoptAllocations(
+    identity: OperationIdentity,
+    generation: number,
+    workerId: string,
+    leaseId: string,
+    allocationIds: string[],
+  ): Promise<OperationAllocation[]> {
+    validateIdentity(identity); validateGeneration(generation); validateWorkerId(workerId)
+    if (!leaseId.trim() || Buffer.byteLength(leaseId) > 512) throw new Error('invalid lease ID')
+    const uniqueIds = [...new Set(allocationIds)]
+    if (uniqueIds.length !== allocationIds.length || uniqueIds.length > 10_000
+      || uniqueIds.some(allocationId => !/^[1-9][0-9]*$/.test(allocationId))) {
+      throw new Error('invalid allocation IDs')
+    }
+    return this.transaction(async client => {
+      const operation = await client.query(`
+        UPDATE hosted_agent_operations
+        SET primary_lease_id = $6
+        WHERE operation = $1 AND idempotency_key = $2 AND tenant_id = $3
+          AND generation = $4 AND worker_id = $5 AND state = 'in_progress'
+          AND (primary_lease_id IS NULL OR primary_lease_id = $6)
+      `, [identity.operation, identity.idempotencyKey, identity.tenantId, generation, workerId, leaseId])
+      if (operation.rowCount !== 1) throw new OperationOwnershipError()
+      if (uniqueIds.length === 0) return []
+      const allocations = await client.query<AllocationRow>(`
+        UPDATE hosted_agent_operation_allocations
+        SET lease_id = $4, state = 'adopted'
+        WHERE operation = $1 AND idempotency_key = $2 AND tenant_id = $3
+          AND allocation_id = ANY($5::bigint[])
+          AND (state = 'allocated' OR (state = 'adopted' AND lease_id = $4))
+        RETURNING allocation_id::text, allocation_kind, resource_id, lease_id, state,
+                  metadata, allocated_at, updated_at, reclaimed_at
+      `, [identity.operation, identity.idempotencyKey, identity.tenantId, leaseId, uniqueIds])
+      if (allocations.rowCount !== uniqueIds.length) throw new OperationOwnershipError()
+      return allocations.rows.map(allocationFromRow)
+    })
+  }
+
   async claimStaleOperations(staleBefore: Date, limit: number, workerId: string): Promise<StaleOperation[]> {
     if (!Number.isInteger(limit) || limit < 1 || limit > 1000) throw new Error('invalid stale-operation limit')
     validateWorkerId(workerId)
