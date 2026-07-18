@@ -29,6 +29,9 @@ production backend. Stable decisions, evidence, and wire schemas are in
 - [x] Add a fenced durable workspace-preparation ledger that binds canonical
   lease/source/sandbox/snapshot intent to exact object allocations and
   linearizes replica-safe commit, abort, and reclaim transitions.
+- [x] Add bounded preparation-scoped object reclamation that preserves unrelated
+  operation allocations, durable references, shared locators, and deletion audit
+  state while recovering partial publication and retry failures.
 - [x] Replace local blobs with authenticated object storage for workspace
   archives, manifests, content blobs, and patch artifacts.
 - [x] Make object stores report their exact durable bucket/key locator so

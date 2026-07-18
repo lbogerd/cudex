@@ -1,6 +1,7 @@
 import type { Pool, PoolClient } from 'pg'
 import type { ObjectStore } from './blob-store.js'
 import { OperationOwnershipError, type OperationIdentity } from './postgres-store.js'
+import { WorkspacePreparationConflictError, type PreparationFence } from './postgres-workspace-preparations.js'
 
 const checksumPattern = /^sha256:([0-9a-f]{64})$/u
 
@@ -68,6 +69,24 @@ export class PostgresObjectReclaimer {
     return result
   }
 
+  async reclaimPreparationObjects(fence: PreparationFence, preparationId: string,
+    limit = 100): Promise<ObjectReclaimBatchResult> {
+    validateOwnership(fence, fence.generation, fence.workerId, limit)
+    validId('preparation ID', preparationId)
+    const candidates = await this.claimPreparationCandidates(fence, preparationId, limit)
+    const result: ObjectReclaimBatchResult = {
+      claimed: candidates.length, reclaimed: 0, retained: 0, shared: 0,
+    }
+    for (const candidate of candidates) {
+      const outcome = await this.reclaimOne(fence, fence.generation, fence.workerId, candidate)
+      if (outcome === 'reclaimed') result.reclaimed += 1
+      else if (outcome === 'shared') { result.reclaimed += 1; result.shared += 1 }
+      else result.retained += 1
+    }
+    await this.finalizePreparationIfReclaimed(fence, preparationId)
+    return result
+  }
+
   async recoverDeletingObjects(tenantId: string, limit = 100): Promise<ObjectDeleteRecoveryResult> {
     validId('tenant ID', tenantId)
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) throw new Error('invalid object reclaim limit')
@@ -119,6 +138,88 @@ export class PostgresObjectReclaimer {
         if (!owned) throw new OperationOwnershipError()
       }
       return result.rows
+    })
+  }
+
+  private async claimPreparationCandidates(fence: PreparationFence, preparationId: string,
+    limit: number): Promise<CandidateRow[]> {
+    return this.transaction(async client => {
+      if (!await this.ownsOperation(client, fence, fence.generation, fence.workerId, true)) {
+        throw new OperationOwnershipError()
+      }
+      const preparation = await client.query<{ state: string }>(`
+        SELECT state FROM hosted_agent_workspace_preparations
+        WHERE preparation_id = $1 AND operation = $2 AND idempotency_key = $3 AND tenant_id = $4
+        FOR UPDATE
+      `, [preparationId, fence.operation, fence.idempotencyKey, fence.tenantId])
+      const state = preparation.rows[0]?.state
+      if (state === 'reclaimed') return []
+      if (state !== 'reclaim_pending') {
+        throw new WorkspacePreparationConflictError('workspace preparation is not pending reclamation')
+      }
+      const result = await client.query<CandidateRow>(`
+        WITH candidates AS (
+          SELECT allocation.allocation_id
+          FROM hosted_agent_workspace_preparation_objects AS prepared_object
+          JOIN hosted_agent_operation_allocations AS allocation
+            ON allocation.allocation_id = prepared_object.allocation_id
+           AND allocation.operation = prepared_object.operation
+           AND allocation.idempotency_key = prepared_object.idempotency_key
+           AND allocation.tenant_id = prepared_object.tenant_id
+          JOIN hosted_agent_objects AS registered_object
+            ON registered_object.object_id = prepared_object.object_id
+           AND registered_object.tenant_id = prepared_object.tenant_id
+          WHERE prepared_object.preparation_id = $1
+            AND prepared_object.operation = $2 AND prepared_object.idempotency_key = $3
+            AND prepared_object.tenant_id = $4 AND allocation.allocation_kind = 'object'
+            AND allocation.resource_id = prepared_object.object_id
+            AND allocation.state IN ('allocated', 'reclaim_pending')
+          ORDER BY allocation.allocation_id
+          FOR UPDATE OF allocation SKIP LOCKED
+          LIMIT $5
+        )
+        UPDATE hosted_agent_operation_allocations AS allocation
+        SET state = 'reclaim_pending'
+        FROM candidates
+        WHERE allocation.allocation_id = candidates.allocation_id
+        RETURNING allocation.allocation_id::text, allocation.resource_id
+      `, [preparationId, fence.operation, fence.idempotencyKey, fence.tenantId, limit])
+      return result.rows
+    })
+  }
+
+  private async finalizePreparationIfReclaimed(fence: PreparationFence, preparationId: string): Promise<void> {
+    await this.transaction(async client => {
+      if (!await this.ownsOperation(client, fence, fence.generation, fence.workerId, true)) {
+        throw new OperationOwnershipError()
+      }
+      const preparation = await client.query<{ state: string }>(`
+        SELECT state FROM hosted_agent_workspace_preparations
+        WHERE preparation_id = $1 AND operation = $2 AND idempotency_key = $3 AND tenant_id = $4
+        FOR UPDATE
+      `, [preparationId, fence.operation, fence.idempotencyKey, fence.tenantId])
+      const state = preparation.rows[0]?.state
+      if (state === 'reclaimed') return
+      if (state !== 'reclaim_pending') {
+        throw new WorkspacePreparationConflictError('workspace preparation left reclamation state')
+      }
+      const progress = await client.query<{ outstanding: string }>(`
+        SELECT count(*) FILTER (WHERE allocation.state <> 'reclaimed')::text AS outstanding
+        FROM hosted_agent_workspace_preparation_objects AS prepared_object
+        JOIN hosted_agent_operation_allocations AS allocation
+          ON allocation.allocation_id = prepared_object.allocation_id
+         AND allocation.operation = prepared_object.operation
+         AND allocation.idempotency_key = prepared_object.idempotency_key
+         AND allocation.tenant_id = prepared_object.tenant_id
+        WHERE prepared_object.preparation_id = $1
+      `, [preparationId])
+      if (progress.rows[0]!.outstanding !== '0') return
+      const updated = await client.query(`
+        UPDATE hosted_agent_workspace_preparations
+        SET state = 'reclaimed', reclaimed_at = now(), committed_at = NULL
+        WHERE preparation_id = $1 AND state = 'reclaim_pending'
+      `, [preparationId])
+      if (updated.rowCount !== 1) throw new WorkspacePreparationConflictError('workspace preparation reclaim lost')
     })
   }
 
@@ -329,11 +430,12 @@ export class PostgresObjectReclaimer {
   }
 
   private async ownsOperation(client: PoolClient, identity: OperationIdentity, generation: number,
-    workerId: string): Promise<boolean> {
+    workerId: string, lock = false): Promise<boolean> {
     const result = await client.query(`
       SELECT 1 FROM hosted_agent_operations
       WHERE operation = $1 AND idempotency_key = $2 AND tenant_id = $3
         AND generation = $4 AND worker_id = $5 AND state = 'in_progress'
+      ${lock ? 'FOR UPDATE' : ''}
     `, [identity.operation, identity.idempotencyKey, identity.tenantId, generation, workerId])
     return result.rowCount === 1
   }

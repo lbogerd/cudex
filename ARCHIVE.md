@@ -550,6 +550,19 @@ object audit rows, while a later hard row purge cascades only its preparation
 association. Publication, preparation-scoped object reclaim, and the final
 provision coordinator remain unwired.
 
+`PostgresObjectReclaimer` can now reclaim one `reclaim_pending` workspace
+preparation without sweeping unrelated object allocations owned by the same
+operation. It holds the current worker/generation fence, locks the preparation,
+claims a bounded allocation batch, and reuses the resumable exact-locator delete,
+durable-reference, and shared-physical-content protections. It terminalizes only
+after every object that was actually registered and associated is reclaimed;
+this intentionally supports failure partway through publication, while bytes
+written before database registration remain the aged-inventory responsibility.
+Deleted logical rows and associations remain as audit state. Live tests cover
+bounded progress, terminal replay, partial publication, unrelated allocations,
+retained references, injected post-delete failure, wrong fences, and refusal to
+reclaim a committed preparation.
+
 ### Bounded PostgreSQL reconciliation foundation
 
 An intentionally unwired `PostgresReconciler` now claims stale operations only
