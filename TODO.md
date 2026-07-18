@@ -107,8 +107,12 @@ failed upload/extraction allocations without Git or shared host paths.
 - [x] Add multi-replica ticket lookup and active-connection revocation
   propagation.
 - [x] Close every active connection on release.
-- [ ] Close stale connections on restore and reject inherited snapshot
-  sessions/secrets.
+- [x] On reconnect, rotate every lease ticket, close active gateway connections
+  on both first execution and idempotent replay, revoke access on confirmed
+  sandbox loss, and preserve viable access across transient provider outages.
+- [ ] Restore only into a clean trusted template, overlay verified workspace
+  state, and reject inherited snapshot sessions/secrets before issuing rekeyed
+  transport credentials.
 - [ ] Keep provider credentials out of URLs, metadata, commands, persistence,
   errors, logs, traces, and metrics.
 - [x] Health-probe exec before provision/reconnect success.
@@ -152,9 +156,11 @@ tickets always fail, and secrets never enter durable or observable state.
   committed before allocation adoption.
 - [ ] On restore, verify and overlay workspace state, remove inherited runtime
   identity, restart exec, and rekey transport credentials.
-- [ ] On child creation, atomically snapshot the owner, use a temporary capture,
-  export workspace only, create a clean role sandbox, and reclaim all temporary
-  snapshots/sandboxes on every path.
+- [x] Reclaim child-capture sandboxes and provider snapshots after successful
+  workspace-only capture and ordinary restore/export failure paths.
+- [ ] Make child creation atomically snapshot the owner, create only a clean
+  trusted-role sandbox, and durably ledger/reconcile temporary captures so
+  provider cleanup outages cannot leak snapshots or sandboxes.
 - [ ] Reconcile pause with `autoResume:false`; choose active/paused timeouts from
   measured cost and latency.
 - [ ] Make release replay succeed after provider loss while retaining referenced

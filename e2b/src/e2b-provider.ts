@@ -1,6 +1,7 @@
-import { Sandbox } from 'e2b'
+import { Sandbox, SandboxNotFoundError } from 'e2b'
 import {
   ProviderCapabilityError,
+  ProviderSandboxMissingError,
   type CreatedSandbox,
   type ExecUpstream,
   type ManagedSandbox,
@@ -35,6 +36,11 @@ function validateMetadata(metadata: Record<string, string>, requireOwnershipMark
   }
 }
 
+function normalizeMissing(error: unknown): never {
+  if (error instanceof SandboxNotFoundError) throw new ProviderSandboxMissingError()
+  throw error
+}
+
 export class E2BProvider implements ProviderAdapter {
   private readonly sandboxes = new Map<string, Sandbox>()
   constructor(
@@ -50,7 +56,9 @@ export class E2BProvider implements ProviderAdapter {
     this.sandboxes.set(sandbox.sandboxId, sandbox); return this.describe(sandbox)
   }
   async connect(sandboxId: string): Promise<CreatedSandbox> {
-    const sandbox = await Sandbox.connect(sandboxId, { ...this.connection, timeoutMs: this.timeoutMs })
+    let sandbox: Sandbox
+    try { sandbox = await Sandbox.connect(sandboxId, { ...this.connection, timeoutMs: this.timeoutMs }) }
+    catch (error) { normalizeMissing(error) }
     this.sandboxes.set(sandboxId, sandbox); return this.describe(sandbox)
   }
   async execUpstream(sandboxId: string): Promise<ExecUpstream> {
@@ -67,16 +75,20 @@ export class E2BProvider implements ProviderAdapter {
     return exportWorkspaceArchive(await this.handle(sandboxId), this.workspaceTransfer)
   }
   async startExecServer(sandboxId: string): Promise<void> {
-    const sandbox = await this.handle(sandboxId)
-    await sandbox.commands.run('pkill -x codex || true; codex exec-server --listen ws://0.0.0.0:22101', { background: true, timeoutMs: 10_000 })
+    try {
+      const sandbox = await this.handle(sandboxId)
+      await sandbox.commands.run('pkill -x codex || true; codex exec-server --listen ws://0.0.0.0:22101', { background: true, timeoutMs: 10_000 })
+    } catch (error) { normalizeMissing(error) }
   }
   async probeExecServer(sandboxId: string): Promise<void> {
-    const sandbox = await this.handle(sandboxId)
-    const result = await sandbox.commands.run(
-      "for attempt in 1 2 3 4 5 6 7 8 9 10; do (exec 3<>/dev/tcp/127.0.0.1/22101) >/dev/null 2>&1 && exit 0; sleep 0.1; done; exit 1",
-      { user: 'root', timeoutMs: 5_000 },
-    )
-    if (result.exitCode !== 0) throw new Error('exec server health probe failed')
+    try {
+      const sandbox = await this.handle(sandboxId)
+      const result = await sandbox.commands.run(
+        "for attempt in 1 2 3 4 5 6 7 8 9 10; do (exec 3<>/dev/tcp/127.0.0.1/22101) >/dev/null 2>&1 && exit 0; sleep 0.1; done; exit 1",
+        { user: 'root', timeoutMs: 5_000 },
+      )
+      if (result.exitCode !== 0) throw new Error('exec server health probe failed')
+    } catch (error) { normalizeMissing(error) }
   }
   async snapshot(sandboxId: string, options: ProviderSnapshotOptions = {}): Promise<string> {
     if (options.name !== undefined) validateOpaque('provider snapshot name', options.name)
@@ -142,7 +154,9 @@ export class E2BProvider implements ProviderAdapter {
   private async handle(id: string): Promise<Sandbox> {
     const existing = this.sandboxes.get(id)
     if (existing) return existing
-    const sandbox = await Sandbox.connect(id, { ...this.connection, timeoutMs: this.timeoutMs })
+    let sandbox: Sandbox
+    try { sandbox = await Sandbox.connect(id, { ...this.connection, timeoutMs: this.timeoutMs }) }
+    catch (error) { normalizeMissing(error) }
     this.sandboxes.set(id, sandbox)
     return sandbox
   }

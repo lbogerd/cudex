@@ -778,6 +778,35 @@ storage primitive; the control-plane lifecycle still needs to replace its JSON
 state paths with these transactions and the operation journal before production
 multi-replica persistence is complete.
 
+### Reconnect fencing and child-capture cleanup
+
+The Linux control-plane spike now distinguishes confirmed provider sandbox loss
+from transient connect, start, and health-probe failures. The E2B adapter maps
+only `SandboxNotFoundError` to the provider-neutral missing-sandbox signal. A
+confirmed loss returns the lease-missing response Codex uses to select durable
+restore and revokes outstanding tickets/connections; other provider failures are
+redacted retryable 503 responses and leave the existing connection authority
+intact.
+
+Successful reconnect now revokes every prior ticket and active gateway socket
+before restarting exec and issuing new access. Replaying the same successful
+operation performs the revocation again before rotating the ticket, preventing a
+previous reconnect response from leaving a live stale session.
+
+Child workspace capture now deletes its temporary owner snapshot as well as
+killing the temporary restored sandbox. Nested cleanup guarantees snapshot
+deletion is attempted even when capture-sandbox termination fails; restore and
+export failures also clean the child allocation, capture, and snapshot. Provider
+cleanup outages still require the planned PostgreSQL allocation ledger and
+reconciler before the broader every-path child/provision cleanup invariant can be
+claimed.
+
+The provider-independent suite has 163 tests: 125 passed and 38 live-database
+tests were skipped without `HOSTED_AGENT_TEST_DATABASE_URL`. New coverage proves
+ticket/socket rotation on reconnect and replay, transient-versus-missing error
+classification, missing-sandbox revocation, and child temporary-resource cleanup
+on success plus restore/export failures.
+
 CubeSandbox was verified on 2026-07-18 through stock E2B TypeScript SDK 2.35.0.
 Provider code lives in the external TypeScript control plane under `e2b/src`, not
 in `codex-core`.

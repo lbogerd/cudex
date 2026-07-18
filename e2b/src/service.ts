@@ -7,6 +7,7 @@ import type { CheckpointRequest, LeaseRecord, OperationRecord, ProvisionRequest,
 import { ServiceError } from './types.js'
 import type { ObjectStore } from './blob-store.js'
 import type { AuthenticatedTenant, ResolvedSourceSnapshot } from './source-snapshots.js'
+import { ProviderSandboxMissingError } from './provider.js'
 
 function canonical(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonical)
@@ -102,10 +103,15 @@ export class ControlPlane {
           } else if (request.source.type === 'agentEnvironment') {
             const owner = await this.activeLease(request.source.ownerLeaseId)
             const ownerSnapshot = await this.provider.snapshot(owner.sandboxId)
-            const capture = await this.provider.restore(ownerSnapshot, { leaseId: `${leaseId}-capture`, agentId: request.agentId, template: request.sandboxTemplate })
+            let capture
             let workspace: Uint8Array
-            try { workspace = await this.provider.exportWorkspace(capture.sandboxId) }
-            finally { await this.provider.kill(capture.sandboxId).catch(() => undefined) }
+            try {
+              capture = await this.provider.restore(ownerSnapshot, { leaseId: `${leaseId}-capture`, agentId: request.agentId, template: request.sandboxTemplate })
+              workspace = await this.provider.exportWorkspace(capture.sandboxId)
+            } finally {
+              try { if (capture) await this.provider.kill(capture.sandboxId) }
+              finally { await this.provider.deleteSnapshot(ownerSnapshot) }
+            }
             await this.provider.uploadArchive(created.sandboxId, workspace)
             cwd = owner.cwd; roots = owner.workspaceRoots
           } else throw new ServiceError(503, 'unsupported provision source')
@@ -127,10 +133,17 @@ export class ControlPlane {
       const lease = await this.activeLease(request.leaseId)
       try {
         await this.provider.connect(lease.sandboxId)
+      }
+      catch (error) {
+        if (error instanceof ProviderSandboxMissingError) await this.revokeLeaseAccess(request.leaseId)
+        throw this.reconnectError(error)
+      }
+      await this.revokeLeaseAccess(request.leaseId)
+      try {
         await this.provider.startExecServer(lease.sandboxId)
         await this.provider.probeExecServer(lease.sandboxId)
       }
-      catch { throw new ServiceError(404, 'lease missing') }
+      catch (error) { throw this.reconnectError(error) }
       return this.response(lease)
     })
   }
@@ -147,8 +160,7 @@ export class ControlPlane {
   async release(request: ReleaseRequest): Promise<void> {
     await this.idempotent('release', request.idempotencyKey, request, async () => {
       const lease = await this.store.read(database => database.leases[request.leaseId])
-      await this.tickets.revokeLease(request.leaseId)
-      this.connections?.revoke(request.leaseId)
+      await this.revokeLeaseAccess(request.leaseId)
       if (lease) { await this.provider.kill(lease.sandboxId).catch(() => undefined); await this.store.transaction(database => { database.leases[request.leaseId]!.state = 'released' }) }
       return { released: true }
     })
@@ -164,6 +176,15 @@ export class ControlPlane {
     return lease
   }
   private operationKey(operation: string, key: string): string { return `${operation}\0${key}` }
+  private async revokeLeaseAccess(leaseId: string): Promise<void> {
+    await this.tickets.revokeLease(leaseId)
+    this.connections?.revoke(leaseId)
+  }
+  private reconnectError(error: unknown): ServiceError {
+    return error instanceof ProviderSandboxMissingError
+      ? new ServiceError(404, 'lease missing')
+      : new ServiceError(503, 'provider temporarily unavailable')
+  }
   private async persistOperation(operation: OperationRecord): Promise<void> { await this.store.transaction(database => { database.operations[this.operationKey(operation.operation, operation.idempotencyKey)] = operation }) }
   private async idempotent<T>(operation: string, key: string, request: unknown, execute: (record: OperationRecord) => Promise<T>): Promise<T> {
     if (!key || key.length > 512) throw new ServiceError(400, 'invalid idempotency key')
@@ -173,7 +194,11 @@ export class ControlPlane {
       if (existing.requestHash !== requestHash) throw new ServiceError(409, 'idempotency key reused with different request')
       if (existing.state === 'succeeded') {
         if ((operation === 'provision' || operation === 'reconnect') && existing.response && typeof existing.response === 'object' && 'leaseId' in existing.response) {
-          return this.response(await this.activeLease(String(existing.response.leaseId))) as Promise<T>
+          const lease = await this.activeLease(String(existing.response.leaseId))
+          if (operation === 'reconnect') {
+            await this.revokeLeaseAccess(lease.leaseId)
+          }
+          return this.response(lease) as Promise<T>
         }
         return existing.response as T
       }

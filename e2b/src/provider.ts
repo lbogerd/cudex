@@ -70,6 +70,14 @@ export class ProviderCapabilityError extends Error {
   }
 }
 
+/** A provider-neutral signal that a sandbox no longer exists or is no longer resumable. */
+export class ProviderSandboxMissingError extends Error {
+  constructor() {
+    super('provider sandbox missing')
+    this.name = 'ProviderSandboxMissingError'
+  }
+}
+
 export interface ProviderAdapter {
   create(templateId: string, metadata: Record<string, string>): Promise<CreatedSandbox>
   connect(sandboxId: string): Promise<CreatedSandbox>

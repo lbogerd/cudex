@@ -53,6 +53,19 @@ test('child gets an isolated spawn-time workspace capture', async () => {
   const child = await context.service.provision({ ...context.request, agentId: 'child', ownerAgentId: 'agent-1', source: { type: 'agentEnvironment', ownerLeaseId: owner.leaseId }, idempotencyKey: 'child-1' })
   const leases = await context.store.read(database => database.leases); const ownerSandbox = context.provider.sandboxes.get(leases[owner.leaseId]!.sandboxId)!; const childSandbox = context.provider.sandboxes.get(leases[child.leaseId]!.sandboxId)!
   assert.deepEqual(childSandbox.bytes, ownerSandbox.bytes); childSandbox.bytes[0] = childSandbox.bytes[0]! ^ 1; assert.notDeepEqual(childSandbox.bytes, ownerSandbox.bytes)
+  assert.equal(context.provider.snapshots.size, 2)
+  assert.equal(context.provider.live().length, 2)
+  assert.equal(context.provider.kills, 1)
+})
+
+for (const point of ['restore', 'export']) test(`child failure at ${point} reclaims its clean sandbox, capture, and temporary snapshot`, async () => {
+  const context = await fixture(); const owner = await context.service.provision(context.request)
+  context.provider.failAt = point
+  await assert.rejects(context.service.provision({ ...context.request, agentId: 'child', ownerAgentId: 'agent-1',
+    source: { type: 'agentEnvironment', ownerLeaseId: owner.leaseId }, idempotencyKey: `child-${point}` }), new RegExp(`injected ${point}`))
+  const leases = await context.store.read(database => database.leases)
+  assert.deepEqual(context.provider.live(), [leases[owner.leaseId]!.sandboxId])
+  assert.equal(context.provider.snapshots.size, 1)
 })
 
 for (const point of ['upload', 'start', 'probe', 'snapshot']) test(`failure at ${point} cleans provider allocation`, async () => {
@@ -194,5 +207,51 @@ test('release closes active gateway connections through the revoker', async () =
   }, { revoke: leaseId => { revoked.push(leaseId) } })
   const agent = await service.provision(context.request)
   await service.release({ leaseId: agent.leaseId, idempotencyKey: 'release-close' })
+  assert.deepEqual(revoked, [agent.leaseId])
+})
+
+test('reconnect rotates tickets and closes stale gateway connections, including on replay', async () => {
+  const context = await fixture(); const revoked: string[] = []
+  const service = new ControlPlane(context.store, context.provider, context.tickets, context.blobs, {
+    templates: { 'general-v1': 'tpl-1' }, allowedRoots: [context.directory], ingress: { maxBytes: 10_000_000, maxRoots: 4 },
+  }, { revoke: leaseId => { revoked.push(leaseId) } })
+  const agent = await service.provision(context.request)
+  const originalTicket = new URL(agent.connection.execServerUrl).searchParams.get('ticket')!
+  const first = await service.reconnect({ leaseId: agent.leaseId, idempotencyKey: 'reconnect-close' })
+  const firstTicket = new URL(first.connection.execServerUrl).searchParams.get('ticket')!
+  assert.equal(await context.tickets.validate(agent.leaseId, originalTicket), false)
+  const replay = await service.reconnect({ leaseId: agent.leaseId, idempotencyKey: 'reconnect-close' })
+  const replayTicket = new URL(replay.connection.execServerUrl).searchParams.get('ticket')!
+  assert.equal(await context.tickets.validate(agent.leaseId, firstTicket), false)
+  assert.equal(await context.tickets.validate(agent.leaseId, replayTicket), true)
+  assert.deepEqual(revoked, [agent.leaseId, agent.leaseId])
+})
+
+test('transient reconnect failure is a retryable provider error and preserves existing access', async () => {
+  const context = await fixture(); const revoked: string[] = []
+  const service = new ControlPlane(context.store, context.provider, context.tickets, context.blobs, {
+    templates: { 'general-v1': 'tpl-1' }, allowedRoots: [context.directory], ingress: { maxBytes: 10_000_000, maxRoots: 4 },
+  }, { revoke: leaseId => { revoked.push(leaseId) } })
+  const agent = await service.provision(context.request)
+  const ticket = new URL(agent.connection.execServerUrl).searchParams.get('ticket')!
+  context.provider.failAt = 'connect'
+  await assert.rejects(service.reconnect({ leaseId: agent.leaseId, idempotencyKey: 'reconnect-outage' }),
+    (error: unknown) => error instanceof ServiceError && error.status === 503 && error.message === 'provider temporarily unavailable')
+  assert.equal(await context.tickets.validate(agent.leaseId, ticket), true)
+  assert.deepEqual(revoked, [])
+})
+
+test('missing sandbox reconnect returns lease-missing and revokes stale access', async () => {
+  const context = await fixture(); const revoked: string[] = []
+  const service = new ControlPlane(context.store, context.provider, context.tickets, context.blobs, {
+    templates: { 'general-v1': 'tpl-1' }, allowedRoots: [context.directory], ingress: { maxBytes: 10_000_000, maxRoots: 4 },
+  }, { revoke: leaseId => { revoked.push(leaseId) } })
+  const agent = await service.provision(context.request)
+  const ticket = new URL(agent.connection.execServerUrl).searchParams.get('ticket')!
+  const lease = await context.store.read(database => database.leases[agent.leaseId]!)
+  await context.provider.kill(lease.sandboxId)
+  await assert.rejects(service.reconnect({ leaseId: agent.leaseId, idempotencyKey: 'reconnect-missing' }),
+    (error: unknown) => error instanceof ServiceError && error.status === 404 && error.message === 'lease missing')
+  assert.equal(await context.tickets.validate(agent.leaseId, ticket), false)
   assert.deepEqual(revoked, [agent.leaseId])
 })

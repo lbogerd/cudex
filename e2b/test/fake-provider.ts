@@ -1,4 +1,4 @@
-import { ProviderCapabilityError, type CreatedSandbox, type ExecUpstream, type ManagedSandbox, type ManagedSandboxQuery,
+import { ProviderCapabilityError, ProviderSandboxMissingError, type CreatedSandbox, type ExecUpstream, type ManagedSandbox, type ManagedSandboxQuery,
   type ManagedSnapshot, type ProviderAdapter, type ProviderSnapshotOptions, type ProviderSnapshotQuery } from '../src/provider.js'
 
 interface FakeSandbox { bytes: Uint8Array; alive: boolean; execReady: boolean; metadata: Record<string, string>; templateId: string; startedAt: Date; endAt: Date }
@@ -11,7 +11,7 @@ export class FakeProvider implements ProviderAdapter {
   async create(templateId = 'fake-template', metadata: Record<string, string> = {}): Promise<CreatedSandbox> { this.failure('create'); this.creates++; return this.allocate(templateId, metadata) }
   async connect(sandboxId: string): Promise<CreatedSandbox> {
     this.failure('connect'); this.connects++; const sandbox = this.sandboxes.get(sandboxId)
-    if (!sandbox?.alive) throw new Error('missing'); return { sandboxId }
+    if (!sandbox?.alive) throw new ProviderSandboxMissingError(); return { sandboxId }
   }
   async execUpstream(sandboxId: string): Promise<ExecUpstream> {
     this.failure('execUpstream')
