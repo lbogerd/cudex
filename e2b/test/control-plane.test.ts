@@ -74,6 +74,17 @@ test('production mode rejects local ingress before provider allocation', async (
   assert.equal(context.provider.creates, 0)
 })
 
+test('immutable source snapshot provision fails closed before provider allocation until one backend owns it', async () => {
+  const context = await fixture()
+  const request = {
+    ...context.request,
+    source: { type: 'sourceSnapshot' as const, sourceSnapshotId: `source_${'a'.repeat(32)}`, checksum: `sha256:${'b'.repeat(64)}` },
+  }
+  await assert.rejects(context.service.provision(request), /immutable source snapshot provisioning is not configured/)
+  assert.equal(context.provider.creates, 0)
+  assert.deepEqual(context.provider.live(), [])
+})
+
 test('release closes active gateway connections through the revoker', async () => {
   const context = await fixture()
   const revoked: string[] = []

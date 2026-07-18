@@ -18,6 +18,8 @@ const toolDomains = new Set([
   'agentEnvironment', 'controlPlane', 'providerHosted', 'environmentBoundMcp',
   'ambientMcp', 'clientCallback', 'extension', 'orchestratorProcess',
 ])
+const sha256ChecksumPattern = /^sha256:[0-9a-f]{64}$/
+const sourceSnapshotIdPattern = /^source_[0-9a-f]{32}$/
 
 type Failure = (message: string) => never
 const requestFailure: Failure = message => { throw new ServiceError(400, message) }
@@ -111,6 +113,13 @@ function source(value: unknown, fail: Failure): SnapshotSource {
     object(record, ['type', 'ownerLeaseId'], fail, 'agent environment source')
     return { type: 'agentEnvironment', ownerLeaseId: opaqueId(record.ownerLeaseId, fail, 'owner lease ID') }
   }
+  if (record.type === 'sourceSnapshot') {
+    object(record, ['type', 'sourceSnapshotId', 'checksum'], fail, 'source snapshot source')
+    const sourceSnapshotId = opaqueId(record.sourceSnapshotId, fail, 'source snapshot ID')
+    if (!sourceSnapshotIdPattern.test(sourceSnapshotId) || typeof record.checksum !== 'string'
+      || !sha256ChecksumPattern.test(record.checksum)) fail('source snapshot source is invalid')
+    return { type: 'sourceSnapshot', sourceSnapshotId, checksum: record.checksum as string }
+  }
   if (record.type === 'durableSnapshot') {
     object(record, ['type', 'snapshotId'], fail, 'durable snapshot source')
     return { type: 'durableSnapshot', snapshotId: opaqueId(record.snapshotId, fail, 'snapshot ID') }
@@ -128,6 +137,7 @@ export function validateProvisionRequest(value: unknown): ProvisionRequest {
   const idempotencyKey = opaqueId(record.idempotencyKey, requestFailure, 'idempotency key')
   if (ownerAgentId === agentId) requestFailure('agent and owner IDs must be distinct')
   if (parsedSource.type === 'rootWorkspace' && ownerAgentId !== null) requestFailure('root workspace agent must not have an owner')
+  if (parsedSource.type === 'sourceSnapshot' && ownerAgentId !== null) requestFailure('source snapshot agent must not have an owner')
   if (parsedSource.type === 'agentEnvironment' && ownerAgentId === null) {
     requestFailure('agent environment source requires a distinct owner')
   }

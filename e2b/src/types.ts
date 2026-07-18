@@ -1,5 +1,6 @@
 export type SnapshotSource =
   | { type: 'rootWorkspace'; cwd: string; workspaceRoots: string[] }
+  | { type: 'sourceSnapshot'; sourceSnapshotId: string; checksum: string }
   | { type: 'agentEnvironment'; ownerLeaseId: string }
   | { type: 'durableSnapshot'; snapshotId: string }
 

@@ -311,6 +311,22 @@ migration, tenant-isolated shared content, immutable replay, and lookup by
 checksum. HTTP upload/auth wiring, service resolution before provider allocation,
 and successful-expiry garbage collection remain open.
 
+The TypeScript wire contract now has an exact `sourceSnapshot` provision source
+containing only the opaque source ID and trusted lowercase SHA-256. It rejects
+tenant IDs, owners, host paths, archive bytes, and extra properties. A separate
+authenticated API adapter validates canonical create/resolve JSON, takes tenant
+only from trusted context, receives archive bytes out of band with a 512 MiB
+pre-dispatch cap, and revalidates lifecycle response identity and archive
+integrity. Seven API tests plus provision/validation coverage pass. Provisioning
+intentionally returns 503 before provider allocation because no mixed JSON/PG
+backend is permitted.
+
+The current Rust Codex `ProjectSnapshotSource` has only root-workspace,
+agent-environment, and durable-snapshot variants, so it cannot yet emit or parse
+this source. Adding the client variant and an actual authenticated upload route
+remains necessary before the control plane can resolve immutable source content
+for an unmodified Codex client.
+
 ### Connection-ticket lifecycle
 
 Gateway tickets now carry an explicit persisted purpose and issuance time, have

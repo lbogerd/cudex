@@ -34,6 +34,10 @@ function rejectsStatus(status: number, fn: () => unknown): void {
 
 test('request validators accept every current exact request shape', () => {
   assert.deepEqual(validateProvisionRequest(rootProvision()), rootProvision())
+  const immutable = { ...rootProvision(), source: {
+    type: 'sourceSnapshot', sourceSnapshotId: `source_${'a'.repeat(32)}`, checksum: `sha256:${'b'.repeat(64)}`,
+  } }
+  assert.deepEqual(validateProvisionRequest(immutable), immutable)
   const child = { ...rootProvision(), agentId: 'agent_child', ownerAgentId: 'agent_root',
     source: { type: 'agentEnvironment', ownerLeaseId: 'lease_owner' } }
   assert.deepEqual(validateProvisionRequest(child), child)
@@ -51,6 +55,12 @@ test('request validators reject malformed types, discriminants, extra keys, and 
   }
   rejectsStatus(400, () => validateProvisionRequest({ ...rootProvision(), source: { type: 'unknown', snapshotId: 'snapshot' } }))
   rejectsStatus(400, () => validateProvisionRequest({ ...rootProvision(), source: { type: 'durableSnapshot', snapshotId: 'snapshot', extra: true } }))
+  const immutable = { type: 'sourceSnapshot', sourceSnapshotId: `source_${'a'.repeat(32)}`, checksum: `sha256:${'b'.repeat(64)}` }
+  rejectsStatus(400, () => validateProvisionRequest({ ...rootProvision(), source: { ...immutable, tenantId: 'tenant_from_body' } }))
+  rejectsStatus(400, () => validateProvisionRequest({ ...rootProvision(), source: { ...immutable, cwd: 'file:///host/workspace' } }))
+  rejectsStatus(400, () => validateProvisionRequest({ ...rootProvision(), source: { ...immutable, sourceSnapshotId: 'source_short' } }))
+  rejectsStatus(400, () => validateProvisionRequest({ ...rootProvision(), source: { ...immutable, checksum: `sha256:${'B'.repeat(64)}` } }))
+  rejectsStatus(400, () => validateProvisionRequest({ ...rootProvision(), ownerAgentId: 'owner', source: immutable }))
   rejectsStatus(400, () => validateProvisionRequest({ ...rootProvision(), ownerAgentId: 'owner' }))
   rejectsStatus(400, () => validateProvisionRequest({ ...rootProvision(), agentId: 'same', ownerAgentId: 'same', source: { type: 'agentEnvironment', ownerLeaseId: 'lease' } }))
   rejectsStatus(400, () => validateProvisionRequest({ ...rootProvision(), agentId: 'same', ownerAgentId: 'same', source: { type: 'durableSnapshot', snapshotId: 'snapshot' } }))

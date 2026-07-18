@@ -43,6 +43,9 @@ connection material or allocation is leaked.
   archive layout/types/links, and all archive quotas before durable publication.
 - [ ] Extend trusted deployment metadata or the provision contract so a remote
   control plane resolves that ID without client-host `file:` access.
+- [x] Define the exact `sourceSnapshot` provision wire shape and authenticated
+  create/resolve API adapter without accepting tenant identity or host paths from
+  JSON; keep provision fail-closed until the durable backend owns the route.
 - [ ] Authorize tenant/checksum/expiry before sandbox allocation.
 - [ ] Preserve roots, cwd, dirty/untracked and binary files, modes, and symlinks
   under `/workspace/roots/<index>/...`.

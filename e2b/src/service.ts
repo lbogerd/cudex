@@ -51,6 +51,9 @@ export class ControlPlane {
       if (request.source.type === 'rootWorkspace' && this.options.allowLocalIngress === false) {
         throw new ServiceError(400, 'local workspace ingress is disabled')
       }
+      if (request.source.type === 'sourceSnapshot') {
+        throw new ServiceError(503, 'immutable source snapshot provisioning is not configured')
+      }
       const leaseId = opaque('lease'); const environmentId = opaque('env')
       let sandboxId: string | undefined; let cwd: string; let roots: string[]; let created
       try {
@@ -69,7 +72,7 @@ export class ControlPlane {
           if (request.source.type === 'rootWorkspace') {
             const archive = await archiveWorkspace(request.source.cwd, request.source.workspaceRoots, this.options.allowedRoots, this.options.ingress)
             await this.provider.uploadArchive(created.sandboxId, archive.bytes); cwd = archive.cwd; roots = archive.roots
-          } else {
+          } else if (request.source.type === 'agentEnvironment') {
             const owner = await this.activeLease(request.source.ownerLeaseId)
             const ownerSnapshot = await this.provider.snapshot(owner.sandboxId)
             const capture = await this.provider.restore(ownerSnapshot, { leaseId: `${leaseId}-capture`, agentId: request.agentId, template: request.sandboxTemplate })
@@ -78,7 +81,7 @@ export class ControlPlane {
             finally { await this.provider.kill(capture.sandboxId).catch(() => undefined) }
             await this.provider.uploadArchive(created.sandboxId, workspace)
             cwd = owner.cwd; roots = owner.workspaceRoots
-          }
+          } else throw new ServiceError(503, 'unsupported provision source')
         }
         sandboxId = created.sandboxId
         await this.provider.startExecServer(sandboxId)
