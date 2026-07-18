@@ -1376,8 +1376,33 @@
         "service_url": {
           "description": "Base URL of the hosted-agent service.",
           "type": "string"
+        },
+        "source_snapshot": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/HostedSourceSnapshotToml"
+            }
+          ],
+          "description": "Trusted immutable source used for root hosted agents."
         }
       },
+      "type": "object"
+    },
+    "HostedSourceSnapshotToml": {
+      "additionalProperties": false,
+      "description": "Non-secret immutable source identity provisioned by trusted deployment tooling.",
+      "properties": {
+        "checksum": {
+          "type": "string"
+        },
+        "source_snapshot_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "checksum",
+        "source_snapshot_id"
+      ],
       "type": "object"
     },
     "KeybindingsSpec": {

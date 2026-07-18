@@ -163,6 +163,7 @@ async fn hosted_thread_manager_with_durable_store_for_tests(
         enabled: true,
         service_url: Some("https://hosted.invalid".to_string()),
         default_agent_type: "default".to_string(),
+        source_snapshot: None,
     };
     config.agent_roles.insert(
         "default".to_string(),
@@ -1456,6 +1457,40 @@ async fn hosted_provisioning_separates_ownership_from_snapshot_lineage() {
 }
 
 #[tokio::test]
+async fn hosted_root_uses_trusted_source_snapshot_without_client_host_paths() {
+    let (_temp_dir, mut config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
+    let source_snapshot_id = "source_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+    let checksum =
+        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
+    let remote_root = PathUri::parse("file:///workspace/roots/0/project").expect("remote root");
+    let remote_cwd = PathUri::parse("file:///workspace/roots/0/project/src").expect("remote cwd");
+    config.hosted_agents.source_snapshot = Some(crate::config::HostedSourceSnapshotConfig {
+        source_snapshot_id: source_snapshot_id.clone(),
+        checksum: checksum.clone(),
+    });
+    hosted_service.register_source_snapshot(
+        source_snapshot_id.clone(),
+        checksum.clone(),
+        remote_cwd,
+        vec![remote_root],
+    );
+
+    let root = manager
+        .start_thread_with_options(start_thread_options(config))
+        .await
+        .expect("start hosted root from immutable source");
+    let request = hosted_provision_request(&hosted_service, root.thread_id);
+    assert_eq!(request.owner_agent_id, None);
+    assert_eq!(
+        request.source,
+        ProjectSnapshotSource::SourceSnapshot {
+            source_snapshot_id,
+            checksum,
+        }
+    );
+}
+
+#[tokio::test]
 async fn hosted_codex_delegate_owns_and_releases_an_isolated_runtime() {
     let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
     let root = manager
@@ -1613,6 +1648,7 @@ async fn hosted_root_and_spawned_threads_own_distinct_provisioned_environments()
         enabled: true,
         service_url: Some("https://hosted.invalid".to_string()),
         default_agent_type: "default".to_string(),
+        source_snapshot: None,
     };
     config.agent_roles.insert(
         "default".to_string(),

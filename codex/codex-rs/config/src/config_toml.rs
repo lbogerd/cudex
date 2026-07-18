@@ -745,6 +745,17 @@ pub struct HostedAgentsToml {
 
     /// Agent role selected when a caller omits an agent type. Defaults to `default`.
     pub default_agent_type: Option<String>,
+
+    /// Trusted immutable source used for root hosted agents.
+    pub source_snapshot: Option<HostedSourceSnapshotToml>,
+}
+
+/// Non-secret immutable source identity provisioned by trusted deployment tooling.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct HostedSourceSnapshotToml {
+    pub source_snapshot_id: String,
+    pub checksum: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]

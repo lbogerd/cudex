@@ -62,7 +62,11 @@ connection material or allocation is leaked.
 - [x] Validate tenant ownership, trusted checksum, expiry, canonical roots/cwd,
   archive layout/types/links, and all archive quotas before durable publication.
 - [ ] Extend trusted deployment metadata or the provision contract so a remote
-  control plane resolves that ID without client-host `file:` access.
+  control plane resolves that ID without client-host `file:` access:
+  - [x] accept a strictly validated trusted source ID/checksum in hosted-agent
+    configuration and emit the exact path-free `sourceSnapshot` provision wire;
+  - [ ] wire production startup to the PostgreSQL resolver and expose a bounded,
+    authenticated creation/upload path for deployment tooling.
 - [x] Define the exact `sourceSnapshot` provision wire shape and authenticated
   create/resolve API adapter without accepting tenant identity or host paths from
   JSON; keep provision fail-closed until the durable backend owns the route.

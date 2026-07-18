@@ -37,6 +37,30 @@ fn child_request(key: &str, owner_lease_id: &str) -> AgentProvisionRequest {
 }
 
 #[test]
+fn immutable_source_snapshot_has_an_exact_path_free_wire_shape() {
+    let source = ProjectSnapshotSource::SourceSnapshot {
+        source_snapshot_id: "source_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        checksum: format!("sha256:{}", "b".repeat(64)),
+    };
+
+    assert_eq!(
+        serde_json::to_value(&source).expect("source should serialize"),
+        json!({
+            "type": "sourceSnapshot",
+            "sourceSnapshotId": "source_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "checksum": format!("sha256:{}", "b".repeat(64)),
+        })
+    );
+    assert_eq!(
+        serde_json::from_value::<ProjectSnapshotSource>(
+            serde_json::to_value(&source).expect("source should serialize")
+        )
+        .expect("source should deserialize"),
+        source
+    );
+}
+
+#[test]
 fn durable_runtime_record_round_trips_without_transient_data() {
     let agent_id =
         ThreadId::from_string("00000000-0000-0000-0000-000000000123").expect("valid thread id");

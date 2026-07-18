@@ -38,6 +38,10 @@ pub enum ProjectSnapshotSource {
         cwd: PathUri,
         workspace_roots: Vec<PathUri>,
     },
+    SourceSnapshot {
+        source_snapshot_id: String,
+        checksum: String,
+    },
     AgentEnvironment {
         owner_lease_id: String,
     },

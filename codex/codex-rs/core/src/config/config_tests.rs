@@ -7479,6 +7479,10 @@ enabled = true
 service_url = " https://sandbox-service.example/v1 "
 default_agent_type = " researcher "
 
+[hosted_agents.source_snapshot]
+source_snapshot_id = "source_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+checksum = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
 [agents.researcher]
 description = "Research role"
 sandbox_template = " research-v1 "
@@ -7496,6 +7500,11 @@ sandbox_template = " research-v1 "
             enabled: true,
             service_url: Some("https://sandbox-service.example/v1".to_string()),
             default_agent_type: "researcher".to_string(),
+            source_snapshot: Some(crate::config::HostedSourceSnapshotConfig {
+                source_snapshot_id: "source_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                checksum: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    .to_string(),
+            }),
         }
     );
     assert_eq!(
@@ -7505,6 +7514,52 @@ sandbox_template = " research-v1 "
             .and_then(|role| role.sandbox_template.as_deref()),
         Some("research-v1")
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn hosted_source_snapshot_requires_canonical_opaque_identity() -> std::io::Result<()> {
+    for (source_snapshot_id, checksum, expected_message) in [
+        (
+            "source_short",
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "source_snapshot_id",
+        ),
+        (
+            "source_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "sha256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+            "lowercase SHA-256",
+        ),
+    ] {
+        let codex_home = TempDir::new()?;
+        let config_toml = format!(
+            r#"
+[features]
+hosted_agents = true
+
+[hosted_agents]
+enabled = true
+service_url = "https://sandbox-service.example"
+
+[hosted_agents.source_snapshot]
+source_snapshot_id = {source_snapshot_id:?}
+checksum = {checksum:?}
+
+[agents.default]
+description = "Default role"
+sandbox_template = "general-v1"
+"#,
+        );
+        let error = Config::load_from_base_config_with_overrides(
+            toml::from_str(&config_toml).expect("hosted config should deserialize"),
+            ConfigOverrides::default(),
+            codex_home.abs(),
+        )
+        .await
+        .expect_err("invalid immutable source should fail configuration");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains(expected_message), "{error}");
+    }
     Ok(())
 }
 

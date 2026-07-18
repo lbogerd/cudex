@@ -50,6 +50,7 @@ struct State {
     releases: HashMap<String, AgentReleaseRequest>,
     release_failure: Option<HostedAgentError>,
     conflicts: HashMap<String, Vec<PathUri>>,
+    source_snapshots: HashMap<(String, String), Snapshot>,
 }
 
 #[derive(Clone)]
@@ -104,6 +105,23 @@ impl FakeHostedAgentService {
             .provisions
             .get(idempotency_key)
             .map(|(request, _)| request.clone())
+    }
+
+    pub fn register_source_snapshot(
+        &self,
+        source_snapshot_id: impl Into<String>,
+        checksum: impl Into<String>,
+        cwd: PathUri,
+        workspace_roots: Vec<PathUri>,
+    ) {
+        self.lock().source_snapshots.insert(
+            (source_snapshot_id.into(), checksum.into()),
+            Snapshot {
+                cwd,
+                workspace_roots,
+                files: HashMap::new(),
+            },
+        );
     }
 
     pub fn set_patch_conflict(&self, artifact_id: impl Into<String>, paths: Vec<PathUri>) {
@@ -289,6 +307,19 @@ impl HostedAgentService for FakeHostedAgentService {
                 workspace_roots: workspace_roots.clone(),
                 files: HashMap::new(),
             },
+            ProjectSnapshotSource::SourceSnapshot {
+                source_snapshot_id,
+                checksum,
+            } => state
+                .source_snapshots
+                .get(&(source_snapshot_id.clone(), checksum.clone()))
+                .cloned()
+                .ok_or_else(|| {
+                    HostedAgentError::new(
+                        HostedAgentErrorCategory::SnapshotMissing,
+                        "source snapshot is unavailable in the in-memory fake",
+                    )
+                })?,
             ProjectSnapshotSource::AgentEnvironment { owner_lease_id } => {
                 let owner = state.active_lease(owner_lease_id)?.clone();
                 let mut source = state

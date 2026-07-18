@@ -1514,13 +1514,19 @@ impl ThreadManagerState {
                 let owner_lease_id = owner_runtime.snapshot().lease_id;
                 ProjectSnapshotSource::AgentEnvironment { owner_lease_id }
             }
-            None => ProjectSnapshotSource::RootWorkspace {
-                cwd: PathUri::from_abs_path(&config.cwd),
-                workspace_roots: config
-                    .workspace_roots
-                    .iter()
-                    .map(PathUri::from_abs_path)
-                    .collect(),
+            None => match &config.hosted_agents.source_snapshot {
+                Some(source) => ProjectSnapshotSource::SourceSnapshot {
+                    source_snapshot_id: source.source_snapshot_id.clone(),
+                    checksum: source.checksum.clone(),
+                },
+                None => ProjectSnapshotSource::RootWorkspace {
+                    cwd: PathUri::from_abs_path(&config.cwd),
+                    workspace_roots: config
+                        .workspace_roots
+                        .iter()
+                        .map(PathUri::from_abs_path)
+                        .collect(),
+                },
             },
         };
         let request = AgentProvisionRequest {

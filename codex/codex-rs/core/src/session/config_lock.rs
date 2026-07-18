@@ -191,6 +191,12 @@ fn save_config_resolved_fields(
         enabled: Some(true),
         service_url: config.hosted_agents.service_url.clone(),
         default_agent_type: Some(config.hosted_agents.default_agent_type.clone()),
+        source_snapshot: config.hosted_agents.source_snapshot.as_ref().map(|source| {
+            codex_config::config_toml::HostedSourceSnapshotToml {
+                source_snapshot_id: source.source_snapshot_id.clone(),
+                checksum: source.checksum.clone(),
+            }
+        }),
     });
 
     lock_config

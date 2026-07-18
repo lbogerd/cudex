@@ -424,11 +424,18 @@ reported as not found. Together with the pre-allocation resolver, this closes
 both sides of the authorization time-of-check gap. Production provision still
 needs to select the PostgreSQL lifecycle and resolver at startup.
 
-The current Rust Codex `ProjectSnapshotSource` has only root-workspace,
-agent-environment, and durable-snapshot variants, so it cannot yet emit or parse
-this source. Adding the client variant and an actual authenticated upload route
-remains necessary before the control plane can resolve immutable source content
-for an unmodified Codex client.
+Rust Codex now accepts optional trusted `[hosted_agents.source_snapshot]`
+deployment metadata containing only a canonical `source_<32 lowercase hex>` ID
+and lowercase SHA-256. It is retained in locked session configuration. Root
+hosted threads emit the exact path-free `sourceSnapshot` provision variant while
+children continue to use their owner lease and development deployments without
+the metadata retain the allowlisted `rootWorkspace` bridge. The in-memory fake
+can register immutable source metadata for deterministic root-selection tests.
+Exact serde, invalid-config, root-selection, and ownership-lineage tests passed;
+the broader lineage test requires the repository's 16 MiB Rust test stack.
+Production startup still needs to construct the PostgreSQL resolver and expose
+a bounded authenticated creation/upload route before deployment tooling can
+produce and resolve these IDs end to end.
 
 ### Connection-ticket lifecycle
 

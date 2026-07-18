@@ -15,6 +15,14 @@ pub struct HostedAgentsConfig {
     pub service_url: Option<String>,
     /// Agent role selected when a caller omits an agent type.
     pub default_agent_type: String,
+    /// Trusted immutable source used instead of client-host paths for root agents.
+    pub source_snapshot: Option<HostedSourceSnapshotConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostedSourceSnapshotConfig {
+    pub source_snapshot_id: String,
+    pub checksum: String,
 }
 
 impl Default for HostedAgentsConfig {
@@ -23,6 +31,7 @@ impl Default for HostedAgentsConfig {
             enabled: false,
             service_url: None,
             default_agent_type: DEFAULT_HOSTED_AGENT_TYPE.to_string(),
+            source_snapshot: None,
         }
     }
 }
@@ -55,6 +64,39 @@ pub(super) fn resolve(
         .filter(|agent_type| !agent_type.is_empty())
         .unwrap_or(DEFAULT_HOSTED_AGENT_TYPE)
         .to_string();
+    let source_snapshot = configured
+        .and_then(|hosted| hosted.source_snapshot.as_ref())
+        .map(|source| {
+            let id_suffix = source.source_snapshot_id.strip_prefix("source_");
+            if !id_suffix.is_some_and(|suffix| {
+                suffix.len() == 32
+                    && suffix
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            }) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "hosted_agents.source_snapshot.source_snapshot_id must be source_ followed by 32 lowercase hex characters",
+                ));
+            }
+            let checksum_suffix = source.checksum.strip_prefix("sha256:");
+            if !checksum_suffix.is_some_and(|suffix| {
+                suffix.len() == 64
+                    && suffix
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            }) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "hosted_agents.source_snapshot.checksum must be a lowercase SHA-256 checksum",
+                ));
+            }
+            Ok(HostedSourceSnapshotConfig {
+                source_snapshot_id: source.source_snapshot_id.clone(),
+                checksum: source.checksum.clone(),
+            })
+        })
+        .transpose()?;
 
     if enabled {
         let service_url = service_url.as_deref().ok_or_else(|| {
@@ -118,5 +160,6 @@ pub(super) fn resolve(
         enabled,
         service_url,
         default_agent_type,
+        source_snapshot,
     })
 }
