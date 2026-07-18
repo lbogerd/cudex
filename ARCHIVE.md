@@ -266,6 +266,25 @@ A follow-up migration aligns the PostgreSQL ticket-purpose constraint with the
 gateway/probe purposes. Cross-replica lookup and active-socket revocation still
 require the PostgreSQL store/event propagation integration.
 
+### Canonical workspace comparison foundation
+
+Patch lifecycle code now has a provider-independent canonical workspace model
+covering directories, regular files (mode, size, SHA-256 content digest), and
+safe relative symlinks (mode and target). It validates NFC canonical relative
+POSIX paths, link containment, modes, digests, duplicate paths, and entry/file/
+byte/path/depth/link/manifest/change quotas. Stable key and path ordering yields
+a canonical JSON checksum independent of input order.
+
+The same module produces complete sorted add/modify/delete diffs and applies the
+archived three-way conflict rule: a changed path conflicts only when the target
+differs from both artifact base and artifact current. It counts every conflict
+before returning at most 256 sorted canonical `file:` URIs and truncates rejection
+text at 4 KiB without splitting a UTF-8 code point. Tests cover binaries,
+executable and directory modes, links, additions/deletions, already-applied
+targets, 300-conflict truncation, malformed inputs, and every quota dimension.
+Manifest capture/persistence and live workspace mutation remain subsequent
+lifecycle work.
+
 CubeSandbox was verified on 2026-07-18 through stock E2B TypeScript SDK 2.35.0.
 Provider code lives in the external TypeScript control plane under `e2b/src`, not
 in `codex-core`.

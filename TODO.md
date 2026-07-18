@@ -94,6 +94,8 @@ identity remains isolated, and lifecycle replay never duplicates resources.
 
 ## 5. Patch export
 
+- [x] Add bounded canonical manifest, diff, checksum, and file-type validation
+  primitives shared by export and apply.
 - [ ] Implement `POST v1/agents/patch/export` using the archived contract.
 - [ ] Build canonical sorted manifests with path, type, mode, link target or
   content digest, and immutable base/current identities.
@@ -108,6 +110,8 @@ Exit criterion: a durable checksummed artifact remains usable after child releas
 
 ## 6. Atomic three-way patch application
 
+- [x] Add pure three-way conflict collection with canonical URI sorting, the
+  256-path cap, and UTF-8-safe 4 KiB rejection bounds.
 - [ ] Implement `POST v1/agents/patch/apply` and `applied`, `conflict`, and
   `rejected` responses.
 - [ ] Validate artifact checksum, authorization, expiry, paths, quotas, base, and
