@@ -70,6 +70,34 @@ export class PostgresReferenceRetention {
             AND reference.reference_kind = 'codex_thread' AND reference.reference_id = $2
             AND reference.artifact_id <> $3`, [this.tenantId, input.agentId, input.artifactId])
       }
+      await client.query(`DELETE FROM hosted_agent_object_references
+        WHERE reference_kind = 'codex_thread' AND reference_id = $1`, [input.agentId])
+      await client.query(`
+        INSERT INTO hosted_agent_object_references
+          (object_id, reference_kind, reference_id, purpose)
+        SELECT reference.object_id, 'codex_thread', $3,
+          left(CASE WHEN reference.reference_id = $4 THEN 'base_' || reference.purpose
+               ELSE 'latest_' || reference.purpose END, 128)
+        FROM hosted_agent_object_references AS reference
+        JOIN hosted_agent_objects AS object_row ON object_row.object_id = reference.object_id
+        WHERE reference.reference_kind = 'snapshot'
+          AND reference.reference_id = ANY($2::text[])
+          AND object_row.tenant_id = $1 AND object_row.state = 'available'
+        ON CONFLICT (object_id, reference_kind, reference_id, purpose) DO NOTHING
+      `, [this.tenantId, [...new Set([input.baseSnapshotId, input.latestSnapshotId])],
+        input.agentId, input.baseSnapshotId])
+      if (input.artifactId !== null) {
+        await client.query(`
+          INSERT INTO hosted_agent_object_references
+            (object_id, reference_kind, reference_id, purpose)
+          SELECT reference.object_id, 'codex_thread', $3, left('artifact_' || reference.purpose, 128)
+          FROM hosted_agent_object_references AS reference
+          JOIN hosted_agent_objects AS object_row ON object_row.object_id = reference.object_id
+          WHERE reference.reference_kind = 'artifact' AND reference.reference_id = $2
+            AND object_row.tenant_id = $1 AND object_row.state = 'available'
+          ON CONFLICT (object_id, reference_kind, reference_id, purpose) DO NOTHING
+        `, [this.tenantId, input.artifactId, input.agentId])
+      }
       await client.query('COMMIT')
     } catch (error) {
       await client.query('ROLLBACK').catch(() => undefined)
@@ -99,9 +127,34 @@ export class PostgresReferenceRetention {
           SELECT 1 FROM hosted_agent_artifact_references
           WHERE artifact_id = retained.artifact_id
             AND reference_kind = 'codex_thread' AND reference_id = retained.agent_id))
+        AND (retained.artifact_id IS NOT NULL OR NOT EXISTS (
+          SELECT 1 FROM hosted_agent_artifacts
+          WHERE tenant_id = lease.tenant_id AND source_lease_id = lease.lease_id
+            AND current_snapshot_id = retained.latest_snapshot_id AND state = 'available'))
+        AND NOT EXISTS (
+          SELECT 1 FROM hosted_agent_object_references source
+          WHERE source.reference_kind = 'snapshot'
+            AND source.reference_id IN (retained.base_snapshot_id, retained.latest_snapshot_id)
+            AND NOT EXISTS (
+              SELECT 1 FROM hosted_agent_object_references rooted
+              WHERE rooted.object_id = source.object_id AND rooted.reference_kind = 'codex_thread'
+                AND rooted.reference_id = retained.agent_id))
+        AND (retained.artifact_id IS NULL OR NOT EXISTS (
+          SELECT 1 FROM hosted_agent_object_references source
+          WHERE source.reference_kind = 'artifact' AND source.reference_id = retained.artifact_id
+            AND NOT EXISTS (
+              SELECT 1 FROM hosted_agent_object_references rooted
+              WHERE rooted.object_id = source.object_id AND rooted.reference_kind = 'codex_thread'
+                AND rooted.reference_id = retained.agent_id)))
       FOR SHARE OF retained
     `, [this.tenantId, leaseId])
     if (result.rowCount !== 1) throw new ServiceError(409, 'durable references are not synchronized')
+  }
+
+  async removeReleasedLeaseRoots(client: PoolClient, leaseId: string): Promise<void> {
+    await client.query(`DELETE FROM hosted_agent_snapshot_references
+      WHERE reference_id = $1
+        AND reference_kind IN ('lease_base', 'lease_latest', 'lease_restore_source')`, [leaseId])
   }
 
   private async authorizeLease(client: PoolClient, input: RetentionRequest): Promise<void> {
@@ -121,9 +174,12 @@ export class PostgresReferenceRetention {
   }
 
   private async authorizeArtifact(client: PoolClient, agentId: string, artifactId: string): Promise<void> {
-    const result = await client.query(`SELECT 1 FROM hosted_agent_artifacts
-      WHERE tenant_id = $1 AND artifact_id = $2 AND state = 'available'
-        AND (agent_id = $3 OR owner_agent_id = $3) FOR SHARE`, [this.tenantId, artifactId, agentId])
+    const result = await client.query(`SELECT 1 FROM hosted_agent_artifacts AS artifact
+      JOIN hosted_agent_leases AS lease
+        ON lease.lease_id = artifact.source_lease_id AND lease.tenant_id = artifact.tenant_id
+      WHERE artifact.tenant_id = $1 AND artifact.artifact_id = $2 AND artifact.state = 'available'
+        AND (artifact.agent_id = $3 OR lease.owner_agent_id = $3) FOR SHARE OF artifact`,
+    [this.tenantId, artifactId, agentId])
     if (result.rowCount !== 1) throw new ServiceError(404, 'artifact missing')
   }
 }

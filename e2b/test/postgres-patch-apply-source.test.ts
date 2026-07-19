@@ -10,6 +10,7 @@ import {
 } from '../src/postgres-patch-apply-source.js'
 import { serializePatchArtifact } from '../src/patch-artifact.js'
 import { PostgresPatchArtifactRepository } from '../src/postgres-artifacts.js'
+import { PostgresReferenceRetention } from '../src/postgres-reference-retention.js'
 import {
   PostgresDurableState,
   type SnapshotInput,
@@ -261,6 +262,18 @@ live('requires the exact owner lease and hides tenant, lease, and expiry mismatc
   await context.artifacts.expireAvailable('tenant-1', new Date(Date.now() + 10 * 60_000))
   await assert.rejects(context.resolver.resolve(request),
     error => error instanceof PatchApplyRejectedError && error.reason === 'artifact is unavailable')
+})
+
+live('a synchronized Codex artifact remains resolvable and excluded from expiry sweep', async context => {
+  await prepared(context)
+  const retention = new PostgresReferenceRetention(context.firstPool, 'tenant-1')
+  await retention.retain({
+    agentId: 'agent-child', leaseId: 'lease-child', baseSnapshotId: 'snapshot-child-base',
+    latestSnapshotId: 'snapshot-child-current', artifactId: 'artifact-1',
+  })
+  assert.equal(await context.artifacts.expireAvailable(
+    'tenant-1', new Date(Date.now() + 10 * 60_000)), 0)
+  assert.equal((await context.resolver.resolve(request)).plan.type, 'ready')
 })
 
 live('fails closed on missing references, dishonest locators, and corrupt bytes', async context => {

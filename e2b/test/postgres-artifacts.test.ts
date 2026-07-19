@@ -9,6 +9,7 @@ import {
   type CreatePatchArtifactInput,
 } from '../src/postgres-artifacts.js'
 import { PostgresDurableState, type CreateLeaseInput, type StoredObject } from '../src/postgres-state.js'
+import { PostgresReferenceRetention } from '../src/postgres-reference-retention.js'
 import { createWorkspaceManifest, workspaceManifestChecksum, type WorkspaceEntry } from '../src/workspace-manifest.js'
 
 const databaseUrl = process.env.HOSTED_AGENT_TEST_DATABASE_URL
@@ -206,6 +207,26 @@ live('expiry changes authorization state without removing durable references', a
     FROM hosted_agent_artifacts a WHERE a.artifact_id = $1
   `, [input.artifactId])
   assert.deepEqual(row.rows[0], { state: 'expired', references: '1' })
+})
+
+live('Codex retention keeps artifact authorization and objects beyond ordinary TTL', async context => {
+  const input = await prepared(context)
+  await context.first.create(input)
+  const retention = new PostgresReferenceRetention(context.firstPool, input.tenantId)
+  await retention.retain({
+    agentId: input.agentId, leaseId: input.sourceLeaseId,
+    baseSnapshotId: input.baseSnapshotId, latestSnapshotId: input.currentSnapshotId,
+    artifactId: input.artifactId,
+  })
+  const future = new Date(Date.now() + 120_000)
+  assert.equal(await context.first.expireAvailable(input.tenantId, future), 0)
+  assert.equal((await context.second.getAuthorized(
+    input.tenantId, input.artifactId, input.agentId, future))?.artifactId, input.artifactId)
+  const roots = await context.firstPool.query<{ count: string }>(`
+    SELECT count(*)::text AS count FROM hosted_agent_object_references
+    WHERE reference_kind = 'codex_thread' AND reference_id = $1
+  `, [input.agentId])
+  assert.equal(Number(roots.rows[0]!.count) > 0, true)
 })
 
 test('repository validates canonical identity, checksums, count, size, expiry, and state before SQL', async () => {

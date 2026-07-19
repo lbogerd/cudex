@@ -295,6 +295,32 @@ live('Codex reference sync is exact, authorized, idempotent, and release-safe', 
     WHERE reference_kind = 'codex_thread' AND reference_id = $1
   `, [request.agentId])
   assert.equal(references.rows[0]!.count, '2')
+  const objectReferences = await context.firstPool.query<{ count: string }>(`
+    SELECT count(*)::text AS count FROM hosted_agent_object_references
+    WHERE reference_kind = 'codex_thread' AND reference_id = $1
+  `, [request.agentId])
+  assert.equal(objectReferences.rows[0]!.count, '4')
+  await context.firstPool.query(`DELETE FROM hosted_agent_object_references
+    WHERE ctid IN (SELECT ctid FROM hosted_agent_object_references
+      WHERE reference_kind = 'codex_thread' AND reference_id = $1 LIMIT 1)`, [request.agentId])
+  const broken = await context.firstPool.connect()
+  try {
+    await broken.query('BEGIN')
+    await assert.rejects(retention.assertSynchronized(broken, request.leaseId))
+    await broken.query('ROLLBACK')
+  } finally { broken.release() }
+  await retention.retain(request)
+  const cleanup = await context.firstPool.connect()
+  try {
+    await cleanup.query('BEGIN')
+    await retention.removeReleasedLeaseRoots(cleanup, request.leaseId)
+    await cleanup.query('COMMIT')
+  } finally { cleanup.release() }
+  const leaseReferences = await context.firstPool.query<{ count: string }>(`
+    SELECT count(*)::text AS count FROM hosted_agent_snapshot_references
+    WHERE reference_id = $1 AND reference_kind IN ('lease_base', 'lease_latest')
+  `, [request.leaseId])
+  assert.equal(leaseReferences.rows[0]!.count, '0')
 })
 
 live('snapshot transactions reject content objects that are no longer available', async context => {

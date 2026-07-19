@@ -265,7 +265,10 @@ export class PostgresPatchArtifactRepository {
       FROM hosted_agent_artifacts a
       JOIN hosted_agent_leases l ON l.lease_id = a.source_lease_id AND l.tenant_id = a.tenant_id
       WHERE a.artifact_id = $1 AND a.tenant_id = $2 AND a.agent_id = $3
-        AND a.state = 'available' AND a.expires_at > $4
+        AND a.state = 'available' AND (a.expires_at > $4 OR EXISTS (
+          SELECT 1 FROM hosted_agent_artifact_references retained
+          WHERE retained.artifact_id = a.artifact_id
+            AND retained.reference_kind = 'codex_thread' AND retained.reference_id = $3))
     `, [artifactId, tenantId, agentId, at])
     return result.rows[0] ? fromRow(result.rows[0]) : null
   }
@@ -277,7 +280,10 @@ export class PostgresPatchArtifactRepository {
       FROM hosted_agent_artifacts a
       JOIN hosted_agent_leases l ON l.lease_id = a.source_lease_id AND l.tenant_id = a.tenant_id
       WHERE a.artifact_id = $1 AND a.tenant_id = $2 AND l.owner_agent_id = $3
-        AND a.state = 'available' AND a.expires_at > $4
+        AND a.state = 'available' AND (a.expires_at > $4 OR EXISTS (
+          SELECT 1 FROM hosted_agent_artifact_references retained
+          WHERE retained.artifact_id = a.artifact_id
+            AND retained.reference_kind = 'codex_thread'))
     `, [artifactId, tenantId, ownerAgentId, at])
     return result.rows[0] ? fromRow(result.rows[0]) : null
   }
@@ -320,6 +326,10 @@ export class PostgresPatchArtifactRepository {
     const result = await this.pool.query(`
       UPDATE hosted_agent_artifacts SET state = 'expired'
       WHERE tenant_id = $1 AND state = 'available' AND expires_at <= $2
+        AND NOT EXISTS (
+          SELECT 1 FROM hosted_agent_artifact_references retained
+          WHERE retained.artifact_id = hosted_agent_artifacts.artifact_id
+            AND retained.reference_kind = 'codex_thread')
     `, [tenantId, at])
     return result.rowCount ?? 0
   }

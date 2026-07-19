@@ -22,7 +22,10 @@ export interface PostgresReleaseOptions {
   workerId: string
   waitTimeoutMs?: number
   connections?: ReleaseConnectionRevoker
-  referenceRetention?: { assertSynchronized(client: PoolClient, leaseId: string): Promise<void> }
+  referenceRetention?: {
+    assertSynchronized(client: PoolClient, leaseId: string): Promise<void>
+    removeReleasedLeaseRoots(client: PoolClient, leaseId: string): Promise<void>
+  }
 }
 
 const operation = 'release'
@@ -101,6 +104,7 @@ export class PostgresReleaseCoordinator {
         const pending = await this.state.beginRelease(this.tenantId, lease.leaseId, client)
         if (pending.state === 'released' || !pending.providerSandboxId) {
           if (pending.state !== 'released') await this.state.releaseLease(this.tenantId, lease.leaseId, client)
+          await this.options.referenceRetention?.removeReleasedLeaseRoots(client, lease.leaseId)
           await this.journal.completeOperation(
             identity, fence.generation, fence.workerId, logicalResponse, client)
           alreadyReleased = true
@@ -142,6 +146,7 @@ export class PostgresReleaseCoordinator {
           try { await this.provider.kill(releaseAllocation!.resourceId) }
           catch (error) { if (!(error instanceof ProviderSandboxMissingError)) throw error }
           await this.state.releaseLease(this.tenantId, request.leaseId, client)
+          await this.options.referenceRetention?.removeReleasedLeaseRoots(client, lease.leaseId)
         }
         await this.journal.updateAllocationState(
           fence, fence.generation, fence.workerId, releaseAllocation!.allocationId, 'reclaimed', client)

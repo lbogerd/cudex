@@ -263,18 +263,25 @@ export class PostgresPatchApplySourceResolver {
     `, [input.tenantId, input.artifactId])
     const artifact = artifactResult.rows[0]
     const now = new Date()
-    if (!artifact || artifact.state !== 'available' || artifact.expires_at <= now
+    const retainedArtifact = artifact && (await executor.query(`
+      SELECT 1 FROM hosted_agent_artifact_references
+      WHERE artifact_id = $1 AND reference_kind = 'codex_thread' LIMIT 1
+    `, [input.artifactId])).rowCount === 1
+    if (!artifact || artifact.state !== 'available' || (artifact.expires_at <= now && !retainedArtifact)
       || artifact.agent_id !== artifact.source_agent_id
       || artifact.source_owner_agent_id !== target.agent_id
       || artifact.source_owner_lease_id !== target.lease_id) {
       throw new PatchApplyRejectedError('artifact is unavailable')
     }
+    const artifactValidationTime = retainedArtifact ? new Date(0) : now
 
     await this.verifyArtifactOwnership(executor, artifact, target.agent_id)
-    const sourceSnapshots = await this.artifactSnapshots(executor, input.tenantId, artifact, now)
+    const sourceSnapshots = await this.artifactSnapshots(
+      executor, input.tenantId, artifact, artifactValidationTime)
     const artifactRows = await this.objectReferences(
       executor, input.tenantId, 'artifact', artifact.artifact_id)
-    const serialized = await this.artifactMaterial(artifact, sourceSnapshots, artifactRows, now)
+    const serialized = await this.artifactMaterial(
+      artifact, sourceSnapshots, artifactRows, artifactValidationTime)
 
     const targetSnapshot = await this.targetSnapshot(
       executor, input.tenantId, target.lease_id, target.latest_snapshot_id, now)
@@ -283,7 +290,7 @@ export class PostgresPatchApplySourceResolver {
     const targetMaterial = await this.snapshotMaterial(targetSnapshot, targetRows, now)
 
     const artifactContent = await this.contentMaterial(
-      artifactRows.filter(row => row.purpose === 'content_blob'), now)
+      artifactRows.filter(row => row.purpose === 'content_blob'), artifactValidationTime)
     const plan = planPatchApplication({
       artifact: serialized,
       targetManifest: targetMaterial.manifest,

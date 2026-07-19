@@ -79,9 +79,11 @@ production backend. Stable decisions, evidence, and wire schemas are in
   - [x] Add the strict retain wire, tenant/agent-authorized exact-set PostgreSQL
     roots, Codex persistence/release synchronization, and a production release
     fence that refuses an unsynchronized latest snapshot.
-  - [ ] Add monotonic reference revisions and desired-set hashes, direct retained
-    object-graph roots, retained-artifact TTL overrides, exact lease-root removal,
-    and a durable thread-deletion tombstone/outbox before enabling collection.
+  - [x] Add direct retained object-graph roots, make live Codex references override
+    ordinary artifact TTL throughout authorization/apply/expiry, verify the graph
+    at release, and remove the released lease's incidental snapshot roots.
+  - [ ] Add monotonic reference revisions and desired-set hashes plus a durable
+    thread-deletion tombstone/outbox before enabling collection.
 - [ ] Reconcile abandoned operations, sandboxes, snapshots, capture sandboxes,
   tickets, archives, and expired blobs after crashes and timeouts.
 - [x] Add bounded, tenant-scoped PostgreSQL reclamation for registered object

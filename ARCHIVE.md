@@ -644,13 +644,21 @@ the sandbox. A failure therefore preserves the lease instead of crossing a local
 persistence/service-retention crash window. This work also fixed a core read
 destructure exposed by the new exec-server `quiesced` response field.
 
-This is a fail-closed foundation, not the completed retention lifecycle. Before
-collection is enabled, sync still needs monotonic revisions and desired hashes;
-direct object-graph roots; retained-artifact authorization beyond its normal TTL;
-precise released-lease root removal; and a durable deletion tombstone/outbox that
-clears the remote set only after local thread deletion. Focused migration,
-authorization, exact-set, HTTP, Rust contract, and lifecycle tests pass, and the
-complete Docker/PostgreSQL suite reached 286 tests with no skips.
+The next retention layer copies the complete snapshot/artifact object graph into
+tenant/thread `codex_thread` roots with unbounded retention. Artifact lookup,
+expiry sweeps, and patch-apply source verification now treat a live Codex root as
+authoritative beyond the artifact's ordinary TTL while continuing to verify
+state, identity, checksums, locators, and bytes. Release verifies every direct
+root under the lease fence and removes that released lease's incidental
+`lease_base`, `lease_latest`, and `lease_restore_source` snapshot roots after the
+Codex roots are safe.
+
+This remains a fail-closed foundation rather than the completed deletion
+lifecycle. Before collection is enabled, sync still needs monotonic revisions and
+desired hashes plus a durable deletion tombstone/outbox that clears the remote
+set only after local thread deletion. Focused migration, authorization, exact-set,
+HTTP, Rust contract, expiry, apply, and lifecycle tests pass. The complete
+Docker/PostgreSQL suite passes 288 tests with no skips.
 
 ### Canonical workspace comparison foundation
 
