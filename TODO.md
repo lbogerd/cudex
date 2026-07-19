@@ -236,7 +236,7 @@ tickets always fail, and secrets never enter durable or observable state.
     enabling production child dispatch.
 - [x] Persist checksummed base/current workspace manifests with the unwired
   durable provision and checkpoint snapshots and service archives.
-- [ ] Carry the same manifest persistence through the remaining production
+- [x] Carry the same manifest persistence through the remaining production
   lifecycle wiring and patch operations.
 - [x] Add an unwired tenant-safe workspace snapshot publisher that validates
   provider archives, stores exact archive/manifest/content objects, and retains

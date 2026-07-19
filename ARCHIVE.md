@@ -696,6 +696,18 @@ core tests cover permanent clear, exact replay, and forwarding the durable fence
 The affected local suites pass 236 tests with no skips; the complete hosted
 Docker/PostgreSQL suite passes 288 tests with no skips.
 
+Production manifest persistence is complete across every lifecycle coordinator.
+Startup injects one `WorkspaceSnapshotPublisher` into immutable provision,
+checkpoint, clean restore, clean child creation, and patch application. Each path
+captures or reconstructs the resulting archive, publishes its exact canonical
+checksummed manifest and deduplicated content graph, and commits the snapshot and
+object references atomically. Patch export resolves and verifies the persisted
+base/current manifests; patch application builds and reparses the prospective
+archive before committing its result through the same checkpoint publisher.
+Workspace publication plus PostgreSQL provision, restore, child, export, and
+apply suites cover these paths. The remaining-work checkbox predated the later
+production coordinator wiring and is now reconciled as complete.
+
 ### Canonical workspace comparison foundation
 
 Patch lifecycle code now has a provider-independent canonical workspace model
