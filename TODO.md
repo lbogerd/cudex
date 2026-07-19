@@ -278,6 +278,8 @@ Exit criterion: a durable checksummed artifact remains usable after child releas
   verify every body, and reparse the result to prove the full manifest round-trip.
 - [x] Add an immutable generation-fenced PostgreSQL apply-attempt ledger with
   allocation-bound rollback identity and explicit swap/checkpoint/rollback phases.
+- [x] Coordinate the clean apply path through rollback capture, validated atomic
+  provider upload, observed-result verification, durable checkpoint, and replay.
 - [ ] Implement `POST v1/agents/patch/apply` and `applied`, `conflict`, and
   `rejected` responses.
 - [x] Validate artifact checksum, authorization, expiry, paths, quotas, base, and
@@ -285,10 +287,10 @@ Exit criterion: a durable checksummed artifact remains usable after child releas
 - [x] Compare artifact base/current and target current for every changed path;
   collect all conflicts before mutation.
 - [x] Bound conflicts to 256 canonical URIs and rejection reasons to 4 KiB.
-- [ ] Guarantee conflict/rejection leaves the target byte-for-byte unchanged.
-- [ ] Create a rollback snapshot, stage and validate the complete result away
+- [x] Guarantee conflict/rejection leaves the target byte-for-byte unchanged.
+- [x] Create a rollback snapshot, stage and validate the complete result away
   from the live workspace, then atomically swap it into place.
-- [ ] Persist the post-apply durable checkpoint before responding.
+- [x] Persist the post-apply durable checkpoint before responding.
 - [ ] Reconcile crashes between rollback, staging, swap, checkpoint, and response.
 
 Exit criterion: clean changes apply atomically; conflicts do not mutate; binary,

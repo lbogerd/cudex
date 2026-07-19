@@ -582,6 +582,37 @@ guards. Migrations remain concurrent and repeatable; the full suite passed 239
 tests with no skips. Provider rollback creation, swap execution, checkpoint
 publication, and reconciliation remain unwired from this ledger.
 
+A PostgreSQL patch-apply coordinator now drives that ledger through real provider
+and durable-storage effects. A session-scoped advisory lease lock, compatible
+with every existing transaction-scoped lifecycle lock, spans provider calls
+while allowing each crash boundary to commit separately. Under it the
+coordinator claims/replays the operation, resolves and plans exact material,
+builds both result and rollback archives, creates and immediately ledgers a
+named provider rollback snapshot, commits `swap_started` before the provider's
+already-staged atomic roots replacement, verifies the exported live result
+against the planned manifest, and creates a named result provider snapshot.
+Workspace preparation now accepts `patch_apply` as a checkpoint source mode, so
+the result archive, manifest, content, provider snapshot, target latest pointer,
+application `checkpointed` phase, and adopted allocations commit as one final
+database transaction before the logical `applied` response.
+
+Normal conflicts and rejections complete without an application row or any
+provider, workspace, or object-store mutation. Post-snapshot failures enter the
+durable rollback path and upload the independently validated original archive;
+the operation becomes terminal only after `rolled_back` and provider-snapshot
+reclamation. A failed rollback deliberately retains its provider snapshot for
+reconciliation. Success similarly deletes and reclaims the temporary rollback
+snapshot before completing the operation, while the result snapshot and all
+checkpoint objects remain adopted. Deterministic application, snapshot, and
+provider snapshot names support later inventory recovery.
+
+Three PostgreSQL integration tests cover clean apply/checkpoint/replay, complete
+conflict immutability, and a one-time provider failure after swap that restores
+the exact original archive and latest-snapshot identity. A separate two-pool
+test proves the session lease lock remains exclusive across an intermediate
+commit. The full suite passed 243 tests with no skips. HTTP/startup wiring and
+stale phase reconciliation remain outstanding.
+
 ### Durable patch-artifact repository
 
 Patch export now has a verified immutable-source boundary. Canonical manifest

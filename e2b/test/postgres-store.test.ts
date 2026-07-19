@@ -258,6 +258,39 @@ live('sorted multi-lease advisory locks avoid reversed-order deadlock', async co
   assert.deepEqual(new Set(completed), new Set(['first', 'second']))
 })
 
+live('session lease locks fence lifecycle transactions across durable phase commits', async context => {
+  await context.firstPool.query(`
+    INSERT INTO hosted_agent_leases
+      (lease_id, environment_id, tenant_id, agent_id, sandbox_template, cwd_uri,
+       workspace_root_uris, state, tool_policy, policy_version)
+    VALUES ('lease-session', 'env-session', 'tenant-1', 'agent-session', 'general-v1',
+      'file:///workspace/root', '["file:///workspace/root"]'::jsonb,
+      'provisioning', '{}'::jsonb, 1)
+  `)
+  let release!: () => void
+  const gate = new Promise<void>(resolve => { release = resolve })
+  let held!: () => void
+  const holding = new Promise<void>(resolve => { held = resolve })
+  let acquired = false
+  const session = context.first.withSessionLeaseLocks(
+    'tenant-1', ['lease-session'], async client => {
+      await client.query('BEGIN')
+      await client.query("UPDATE hosted_agent_leases SET sandbox_template = 'general-v1' WHERE lease_id = 'lease-session'")
+      await client.query('COMMIT')
+      held()
+      await gate
+    })
+  await holding
+  const transaction = context.second.withLeaseLocks('tenant-1', ['lease-session'], async () => {
+    acquired = true
+  })
+  await new Promise(resolve => setTimeout(resolve, 50))
+  assert.equal(acquired, false)
+  release()
+  await Promise.all([session, transaction])
+  assert.equal(acquired, true)
+})
+
 live('provider resource locks serialize the same durable provider identity across replicas', async context => {
   let active = 0; let maximum = 0
   const enter = async () => {

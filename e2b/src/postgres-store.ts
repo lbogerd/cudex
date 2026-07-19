@@ -499,6 +499,37 @@ export class PostgresJournal {
   }
 
   /**
+   * Holds the lifecycle advisory lock across multiple caller-managed database
+   * transactions and external provider calls. The callback must commit every
+   * durable phase before its corresponding external side effect.
+   */
+  async withSessionLeaseLocks<T>(tenantId: string, leaseIds: string[],
+    fn: (client: PoolClient) => Promise<T>): Promise<T> {
+    if (!tenantId.trim() || Buffer.byteLength(tenantId) > 512) throw new Error('invalid tenant ID')
+    const sorted = [...new Set(leaseIds)].map(leaseId => {
+      if (!leaseId.trim() || Buffer.byteLength(leaseId) > 512) throw new Error('invalid lease ID')
+      return leaseId
+    }).sort((left, right) => left < right ? -1 : left > right ? 1 : 0)
+    const keys = sorted.map(leaseId => `hosted-agent:lease:${tenantId}:${leaseId}`)
+    const client = await this.pool.connect()
+    const locked: string[] = []
+    try {
+      for (const key of keys) {
+        await client.query('SELECT pg_advisory_lock(hashtextextended($1, 0))', [key])
+        locked.push(key)
+      }
+      return await fn(client)
+    } finally {
+      await client.query('ROLLBACK').catch(() => undefined)
+      for (const key of locked.reverse()) {
+        await client.query('SELECT pg_advisory_unlock(hashtextextended($1, 0))', [key])
+          .catch(() => undefined)
+      }
+      client.release()
+    }
+  }
+
+  /**
    * Holds a transaction-scoped advisory lock across an external provider
    * mutation. Every production lifecycle writer must take the same lock before
    * associating an already-created provider resource with durable state.

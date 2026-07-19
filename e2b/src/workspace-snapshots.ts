@@ -264,7 +264,7 @@ export class WorkspaceSnapshotPublisher {
   async prepareDurableBase(input: PrepareDurableBaseWorkspaceSnapshotInput): Promise<PreparedDurableBaseWorkspaceSnapshot> {
     const coordinator = this.options.durablePreparation
     if (!coordinator) throw new ServiceError(503, 'durable workspace preparation is unavailable')
-    if (input.fence.operation !== 'provision' && input.fence.operation !== 'checkpoint') {
+    if (!['provision', 'checkpoint', 'patch_apply'].includes(input.fence.operation)) {
       throw new ServiceError(400, 'invalid workspace preparation operation')
     }
     const immutableSource = input.sourceSnapshotId != null || input.expectedSourceChecksum !== null
@@ -273,6 +273,7 @@ export class WorkspaceSnapshotPublisher {
     const immutablePaired = input.sourceSnapshotId != null && input.expectedSourceChecksum !== null
     const restorePaired = input.restoreSourceLeaseId != null && input.restoreSourceSnapshotId != null
     const validSourceMode = input.fence.operation === 'checkpoint'
+      || input.fence.operation === 'patch_apply'
       ? checkpointSource && !immutableSource && !restoreSource
       : !checkpointSource && ((immutablePaired && !restoreSource) || (restorePaired && !immutableSource))
     if (!validSourceMode) throw new ServiceError(400, 'invalid workspace preparation source mode')
@@ -289,7 +290,8 @@ export class WorkspaceSnapshotPublisher {
         sourceSnapshotId: input.sourceSnapshotId ?? null, expectedSourceChecksum: input.expectedSourceChecksum,
         restoreSourceLeaseId: input.restoreSourceLeaseId ?? null,
         restoreSourceSnapshotId: input.restoreSourceSnapshotId ?? null,
-        expectedLatestSnapshotId: input.fence.operation === 'checkpoint'
+        expectedLatestSnapshotId: (input.fence.operation === 'checkpoint'
+          || input.fence.operation === 'patch_apply')
           ? input.expectedLatestSnapshotId ?? null : null,
         providerSandboxId: input.providerSandboxId, sandboxTemplate: input.sandboxTemplate,
         cwdUri: input.cwdUri, workspaceRootUris: [...input.workspaceRootUris],
@@ -449,7 +451,9 @@ export class WorkspaceSnapshotPublisher {
     }> {
     const coordinator = this.options.durablePreparation
     if (!coordinator) throw new ServiceError(503, 'durable workspace preparation is unavailable')
-    if (fence.operation !== 'checkpoint') throw new ServiceError(400, 'invalid workspace preparation operation')
+    if (fence.operation !== 'checkpoint' && fence.operation !== 'patch_apply') {
+      throw new ServiceError(400, 'invalid workspace preparation operation')
+    }
     try {
       const locked = await coordinator.preparations.lockForCommit(
         fence, prepared.preparation.preparationId, prepared.intent, executor)
