@@ -43,6 +43,8 @@ interface ServiceOptions {
 interface ConnectionRevoker { revoke(leaseId: string): void }
 
 export class ControlPlane {
+  private readonly inFlight = new Map<string, Promise<void>>()
+
   constructor(
     private readonly store: JsonStore,
     private readonly provider: ProviderAdapter,
@@ -221,6 +223,24 @@ export class ControlPlane {
   private async idempotent<T>(operation: string, key: string, request: unknown, execute: (record: OperationRecord) => Promise<T>): Promise<T> {
     if (!key || key.length > 512) throw new ServiceError(400, 'invalid idempotency key')
     const requestHash = hash(request); const recordKey = this.operationKey(operation, key)
+    const active = this.inFlight.get(recordKey)
+    if (active) {
+      await active
+      return this.idempotent(operation, key, request, execute)
+    }
+    let finish!: () => void
+    const running = new Promise<void>(resolve => { finish = resolve })
+    this.inFlight.set(recordKey, running)
+    try {
+      return await this.runIdempotent(operation, key, requestHash, recordKey, execute)
+    } finally {
+      if (this.inFlight.get(recordKey) === running) this.inFlight.delete(recordKey)
+      finish()
+    }
+  }
+
+  private async runIdempotent<T>(operation: string, key: string, requestHash: string, recordKey: string,
+    execute: (record: OperationRecord) => Promise<T>): Promise<T> {
     const existing = await this.store.read(database => database.operations[recordKey])
     if (existing) {
       if (existing.requestHash !== requestHash) throw new ServiceError(409, 'idempotency key reused with different request')
@@ -244,6 +264,12 @@ export class ControlPlane {
         : response
       delete record.allocatedSandboxId; await this.persistOperation(record); return response
     }
-    catch (error) { record.state = 'failed_terminal'; record.error = error instanceof Error ? error.message.slice(0, 1024) : 'unknown error'; await this.persistOperation(record); throw error }
+    catch (error) {
+      record.state = 'failed_terminal'
+      record.error = error instanceof ServiceError && error.status < 500
+        ? `request rejected (${error.status})`
+        : 'service unavailable'
+      await this.persistOperation(record); throw error
+    }
   }
 }

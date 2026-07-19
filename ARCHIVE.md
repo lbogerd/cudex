@@ -494,6 +494,34 @@ interval supplies cross-replica propagation without relying on lossy events.
 Focused gateway coverage proves an established connection closes after a
 separate durable-state writer releases its lease.
 
+### Local black-box lifecycle acceptance
+
+A local Linux acceptance harness now drives the actual HTTP server,
+development control plane, JSON store, filesystem object store, ticket issuer,
+gateway, fake provider, and a token-checking WebSocket exec endpoint solely
+through public HTTP/WSS boundaries. Concurrent identical provision requests
+exposed a read-before-journal race in the development control plane. A
+per-operation in-process gate now makes identical callers wait for terminal
+replay and makes changed requests observe the committed request hash before any
+provider mutation. This gate intentionally hardens only the single-process JSON
+development substitute; PostgreSQL uniqueness, claims, and fencing remain the
+multi-replica production mechanism.
+
+The harness proves one allocation for concurrent duplicates, changed-key
+rejection before mutation, unique distinct leases/environments, checkpoint
+durability, service/store restart against the same provider sandbox, ticket
+rotation, authenticated command echo after reconnect, missing-sandbox 404,
+workspace-only clean restore with fresh identity, repeatable release, zero live
+sandboxes, and retained checkpoint bytes. Provider creation errors and gateway
+upstream authentication denial return stable redacted failures, cause no
+fallback allocation, and leave neither injected provider error text nor traffic
+credentials in persisted JSON. Unexpected development-provider errors are now
+recorded only as `service unavailable`; bounded client-caused failures retain
+only their status class. The three focused black-box tests and the complete
+PostgreSQL-backed 254-test suite pass with no skips. This coverage does not
+replace production PostgreSQL lifecycle dispatch or the final live E2B run with
+an unmodified Codex client.
+
 ### Canonical workspace comparison foundation
 
 Patch lifecycle code now has a provider-independent canonical workspace model

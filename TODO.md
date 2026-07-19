@@ -301,7 +301,9 @@ mode, symlink, addition, and deletion behavior matches the Codex fake.
 - [ ] Add tenant quotas, authorization tests, abuse controls, and audit events.
 - [ ] Bound all requests, responses, manifests, artifacts, conflicts, log fields,
   and errors.
-- [ ] Treat provider/gateway denial as final; never fall back to local execution.
+- [x] Treat provider/gateway denial as final; never fall back to local execution,
+  with a black-box HTTP/WSS test proving stable denial, no alternate provider
+  mutation, and no provider error/credential persistence.
 - [ ] Add dashboards/alerts for allocations, leases, reconnect/restore, ticket
   denial, cleanup lag, leaks, storage growth, and gateway health.
 - [ ] Exercise provider/API/gateway/database/object-store outages, process crash,
@@ -350,6 +352,16 @@ then run the complete app-server flow against live E2B.
 | denied tool | hidden or rejected without local fallback |
 | observability | no ticket, URL, credential, content, or secret leakage |
 | outage/crash | terminal reconciliation and zero leaked resources |
+
+The local black-box harness now traverses the real HTTP validator, development
+control plane, filesystem object store, ticket issuer, gateway, provider adapter,
+and authenticated WebSocket proxy. It covers identical and changed-key replay,
+concurrent duplicates, distinct identities, checkpoint plus service/store
+restart, reconnect and command echo, ticket rotation, missing-sandbox 404 plus
+clean durable restore, repeated release with retained snapshot data, and final
+provider/gateway denial with secret-taint checks. These are boundary regressions,
+not substitutes for the still-required PostgreSQL production routing and live
+unmodified-Codex/E2B run.
 
 Final acceptance requires an unmodified hosted Codex client to provision through
 the HTTPS service and execute before and after checkpoint recovery. Keep the
