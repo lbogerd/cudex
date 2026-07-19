@@ -188,12 +188,20 @@ export function createWorkspaceManifest(
   validateIdentity(identity)
   if (entries.length > limits.maxEntries) quota('workspace entry limit exceeded')
   const canonicalEntries = entries.map(entry => canonicalEntry(entry, limits)).sort((left, right) => compareText(left.path, right.path))
+  const entriesByPath = new Map(canonicalEntries.map(entry => [entry.path, entry]))
   let files = 0
   let totalBytes = 0
   let previous: string | undefined
   for (const entry of canonicalEntries) {
     if (entry.path === previous) invalid('workspace manifest contains a duplicate path')
     previous = entry.path
+    const segments = entry.path.split('/')
+    for (let length = 1; length < segments.length; length += 1) {
+      const ancestor = entriesByPath.get(segments.slice(0, length).join('/'))
+      if (ancestor && ancestor.type !== 'directory') {
+        invalid('workspace manifest contains a non-directory ancestor')
+      }
+    }
     if (entry.type === 'file') {
       files += 1
       totalBytes += entry.sizeBytes

@@ -269,13 +269,15 @@ Exit criterion: a durable checksummed artifact remains usable after child releas
 
 - [x] Add pure three-way conflict collection with canonical URI sorting, the
   256-path cap, and UTF-8-safe 4 KiB rejection bounds.
+- [x] Add a mutation-free patch-application planner that verifies complete
+  manifest/content material and produces the full prospective workspace.
 - [ ] Implement `POST v1/agents/patch/apply` and `applied`, `conflict`, and
   `rejected` responses.
 - [ ] Validate artifact checksum, authorization, expiry, paths, quotas, base, and
   target before mutation.
-- [ ] Compare artifact base/current and target current for every changed path;
+- [x] Compare artifact base/current and target current for every changed path;
   collect all conflicts before mutation.
-- [ ] Bound conflicts to 256 canonical URIs and rejection reasons to 4 KiB.
+- [x] Bound conflicts to 256 canonical URIs and rejection reasons to 4 KiB.
 - [ ] Guarantee conflict/rejection leaves the target byte-for-byte unchanged.
 - [ ] Create a rollback snapshot, stage and validate the complete result away
   from the live workspace, then atomically swap it into place.

@@ -510,7 +510,19 @@ before returning at most 256 sorted canonical `file:` URIs and truncates rejecti
 text at 4 KiB without splitting a UTF-8 code point. Tests cover binaries,
 executable and directory modes, links, additions/deletions, already-applied
 targets, 300-conflict truncation, malformed inputs, and every quota dimension.
-Manifest capture/persistence and live workspace mutation remain subsequent
+
+A mutation-free patch-application planner now reparses the checksummed artifact,
+canonicalizes the target, verifies the exact target and artifact content-object
+sets, and computes every three-way conflict before it can return a ready plan.
+Clean plans overlay additions, modifications, deletions, binary files, modes,
+directories, and symlinks while preserving unrelated target changes, and return
+the complete prospective manifest plus its path-to-object map. Manifest creation
+also rejects any present non-directory ancestor, so file/directory hierarchy
+collisions fail before provider mutation. The focused planner tests and the full
+PostgreSQL-backed suite passed (227 tests, no skips). Provider mutation remains
+unwired until durable apply-source resolution, archive staging, rollback phases,
+checkpoint persistence, and crash reconciliation are implemented.
+Durable apply-source resolution and live workspace mutation remain subsequent
 lifecycle work.
 
 ### Durable patch-artifact repository
