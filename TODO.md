@@ -276,6 +276,8 @@ Exit criterion: a durable checksummed artifact remains usable after child releas
   artifact, manifest, and content object from durable storage.
 - [x] Assemble ready plans into deterministic bounded Linux workspace tar files,
   verify every body, and reparse the result to prove the full manifest round-trip.
+- [x] Add an immutable generation-fenced PostgreSQL apply-attempt ledger with
+  allocation-bound rollback identity and explicit swap/checkpoint/rollback phases.
 - [ ] Implement `POST v1/agents/patch/apply` and `applied`, `conflict`, and
   `rejected` responses.
 - [x] Validate artifact checksum, authorization, expiry, paths, quotas, base, and

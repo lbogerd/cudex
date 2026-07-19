@@ -6,7 +6,7 @@ import { loadMigrations, runMigrations } from '../src/migrate.js'
 
 test('migration files load in version order with stable checksums', async () => {
   const migrations = await loadMigrations()
-  assert.deepEqual(migrations.map(migration => migration.version), [1, 2, 3, 4, 5, 6, 7, 8])
+  assert.deepEqual(migrations.map(migration => migration.version), [1, 2, 3, 4, 5, 6, 7, 8, 9])
   assert.equal(migrations[0]!.filename, '0001_control_plane.sql')
   assert.match(migrations[0]!.checksum, /^sha256:[0-9a-f]{64}$/)
 })
@@ -20,7 +20,7 @@ test('PostgreSQL migrations are transactional, repeatable, and enforce identity 
   try {
     await Promise.all([runMigrations(pool), runMigrations(pool)])
     const applied = await pool.query<{ version: number }>('SELECT version FROM hosted_agent_schema_migrations ORDER BY version')
-    assert.deepEqual(applied.rows.map(row => row.version), [1, 2, 3, 4, 5, 6, 7, 8])
+    assert.deepEqual(applied.rows.map(row => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9])
 
     const tableNames = await pool.query<{ table_name: string }>(`
       SELECT table_name FROM information_schema.tables
@@ -32,6 +32,7 @@ test('PostgreSQL migrations are transactional, repeatable, and enforce identity 
       'hosted_agent_operations', 'hosted_agent_operation_allocations', 'hosted_agent_tickets',
       'hosted_agent_objects', 'hosted_agent_object_references', 'hosted_agent_source_snapshots',
       'hosted_agent_workspace_preparations', 'hosted_agent_workspace_preparation_objects',
+      'hosted_agent_patch_applications',
     ]) assert.equal(names.has(expected), true, `${expected} should exist`)
 
     const digest = `sha256:${'a'.repeat(64)}`

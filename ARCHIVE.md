@@ -559,6 +559,29 @@ executable/directory modes, symlinks, long PAX paths, deterministic repetition,
 missing/extra/duplicate/dishonest content, inconsistent object reuse, and archive
 quota overflow. The full suite passed 235 tests with no skips.
 
+Migration 0009 and a transaction-composable PostgreSQL repository now persist
+each mutating patch attempt independently of the operation's eventual logical
+response. An immutable identity fixes the exact target lease and pre-apply
+snapshot, artifact, provider sandbox, result snapshot and manifest, and staged
+archive checksum and size. The rollback provider snapshot can be recorded only
+through an allocated `provider_snapshot` ledger row owned by the same fenced
+operation and target lease. Database triggers permit only `planned` to
+`rollback_ready`, ordered swap/checkpoint transitions, or explicit rollback and
+pre-mutation failure paths; identity, prior timestamps, rollback allocation, and
+error metadata cannot be rewritten during later transitions.
+
+Repository transitions require the current operation generation and worker, so
+stale takeover immediately fences the old process while allowing the new owner
+to resume the recorded phase. `checkpointed` additionally requires that the
+result is the target lease's available latest snapshot and that its manifest and
+workspace-archive objects match the planned checksums and archive size. Four live
+two-pool tests cover exact concurrent replay, caller-owned transaction rollback,
+the complete success path, unavailable checkpoint refusal, stale-worker rollback
+resumption, invalid rollback allocations, and direct-SQL identity/timestamp/phase
+guards. Migrations remain concurrent and repeatable; the full suite passed 239
+tests with no skips. Provider rollback creation, swap execution, checkpoint
+publication, and reconciliation remain unwired from this ledger.
+
 ### Durable patch-artifact repository
 
 Patch export now has a verified immutable-source boundary. Canonical manifest
