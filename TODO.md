@@ -40,9 +40,9 @@ complete until a real ChatGPT-authenticated automated run passes.
 
 - [x] Document every public command, prerequisite, cost, warning, and recovery path.
 - [x] Run the full relevant E2B suite and confirm `codex/codex-rs` is unchanged.
-- [ ] Run a real ChatGPT-authenticated automated proof and record redacted evidence.
-- [ ] Run interactive mode when needed for diagnosis and record its acceptance result.
-- [ ] Commit and push each sizeable implementation chunk.
+- [x] Run a real ChatGPT-authenticated automated proof and record redacted evidence.
+- [x] Confirm automated mode completed without needing interactive diagnosis.
+- [x] Commit and push each sizeable implementation chunk.
 
 ## Deferred production hardening — not required for local POC
 

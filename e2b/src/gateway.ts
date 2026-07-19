@@ -161,37 +161,16 @@ export class ExecGateway {
     revalidation.unref()
     client.on('close', () => cleanup())
     client.on('error', () => cleanup())
-
-    if (!sameTarget(await this.activeLeaseTarget(leaseId), target)) {
-      cleanup(1008, 'lease inactive')
-      return
-    }
-    if (closed) return
-    let upstreamConnection
-    try { upstreamConnection = validateExecUpstream(await this.provider.execUpstream(target.sandboxId), this.allowInsecureUpstream) }
-    catch { cleanup(1013, 'gateway upstream unavailable'); return }
-    if (closed) return
-    if (!sameTarget(await this.activeLeaseTarget(leaseId), target)) {
-      cleanup(1008, 'lease inactive')
-      return
-    }
-    if (closed) return
-
-    try {
-      upstream = new WebSocket(upstreamConnection.url, {
-        headers: { 'X-Access-Token': upstreamConnection.accessToken },
-        maxPayload: this.limits.maxPayloadBytes,
-      })
-    }
-    catch { cleanup(1013, 'gateway upstream unavailable'); return }
-
+    // The downstream WebSocket is already open while provider lookup and
+    // upstream validation run. Capture frames immediately: exec clients send
+    // `initialize` as soon as their handshake completes.
     client.on('message', (data, binary) => {
       clientFrames = clientFrames.then(async () => {
-        if (closed || !upstream) return
+        if (closed) return
         const trackingKey = await tracker?.clientFrame(data, binary) ?? null
         if (closed) return
         const size = bytes(data)
-        if (upstream.readyState === WebSocket.OPEN && upstreamReady) {
+        if (upstream?.readyState === WebSocket.OPEN && upstreamReady) {
           if (upstream.bufferedAmount + size > this.limits.maxBufferedBytes) {
             cleanup(1013, 'gateway backpressure')
           } else {
@@ -200,7 +179,7 @@ export class ExecGateway {
               if (error) cleanup(1013, 'gateway upstream unavailable')
             })
           }
-        } else if (upstream.readyState === WebSocket.CONNECTING
+        } else if (!upstream || upstream.readyState === WebSocket.CONNECTING
           || upstream.readyState === WebSocket.OPEN) {
           if (pending.length >= this.limits.maxPendingMessages
             || pendingBytes + size > this.limits.maxPendingBytes) {
@@ -212,6 +191,36 @@ export class ExecGateway {
         } else cleanup(1013, 'gateway upstream unavailable')
       }).catch(() => cleanup(1008, 'invalid exec protocol'))
     })
+
+    if (!sameTarget(await this.activeLeaseTarget(leaseId), target)) {
+      cleanup(1008, 'lease inactive')
+      return
+    }
+    if (closed) return
+    let upstreamConnection
+    try { upstreamConnection = validateExecUpstream(await this.provider.execUpstream(target.sandboxId), this.allowInsecureUpstream) }
+    catch {
+      console.error(JSON.stringify({ event: 'gateway_upstream_failed', phase: 'provider_connection' }))
+      cleanup(1013, 'gateway upstream unavailable'); return
+    }
+    if (closed) return
+    if (!sameTarget(await this.activeLeaseTarget(leaseId), target)) {
+      cleanup(1008, 'lease inactive')
+      return
+    }
+    if (closed) return
+
+    try {
+      upstream = new WebSocket(upstreamConnection.url, {
+        headers: { 'E2b-Traffic-Access-Token': upstreamConnection.accessToken },
+        maxPayload: this.limits.maxPayloadBytes,
+      })
+    }
+    catch {
+      console.error(JSON.stringify({ event: 'gateway_upstream_failed', phase: 'socket_construction' }))
+      cleanup(1013, 'gateway upstream unavailable'); return
+    }
+
     upstream.once('open', () => {
       void (async () => {
         if (!sameTarget(await this.activeLeaseTarget(leaseId), target)) {
@@ -243,7 +252,10 @@ export class ExecGateway {
       })().catch(() => cleanup(1013, 'gateway unavailable'))
     })
     upstream.on('close', () => cleanup())
-    upstream.on('error', () => cleanup(1013, 'gateway upstream unavailable'))
+    upstream.on('error', () => {
+      console.error(JSON.stringify({ event: 'gateway_upstream_failed', phase: upstreamReady ? 'active_socket' : 'handshake' }))
+      cleanup(1013, 'gateway upstream unavailable')
+    })
   }
 
   private async activeLeaseTarget(leaseId: string): Promise<ActiveLeaseTarget | undefined> {

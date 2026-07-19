@@ -64,7 +64,7 @@ test('production gateway journals before forwarding and settles only on quiescen
     let filesystemReceived!: () => void
     const filesystemForwarded = new Promise<void>(resolve => { filesystemReceived = resolve })
     upstreamServer.on('upgrade', (request, socket, head) => {
-      assert.equal(request.headers['x-access-token'], 'traffic-token')
+      assert.equal(request.headers['e2b-traffic-access-token'], 'traffic-token')
       upstreamWebSocket.handleUpgrade(request, socket, head, client => {
         client.on('message', data => {
           const message = JSON.parse(data.toString()) as {

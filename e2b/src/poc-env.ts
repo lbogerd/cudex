@@ -2,7 +2,8 @@ import { readFile } from 'node:fs/promises'
 import { parseEnv } from 'node:util'
 
 export const pocEnvKeys = [
-  'E2B_API_KEY', 'E2B_API_URL', 'E2B_DOMAIN', 'POC_TEMPLATE_METADATA',
+  'E2B_API_KEY', 'E2B_API_URL', 'E2B_DOMAIN', 'E2B_VALIDATE_API_KEY', 'POC_PROVIDER_CA_CERTIFICATE',
+  'POC_TEMPLATE_METADATA',
   'CODEX_ACCESS_TOKEN', 'CODEX_AUTH_JSON_FILE', 'POC_CODEX_MODEL',
   'POC_CONTROL_PORT', 'POC_POSTGRES_PORT', 'POC_GARAGE_PORT',
   'POC_KEEP_ON_FAILURE', 'POC_VERIFY_TEMPLATE',
@@ -12,6 +13,8 @@ export interface PocEnvironment {
   e2bApiKey: string
   e2bApiUrl: string
   e2bDomain: string
+  e2bValidateApiKey: boolean
+  providerCaCertificate?: string
   templateMetadata: string
   accessToken?: string
   authJsonFile?: string
@@ -76,6 +79,9 @@ export function validatePocEnvironment(raw: RawEnvironment): PocEnvironment {
     e2bApiKey: required(raw, 'E2B_API_KEY'),
     e2bApiUrl: required(raw, 'E2B_API_URL'),
     e2bDomain: value(raw, 'E2B_DOMAIN') ?? 'cube.app',
+    e2bValidateApiKey: bool(raw, 'E2B_VALIDATE_API_KEY', true),
+    ...(value(raw, 'POC_PROVIDER_CA_CERTIFICATE')
+      ? { providerCaCertificate: value(raw, 'POC_PROVIDER_CA_CERTIFICATE')! } : {}),
     templateMetadata: required(raw, 'POC_TEMPLATE_METADATA'),
     ...(accessToken ? { accessToken } : {}),
     ...(authJsonFile ? { authJsonFile } : {}),

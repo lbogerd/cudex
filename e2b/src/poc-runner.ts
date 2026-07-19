@@ -3,10 +3,11 @@ import { dirname, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import process from 'node:process'
 import { spawn } from 'node:child_process'
+import { request as httpsRequest } from 'node:https'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { parseEnv } from 'node:util'
-import { copyAuthJsonToRuntime, createCodexProcessEnvironment, removeRuntimeAuth, validateAuthJsonFile } from './poc-auth.js'
+import { copyAuthJsonToRuntime, createCodexProcessEnvironment, redactSecrets, removeRuntimeAuth, validateAuthJsonFile } from './poc-auth.js'
 import { createRunId, generateCodexConfiguration, generateRuntimeSecrets, pocRunPaths, prepareRunFiles,
   resolveRepositoryPath, validateGeneratedCodexConfiguration, validatePocProvenance,
   type PocProvenance, type PocRunPaths } from './poc-config.js'
@@ -17,7 +18,7 @@ import {
   verifyControlService, verifyGarage, writeCurrentPointer,
   type DockerCommand,
 } from './poc-infrastructure.js'
-import { generatePocTls, type PocTlsMaterial } from './poc-tls.js'
+import { generatePocTls, validateProviderCaCertificate, type PocTlsMaterial } from './poc-tls.js'
 import { archiveWorkspace } from './ingress.js'
 import { uploadSourceSnapshot } from './source-snapshot-client.js'
 import { deleteThreadTree, initializeAndReadAccount, runAutomatedTurn, startPocAppServer,
@@ -46,7 +47,26 @@ function usage(): never {
 async function configuration(): Promise<PocEnvironment> {
   const loaded = await loadPocEnvironment(envPath)
   return { ...loaded, templateMetadata: resolveRepositoryPath(repositoryRoot, loaded.templateMetadata),
-    ...(loaded.authJsonFile ? { authJsonFile: resolveRepositoryPath(repositoryRoot, loaded.authJsonFile) } : {}) }
+    ...(loaded.authJsonFile ? { authJsonFile: resolveRepositoryPath(repositoryRoot, loaded.authJsonFile) } : {}),
+    ...(loaded.providerCaCertificate
+      ? { providerCaCertificate: resolveRepositoryPath(repositoryRoot, loaded.providerCaCertificate) } : {}) }
+}
+
+async function ensureProviderProcessEnvironment(env: PocEnvironment, command: string): Promise<boolean> {
+  if (command === 'auth') return false
+  const providerCa = env.providerCaCertificate
+    ? await validateProviderCaCertificate(repositoryRoot, env.providerCaCertificate) : undefined
+  const validateApiKey = String(env.e2bValidateApiKey)
+  if ((providerCa === undefined || process.env.NODE_EXTRA_CA_CERTS === providerCa)
+    && process.env.E2B_VALIDATE_API_KEY === validateApiKey) return false
+  const child = spawn(process.execPath, [process.argv[1]!, command], { cwd: repositoryRoot, stdio: 'inherit',
+    env: { ...process.env, E2B_VALIDATE_API_KEY: validateApiKey,
+      ...(providerCa ? { NODE_EXTRA_CA_CERTS: providerCa } : {}) } })
+  const code = await new Promise<number | null>((resolveExit, reject) => {
+    child.once('error', reject); child.once('exit', resolveExit)
+  })
+  process.exitCode = code ?? 1
+  return true
 }
 
 async function preflight(configured?: PocEnvironment): Promise<void> {
@@ -54,7 +74,9 @@ async function preflight(configured?: PocEnvironment): Promise<void> {
   if (process.platform !== 'linux' || process.arch !== 'x64') throw new Error('the POC requires x86_64 Linux')
   if (Number(process.versions.node.split('.')[0]) < 22) throw new Error('the POC requires Node.js 22 or newer')
   const [provenance] = await Promise.all([validatePocProvenance(repositoryRoot, env.templateMetadata), detectDocker(),
-    env.authJsonFile ? validateAuthJsonFile(repositoryRoot, env.authJsonFile) : Promise.resolve()])
+    env.authJsonFile ? validateAuthJsonFile(repositoryRoot, env.authJsonFile) : Promise.resolve(),
+    env.providerCaCertificate
+      ? validateProviderCaCertificate(repositoryRoot, env.providerCaCertificate) : Promise.resolve()])
   await assertPocPortsAvailable(env)
   await mkdir(`${e2bRoot}/.state/poc`, { recursive: true, mode: 0o700 })
   const temporaryRoot = await mkdtemp(`${e2bRoot}/.state/poc/preflight-`)
@@ -63,7 +85,7 @@ async function preflight(configured?: PocEnvironment): Promise<void> {
     paths.runDirectory = temporaryRoot; paths.codexHome = `${temporaryRoot}/codex-home`; paths.tlsDirectory = `${temporaryRoot}/tls`
     const fakeSource = { sourceSnapshotId: `source_${'a'.repeat(32)}`, checksum: `sha256:${'b'.repeat(64)}`,
       expiresAt: new Date(Date.now() + 60_000).toISOString(), manifestChecksum: `sha256:${'c'.repeat(64)}`, sizeBytes: 1 }
-    const tls = await generatePocTls(paths.tlsDirectory)
+    const tls = await generatePocTls(paths.tlsDirectory, env.providerCaCertificate)
     await generateCodexConfiguration(paths, env, fakeSource, provenance)
     await validateGeneratedCodexConfiguration(provenance, paths, tls.combinedCaBundlePath, 'preflight-nonsecret-bearer')
     if (env.authJsonFile) await copyAuthJsonToRuntime(await validateAuthJsonFile(repositoryRoot, env.authJsonFile), paths.codexHome)
@@ -76,8 +98,8 @@ async function preflight(configured?: PocEnvironment): Promise<void> {
     await exec(process.execPath, [`${e2bRoot}/scripts/verify-template.mjs`, env.templateMetadata], {
       cwd: repositoryRoot, timeout: 300_000, maxBuffer: 2 * 1024 * 1024,
       env: { PATH: process.env.PATH, E2B_API_KEY: env.e2bApiKey, E2B_API_URL: env.e2bApiUrl,
-        E2B_DOMAIN: env.e2bDomain, ...(process.env.E2B_VALIDATE_API_KEY ? { E2B_VALIDATE_API_KEY: process.env.E2B_VALIDATE_API_KEY } : {}),
-        ...(process.env.NODE_EXTRA_CA_CERTS ? { NODE_EXTRA_CA_CERTS: process.env.NODE_EXTRA_CA_CERTS } : {}) },
+      E2B_DOMAIN: env.e2bDomain, E2B_VALIDATE_API_KEY: String(env.e2bValidateApiKey),
+        ...(env.providerCaCertificate ? { NODE_EXTRA_CA_CERTS: env.providerCaCertificate } : {}) },
     })
   }
   console.log(JSON.stringify({ ready: true, platform: `${process.platform}-${process.arch}`,
@@ -117,7 +139,7 @@ async function prepareCompleteRun(env: PocEnvironment): Promise<CompleteRun> {
   await mkdir(dirname(pointerPath), { recursive: true, mode: 0o700 })
   await prepareRunFiles(paths, env, generateRuntimeSecrets())
   const docker = await detectDocker()
-  const tls = await generatePocTls(paths.tlsDirectory)
+  const tls = await generatePocTls(paths.tlsDirectory, env.providerCaCertificate)
   let composeStarted = false
   try {
     await startCompose(docker, paths); composeStarted = true
@@ -159,7 +181,7 @@ type CleanupRun = Pick<CompleteRun, 'env' | 'paths' | 'docker' | 'tls' | 'runtim
 
 function providerInspector(run: CleanupRun): PocProviderInspector {
   return new PocProviderInspector({ apiKey: run.env.e2bApiKey, apiUrl: run.env.e2bApiUrl,
-    domain: run.env.e2bDomain, validateApiKey: process.env.E2B_VALIDATE_API_KEY !== 'false' },
+    domain: run.env.e2bDomain, validateApiKey: run.env.e2bValidateApiKey },
   `cudex-poc-${run.paths.runId}`, `poc-${run.paths.runId}`)
 }
 
@@ -175,8 +197,64 @@ async function inspectFunctionalRun(run: CompleteRun, evidence: PocAppServerEvid
     const database = await opened.inspector.inspect()
     const functional = evaluatePocFunctionalInspection(database, evidence)
     const workspaceVerified = functional.rootLease
-      ? await providerInspector(run).verifyRootWorkspace(functional.rootLease).catch(() => false) : false
+      ? await verifyRootWorkspace(run, functional.rootLease.providerSandboxId).catch(() => false) : false
     return { database, functional, workspaceVerified }
+  } finally { await opened.close() }
+}
+
+async function verifyRootWorkspace(run: CompleteRun, providerSandboxId: string | null): Promise<boolean> {
+  if (!providerSandboxId) return false
+  // A terminal hosted checkpoint can briefly pause the E2B command channel just
+  // after turn/completed. Retry only this fixed, read-only probe across that
+  // bounded lifecycle transition.
+  const deadline = Date.now() + 60_000
+  do {
+    try {
+      const response = await callPocService(run, '/v1/poc/workspace-verification', { providerSandboxId })
+      if (response && typeof response === 'object' && !Array.isArray(response)
+        && Reflect.ownKeys(response).length === 1 && (response as Record<string, unknown>).verified === true) return true
+    } catch { /* The exact probe is safe to repeat while the root lease remains active. */ }
+    if (Date.now() >= deadline) return false
+    await new Promise(resolveWait => setTimeout(resolveWait, 500))
+  } while (true)
+}
+
+async function callPocService(run: CleanupRun, path: string, input: Record<string, unknown>): Promise<unknown> {
+  const body = Buffer.from(JSON.stringify(input))
+  const ca = await readFile(run.tls.combinedCaBundlePath)
+  const response = await new Promise<{ status: number; bytes: Buffer }>((resolve, reject) => {
+    const request = httpsRequest({ hostname: 'localhost', port: run.env.controlPort,
+      path, method: 'POST', ca, rejectUnauthorized: true,
+      headers: { authorization: `Bearer ${run.runtime.POC_SERVICE_BEARER!}`,
+        'content-type': 'application/json', 'content-length': String(body.byteLength) } }, incoming => {
+      const chunks: Buffer[] = []; let size = 0
+      incoming.on('data', chunk => {
+        size += chunk.length
+        if (size <= 1024) chunks.push(Buffer.from(chunk))
+        else request.destroy(new Error('POC service response is too large'))
+      })
+      incoming.once('end', () => resolve({ status: incoming.statusCode ?? 0, bytes: Buffer.concat(chunks) }))
+    })
+    request.setTimeout(120_000, () => request.destroy(new Error('POC service operation timed out')))
+    request.once('error', reject)
+    request.end(body)
+  })
+  if (response.status !== 200 || response.bytes.byteLength === 0) throw new Error('POC service operation failed')
+  let value: unknown
+  try { value = JSON.parse(response.bytes.toString('utf8')) } catch { throw new Error('POC service response is invalid') }
+  return value
+}
+
+async function environmentIdForThread(run: CompleteRun, threadId: string): Promise<string> {
+  const opened = await openPocDatabaseInspector(run.runtime.POC_DATABASE_URL!, `poc-${run.paths.runId}`)
+  try {
+    const deadline = Date.now() + 30_000
+    do {
+      const lease = (await opened.inspector.leases()).find(item => item.agentId === threadId)
+      if (lease) return lease.environmentId
+      if (Date.now() >= deadline) throw new Error('hosted root lease was not durably visible')
+      await new Promise(resolveWait => setTimeout(resolveWait, 100))
+    } while (true)
   } finally { await opened.close() }
 }
 
@@ -216,6 +294,10 @@ async function exactCleanup(run: CleanupRun, appServer: PocAppServerProcess | un
       await new Promise(resolveWait => setTimeout(resolveWait, 500))
     } while (true)
     cleanupAssertions.databaseInspectionCompleted = true
+    if (!preserve) {
+      await callPocService(run, '/v1/poc/provider-snapshots/cleanup', {})
+      database = await opened.inspector.inspect()
+    }
     try {
       provider = await providerInspector(run).inspect(database)
       cleanupAssertions.providerInspectionCompleted = true
@@ -248,6 +330,7 @@ async function exactCleanup(run: CleanupRun, appServer: PocAppServerProcess | un
 function appAssertions(evidence: PocAppServerEvidence | undefined): Record<string, boolean> {
   return {
     rootThreadStarted: evidence?.rootThreadStarted === true,
+    rootEnvironmentReady: evidence?.rootEnvironmentReady === true,
     spawnAgentCompleted: evidence?.spawnAgentCompleted === true,
     spawnAgentCalledExactlyOnce: evidence?.spawnAgentCount === 1,
     distinctChildThread: Boolean(evidence?.childThreadId && evidence.childThreadId !== evidence.rootThreadId),
@@ -272,6 +355,31 @@ async function reportSecretValues(run: CompleteRun): Promise<string[]> {
     if (value && /(?:PASSWORD|SECRET|TOKEN|KEY)/u.test(key)) values.push(value)
   }
   return [...new Set(values.filter(value => value.length >= 8))]
+}
+
+function nestedStringValues(value: unknown, result: string[]): void {
+  if (typeof value === 'string') { if (value.length >= 8) result.push(value); return }
+  if (Array.isArray(value)) { for (const item of value) nestedStringValues(item, result); return }
+  if (value && typeof value === 'object') {
+    for (const item of Object.values(value as Record<string, unknown>)) nestedStringValues(item, result)
+  }
+}
+
+async function safeAgentDiagnostic(run: CompleteRun, evidence: PocAppServerEvidence | undefined): Promise<string | undefined> {
+  const message = evidence?.lastRootAgentMessage?.trim()
+  if (!message) return undefined
+  const secrets = await reportSecretValues(run)
+  if (run.env.authJsonFile) {
+    const runtimeAuth = await readFile(`${run.paths.codexHome}/auth.json`, 'utf8').catch(() => '')
+    if (runtimeAuth) {
+      try { nestedStringValues(JSON.parse(runtimeAuth), secrets) } catch { /* Auth was already validated. */ }
+    }
+  }
+  return redactSecrets(message, secrets)
+    .replace(/(?:https?|wss):\/\/\S+/gu, '[REDACTED_URL]')
+    .replace(/\b(?:eyJ[A-Za-z0-9._-]+|sk-[A-Za-z0-9_-]+)\b/gu, '[REDACTED_TOKEN]')
+    .replace(/[A-Za-z0-9_-]{80,}/gu, '[REDACTED_OPAQUE]')
+    .slice(0, 2_048)
 }
 
 async function writeReport(run: CompleteRun, mode: 'automated' | 'interactive', startedAt: string,
@@ -305,6 +413,7 @@ async function automated(): Promise<void> {
   let inspection: FunctionalRunInspection = { workspaceVerified: false }
   let functional = false
   let failure: unknown
+  let agentDiagnostic: string | undefined
   let rejectSignal: ((error: Error) => void) | undefined
   const interrupted = new Promise<never>((_resolve, reject) => { rejectSignal = reject })
   const onSigint = () => rejectSignal?.(new Error('automated POC interrupted by SIGINT'))
@@ -315,14 +424,18 @@ async function automated(): Promise<void> {
       caBundlePath: run.tls.combinedCaBundlePath, hostedBearer: run.runtime.POC_SERVICE_BEARER!,
       ...(env.accessToken ? { accessToken: env.accessToken } : {}),
       stderrLogPath: `${run.paths.logsDirectory}/app-server.log` })
-    evidence = await Promise.race([runAutomatedTurn({ process: appServer,
-      prompt: await readFile(`${e2bRoot}/poc/prompts/automated.md`, 'utf8'), fixturePath: `${e2bRoot}/poc/fixture`,
+    evidence = await Promise.race([runAutomatedTurn({ process: appServer, codexHome: run.paths.codexHome,
+      prompt: await readFile(`${e2bRoot}/poc/prompts/automated.md`, 'utf8'),
       ...(env.codexModel ? { model: env.codexModel } : {}), deadlineMs: 20 * 60_000,
+      environmentIdForThread: threadId => environmentIdForThread(run, threadId),
       onEvidence: value => { evidence = value } }), interrupted])
     inspection = await inspectFunctionalRun(run, evidence)
     functional = Object.values({ ...appAssertions(evidence), ...(inspection.functional?.assertions ?? {}),
       rootWorkspaceVerified: inspection.workspaceVerified }).every(Boolean)
-    if (!functional) failure = new Error('automated app-server evidence is incomplete')
+    if (!functional) {
+      agentDiagnostic = await safeAgentDiagnostic(run, evidence)
+      failure = new Error('automated app-server evidence is incomplete')
+    }
   } catch (error) { failure = error }
   finally { process.off('SIGINT', onSigint); process.off('SIGTERM', onSigterm) }
   const preserve = !functional && env.keepOnFailure
@@ -332,13 +445,15 @@ async function automated(): Promise<void> {
   const assertions = { ...appAssertions(evidence), ...(inspection.functional?.assertions ?? {}),
     rootWorkspaceVerified: inspection.workspaceVerified, ...deletionAssertions(evidence), ...cleanup.assertions,
     retainedLogsRedacted: logsRedacted }
-  functional = functional && logsRedacted
+  functional = Object.values({ ...appAssertions(evidence), ...(inspection.functional?.assertions ?? {}),
+    rootWorkspaceVerified: inspection.workspaceVerified }).every(Boolean) && logsRedacted
   const passed = functional && cleanup.serviceCleanupComplete && cleanup.dockerVolumesRemoved && !cleanup.forcedProviderCleanup
   const status = passed ? 'passed' : functional && cleanup.forcedProviderCleanup ? 'cleanup_intervention' : 'failed'
   await writeReport(run, 'automated', startedAt, status, evidence, inspection.functional, assertions, cleanup)
   console.log(JSON.stringify({ runId: run.paths.runId, status, report: run.paths.report }))
   if (!passed) {
     console.error(failure instanceof Error ? failure.message : 'automated POC failed')
+    if (agentDiagnostic) console.error(`Redacted root response: ${agentDiagnostic}`)
     process.exitCode = status === 'cleanup_intervention' ? 3 : 1
   }
 }
@@ -437,7 +552,7 @@ async function up(): Promise<void> {
   const docker = await detectDocker()
   let started = false
   try {
-    const tls = await generatePocTls(paths.tlsDirectory)
+    const tls = await generatePocTls(paths.tlsDirectory, env.providerCaCertificate)
     await startCompose(docker, paths); started = true
     const runtime = await readRuntimeEnvironment(paths)
     await verifyGarage(env, runtime)
@@ -496,6 +611,7 @@ async function down(): Promise<void> {
 async function main(): Promise<void> {
   const command = process.argv[2]
   if (!command) usage()
+  if (command !== 'auth' && await ensureProviderProcessEnvironment(await configuration(), command)) return
   if (command === 'auth') return auth()
   if (command === 'preflight') return preflight()
   if (command === 'up') return up()

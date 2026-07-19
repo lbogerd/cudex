@@ -26,7 +26,9 @@ test('Codex subprocess environment contains only auth, hosted bearer, CA, home, 
   const env = createCodexProcessEnvironment({ codexHome: '/run/codex', caBundlePath: '/run/ca.pem',
     hostedBearer: 'hosted-secret', accessToken: 'codex-secret' })
   assert.deepEqual(Object.keys(env).sort(), ['CODEX_ACCESS_TOKEN', 'CODEX_CA_CERTIFICATE',
-    'CODEX_HOME', 'CODEX_HOSTED_AGENT_TOKEN', 'PATH'])
+    'CODEX_HOME', 'CODEX_HOSTED_AGENT_TOKEN', 'PATH', 'SSL_CERT_FILE'])
+  assert.equal(env.CODEX_CA_CERTIFICATE, '/run/ca.pem')
+  assert.equal(env.SSL_CERT_FILE, '/run/ca.pem')
   assert.ok(!Object.hasOwn(env, 'E2B_API_KEY'))
   assert.ok(!Object.hasOwn(env, 'AWS_SECRET_ACCESS_KEY'))
   assert.ok(!Object.hasOwn(env, 'HOSTED_AGENT_DATABASE_URL'))

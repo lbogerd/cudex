@@ -143,13 +143,17 @@ export async function validatePocProvenance(repositoryRoot: string, metadataPath
 }
 
 export function createTrustedRoles(templateId: string): Record<string, unknown> {
-  const tools = (names: string[]): Array<{ name: string; namespace: null }> => names.map(name => ({ name, namespace: null }))
+  const plainTools = (names: string[]): Array<{ name: string; namespace: null }> =>
+    names.map(name => ({ name, namespace: null }))
+  const collaborationTools = (names: string[]): Array<{ name: string; namespace: string }> =>
+    names.map(name => ({ name, namespace: 'collaboration' }))
   return {
     root: { sandboxTemplate: 'poc-root-v1', providerTemplateId: templateId, policyVersion: 1,
       toolPolicy: { allowedDomains: ['agentEnvironment', 'controlPlane'],
-        allowedTools: tools(['exec_command', 'write_stdin', 'spawn_agent', 'wait_agent', 'apply_agent_patch']) } },
+        allowedTools: [...plainTools(['exec_command', 'write_stdin']),
+          ...collaborationTools(['spawn_agent', 'wait_agent']), ...plainTools(['apply_agent_patch'])] } },
     child: { sandboxTemplate: 'poc-child-v1', providerTemplateId: templateId, policyVersion: 1,
-      toolPolicy: { allowedDomains: ['agentEnvironment'], allowedTools: tools(['exec_command', 'write_stdin']) } },
+      toolPolicy: { allowedDomains: ['agentEnvironment'], allowedTools: plainTools(['exec_command', 'write_stdin']) } },
   }
 }
 
@@ -169,6 +173,7 @@ hosted_agents = true
 
 [features.multi_agent_v2]
 enabled = true
+tool_namespace = "collaboration"
 
 [hosted_agents]
 enabled = true
@@ -197,7 +202,8 @@ export async function validateGeneratedCodexConfiguration(
 ): Promise<void> {
   const environment: NodeJS.ProcessEnv = {
     PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin', CODEX_HOME: paths.codexHome,
-    CODEX_CA_CERTIFICATE: caBundlePath, CODEX_HOSTED_AGENT_TOKEN: hostedBearer,
+    CODEX_CA_CERTIFICATE: caBundlePath, SSL_CERT_FILE: caBundlePath,
+    CODEX_HOSTED_AGENT_TOKEN: hostedBearer,
   }
   const child = spawn(provenance.binaryPath, ['app-server', '--listen', 'stdio://', '--strict-config'], {
     cwd: paths.repositoryRoot, env: environment, stdio: ['pipe', 'pipe', 'pipe'],

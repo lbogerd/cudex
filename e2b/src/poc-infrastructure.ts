@@ -132,6 +132,7 @@ export async function startControlService(
     AWS_ACCESS_KEY_ID: accessKeyId, AWS_SECRET_ACCESS_KEY: secretAccessKey, AWS_REGION: 'garage',
     HOSTED_AGENT_TENANT_ID: `poc-${paths.runId}`, HOSTED_AGENT_WORKER_ID: `poc-worker-${paths.runId}`,
     HOSTED_AGENT_MANAGED_BY: `cudex-poc-${paths.runId}`, HOSTED_AGENT_ROLES: JSON.stringify(createTrustedRoles(metadata.templateId)),
+    HOSTED_AGENT_POC_INSPECTION: 'true',
     CODEX_HOSTED_AGENT_TOKEN: bearer, HOSTED_AGENT_GATEWAY_URL: `wss://localhost:${env.controlPort}/`,
     HOSTED_AGENT_HOST: '127.0.0.1', HOSTED_AGENT_PORT: String(env.controlPort),
     HOSTED_AGENT_TLS_CERT: tls.serverCertificatePath, HOSTED_AGENT_TLS_KEY: tls.serverKeyPath,
@@ -140,8 +141,8 @@ export async function startControlService(
     HOSTED_AGENT_PATCH_APPLY_STALE_MS: '20000', HOSTED_AGENT_PATCH_APPLY_RECONCILE_MS: '1000',
     HOSTED_AGENT_TICKET_TTL_MS: '60000', HOSTED_AGENT_SOURCE_MAX_TTL_MS: String(4 * 60 * 60_000),
   }
-  if (process.env.NODE_EXTRA_CA_CERTS) serviceEnv.NODE_EXTRA_CA_CERTS = process.env.NODE_EXTRA_CA_CERTS
-  if (process.env.E2B_VALIDATE_API_KEY) serviceEnv.E2B_VALIDATE_API_KEY = process.env.E2B_VALIDATE_API_KEY
+  serviceEnv.E2B_VALIDATE_API_KEY = String(env.e2bValidateApiKey)
+  if (env.providerCaCertificate) serviceEnv.NODE_EXTRA_CA_CERTS = env.providerCaCertificate
   const child = spawn(process.execPath, [`${paths.e2bRoot}/dist/src/main.js`], {
     cwd: paths.repositoryRoot, env: serviceEnv, detached: true, stdio: ['ignore', log.fd, log.fd],
   })

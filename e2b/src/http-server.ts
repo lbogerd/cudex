@@ -45,6 +45,10 @@ interface ServerOptions {
     retain: (request: ReturnType<typeof validateRetentionRequest>) => Promise<unknown>
     clear: (request: ReturnType<typeof validateReferenceClearRequest>) => Promise<unknown>
   }
+  pocInspection?: {
+    verifyWorkspace(providerSandboxId: string): Promise<boolean>
+    cleanupProviderSnapshots(): Promise<number>
+  }
 }
 const maxRequestBytes = 1024 * 1024
 const maxSourceMetadataBytes = 64 * 1024
@@ -58,6 +62,20 @@ const routes = new Map([
   ['/v1/agents/references/clear', 'clearReferences'],
 ] as const)
 type Method = 'provision' | 'reconnect' | 'checkpoint' | 'exportPatch' | 'applyPatch' | 'release' | 'retain' | 'clearReferences'
+
+function safeFailureDiagnostic(error: unknown): { errorType: string; errorCode?: string } {
+  let current = error
+  let errorType = 'UnknownError'
+  for (let depth = 0; depth < 4 && current && typeof current === 'object'; depth += 1) {
+    const record = current as { name?: unknown; code?: unknown; cause?: unknown }
+    if (typeof record.name === 'string' && /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/u.test(record.name)) errorType = record.name
+    if (typeof record.code === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/u.test(record.code)) {
+      return { errorType, errorCode: record.code }
+    }
+    current = record.cause
+  }
+  return { errorType }
+}
 
 function validateInput(method: Method, value: unknown): unknown {
   switch (method) {
@@ -136,12 +154,14 @@ export async function startServer(service: AgentLifecycleService, gateway: ExecG
   const handler = async (request: IncomingMessage, response: ServerResponse) => {
     response.setHeader('cache-control', 'no-store')
     response.setHeader('x-content-type-options', 'nosniff')
+    let operation = 'unrouted'
     try {
       if (request.method !== 'POST') throw new ServiceError(404, 'not found')
       if (!authorized(request.headers.authorization, options.bearerToken)) throw new ServiceError(401, 'unauthorized')
       const url = new URL(request.url ?? '/', 'http://localhost')
       if (url.search || url.hash) throw new ServiceError(404, 'not found')
       if (url.pathname === '/v1/source-snapshots') {
+        operation = 'sourceSnapshot'
         const source = options.sourceSnapshots
         if (!source) throw new ServiceError(503, 'source snapshot service unavailable')
         if (request.headers['content-type'] !== sourceSnapshotContentType) {
@@ -154,8 +174,36 @@ export async function startServer(service: AgentLifecycleService, gateway: ExecG
         response.statusCode = 201; response.setHeader('content-type', 'application/json')
         response.end(JSON.stringify(result)); return
       }
+      if (url.pathname === '/v1/poc/workspace-verification') {
+        operation = 'pocWorkspaceVerification'
+        if (!options.pocInspection) throw new ServiceError(404, 'not found')
+        const input = await body(request)
+        if (!input || typeof input !== 'object' || Array.isArray(input)
+          || Reflect.ownKeys(input).length !== 1
+          || typeof (input as Record<string, unknown>).providerSandboxId !== 'string'
+          || !/^[A-Za-z0-9_.-]{1,512}$/u.test((input as Record<string, string>).providerSandboxId!)) {
+          throw new ServiceError(400, 'invalid POC workspace verification request')
+        }
+        const verified = await options.pocInspection.verifyWorkspace(
+          (input as Record<string, string>).providerSandboxId!,
+        )
+        response.statusCode = 200; response.setHeader('content-type', 'application/json')
+        response.end(JSON.stringify({ verified })); return
+      }
+      if (url.pathname === '/v1/poc/provider-snapshots/cleanup') {
+        operation = 'pocProviderSnapshotCleanup'
+        if (!options.pocInspection) throw new ServiceError(404, 'not found')
+        const input = await body(request)
+        if (!input || typeof input !== 'object' || Array.isArray(input) || Reflect.ownKeys(input).length !== 0) {
+          throw new ServiceError(400, 'invalid POC provider snapshot cleanup request')
+        }
+        const deleted = await options.pocInspection.cleanupProviderSnapshots()
+        response.statusCode = 200; response.setHeader('content-type', 'application/json')
+        response.end(JSON.stringify({ deleted })); return
+      }
       const method = routes.get(url.pathname as '/v1/agents/provision')
       if (!method) throw new ServiceError(404, 'not found')
+      operation = method
       const input = validateInput(method, await body(request))
       const patchExport = options.patchExport
       const patchApply = options.patchApply
@@ -174,6 +222,8 @@ export async function startServer(service: AgentLifecycleService, gateway: ExecG
       response.end(method === 'release' ? undefined : JSON.stringify(result))
     } catch (error) {
       const status = error instanceof ServiceError ? error.status : 503
+      if (status >= 500) console.error(JSON.stringify({ event: 'control_plane_request_failed', operation, status,
+        ...safeFailureDiagnostic(error) }))
       response.statusCode = status; response.setHeader('content-type', 'application/json')
       if (status === 413) response.setHeader('connection', 'close')
       const message = error instanceof ServiceError && error.status < 500 ? error.message : 'service unavailable'

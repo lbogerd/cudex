@@ -27,7 +27,8 @@ test('database inspector scopes every SQL lookup to the exact run tenant', async
 
 test('functional inspector requires distinct owned child, durable artifact, and advanced applied snapshot', () => {
   const evidence: PocAppServerEvidence = { rootThreadId: 'root-agent', childThreadId: 'child-agent',
-    rootThreadStarted: true, spawnAgentCompleted: true, spawnAgentCount: 1, waitCompleted: true,
+    rootThreadStarted: true, rootEnvironmentReady: true, spawnAgentCompleted: true, spawnAgentCount: 1,
+    spawnCallIds: ['spawn-call'], waitCompleted: true,
     rootPatchAvailable: true, childPatchAvailable: true, rootTurnCompleted: true, finalMarker: true,
     deletedThreadIds: [] }
   const database: PocDatabaseInspection = {
@@ -37,7 +38,9 @@ test('functional inspector requires distinct owned child, durable artifact, and 
       { leaseId: 'child-lease', environmentId: 'child-env', agentId: 'child-agent', ownerAgentId: 'root-agent',
         ownerLeaseId: 'root-lease', providerSandboxId: 'child-sandbox', baseSnapshotId: 'child-base', latestSnapshotId: 'child-current', state: 'released' },
     ],
-    operations: [], snapshots: [], allocations: [], liveTicketCount: 0, unfinishedInteractionCount: 0,
+    operations: [], snapshots: [{ snapshotId: 'result', leaseId: 'root-lease',
+      providerSnapshotId: 'provider-result', state: 'available' }],
+    allocations: [], liveTicketCount: 0, unfinishedInteractionCount: 0,
     artifacts: [{ artifactId: 'artifact', agentId: 'child-agent', sourceLeaseId: 'child-lease', state: 'available' }],
     patchApplications: [{ applicationId: 'application', targetLeaseId: 'root-lease', artifactId: 'artifact',
       sourceTargetSnapshotId: 'before-apply', resultSnapshotId: 'result', phase: 'checkpointed' }],

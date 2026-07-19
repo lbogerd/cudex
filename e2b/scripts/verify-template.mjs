@@ -2,6 +2,7 @@ import fs from 'node:fs/promises'
 import process from 'node:process'
 import { Sandbox } from 'e2b'
 import WebSocket from 'ws'
+import { E2BSecureDataPlane } from '../dist/src/e2b-secure-data-plane.js'
 
 const metadataPath = process.argv[2]
 if (!metadataPath) {
@@ -25,7 +26,7 @@ function openWebSocket(url, accessToken) {
     throw new Error('sandbox traffic access token is unavailable')
   }
   return new Promise((resolve, reject) => {
-    const socket = new WebSocket(url, { headers: { 'X-Access-Token': accessToken } })
+    const socket = new WebSocket(url, { headers: { 'E2b-Traffic-Access-Token': accessToken } })
     socket.once('open', () => resolve(socket))
     socket.once('error', reject)
   })
@@ -53,25 +54,29 @@ try {
     ...connection,
     timeoutMs: 120_000,
     secure: true,
+    network: { allowPublicTraffic: false },
     lifecycle: { onTimeout: 'kill', autoResume: false },
   })
+  const dataPlane = new E2BSecureDataPlane(sandbox, { requestTimeoutMs: 120_000 })
 
-  const installed = JSON.parse(await sandbox.files.read('/etc/cudex/codex-build.json'))
+  const installed = JSON.parse(Buffer.from(await dataPlane.files.read(
+    '/etc/cudex/codex-build.json', { format: 'bytes' },
+  )).toString('utf8'))
   if (installed.revision !== expected.revision || installed.sha256 !== expected.codexSha256) {
     throw new Error('sandbox Codex metadata does not match template metadata')
   }
 
-  const checksum = await sandbox.commands.run('sha256sum /usr/local/bin/codex')
+  const checksum = await dataPlane.commands.run('sha256sum /usr/local/bin/codex')
   if (checksum.exitCode !== 0 || checksum.stdout.split(/\s+/)[0] !== expected.codexSha256) {
     throw new Error('sandbox Codex checksum does not match template metadata')
   }
 
   const stderr = []
-  await sandbox.commands.run('codex exec-server --listen ws://0.0.0.0:22101', {
-    background: true,
-    timeoutMs: 10_000,
-    onStderr: data => stderr.push(data),
-  })
+  const started = await dataPlane.commands.run(
+    'nohup codex exec-server --listen ws://0.0.0.0:22101 >/tmp/cudex-template-canary.log 2>&1 </dev/null &',
+    { timeoutMs: 10_000 },
+  )
+  if (started.exitCode !== 0) throw new Error('exec-server canary failed to start')
   await new Promise(resolve => setTimeout(resolve, 500))
 
   const host = sandbox.getHost(22101)

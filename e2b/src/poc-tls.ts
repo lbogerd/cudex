@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process'
 import { X509Certificate } from 'node:crypto'
-import { chmod, mkdir, readFile, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { chmod, lstat, mkdir, readFile, writeFile } from 'node:fs/promises'
+import { isAbsolute, join, resolve } from 'node:path'
 import { promisify } from 'node:util'
 
 const exec = promisify(execFile)
@@ -20,7 +20,20 @@ async function openssl(args: string[]): Promise<void> {
   catch { throw new Error('failed to generate ephemeral POC TLS material') }
 }
 
-export async function generatePocTls(directory: string): Promise<PocTlsMaterial> {
+export async function validateProviderCaCertificate(repositoryRoot: string, configuredPath: string): Promise<string> {
+  const path = isAbsolute(configuredPath) ? configuredPath : resolve(repositoryRoot, configuredPath)
+  let metadata
+  try { metadata = await lstat(path) } catch { throw new Error('POC provider CA certificate is unavailable') }
+  if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size <= 0 || metadata.size > 1024 * 1024) {
+    throw new Error('POC provider CA certificate must be a bounded regular file')
+  }
+  try { await exec('openssl', ['crl2pkcs7', '-nocrl', '-certfile', path, '-outform', 'DER', '-out', '/dev/null'],
+    { timeout: 30_000, maxBuffer: 1024 * 1024 }) }
+  catch { throw new Error('POC provider CA certificate is invalid') }
+  return path
+}
+
+export async function generatePocTls(directory: string, providerCaCertificate?: string): Promise<PocTlsMaterial> {
   await mkdir(directory, { recursive: true, mode: 0o700 })
   const material: PocTlsMaterial = {
     caCertificatePath: join(directory, 'ca.crt'), caKeyPath: join(directory, 'ca.key'),
@@ -42,10 +55,13 @@ export async function generatePocTls(directory: string): Promise<PocTlsMaterial>
     '-CA', material.caCertificatePath, '-CAkey', material.caKeyPath, '-CAcreateserial',
     '-extfile', extensionsPath, '-out', material.serverCertificatePath])
   await Promise.all([chmod(material.caKeyPath, 0o600), chmod(material.serverKeyPath, 0o600)])
-  const [systemRoots, localRoot, server] = await Promise.all([
-    readFile(systemCaPath), readFile(material.caCertificatePath), readFile(material.serverCertificatePath, 'utf8'),
+  const [systemRoots, localRoot, providerRoot, server] = await Promise.all([
+    readFile(systemCaPath), readFile(material.caCertificatePath),
+    providerCaCertificate ? readFile(providerCaCertificate) : Promise.resolve(Buffer.alloc(0)),
+    readFile(material.serverCertificatePath, 'utf8'),
   ])
-  await writeFile(material.combinedCaBundlePath, Buffer.concat([systemRoots, Buffer.from('\n'), localRoot]), { mode: 0o600 })
+  await writeFile(material.combinedCaBundlePath,
+    Buffer.concat([systemRoots, Buffer.from('\n'), providerRoot, Buffer.from('\n'), localRoot]), { mode: 0o600 })
   const certificate = new X509Certificate(server)
   if (!certificate.subjectAltName?.includes('DNS:localhost') || !certificate.subjectAltName.includes('IP Address:127.0.0.1')) {
     throw new Error('generated POC certificate is missing required localhost SANs')

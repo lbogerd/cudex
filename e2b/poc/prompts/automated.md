@@ -2,7 +2,7 @@ You are the root agent for a strict hosted-agent proof. Complete every step belo
 
 1. In your workspace, write `state.txt` containing exactly `owner-spawn-state` plus a newline.
 2. Create the owner-only marker `/tmp/cudex-poc-owner-secret` containing any non-secret marker text.
-3. Call `spawn_agent` exactly once, with `agent_type` set to `child`. Do not call it a second time, even after a failure.
+3. Call `spawn_agent` exactly once, with `agent_type` set to `child` and `fork_turns` set to `none`. A typed hosted child cannot use the tool's default full-history fork. Do not call it a second time, even after a failure.
 4. In that single child prompt, require the child to:
    - confirm `state.txt` contains exactly `owner-spawn-state`;
    - confirm `/tmp/cudex-poc-owner-secret` is absent in the child environment, and fail if it exists;

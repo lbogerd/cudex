@@ -16,7 +16,7 @@ test('POC runtime files contain distinct generated secrets with mode 0600', asyn
   await writeFile(join(e2bRoot, 'poc', 'garage.toml.template'), 'replication_factor = 1\n')
   const paths = pocRunPaths(repositoryRoot, '20260719120000-123456abcdef')
   const env: PocEnvironment = {
-    e2bApiKey: 'key', e2bApiUrl: 'https://e2b.invalid', e2bDomain: 'cube.app',
+    e2bApiKey: 'key', e2bApiUrl: 'https://e2b.invalid', e2bDomain: 'cube.app', e2bValidateApiKey: true,
     templateMetadata: 'metadata.json', accessToken: 'auth', controlPort: 18443,
     postgresPort: 15432, garagePort: 13900, keepOnFailure: false, verifyTemplate: false,
   }
@@ -65,14 +65,14 @@ async function fakeProvenanceRoot(): Promise<{ repositoryRoot: string; metadataP
   return { repositoryRoot, metadataPath }
 }
 
-test('provenance and generated configuration contain exact hosted roles and plain tools', async () => {
+test('provenance and generated configuration contain exact hosted roles and explicit tool namespaces', async () => {
   const { repositoryRoot, metadataPath } = await fakeProvenanceRoot()
   const provenance = await validatePocProvenance(repositoryRoot, metadataPath)
   const runRoot = join(repositoryRoot, 'run')
   await mkdir(runRoot)
   const paths = pocRunPaths(repositoryRoot, '20260719120000-abcdef123456')
   paths.runDirectory = runRoot; paths.codexHome = join(runRoot, 'codex-home')
-  const env: PocEnvironment = { e2bApiKey: 'key', e2bApiUrl: 'https://e2b.invalid', e2bDomain: 'cube.app',
+  const env: PocEnvironment = { e2bApiKey: 'key', e2bApiUrl: 'https://e2b.invalid', e2bDomain: 'cube.app', e2bValidateApiKey: true,
     templateMetadata: metadataPath, accessToken: 'auth', codexModel: 'gpt-test', controlPort: 18443,
     postgresPort: 15432, garagePort: 13900, keepOnFailure: false, verifyTemplate: false }
   const source = { sourceSnapshotId: `source_${'a'.repeat(32)}`, checksum: `sha256:${'b'.repeat(64)}`,
@@ -82,11 +82,11 @@ test('provenance and generated configuration contain exact hosted roles and plai
   for (const expected of ['hosted_agents = true', '[features.multi_agent_v2]', 'enabled = true',
     'default_agent_type = "root"', 'sandbox_template = "poc-root-v1"', 'sandbox_template = "poc-child-v1"',
     source.sourceSnapshotId, source.checksum, 'model = "gpt-test"']) assert.ok(config.includes(expected))
-  assert.ok(!config.includes('tool_namespace'))
+  assert.ok(config.includes('tool_namespace = "collaboration"'))
   const roles = JSON.parse(await readFile(generated.trustedRolesPath, 'utf8')) as {
     root: { toolPolicy: { allowedTools: Array<{ namespace: unknown }> } }
   }
   assert.deepEqual(roles, createTrustedRoles(provenance.templateId))
   assert.deepEqual(roles.root.toolPolicy.allowedTools.map(tool => tool.namespace),
-    [null, null, null, null, null])
+    [null, null, 'collaboration', 'collaboration', null])
 })

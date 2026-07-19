@@ -5,6 +5,63 @@ architecture decisions, and spike results for the hosted-agent E2B backend. It
 is reference material, not a work queue. Remaining implementation work is in
 [`TODO.md`](TODO.md).
 
+## Live local hosted-Codex POC acceptance (2026-07-19)
+
+Automated run `20260719181643-56f841ab0440` passed with real ChatGPT
+authentication and the published E2B template `tpl-846bf120ea914bb9bf6baba2`. The
+local and template Codex provenance matched build `ddbab096053f`, revision
+`ddbab096053fe56f7c6eee081197e141887a32c8`, and SHA-256
+`9d934748aab8a11a5443cc61a139e6719e2db4a0d2f221e729d22db94a859da8`.
+Interactive diagnosis was not required.
+
+Every retained report assertion was true: the root environment became ready;
+one child was spawned; the root and child had distinct threads, leases,
+environments, and provider sandboxes; child ownership and isolation held; the
+child released with a durable patch; the owner applied it and advanced its
+snapshot; `verify.sh` and the owner-only `/tmp` marker passed; the exact terminal
+marker was observed; the whole thread tree released and deleted; no live ticket,
+interaction, operation, allocation, managed sandbox, or known provider snapshot
+remained; retained logs passed the secret-taint scan; Docker volumes were
+removed; and no forced provider cleanup was needed.
+
+The pinned Codex Multi-Agent V2 surface represents a successful spawn with the
+canonical completed `subAgentActivity` item (`kind: started`); the older V1
+surface represents it as `collabToolCall(spawnAgent)`. The POC driver accepts
+both and deduplicates by the exact tool call ID. Likewise, one
+`agent/patchAvailable` notification identifies the root as its recipient and the
+child as the artifact owner, satisfying both root delivery and child artifact
+evidence without inventing a root artifact.
+
+The secured CubeSandbox data path is implemented entirely in `e2b/`, with no
+dependency patch. Sandboxes request `secure: true` and disabled public traffic;
+the first-party bounded adapter attaches the create-time E2B traffic credential
+to envd file/command calls, while the gateway and template verifier use the
+standard `E2b-Traffic-Access-Token` header for port 22101. The adapter exists
+because the pinned SDK's high-level envd clients do not propagate that secured
+traffic credential. The credential is never persisted or reported. This does
+not relax the production blocker: private/reverse executor transport must still
+replace the secured public port route.
+
+The gateway now buffers the downstream client's immediate `initialize` frame
+while durable lease revalidation and provider lookup complete. The prior event
+listener ordering could drop that first frame and make `thread/start` fail
+nondeterministically. A regression test holds provider lookup open and proves
+the first frame is delivered after the upstream connects.
+
+Two default-off, bearer-authenticated POC operations run inside the control
+service so they can reuse the original one-time provider credential. One runs a
+fixed root workspace verification command after any transient terminal
+checkpoint pause. The other deletes only provider snapshot IDs selected from
+the exact POC tenant after all its leases and operations are terminal. The
+runner still retains its exact-scope forced-cleanup fallback, but the passing run
+did not use it.
+
+Final verification ran 324 TypeScript tests without a database: 199 passed and
+125 opt-in PostgreSQL cases skipped. The same suite against a disposable
+`postgres:17-alpine` instance passed 323 and skipped only one live-provider
+case. The real authenticated automated proof passed separately. No file under
+`codex/codex-rs` changed.
+
 ## Local hosted-Codex POC foundation (2026-07-19)
 
 The Linux-only POC uses a host Node.js control service and a disposable Compose
@@ -63,12 +120,9 @@ binds the immutable source, and gives root/child distinct logical templates. The
 server-owned JSON maps both logical roles to the verified provider template with
 policy version one and the exact domain/plain-tool allowlists.
 
-The ignored template metadata currently present in this workspace points to an
-older checksummed binary whose strict-config checker reports
-`hosted_agents.source_snapshot` as unknown. The new preflight correctly fails on
-that mismatch before Docker or E2B allocation. A rebuilt matching Codex artifact
-and hosted template metadata are therefore required for the live proof; no Rust
-source was changed to bypass the check.
+The published metadata and matching local executable named above passed strict
+configuration validation, template verification, live provisioning, and exact
+checksum comparison. No Rust source was changed to bypass provenance checks.
 
 ## Automated and interactive POC drivers (2026-07-19)
 
@@ -81,11 +135,12 @@ request parameters or server error bodies in thrown errors. Initialization opts
 into the experimental API, completes the `initialized` handshake, and requires
 `account/read` to return a non-null ChatGPT account before E2B allocation.
 
-The evidence collector accepts the app protocol's current
-`collabAgentToolCall` spelling and the earlier `collabToolCall` spelling. It
-records only non-secret identities and booleans for root start, exactly one
-completed spawn, distinct child, completed wait, root/child patch notices,
-successful root turn, exact terminal marker, and descendant/root deletion.
+The evidence collector accepts Multi-Agent V2's completed `subAgentActivity`
+spawn item plus the V1 `collabAgentToolCall`/`collabToolCall` forms, deduplicated
+by call ID. It records only non-secret identities and booleans for root start,
+exactly one successful spawn, distinct child, completed wait, root delivery and
+child ownership of the patch notice, successful root turn, exact terminal
+marker, and descendant/root deletion.
 Automated turns have one 20-minute deadline and no model retry. SIGINT/SIGTERM
 enters the same delete/stop/teardown path.
 
@@ -112,21 +167,24 @@ root/child leases, environments, and provider sandbox IDs; exact child ownership
 released child state; an available child artifact; a checkpointed application;
 and a root latest snapshot advanced to the application result.
 
-Before thread deletion, the runner connects only to the root lease's persisted
-E2B sandbox ID and runs `./verify.sh` plus the owner-only `/tmp` marker assertion
-inside `/workspace/roots/0/fixture`. It retains only the boolean result. Provider
-inventory is filtered by the exact `managedBy=cudex-poc-<run-id>` and tenant
-metadata pair. Snapshot inspection starts only from provider IDs recorded in the
-same tenant's leases and allocations; no provider-wide snapshot inventory is
-performed.
+Before thread deletion, the runner asks the default-off POC inspection endpoint
+to validate the root lease's exact persisted E2B sandbox ID and run `./verify.sh`
+plus the owner-only `/tmp` marker assertion inside
+`/workspace/roots/0/fixture`. The service retains the original one-time provider
+credential and returns only the boolean result. Provider inventory is filtered
+by the exact `managedBy=cudex-poc-<run-id>` and tenant metadata pair. Snapshot
+inspection starts only from provider IDs recorded in the same tenant's leases
+and allocations; no provider-wide snapshot inventory is performed.
 
 Cleanup attempts root-tree deletion, gracefully stops Codex, waits up to 60
 seconds for direct release and configured reconcilers, and then requires released
 leases, terminal operations, no pending allocations, no live tickets or
-interactions, and no exact-scope E2B sandboxes or known snapshots. When necessary,
-forced cleanup kills only the filtered sandboxes and deletes only provider
-snapshot IDs read from the run's durable records. A functionally successful run
-that needs that intervention exits 3; functional/lifecycle failure exits 1 and
+interactions, and no exact-scope E2B sandboxes or known snapshots. After every
+lease and operation is terminal, the default-off POC cleanup endpoint deletes
+at most 1,000 distinct provider snapshot IDs selected from that exact tenant.
+When necessary, forced cleanup kills only the filtered sandboxes and deletes
+only provider snapshot IDs read from the run's durable records. A functionally
+successful run that needs that intervention exits 3; functional/lifecycle failure exits 1 and
 configuration failure exits 2. `down` uses this same exact cleanup path.
 
 The report serializer rejects secret-shaped fields, connection/ticket URLs, and
@@ -135,8 +193,8 @@ scanned for E2B/Codex/Garage/database credentials, bearer material, WSS ticket
 URLs, and auth JSON markers. Unit evidence covers every SQL tenant predicate,
 the exact provider metadata filter, known-ID-only deletion, cleanup idempotency,
 functional/cleanup state evaluation, and log/report taint rejection. The live
-ChatGPT/E2B acceptance remains pending on a current matching Codex artifact,
-template metadata, and user-owned ignored `.env` credentials.
+ChatGPT/E2B acceptance passed with the provenance and run recorded in the live
+acceptance section above.
 
 Chunk 4 verification ran all 315 TypeScript tests: 190 passed and 125
 PostgreSQL/live-provider cases were correctly skipped without their opt-in

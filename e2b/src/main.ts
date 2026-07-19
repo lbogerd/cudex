@@ -33,6 +33,7 @@ import { PostgresLifecycleService, type AgentLifecycleService } from './lifecycl
 import { PostgresReconciler } from './postgres-reconciler.js'
 import { PostgresChildReconciler } from './postgres-child-reconciler.js'
 import { PostgresChildCoordinator } from './postgres-child.js'
+import { ServiceError } from './types.js'
 import { parseTrustedRoles } from './trusted-roles.js'
 import type { ActiveLeaseDirectory } from './gateway.js'
 import { PostgresLeaseInteractionGate } from './postgres-lease-interactions.js'
@@ -316,5 +317,37 @@ await startServer(service, gateway, { host, port, bearerToken: required('CODEX_H
   ...(patchExport ? { patchExport } : {}),
   ...(patchApply ? { patchApply } : {}),
   ...(retention ? { retention } : {}),
+  ...(sourceRuntime && process.env.HOSTED_AGENT_POC_INSPECTION === 'true' ? { pocInspection: {
+    async verifyWorkspace(providerSandboxId: string): Promise<boolean> {
+      const ownership = await sourceRuntime.pool.query(`SELECT lease_id FROM hosted_agent_leases
+        WHERE tenant_id = $1 AND provider_sandbox_id = $2 AND state = 'active' LIMIT 2`,
+      [sourceRuntime.principal.tenantId, providerSandboxId])
+      if (ownership.rowCount !== 1) throw new ServiceError(404, 'active POC sandbox not found')
+      return provider.verifyPocWorkspace(providerSandboxId)
+    },
+    async cleanupProviderSnapshots(): Promise<number> {
+      const tenantId = sourceRuntime.principal.tenantId
+      if (!tenantId.startsWith('poc-')) throw new ServiceError(403, 'POC cleanup requires a POC tenant')
+      const unsettled = await sourceRuntime.pool.query(`SELECT
+        (SELECT count(*)::integer FROM hosted_agent_leases
+          WHERE tenant_id = $1 AND state <> 'released') AS leases,
+        (SELECT count(*)::integer FROM hosted_agent_operations
+          WHERE tenant_id = $1 AND state = 'in_progress') AS operations`, [tenantId])
+      if (Number(unsettled.rows[0]?.leases) !== 0 || Number(unsettled.rows[0]?.operations) !== 0) {
+        throw new ServiceError(409, 'POC tenant is not fully released')
+      }
+      const result = await sourceRuntime.pool.query(`SELECT DISTINCT provider_snapshot_id
+        FROM hosted_agent_snapshots
+        WHERE tenant_id = $1 AND provider_snapshot_id IS NOT NULL
+        ORDER BY provider_snapshot_id LIMIT 1001`, [tenantId])
+      if ((result.rowCount ?? result.rows.length) > 1000) throw new ServiceError(409, 'POC snapshot cleanup bound exceeded')
+      let deleted = 0
+      for (const row of result.rows) {
+        const snapshotId = String(row.provider_snapshot_id)
+        if (await provider.deleteSnapshot(snapshotId)) deleted += 1
+      }
+      return deleted
+    },
+  } } : {}),
   allowInsecureHttp: development })
 console.log(JSON.stringify({ event: 'control_plane_started', host, port, tls: Boolean(process.env.HOSTED_AGENT_TLS_CERT) }))

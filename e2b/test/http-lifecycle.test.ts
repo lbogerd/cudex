@@ -89,7 +89,7 @@ async function echoServer(t: TestContext) {
   const server = createServer()
   const websocket = new WebSocketServer({ noServer: true })
   server.on('upgrade', (request, socket, head) => {
-    if (request.headers['x-access-token'] !== upstreamToken) {
+    if (request.headers['e2b-traffic-access-token'] !== upstreamToken) {
       socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')
       return
     }

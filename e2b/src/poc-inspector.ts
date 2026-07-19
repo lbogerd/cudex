@@ -129,9 +129,10 @@ export function evaluatePocFunctionalInspection(
     childReleased: childLease?.state === 'released',
     durableChildArtifactAvailable: Boolean(artifact),
     patchApplicationApplied: application?.phase === 'checkpointed',
-    rootLatestSnapshotAdvanced: Boolean(rootLease && application
-      && rootLease.latestSnapshotId === application.resultSnapshotId
-      && application.resultSnapshotId !== application.sourceTargetSnapshotId),
+    rootLatestSnapshotAdvanced: Boolean(rootLease && application && application.phase === 'checkpointed'
+      && rootLease.latestSnapshotId && rootLease.latestSnapshotId !== application.sourceTargetSnapshotId
+      && database.snapshots.some(snapshot => snapshot.snapshotId === rootLease.latestSnapshotId
+        && snapshot.leaseId === rootLease.leaseId)),
   }
   return { ...(rootLease ? { rootLease } : {}), ...(childLease ? { childLease } : {}),
     ...(artifact ? { artifactId: artifact.artifactId } : {}), assertions }

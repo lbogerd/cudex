@@ -40,8 +40,10 @@ test('JSON-RPC client handles errors, EOF, and timeouts without response detail 
   const errorHarness = harness()
   const failed = errorHarness.client.request('secret/method', { bearer: 'request-secret' })
   const wire = await errorHarness.read()
-  errorHarness.responses.write(`${JSON.stringify({ id: wire.id, error: { message: 'response-secret' } })}\n`)
+  errorHarness.responses.write(`${JSON.stringify({ id: wire.id,
+    error: { code: -32603, message: 'response-secret hosted-agent service Unavailable: service rejected the request' } })}\n`)
   await assert.rejects(failed, error => !String(error).includes('response-secret') && !String(error).includes('request-secret'))
+  await failed.catch(error => assert.match(String(error), /hosted-agent unavailable, JSON-RPC -32603/))
 
   const eofHarness = harness(); const eof = eofHarness.client.request('pending', {})
   await eofHarness.read(); eofHarness.responses.end()
@@ -63,23 +65,25 @@ test('JSON-RPC client rejects malformed and oversized server messages', async ()
 })
 
 test('event collector accepts interleaved root/child evidence and terminal ordering', () => {
-  const evidence: PocAppServerEvidence = { rootThreadId: 'root', rootThreadStarted: true,
-    spawnAgentCompleted: false, spawnAgentCount: 0, waitCompleted: false, rootPatchAvailable: false,
+  const evidence: PocAppServerEvidence = { rootThreadId: 'root', rootThreadStarted: true, rootEnvironmentReady: true,
+    spawnAgentCompleted: false, spawnAgentCount: 0, spawnCallIds: [], waitCompleted: false, rootPatchAvailable: false,
     childPatchAvailable: false, rootTurnCompleted: false, finalMarker: false, deletedThreadIds: [] }
   const event = (method: string, params: unknown) => collectAppServerNotification(evidence, { method, params })
   assert.equal(event('item/completed', { threadId: 'root', item: { type: 'collabAgentToolCall',
-    tool: 'spawnAgent', status: 'completed', receiverThreadIds: ['child'] } }), false)
+    id: 'spawn-call', tool: 'spawnAgent', status: 'completed', receiverThreadIds: ['child'] } }), false)
+  event('item/completed', { threadId: 'root', item: { type: 'subAgentActivity',
+    id: 'spawn-call', kind: 'started', agentThreadId: 'child', agentPath: '/root/child' } })
   event('agent/patchAvailable', { threadId: 'root', artifact: { artifactId: 'artifact', agentId: 'child' } })
   event('item/completed', { threadId: 'child', item: { type: 'agentMessage', text: 'child done' } })
   event('item/completed', { threadId: 'root', item: { type: 'collabAgentToolCall', tool: 'wait', status: 'completed' } })
-  event('agent/patchAvailable', { threadId: 'root', artifact: { artifactId: 'root-artifact', agentId: 'root' } })
   event('item/completed', { threadId: 'root', item: { type: 'agentMessage', text: 'done\nHOSTED_CODEX_POC_OK' } })
   assert.equal(event('turn/completed', { threadId: 'root', turn: { status: 'completed' } }), true)
   event('thread/deleted', { threadId: 'child' }); event('thread/deleted', { threadId: 'root' })
   assert.deepEqual(evidence, { rootThreadId: 'root', childThreadId: 'child', artifactId: 'artifact',
-    rootThreadStarted: true, spawnAgentCompleted: true, spawnAgentCount: 1, waitCompleted: true,
+    rootThreadStarted: true, rootEnvironmentReady: true, spawnAgentCompleted: true, spawnAgentCount: 1,
+    spawnCallIds: ['spawn-call'], waitCompleted: true,
     rootPatchAvailable: true, childPatchAvailable: true, rootTurnCompleted: true, finalMarker: true,
-    deletedThreadIds: ['child', 'root'] })
+    lastRootAgentMessage: 'done\nHOSTED_CODEX_POC_OK', deletedThreadIds: ['child', 'root'] })
 })
 
 test('app-server startup performs initialize and ChatGPT account preflight in isolation', async () => {

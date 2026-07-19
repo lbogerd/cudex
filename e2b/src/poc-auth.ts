@@ -62,7 +62,11 @@ export function createCodexProcessEnvironment(input: {
 }): NodeJS.ProcessEnv {
   return {
     PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin', CODEX_HOME: input.codexHome,
-    CODEX_CA_CERTIFICATE: input.caBundlePath, CODEX_HOSTED_AGENT_TOKEN: input.hostedBearer,
+    // Shared Codex HTTP/websocket clients read CODEX_CA_CERTIFICATE. The hosted-agent
+    // service uses reqwest's Linux native-root loader, which reads SSL_CERT_FILE.
+    // Using the same combined bundle keeps every POC Codex transport on one trust policy.
+    CODEX_CA_CERTIFICATE: input.caBundlePath, SSL_CERT_FILE: input.caBundlePath,
+    CODEX_HOSTED_AGENT_TOKEN: input.hostedBearer,
     ...(input.accessToken ? { CODEX_ACCESS_TOKEN: input.accessToken } : {}),
   }
 }

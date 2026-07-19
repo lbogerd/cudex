@@ -45,7 +45,7 @@ async function fixture(rawExecUrl: string, limits: Partial<GatewayLimits> = {}) 
 async function echoServer() {
   const server = createServer(); const websocket = new WebSocketServer({ noServer: true })
   server.on('upgrade', (request, socket, head) => {
-    if (request.headers['x-access-token'] !== 'fake-traffic-access-token') {
+    if (request.headers['e2b-traffic-access-token'] !== 'fake-traffic-access-token') {
       socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')
       return
     }
@@ -66,6 +66,30 @@ test('gateway rejects missing tickets, proxies frames, and closes revoked leases
   client.send('{"id":1,"method":"initialize"}'); assert.equal(await echoed, '{"id":1,"method":"initialize"}')
   const close = closed(client); context.gateway.revoke('lease_test'); assert.equal(await close, 1008)
   assert.equal(await rejectedStatus(context.url.replace(/\?.*/, '')), 401)
+})
+
+test('gateway buffers the first client frame while provider lookup is pending', async t => {
+  const upstream = await echoServer(); t.after(() => { upstream.websocket.close(); upstream.server.close() })
+  const context = await fixture(upstream.url); t.after(() => context.server.close())
+  const original = context.provider.execUpstream.bind(context.provider)
+  let lookupEntered!: () => void
+  let releaseLookup!: () => void
+  const entered = new Promise<void>(resolve => { lookupEntered = resolve })
+  const gate = new Promise<void>(resolve => { releaseLookup = resolve })
+  context.provider.execUpstream = async sandboxId => {
+    lookupEntered()
+    await gate
+    return original(sandboxId)
+  }
+  const client = new WebSocket(context.url)
+  await opened(client)
+  await entered
+  const echoed = new Promise<string>(resolve => client.once('message', data => resolve(data.toString())))
+  client.send('{"id":1,"method":"initialize"}')
+  await immediate()
+  releaseLookup()
+  assert.equal(await echoed, '{"id":1,"method":"initialize"}')
+  client.close()
 })
 
 test('gateway rejects duplicate or extra query parameters before ticket consumption', async t => {

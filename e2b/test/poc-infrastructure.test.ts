@@ -22,7 +22,7 @@ test('POC Compose provides repeatable PostgreSQL migrations and Garage object st
   const paths = pocRunPaths(repositoryRoot, createRunId())
   const env: PocEnvironment = {
     e2bApiKey: 'e2b_0000000000000000000000000000000000000000', e2bApiUrl: 'https://e2b.invalid',
-    e2bDomain: 'cube.app', templateMetadata: 'unused.json', accessToken: 'unused',
+    e2bDomain: 'cube.app', e2bValidateApiKey: true, templateMetadata: 'unused.json', accessToken: 'unused',
     controlPort: 18443, postgresPort: 15432, garagePort: 13900,
     keepOnFailure: false, verifyTemplate: false,
   }

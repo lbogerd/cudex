@@ -103,6 +103,39 @@ test('HTTP retention route strictly dispatches the exact durable set', async t =
   assert.deepEqual(seen, [request, clear])
 })
 
+test('POC inspection routes are disabled by default and accept only bounded exact requests', async t => {
+  const unavailable = await fixture({})
+  t.after(() => unavailable.server.close())
+  assert.equal((await post(unavailable.port, '/v1/poc/workspace-verification',
+    JSON.stringify({ providerSandboxId: 'sandbox' }))).status, 404)
+
+  const calls: unknown[] = []
+  const gateway = { attach() {} } as unknown as ExecGateway
+  const server = await startServer({} as ControlPlane, gateway, {
+    host: '127.0.0.1', port: 0, bearerToken: 'test-token', allowInsecureHttp: true,
+    pocInspection: {
+      async verifyWorkspace(providerSandboxId) { calls.push(providerSandboxId); return true },
+      async cleanupProviderSnapshots() { calls.push('cleanup'); return 3 },
+    },
+  })
+  t.after(() => server.close())
+  const port = (server.address() as import('node:net').AddressInfo).port
+  const verified = await post(port, '/v1/poc/workspace-verification',
+    JSON.stringify({ providerSandboxId: 'sandbox_123' }))
+  assert.equal(verified.status, 200)
+  assert.deepEqual(JSON.parse(verified.body), { verified: true })
+  const cleaned = await post(port, '/v1/poc/provider-snapshots/cleanup', '{}')
+  assert.equal(cleaned.status, 200)
+  assert.deepEqual(JSON.parse(cleaned.body), { deleted: 3 })
+  assert.deepEqual(calls, ['sandbox_123', 'cleanup'])
+
+  assert.equal((await post(port, '/v1/poc/workspace-verification',
+    JSON.stringify({ providerSandboxId: 'sandbox_123', tenantId: 'spoofed' }))).status, 400)
+  assert.equal((await post(port, '/v1/poc/provider-snapshots/cleanup',
+    JSON.stringify({ tenantId: 'spoofed' }))).status, 400)
+  assert.deepEqual(calls, ['sandbox_123', 'cleanup'])
+})
+
 test('HTTP rejects oversized declared and streamed bodies before service dispatch', async t => {
   let calls = 0
   const service = { async provision() { calls++; return { ok: true } } }
