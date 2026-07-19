@@ -93,6 +93,11 @@ production backend. Stable decisions, evidence, and wire schemas are in
     enabling collection.
 - [ ] Reconcile abandoned operations, sandboxes, snapshots, capture sandboxes,
   tickets, archives, and expired blobs after crashes and timeouts.
+  - [x] Wire bounded tenant-scoped recovery of registered objects left in the
+    durable `deleting` state after physical deletion or worker loss.
+  - [ ] Collect expired references and unreferenced registered archives/blobs,
+    including bounded authenticated object-store inventory for pre-registration
+    publication loss and paginated provider inventory.
 - [x] Add bounded, tenant-scoped PostgreSQL reclamation for registered object
   allocations with operation fencing, reference/shared-locator protection,
   retry-safe exact-key deletion, and cross-replica physical-location locking.

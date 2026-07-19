@@ -24,6 +24,33 @@ function allocation(id: string, kind: string, resourceId: string): OperationAllo
     metadata: {}, allocatedAt: new Date(), updatedAt: new Date(), reclaimedAt: null }
 }
 
+test('general reconciliation runs bounded tenant-scoped deleting-object recovery', async () => {
+  let recovery: { tenantId: string; limit: number } | undefined
+  const journal = {
+    claimStaleOperations: async () => [],
+    hasUnreclaimedAllocation: async () => false,
+  } as unknown as PostgresJournal
+  const state = {
+    cleanupTickets: async () => 0,
+  } as unknown as PostgresDurableState
+  const result = await new PostgresReconciler(journal, state, new FakeProvider(), {
+    managedBy: 'cudex', tenantId: 'tenant-1', workerId: 'reconciler',
+    maxDeletingObjectsPerRun: 7,
+    objectRecovery: {
+      async recoverDeletingObjects(tenantId, limit) {
+        recovery = { tenantId, limit: limit ?? 100 }
+        return { found: 3, reclaimed: 2, failed: 1 }
+      },
+    },
+  }).runOnce()
+  assert.deepEqual(recovery, { tenantId: 'tenant-1', limit: 7 })
+  assert.deepEqual({
+    found: result.deletingObjectsFound,
+    reclaimed: result.deletingObjectsReclaimed,
+    failed: result.deletingObjectsFailed,
+  }, { found: 3, reclaimed: 2, failed: 1 })
+})
+
 test('known cleanup is fenced, active durable sandboxes are adopted, and failures remain pending', async () => {
   const provider = new FakeProvider()
   const protectedSandbox = await provider.create('template', { managedBy: 'cudex', tenantId: 'tenant-1' })

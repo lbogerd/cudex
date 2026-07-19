@@ -720,6 +720,15 @@ claim and reconcile the stale operation without losing access or duplicating the
 provider transition. Existing ambiguous-commit and stale-allocation tests cover
 the remaining restart boundaries and cleanup/adoption outcomes.
 
+The production general reconciler now invokes the object reclaimer's bounded,
+tenant-scoped `deleting` recovery on every pass. This closes the crash window
+where physical object deletion succeeded but the worker died before committing
+the logical `deleted`/allocation audit state; exact locator locking, shared
+physical-object protection, and idempotent store deletion remain enforced by the
+existing reclaimer. General operation, inventory, ticket, and deleting-object
+work share independently bounded counters. Expiry-driven registered-object GC,
+pre-registration object-store inventory, and provider pagination remain queued.
+
 ### Canonical workspace comparison foundation
 
 Patch lifecycle code now has a provider-independent canonical workspace model

@@ -30,6 +30,7 @@ export interface PostgresReconcilerOptions {
   maxInventorySandboxesPerRun?: number
   maxInventorySnapshotsPerSandbox?: number
   maxTicketsPerRun?: number
+  maxDeletingObjectsPerRun?: number
   ticketRetentionMs?: number
   connections?: { revoke(leaseId: string): void }
   workspaceRecovery?: {
@@ -41,6 +42,7 @@ export interface PostgresReconcilerOptions {
     artifacts: Pick<PostgresPatchArtifactRepository, 'findForReconciliation'>
     reclaimer: Pick<PostgresObjectReclaimer, 'reclaimOperationObjects'>
   }
+  objectRecovery?: Pick<PostgresObjectReclaimer, 'recoverDeletingObjects'>
   onError?: (error: unknown) => void
 }
 
@@ -51,6 +53,9 @@ export interface ReconcileRunResult {
   protectedResources: number
   inventorySandboxesReclaimed: number
   ticketsDeleted: number
+  deletingObjectsFound: number
+  deletingObjectsReclaimed: number
+  deletingObjectsFailed: number
 }
 
 const defaults = {
@@ -61,6 +66,7 @@ const defaults = {
   maxInventorySandboxesPerRun: 100,
   maxInventorySnapshotsPerSandbox: 100,
   maxTicketsPerRun: 1000,
+  maxDeletingObjectsPerRun: 100,
   ticketRetentionMs: 5 * 60_000,
 }
 
@@ -89,9 +95,9 @@ function patchExportAllocationIdentity(allocation: OperationAllocation,
 
 export class PostgresReconciler {
   private readonly options: Required<Omit<PostgresReconcilerOptions,
-    'connections' | 'workspaceRecovery' | 'patchExportRecovery' | 'onError'>>
+    'connections' | 'workspaceRecovery' | 'patchExportRecovery' | 'objectRecovery' | 'onError'>>
     & Pick<PostgresReconcilerOptions,
-      'connections' | 'workspaceRecovery' | 'patchExportRecovery' | 'onError'>
+      'connections' | 'workspaceRecovery' | 'patchExportRecovery' | 'objectRecovery' | 'onError'>
   private timer: ReturnType<typeof setTimeout> | undefined
   private running: Promise<ReconcileRunResult> | undefined
   private stopped = true
@@ -113,6 +119,7 @@ export class PostgresReconciler {
     positiveInteger('inventory batch size', this.options.maxInventorySandboxesPerRun, 1000)
     positiveInteger('snapshot inventory batch size', this.options.maxInventorySnapshotsPerSandbox, 1000)
     positiveInteger('ticket cleanup batch size', this.options.maxTicketsPerRun, 10_000)
+    positiveInteger('deleting object recovery batch size', this.options.maxDeletingObjectsPerRun, 1000)
     positiveInteger('ticket retention', this.options.ticketRetentionMs, 30 * 24 * 60 * 60_000)
   }
 
@@ -155,6 +162,9 @@ export class PostgresReconciler {
       protectedResources: 0,
       inventorySandboxesReclaimed: 0,
       ticketsDeleted: 0,
+      deletingObjectsFound: 0,
+      deletingObjectsReclaimed: 0,
+      deletingObjectsFailed: 0,
     }
     const staleBefore = new Date(Date.now() - this.options.staleAfterMs)
     const operations = await this.journal.claimStaleOperations(
@@ -167,6 +177,13 @@ export class PostgresReconciler {
     result.ticketsDeleted = await this.state.cleanupTickets(
       new Date(Date.now() - this.options.ticketRetentionMs), this.options.maxTicketsPerRun,
     )
+    if (this.options.objectRecovery) {
+      const recovered = await this.options.objectRecovery.recoverDeletingObjects(
+        this.options.tenantId, this.options.maxDeletingObjectsPerRun)
+      result.deletingObjectsFound = recovered.found
+      result.deletingObjectsReclaimed = recovered.reclaimed
+      result.deletingObjectsFailed = recovered.failed
+    }
     return result
   }
 

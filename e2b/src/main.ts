@@ -280,6 +280,7 @@ const generalReconciler = sourceRuntime
       pollIntervalMs: positiveInteger('HOSTED_AGENT_RECONCILE_MS', 30_000),
       workspaceRecovery: { preparations: durablePreparations!, reclaimer: durableReclaimer! },
       patchExportRecovery: { artifacts: durableArtifacts!, reclaimer: durableReclaimer! },
+      objectRecovery: durableReclaimer!,
       connections: gateway,
       onError: () => console.error(JSON.stringify({ event: 'reconciliation_failed' })),
     })
