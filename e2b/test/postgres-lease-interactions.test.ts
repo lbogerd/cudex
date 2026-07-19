@@ -7,6 +7,7 @@ import {
   LeaseInteractionConflictError,
   LeaseNotQuiescentError,
   PostgresLeaseInteractionGate,
+  hostedCodeModeProcessId,
   type LeaseInteractionIdentity,
 } from '../src/postgres-lease-interactions.js'
 import { PostgresDurableState } from '../src/postgres-state.js'
@@ -87,6 +88,30 @@ test('lease interaction transitions are exact, idempotent, and terminal', {
       UPDATE hosted_agent_lease_interactions SET session_id = 'tampered'
       WHERE interaction_id = $1
     `, [identity.interactionId]), /lease interaction identity is immutable/)
+  } finally { await close(context) }
+})
+
+test('the exact lease-bound code-mode host does not permanently block workspace lifecycle', {
+  skip: databaseUrl ? false : 'HOSTED_AGENT_TEST_DATABASE_URL is not set',
+}, async () => {
+  const context = await fixture()
+  try {
+    const runtime: LeaseInteractionIdentity = {
+      ...processInteraction('hosted-code-mode-runtime'),
+      processId: hostedCodeModeProcessId('lease-active', 'environment-active', 0),
+    }
+    await context.gates[0].begin(runtime)
+    await context.journals[0].withLeaseLocks(tenantId, [runtime.leaseId], client =>
+      context.gates[0].assertQuiescent(tenantId, runtime.leaseId, 0, client))
+
+    const ordinary = processInteraction('ordinary-command')
+    await context.gates[0].begin(ordinary)
+    await assert.rejects(context.journals[0].withLeaseLocks(
+      tenantId, [ordinary.leaseId], client =>
+        context.gates[0].assertQuiescent(tenantId, ordinary.leaseId, 0, client)),
+    LeaseNotQuiescentError)
+    await context.gates[0].finish(ordinary)
+    await context.gates[0].finish(runtime)
   } finally { await close(context) }
 })
 

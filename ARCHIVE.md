@@ -2194,6 +2194,18 @@ IDs. The negative local-placement assertion walks only the app-server's Linux
 `/proc` descendant tree and rejects a local `codex-code-mode-host`; sandbox `ps`
 output and model prose are not accepted as evidence.
 
+The hosted code-mode process is lease-long, so lifecycle quiescence must not
+treat its mere presence as an active workspace mutation. The PostgreSQL gate
+exempts only the deterministic process ID derived from the lease ID,
+environment ID, and connection generation with the same
+`hosted-code-mode-v1` hash as Rust. Ordinary processes, nested commands, and
+filesystem interactions still block snapshots. JavaScript-only state is not
+part of workspace persistence and is explicitly non-durable. This exact-match
+exception is necessary for a root cell to spawn a child: otherwise the child
+snapshot transaction is permanently rejected by the root runtime that issued
+the spawn call. Exec-server's unique process ID also prevents an ordinary
+command from adopting that exempt identity while the singleton host is live.
+
 The Linux/musl release build uses linker-plugin LTO across the full CLI graph.
 With the pinned Rust toolchain, the hosted additions push the CLI layout query
 past rustc's default recursion depth; `cli/src/main.rs` therefore declares the

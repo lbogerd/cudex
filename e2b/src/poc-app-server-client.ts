@@ -262,7 +262,8 @@ export async function assertHostedModelCompatibility(
   const capability = entries.find(entry => entry.slug === model)
   if (!capability) throw new Error('selected model capability is unavailable')
   if (capability.tool_mode !== null && capability.tool_mode !== 'code_mode_only') {
-    throw new Error('selected model has an unknown hosted tool mode')
+    const mode = typeof capability.tool_mode === 'string' ? capability.tool_mode : typeof capability.tool_mode
+    throw new Error(`selected model has an unknown hosted tool mode: ${model} (${mode})`)
   }
   return model
 }

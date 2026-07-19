@@ -61,6 +61,10 @@ its existing process-owned/in-process behavior; hosted Codex must fail closed.
   and exact final cleanup.
 - [ ] Switch the POC default from `gpt-5.5` only after the full code-mode-only
   acceptance run passes.
+- [x] Exempt only the exact identity-derived lease-long code-mode host from
+  workspace quiescence, while retaining gates for commands and
+  filesystem activity; cover the root-spawns-child deadlock regression in
+  PostgreSQL.
 
 ## 1. Local POC infrastructure
 

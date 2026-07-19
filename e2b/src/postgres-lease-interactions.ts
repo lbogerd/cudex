@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import type { PoolClient } from 'pg'
 import type { PostgresDurableState } from './postgres-state.js'
 import type { PostgresJournal } from './postgres-store.js'
@@ -62,6 +63,21 @@ export class LeaseInteractionConflictError extends Error {
 
 export class LeaseNotQuiescentError extends Error {
   constructor() { super('lease has unfinished command interactions') }
+}
+
+export function hostedCodeModeProcessId(
+  leaseId: string, environmentId: string, connectionGeneration: number,
+): string {
+  bounded('lease ID', leaseId)
+  bounded('environment ID', environmentId)
+  generation(connectionGeneration)
+  const hash = createHash('sha256')
+    .update('hosted-code-mode-v1\0').update(leaseId).update('\0')
+    .update(environmentId).update('\0')
+  const generationBytes = Buffer.alloc(8)
+  generationBytes.writeBigUInt64LE(BigInt(connectionGeneration))
+  hash.update(generationBytes)
+  return `hosted-code-mode-${hash.digest('hex').slice(0, 32)}`
 }
 
 const columns = `
@@ -200,11 +216,17 @@ export class PostgresLeaseInteractionGate implements LeaseInteractionLedger {
       || lease.connectionGeneration !== expectedGeneration) {
       throw new LeaseInteractionConflictError()
     }
+    // The dedicated code-mode host is intentionally lease-long and does not mutate the
+    // workspace directly. Exempt only the exact identity-bound process; nested command
+    // and filesystem interactions remain subject to the lifecycle gate.
+    const codeModeProcessId = hostedCodeModeProcessId(
+      lease.leaseId, lease.environmentId, lease.connectionGeneration)
     const result = await executor.query(`
       SELECT 1 FROM hosted_agent_lease_interactions
       WHERE tenant_id = $1 AND lease_id = $2 AND state <> 'finished'
+        AND NOT (interaction_kind = 'process' AND process_id = $3)
       LIMIT 1
-    `, [tenantId, leaseId])
+    `, [tenantId, leaseId, codeModeProcessId])
     if (result.rowCount !== 0) throw new LeaseNotQuiescentError()
   }
 
