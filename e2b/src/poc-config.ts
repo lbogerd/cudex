@@ -2,6 +2,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import { chmod, mkdir, readFile, stat, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { spawn } from 'node:child_process'
+import { setTimeout as scheduleTimeout } from 'node:timers'
 import type { PocEnvironment } from './poc-env.js'
 import type { UploadedSourceSnapshot } from './source-snapshot-client.js'
 
@@ -207,12 +208,12 @@ export async function validateGeneratedCodexConfiguration(
   })
   const exited = new Promise<number | null>(resolveExit => child.once('exit', resolveExit))
   const result = await Promise.race([exited.then(code => ({ exited: true as const, code })),
-    new Promise<{ exited: false }>(resolveWait => setTimeout(() => resolveWait({ exited: false }), 500))])
+    new Promise<{ exited: false }>(resolveWait => { const timer = scheduleTimeout(() => resolveWait({ exited: false }), 500); timer.unref() })])
   if (result.exited) {
     const detail = Buffer.concat(errors).toString('utf8').split(hostedBearer).join('[REDACTED]').trim().slice(0, 4096)
     throw new Error(`generated Codex configuration failed strict validation (exit ${result.code ?? 'signal'})${detail ? `: ${detail}` : ''}`)
   }
   child.kill('SIGTERM')
-  const code = await Promise.race([exited, new Promise<undefined>(resolveWait => setTimeout(resolveWait, 3_000))])
+  const code = await Promise.race([exited, new Promise<undefined>(resolveWait => { const timer = scheduleTimeout(() => resolveWait(undefined), 3_000); timer.unref() })])
   if (code === undefined) { child.kill('SIGKILL'); await exited }
 }

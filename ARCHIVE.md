@@ -70,6 +70,38 @@ that mismatch before Docker or E2B allocation. A rebuilt matching Codex artifact
 and hosted template metadata are therefore required for the live proof; no Rust
 source was changed to bypass the check.
 
+## Automated and interactive POC drivers (2026-07-19)
+
+The automated driver launches only the provenance-matched artifact as
+`codex app-server --listen stdio:// --strict-config`. Its bounded newline JSON
+client correlates interleaved responses by integer ID, separately queues capped
+notifications, rejects malformed/oversized/unsupported messages, fails pending
+work on EOF, enforces per-request and overall deadlines, and never includes
+request parameters or server error bodies in thrown errors. Initialization opts
+into the experimental API, completes the `initialized` handshake, and requires
+`account/read` to return a non-null ChatGPT account before E2B allocation.
+
+The evidence collector accepts the app protocol's current
+`collabAgentToolCall` spelling and the earlier `collabToolCall` spelling. It
+records only non-secret identities and booleans for root start, exactly one
+completed spawn, distinct child, completed wait, root/child patch notices,
+successful root turn, exact terminal marker, and descendant/root deletion.
+Automated turns have one 20-minute deadline and no model retry. SIGINT/SIGTERM
+enters the same delete/stop/teardown path.
+
+The automated prompt forbids owner-side reproduction of child changes, requires
+the owner state and `/tmp` isolation checks, one child spawn, pre-apply owner
+verification, durable `apply_agent_patch`, fixture verification, and the exact
+terminal marker. Interactive mode uses the same source, config, auth, CA, and
+artifact in TUI mode, prints the tracked diagnostic prompt and an optional
+single clipboard command, and does not treat a zero TUI exit as acceptance.
+
+Unit evidence covers response/notification interleaving, JSON-RPC errors, EOF,
+timeouts, malformed/oversized messages, root/child event reordering, terminal
+deletion order, isolated app-server startup, initialize, and ChatGPT account
+preflight. App-server stderr is capped and exact auth/bearer values are redacted
+before the retained mode-`0600` log is written. No raw protocol stream is logged.
+
 The Codex-side sources of truth are:
 
 - `codex/codex-rs/hosted-agent/src/types.rs` for wire and lifecycle types;

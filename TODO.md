@@ -23,10 +23,10 @@ complete until a real ChatGPT-authenticated automated run passes.
 
 ## 3. Automated and interactive drivers
 
-- [ ] Add the bounded app-server JSON-RPC transport and evidence collector.
-- [ ] Add the automated root/child/apply/verify prompt and 20-minute driver.
-- [ ] Add diagnostic interactive TUI mode using the same artifact and configuration.
-- [ ] Add a secret-safe report schema, signal handling, and deadline behavior.
+- [x] Add the bounded app-server JSON-RPC transport and evidence collector.
+- [x] Add the automated root/child/apply/verify prompt and 20-minute driver.
+- [x] Add diagnostic interactive TUI mode using the same artifact and configuration.
+- [x] Add a secret-safe report schema, signal handling, and deadline behavior.
 
 ## 4. Acceptance and cleanup
 
