@@ -108,6 +108,8 @@ impl fmt::Debug for HostedEnvironmentConnection {
 pub struct ProvisionedAgent {
     pub lease_id: String,
     pub environment_id: String,
+    /// Generation of the executor connection that owns this environment binding.
+    pub connection_generation: u64,
     pub connection: HostedEnvironmentConnection,
     pub cwd: PathUri,
     pub workspace_roots: Vec<PathUri>,
@@ -231,6 +233,8 @@ pub struct HostedAgentRuntimeRecord {
     pub sandbox_template: String,
     pub lease_id: String,
     pub environment_id: String,
+    #[serde(default)]
+    pub connection_generation: u64,
     pub base_snapshot_id: String,
     pub latest_snapshot_id: Option<String>,
     pub last_exported_patch: Option<AgentPatchArtifact>,

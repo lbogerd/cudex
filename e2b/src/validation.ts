@@ -350,7 +350,8 @@ export function validateToolPolicy(value: unknown): ToolPolicy {
 }
 
 export function validateProvisionedAgent(value: unknown): ProvisionedAgent {
-  const record = object(value, ['leaseId', 'environmentId', 'connection', 'cwd', 'workspaceRoots', 'baseSnapshotId', 'toolPolicy'], responseFailure, 'provisioned agent')
+  const record = object(value, ['leaseId', 'environmentId', 'connection', 'cwd', 'workspaceRoots',
+    'baseSnapshotId', 'connectionGeneration', 'toolPolicy'], responseFailure, 'provisioned agent')
   const leaseId = opaqueId(record.leaseId, responseFailure, 'lease ID')
   const environmentId = opaqueId(record.environmentId, responseFailure, 'environment ID')
   const baseSnapshotId = opaqueId(record.baseSnapshotId, responseFailure, 'base snapshot ID')
@@ -360,6 +361,9 @@ export function validateProvisionedAgent(value: unknown): ProvisionedAgent {
   if (!roots.some(root => below(cwd.path, root.path))) responseFailure('workspace cwd must be under a workspace root')
   return {
     leaseId, environmentId, connection: validateConnection(record.connection, leaseId), cwd: cwd.uri,
-    workspaceRoots: roots.map(root => root.uri), baseSnapshotId, toolPolicy: validateToolPolicy(record.toolPolicy),
+    workspaceRoots: roots.map(root => root.uri), baseSnapshotId,
+    connectionGeneration: boundedNonnegativeInteger(
+      record.connectionGeneration, Number.MAX_SAFE_INTEGER, responseFailure, 'connection generation'),
+    toolPolicy: validateToolPolicy(record.toolPolicy),
   }
 }

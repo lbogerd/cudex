@@ -2139,6 +2139,30 @@ into a new sandbox, overlay the archive, remove inherited process/gateway
 identity, restart exec, and issue fresh credentials. Pause alone is not durable;
 workspace-only restore loses runtime state; old credential reuse enables replay.
 
+Code-mode runtime memory is deliberately not durable. The control service owns
+the monotonically increasing `connectionGeneration`; Codex persists it beside
+the lease and environment IDs and includes it in the runtime identity and
+deterministic process ID. A replacement environment starts a fresh host and loses
+all JavaScript cells and `store()` values while conversation history survives.
+If reconnect cannot prove that the exact lease, environment, generation, and
+original exec-server process still match, it releases the lease rather than
+starting a second process or adopting an unknown singleton.
+
+### Hosted code-mode ownership and shutdown
+
+Runtime placement is explicit at session construction: local sessions receive a
+local provider, while production hosted sessions receive only the provider made
+during their own provisioning transaction. Child provisioning therefore cannot
+inherit the parent's provider. Hosted startup is eager and thread readiness is
+withheld until the remote process handshake succeeds.
+
+The thread manager retains the verified provider with the hosted runtime. Release
+first closes logical sessions, interrupts active work, requests protocol shutdown,
+and waits for exec-server process-group quiescence; a timeout escalates to remote
+termination and the exact lease's forced cleanup boundary. Provisioning rollback
+uses the same path before unregistering the environment. Hosted paths never fall
+back to the shared local or in-process V8 providers.
+
 ### Child creation
 
 Snapshot the owner atomically, restore into a temporary capture sandbox, export

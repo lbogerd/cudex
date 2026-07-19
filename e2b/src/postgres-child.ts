@@ -48,6 +48,7 @@ interface LogicalChildResponse {
   cwd: string
   workspaceRoots: string[]
   baseSnapshotId: string
+  connectionGeneration: number
   toolPolicy: ToolPolicy
 }
 
@@ -106,6 +107,7 @@ export function logicalChildFromLease(lease: Lease): LogicalChildResponse {
     cwd: lease.cwdUri,
     workspaceRoots: [...lease.workspaceRootUris],
     baseSnapshotId: lease.baseSnapshotId,
+    connectionGeneration: lease.connectionGeneration,
     toolPolicy: policy(lease.toolPolicy),
   }
 }
@@ -402,6 +404,7 @@ export class PostgresChildCoordinator {
     }
     return validateProvisionedAgent({
       ...logical,
+      connectionGeneration: lease.connectionGeneration,
       connection: {
         execServerUrl: await this.tickets.issue(
           logical.leaseId, gatewayConnectTicketPurpose, lease.connectionGeneration),

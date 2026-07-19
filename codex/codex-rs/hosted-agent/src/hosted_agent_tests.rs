@@ -37,6 +37,33 @@ fn child_request(key: &str, owner_lease_id: &str) -> AgentProvisionRequest {
 }
 
 #[test]
+fn provisioned_agent_requires_connection_generation_on_the_wire() {
+    let response = json!({
+        "leaseId": "lease-1",
+        "environmentId": "environment-1",
+        "connectionGeneration": 42,
+        "connection": { "execServerUrl": "wss://executor.invalid/session" },
+        "cwd": "file:///workspace",
+        "workspaceRoots": ["file:///workspace"],
+        "baseSnapshotId": "snapshot-1",
+        "toolPolicy": { "allowedDomains": [], "allowedTools": [] }
+    });
+
+    let provisioned: ProvisionedAgent =
+        serde_json::from_value(response.clone()).expect("generation-bearing response");
+    assert_eq!(provisioned.connection_generation, 42);
+
+    let mut missing = response;
+    missing
+        .as_object_mut()
+        .expect("response object")
+        .remove("connectionGeneration");
+    let error = serde_json::from_value::<ProvisionedAgent>(missing)
+        .expect_err("missing generation must fail closed");
+    assert!(error.to_string().contains("connectionGeneration"));
+}
+
+#[test]
 fn immutable_source_snapshot_has_an_exact_path_free_wire_shape() {
     let source = ProjectSnapshotSource::SourceSnapshot {
         source_snapshot_id: "source_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
@@ -70,6 +97,7 @@ fn durable_runtime_record_round_trips_without_transient_data() {
         sandbox_template: "review-v2".to_string(),
         lease_id: "lease-1".to_string(),
         environment_id: "environment-1".to_string(),
+        connection_generation: 0,
         base_snapshot_id: "snapshot-base".to_string(),
         latest_snapshot_id: Some("snapshot-latest".to_string()),
         last_exported_patch: Some(AgentPatchArtifact {
@@ -93,6 +121,7 @@ fn durable_runtime_record_round_trips_without_transient_data() {
             "sandboxTemplate": "review-v2",
             "leaseId": "lease-1",
             "environmentId": "environment-1",
+            "connectionGeneration": 0,
             "baseSnapshotId": "snapshot-base",
             "latestSnapshotId": "snapshot-latest",
             "lastExportedPatch": {
@@ -720,6 +749,7 @@ async fn http_client_rejects_duplicate_lease_or_environment_ids() {
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "leaseId": "lease-1",
                 "environmentId": environment_id,
+                "connectionGeneration": 17,
                 "connection": { "execServerUrl": "wss://executor.invalid/session" },
                 "cwd": "file:///workspace",
                 "workspaceRoots": ["file:///workspace"],
@@ -730,10 +760,11 @@ async fn http_client_rejects_duplicate_lease_or_environment_ids() {
             .await;
     }
     let client = HttpHostedAgentService::for_test(&server.uri(), "secret").unwrap();
-    client
+    let provisioned = client
         .provision(root_request("one"))
         .await
         .expect("first response is valid");
+    assert_eq!(provisioned.connection_generation, 17);
     let error = client
         .provision(root_request("two"))
         .await

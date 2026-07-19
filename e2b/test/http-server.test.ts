@@ -56,6 +56,7 @@ test('HTTP responses disable caching and redact unexpected service errors', asyn
     async reconnect() {
       return {
         leaseId: 'lease', environmentId: 'environment', baseSnapshotId: 'snapshot',
+        connectionGeneration: 1,
         connection: { execServerUrl: 'wss://gateway.example/leases/lease?ticket=opaque_ticket' },
         cwd: 'file:///workspace/root', workspaceRoots: ['file:///workspace/root'],
         toolPolicy: { allowedDomains: [], allowedTools: [] },

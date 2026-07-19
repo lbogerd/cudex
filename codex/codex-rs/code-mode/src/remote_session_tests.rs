@@ -403,8 +403,13 @@ async fn hosted_provider_uses_exact_minimal_exec_params_and_one_process() {
     .expect("start hosted provider");
 
     assert_eq!(backend.starts.load(Ordering::SeqCst), 1);
-    let params = backend.params.lock().expect("params lock");
-    let params = params.first().expect("start params");
+    let params = backend
+        .params
+        .lock()
+        .expect("params lock")
+        .first()
+        .expect("start params")
+        .clone();
     assert_eq!(
         params.argv,
         vec![
@@ -509,4 +514,66 @@ async fn stderr_cannot_complete_the_hosted_handshake() {
     assert!(error.contains("timed out negotiating"));
     assert_eq!(backend.process.terminate_count.load(Ordering::SeqCst), 1);
     assert!(backend.process.quiesced.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn hosted_provider_shutdown_closes_session_and_requires_remote_quiescence() {
+    let backend = Arc::new(FakeExecBackend::new(FakeHostBehavior::Healthy));
+    let provider = HostedEnvironmentCodeModeSessionProvider::start(
+        hosted_identity(),
+        backend.clone(),
+        "file:///workspace".parse().expect("cwd URI"),
+    )
+    .await
+    .expect("start provider");
+    let session = provider
+        .create_session(Arc::new(NoopCodeModeSessionDelegate))
+        .await
+        .expect("create session");
+
+    assert!(provider.is_healthy());
+    assert!(!provider.is_quiesced());
+    provider.shutdown().await.expect("shutdown hosted provider");
+
+    assert!(!provider.is_healthy());
+    assert!(provider.is_quiesced());
+    assert_eq!(backend.process.signal_count.load(Ordering::SeqCst), 1);
+    assert_eq!(backend.process.terminate_count.load(Ordering::SeqCst), 1);
+    let error = session
+        .execute(ExecuteRequest {
+            tool_call_id: "after-shutdown".to_string(),
+            enabled_tools: Vec::new(),
+            source: "text('unreachable')".to_string(),
+            yield_time_ms: None,
+            max_output_tokens: None,
+        })
+        .await
+        .err()
+        .expect("closed session rejects new cells");
+    assert_eq!(error, "code mode session is shutting down");
+
+    provider.shutdown().await.expect("idempotent shutdown");
+    assert_eq!(backend.process.signal_count.load(Ordering::SeqCst), 1);
+    assert_eq!(backend.process.terminate_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn hosted_provider_shutdown_before_session_prevents_session_creation() {
+    let backend = Arc::new(FakeExecBackend::new(FakeHostBehavior::Healthy));
+    let provider = HostedEnvironmentCodeModeSessionProvider::start(
+        hosted_identity(),
+        backend.clone(),
+        "file:///workspace".parse().expect("cwd URI"),
+    )
+    .await
+    .expect("start provider");
+
+    provider.shutdown().await.expect("shutdown hosted provider");
+    let error = provider
+        .create_session(Arc::new(NoopCodeModeSessionDelegate))
+        .await
+        .err()
+        .expect("stopping provider rejects a session");
+    assert_eq!(error, "hosted code-mode provider is shutting down");
+    assert!(provider.is_quiesced());
 }

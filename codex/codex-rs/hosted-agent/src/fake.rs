@@ -379,6 +379,7 @@ impl HostedAgentService for FakeHostedAgentService {
         let provisioned = ProvisionedAgent {
             lease_id: lease_id.clone(),
             environment_id: environment_id.clone(),
+            connection_generation: 0,
             connection: HostedEnvironmentConnection::try_new(format!(
                 "wss://fake.invalid/{environment_id}?token=secret"
             ))?,

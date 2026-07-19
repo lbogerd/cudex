@@ -46,6 +46,7 @@ interface LogicalProvisionResponse {
   cwd: string
   workspaceRoots: string[]
   baseSnapshotId: string
+  connectionGeneration: number
   toolPolicy: ToolPolicy
 }
 
@@ -76,6 +77,7 @@ function logicalFromLease(lease: Lease): LogicalProvisionResponse {
     cwd: lease.cwdUri,
     workspaceRoots: [...lease.workspaceRootUris],
     baseSnapshotId: lease.baseSnapshotId,
+    connectionGeneration: lease.connectionGeneration,
     toolPolicy: policy(lease.toolPolicy),
   }
 }

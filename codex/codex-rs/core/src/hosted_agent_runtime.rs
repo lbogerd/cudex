@@ -47,6 +47,7 @@ pub(crate) struct HostedAgentRuntime {
     pub(crate) owner_agent_id: Option<codex_protocol::ThreadId>,
     pub(crate) lease_id: String,
     pub(crate) environment_id: String,
+    pub(crate) connection_generation: u64,
     pub(crate) agent_type: String,
     pub(crate) sandbox_template: String,
     pub(crate) base_snapshot_id: String,
@@ -121,6 +122,7 @@ impl HostedAgentRuntime {
             sandbox_template: self.sandbox_template.clone(),
             lease_id: self.lease_id.clone(),
             environment_id: self.environment_id.clone(),
+            connection_generation: self.connection_generation,
             base_snapshot_id: self.base_snapshot_id.clone(),
             latest_snapshot_id: self.latest_snapshot_id.clone(),
             last_exported_patch: self.last_exported_patch.clone(),
@@ -230,6 +232,13 @@ where
 pub(crate) struct HostedAgentProvisioner {
     service: Arc<dyn ErasedHostedAgentService>,
     environment_manager: Arc<EnvironmentManager>,
+    code_mode_startup: HostedCodeModeStartup,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum HostedCodeModeStartup {
+    Required,
+    DisabledForTests,
 }
 
 impl HostedAgentProvisioner {
@@ -266,6 +275,22 @@ impl HostedAgentProvisioner {
         Self {
             service,
             environment_manager,
+            code_mode_startup: HostedCodeModeStartup::Required,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_without_code_mode_for_tests<Service>(
+        service: Arc<Service>,
+        environment_manager: Arc<EnvironmentManager>,
+    ) -> Self
+    where
+        Service: HostedAgentService + 'static,
+    {
+        Self {
+            service,
+            environment_manager,
+            code_mode_startup: HostedCodeModeStartup::DisabledForTests,
         }
     }
 
@@ -288,10 +313,12 @@ impl HostedAgentProvisioner {
             provision_result.is_ok(),
         );
         let provisioned = provision_result.map_err(HostedAgentRuntimeError::Provision)?;
+        let connection_generation = provisioned.connection_generation;
         let runtime = HostedAgentRuntime {
             owner_agent_id,
             lease_id: provisioned.lease_id,
             environment_id: provisioned.environment_id,
+            connection_generation,
             agent_type,
             sandbox_template,
             base_snapshot_id: provisioned.base_snapshot_id.clone(),
@@ -332,25 +359,31 @@ impl HostedAgentProvisioner {
             });
         }
 
-        let code_mode_provider = if cfg!(test) {
-            None
-        } else {
-            let code_mode_start: Pin<Box<dyn Future<Output = _> + Send + '_>> =
-                Box::pin(self.start_code_mode_provider(agent_id, &runtime, &environment_selection));
-            match code_mode_start.await {
-                Ok(provider) => Some(provider),
-                Err(error) => {
-                    let _ = cleanup_runtime(
+        let code_mode_provider =
+            if self.code_mode_startup == HostedCodeModeStartup::DisabledForTests {
+                None
+            } else {
+                let code_mode_start: Pin<Box<dyn Future<Output = _> + Send + '_>> =
+                    Box::pin(self.start_code_mode_provider(
                         agent_id,
-                        runtime,
-                        self.environment_manager.as_ref(),
-                        self.service.as_ref(),
-                    )
-                    .await;
-                    return Err(error);
+                        &runtime,
+                        &environment_selection,
+                        connection_generation,
+                    ));
+                match code_mode_start.await {
+                    Ok(provider) => Some(provider),
+                    Err(error) => {
+                        let _ = cleanup_runtime(
+                            agent_id,
+                            runtime,
+                            self.environment_manager.as_ref(),
+                            self.service.as_ref(),
+                        )
+                        .await;
+                        return Err(error);
+                    }
                 }
-            }
-        };
+            };
         Ok(PendingHostedAgentRuntime {
             agent_id,
             runtime,
@@ -425,10 +458,34 @@ impl HostedAgentProvisioner {
             }
             Err(error) => return Err(HostedAgentRuntimeError::Reconnect(error)),
         };
+        if rollback == PendingRuntimeRollback::KeepLease {
+            let same_environment = provisioned.environment_id == record.environment_id;
+            let same_generation = provisioned.connection_generation == record.connection_generation;
+            if same_environment || provisioned.connection_generation < record.connection_generation
+            {
+                let _ = self
+                    .service
+                    .release(AgentReleaseRequest {
+                        lease_id: provisioned.lease_id.clone(),
+                        idempotency_key: release_idempotency_key(agent_id, &provisioned.lease_id),
+                    })
+                    .await;
+                let reason = if same_environment && same_generation {
+                    "the original hosted code-mode process cannot be proven recoverable"
+                } else {
+                    "a replacement hosted code-mode generation did not receive a new environment"
+                };
+                return Err(HostedAgentRuntimeError::CodeModeRecovery(
+                    reason.to_string(),
+                ));
+            }
+        }
+        let connection_generation = provisioned.connection_generation;
         let runtime = HostedAgentRuntime {
             owner_agent_id,
             lease_id: provisioned.lease_id,
             environment_id: provisioned.environment_id,
+            connection_generation,
             agent_type: record.agent_type,
             sandbox_template: record.sandbox_template,
             base_snapshot_id: record.base_snapshot_id,
@@ -462,25 +519,31 @@ impl HostedAgentProvisioner {
                 source,
             });
         }
-        let code_mode_provider = if cfg!(test) {
-            None
-        } else {
-            let code_mode_start: Pin<Box<dyn Future<Output = _> + Send + '_>> =
-                Box::pin(self.start_code_mode_provider(agent_id, &runtime, &environment_selection));
-            match code_mode_start.await {
-                Ok(provider) => Some(provider),
-                Err(error) => {
-                    let _ = cleanup_runtime(
+        let code_mode_provider =
+            if self.code_mode_startup == HostedCodeModeStartup::DisabledForTests {
+                None
+            } else {
+                let code_mode_start: Pin<Box<dyn Future<Output = _> + Send + '_>> =
+                    Box::pin(self.start_code_mode_provider(
                         agent_id,
-                        runtime,
-                        self.environment_manager.as_ref(),
-                        self.service.as_ref(),
-                    )
-                    .await;
-                    return Err(error);
+                        &runtime,
+                        &environment_selection,
+                        connection_generation,
+                    ));
+                match code_mode_start.await {
+                    Ok(provider) => Some(provider),
+                    Err(error) => {
+                        let _ = cleanup_runtime(
+                            agent_id,
+                            runtime,
+                            self.environment_manager.as_ref(),
+                            self.service.as_ref(),
+                        )
+                        .await;
+                        return Err(error);
+                    }
                 }
-            }
-        };
+            };
         Ok(PendingHostedAgentRuntime {
             agent_id,
             runtime,
@@ -497,6 +560,7 @@ impl HostedAgentProvisioner {
         agent_id: codex_protocol::ThreadId,
         runtime: &HostedAgentRuntime,
         environment_selection: &TurnEnvironmentSelection,
+        connection_generation: u64,
     ) -> Result<Arc<HostedEnvironmentCodeModeSessionProvider>, HostedAgentRuntimeError> {
         let environment = self
             .environment_manager
@@ -522,7 +586,7 @@ impl HostedAgentProvisioner {
                 thread_id: agent_id,
                 lease_id: runtime.lease_id.clone(),
                 environment_id: runtime.environment_id.clone(),
-                connection_generation: 1,
+                connection_generation,
             },
             environment.get_exec_backend(),
             environment_selection.cwd.clone(),
@@ -564,6 +628,7 @@ impl HostedAgentProvisioner {
                 owner_agent_id: record.owner_agent_id,
                 lease_id: record.lease_id,
                 environment_id: record.environment_id,
+                connection_generation: record.connection_generation,
                 agent_type: record.agent_type,
                 sandbox_template: record.sandbox_template,
                 base_snapshot_id: record.base_snapshot_id,
@@ -721,8 +786,18 @@ impl PendingHostedAgentRuntime {
         self.code_mode_provider.clone()
     }
 
+    #[cfg(test)]
     pub(crate) fn commit(self) -> HostedAgentRuntime {
         self.runtime
+    }
+
+    pub(crate) fn commit_with_provider(
+        self,
+    ) -> (
+        HostedAgentRuntime,
+        Option<Arc<HostedEnvironmentCodeModeSessionProvider>>,
+    ) {
+        (self.runtime, self.code_mode_provider)
     }
 
     pub(crate) fn durable_record(&self) -> HostedAgentRuntimeRecord {
@@ -736,7 +811,11 @@ impl PendingHostedAgentRuntime {
     }
 
     pub(crate) async fn rollback(self) -> Result<(), HostedAgentRuntimeError> {
-        match self.rollback {
+        let shutdown_result = match &self.code_mode_provider {
+            Some(provider) => provider.shutdown().await,
+            None => Ok(()),
+        };
+        let cleanup_result = match self.rollback {
             PendingRuntimeRollback::KeepLease => self
                 .environment_manager
                 .remove_environment(&self.runtime.environment_id)
@@ -754,7 +833,9 @@ impl PendingHostedAgentRuntime {
             )
             .await
             .map(|_| ()),
-        }
+        };
+        cleanup_result?;
+        shutdown_result.map_err(HostedAgentRuntimeError::CodeMode)
     }
 }
 
@@ -774,6 +855,8 @@ pub(crate) enum HostedAgentRuntimeError {
     },
     #[error("failed to start hosted code-mode runtime: {0}")]
     CodeMode(String),
+    #[error("failed to recover hosted code-mode runtime: {0}")]
+    CodeModeRecovery(String),
     #[error("failed to checkpoint hosted-agent lease: {0}")]
     Checkpoint(HostedAgentError),
     #[error("failed to export hosted-agent patch: {0}")]

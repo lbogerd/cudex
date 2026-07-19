@@ -202,7 +202,8 @@ export class ControlPlane {
 
   private async response(lease: LeaseRecord): Promise<ProvisionedAgent> {
     return { leaseId: lease.leaseId, environmentId: lease.environmentId, connection: { execServerUrl: await this.tickets.issue(lease.leaseId) }, cwd: lease.cwd,
-      workspaceRoots: lease.workspaceRoots, baseSnapshotId: lease.baseSnapshotId, toolPolicy: lease.toolPolicy }
+      workspaceRoots: lease.workspaceRoots, baseSnapshotId: lease.baseSnapshotId,
+      connectionGeneration: lease.connectionGeneration ?? 0, toolPolicy: lease.toolPolicy }
   }
   private async activeLease(leaseId: string): Promise<LeaseRecord> {
     const lease = await this.store.read(database => database.leases[leaseId])

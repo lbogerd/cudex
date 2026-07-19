@@ -46,6 +46,7 @@ export function logicalReconnectFromLease(lease: Lease): LogicalReconnectRespons
     cwd: lease.cwdUri,
     workspaceRoots: [...lease.workspaceRootUris],
     baseSnapshotId: lease.baseSnapshotId,
+    connectionGeneration: lease.connectionGeneration,
     toolPolicy: structuredClone(lease.toolPolicy),
   })
   const { connection: _connection, ...logical } = validated
@@ -204,7 +205,8 @@ export class PostgresReconnectCoordinator {
     expectedConnectionGeneration: number): Promise<ProvisionedAgent> {
     try {
       return validateProvisionedAgent({
-        ...logical, connection: { execServerUrl: await this.tickets.issue(
+        ...logical, connectionGeneration: expectedConnectionGeneration,
+        connection: { execServerUrl: await this.tickets.issue(
           logical.leaseId, undefined, expectedConnectionGeneration) },
       })
     } catch { throw new ServiceError(503, 'gateway ticket service unavailable') }

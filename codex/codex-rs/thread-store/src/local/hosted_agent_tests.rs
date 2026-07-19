@@ -18,6 +18,7 @@ fn runtime_record() -> HostedAgentRuntimeRecord {
         sandbox_template: "review-v2".to_string(),
         lease_id: "lease-1".to_string(),
         environment_id: "environment-1".to_string(),
+        connection_generation: 0,
         base_snapshot_id: "snapshot-base".to_string(),
         latest_snapshot_id: Some("snapshot-latest".to_string()),
         last_exported_patch: None,

@@ -96,6 +96,9 @@ pub(super) struct Connection {
     alive: Arc<AtomicBool>,
     failure: Arc<std::sync::Mutex<Option<String>>>,
     cancellation: CancellationToken,
+    remote_process: Option<Arc<dyn ExecProcess>>,
+    remote_shutdown: Arc<tokio::sync::OnceCell<Result<(), String>>>,
+    quiesced: Arc<AtomicBool>,
 }
 
 struct CallerCancellation {
@@ -112,6 +115,8 @@ struct ConnectionSupervisor {
     driver_task: JoinHandle<()>,
     reader_task: JoinHandle<Result<(), String>>,
     writer_task: JoinHandle<Result<(), String>>,
+    remote_shutdown: Arc<tokio::sync::OnceCell<Result<(), String>>>,
+    quiesced: Arc<AtomicBool>,
 }
 
 enum ConnectionProcess {
@@ -291,6 +296,12 @@ impl Connection {
             return Err(ConnectionError::Other(err));
         }
 
+        let remote_process = match &process {
+            ConnectionProcess::Remote(process) => Some(Arc::clone(process)),
+            ConnectionProcess::Local(_) => None,
+        };
+        let remote_shutdown = Arc::new(tokio::sync::OnceCell::new());
+        let quiesced = Arc::new(AtomicBool::new(false));
         let (command_tx, command_rx) = mpsc::channel(IPC_CHANNEL_CAPACITY);
         let (event_tx, event_rx) = mpsc::channel(IPC_CHANNEL_CAPACITY);
         let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<EncodedFrame>(IPC_CHANNEL_CAPACITY);
@@ -344,6 +355,8 @@ impl Connection {
                 driver_task,
                 reader_task,
                 writer_task,
+                remote_shutdown: Arc::clone(&remote_shutdown),
+                quiesced: Arc::clone(&quiesced),
             }
             .run(),
         );
@@ -354,6 +367,9 @@ impl Connection {
             alive,
             failure,
             cancellation,
+            remote_process,
+            remote_shutdown,
+            quiesced,
         })
     }
 
@@ -366,6 +382,24 @@ impl Connection {
             );
         }
         self.alive.load(Ordering::Acquire)
+    }
+
+    pub(super) fn is_quiesced(&self) -> bool {
+        self.quiesced.load(Ordering::Acquire)
+    }
+
+    pub(super) async fn shutdown_remote(&self) -> Result<(), String> {
+        let process = self
+            .remote_process
+            .as_ref()
+            .ok_or_else(|| "code-mode connection is not remote".to_string())?;
+        mark_connection_dead(
+            &self.alive,
+            &self.failure,
+            "hosted code-mode runtime is shutting down".to_string(),
+        );
+        self.cancellation.cancel();
+        terminate_remote_process(process, &self.remote_shutdown, &self.quiesced).await
     }
 
     pub(super) async fn open_session(
@@ -520,7 +554,14 @@ impl ConnectionSupervisor {
         let _ = self.event_tx.try_send(DriverEvent::Failed(reason));
         self.cancellation.cancel();
         if !process_exited {
-            terminate_process(&self.process).await;
+            match &self.process {
+                ConnectionProcess::Local(_) => terminate_process(&self.process).await,
+                ConnectionProcess::Remote(process) => {
+                    let _ =
+                        terminate_remote_process(process, &self.remote_shutdown, &self.quiesced)
+                            .await;
+                }
+            }
         }
     }
 }
@@ -605,4 +646,49 @@ async fn terminate_process(process: &ConnectionProcess) {
             .await;
         }
     }
+}
+
+async fn terminate_remote_process(
+    process: &Arc<dyn ExecProcess>,
+    shutdown: &tokio::sync::OnceCell<Result<(), String>>,
+    quiesced: &AtomicBool,
+) -> Result<(), String> {
+    shutdown
+        .get_or_init(|| async {
+            if quiesced.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            process
+                .signal(ProcessSignal::Interrupt)
+                .await
+                .map_err(|error| {
+                    format!("failed to interrupt hosted code-mode process: {error}")
+                })?;
+            process.terminate().await.map_err(|error| {
+                format!("failed to terminate hosted code-mode process: {error}")
+            })?;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let status = process
+                        .read(None, Some(1), Some(100))
+                        .await
+                        .map_err(|error| {
+                            format!(
+                                "failed waiting for hosted code-mode process quiescence: {error}"
+                            )
+                        })?;
+                    if status.quiesced {
+                        return Ok::<(), String>(());
+                    }
+                }
+            })
+            .await
+            .map_err(|_| {
+                "timed out waiting for hosted code-mode process quiescence".to_string()
+            })??;
+            quiesced.store(true, Ordering::Release);
+            Ok(())
+        })
+        .await
+        .clone()
 }

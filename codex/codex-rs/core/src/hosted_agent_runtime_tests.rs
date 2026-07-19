@@ -14,6 +14,7 @@ use codex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
 
 use super::HostedAgentProvisioner;
+use super::HostedAgentRuntimeError;
 
 fn request(agent_id: ThreadId) -> AgentProvisionRequest {
     AgentProvisionRequest {
@@ -35,8 +36,10 @@ fn request(agent_id: ThreadId) -> AgentProvisionRequest {
 async fn provision_registers_exactly_one_pending_environment() {
     let service = Arc::new(FakeHostedAgentService::default());
     let environment_manager = Arc::new(EnvironmentManager::without_environments());
-    let provisioner =
-        HostedAgentProvisioner::new(Arc::clone(&service), Arc::clone(&environment_manager));
+    let provisioner = HostedAgentProvisioner::new_without_code_mode_for_tests(
+        Arc::clone(&service),
+        Arc::clone(&environment_manager),
+    );
     let agent_id = ThreadId::new();
 
     let pending = provisioner
@@ -72,8 +75,10 @@ async fn provision_registers_exactly_one_pending_environment() {
 async fn rollback_unregisters_environment_and_releases_lease() {
     let service = Arc::new(FakeHostedAgentService::default());
     let environment_manager = Arc::new(EnvironmentManager::without_environments());
-    let provisioner =
-        HostedAgentProvisioner::new(Arc::clone(&service), Arc::clone(&environment_manager));
+    let provisioner = HostedAgentProvisioner::new_without_code_mode_for_tests(
+        Arc::clone(&service),
+        Arc::clone(&environment_manager),
+    );
     let agent_id = ThreadId::new();
     let pending = provisioner
         .provision(request(agent_id))
@@ -118,8 +123,10 @@ async fn registration_collision_releases_new_lease_without_replacing_environment
         .expect("existing environment");
     let service = Arc::new(FakeHostedAgentService::default());
     service.set_next_environment_id("collision");
-    let provisioner =
-        HostedAgentProvisioner::new(Arc::clone(&service), Arc::clone(&environment_manager));
+    let provisioner = HostedAgentProvisioner::new_without_code_mode_for_tests(
+        Arc::clone(&service),
+        Arc::clone(&environment_manager),
+    );
     let agent_id = ThreadId::new();
     let request = request(agent_id);
     let provision_key = request.idempotency_key.clone();
@@ -151,11 +158,13 @@ async fn registration_collision_releases_new_lease_without_replacing_environment
 }
 
 #[tokio::test]
-async fn reconnect_rollback_unregisters_without_releasing_existing_lease() {
+async fn uncertain_same_environment_reconnect_releases_the_lease() {
     let service = Arc::new(FakeHostedAgentService::default());
     let environment_manager = Arc::new(EnvironmentManager::without_environments());
-    let provisioner =
-        HostedAgentProvisioner::new(Arc::clone(&service), Arc::clone(&environment_manager));
+    let provisioner = HostedAgentProvisioner::new_without_code_mode_for_tests(
+        Arc::clone(&service),
+        Arc::clone(&environment_manager),
+    );
     let agent_id = ThreadId::new();
     let runtime = provisioner
         .provision(request(agent_id))
@@ -169,13 +178,14 @@ async fn reconnect_rollback_unregisters_without_releasing_existing_lease() {
         .await
         .expect("detach stale environment");
 
-    let pending = provisioner
-        .reconnect_or_restore(agent_id, record)
-        .await
-        .expect("reconnect active lease");
-    assert_eq!(pending.runtime.lease_id, runtime.lease_id);
-    assert_eq!(pending.runtime.latest_snapshot_id, None);
-    pending.rollback().await.expect("roll back reconnect");
+    let error = match provisioner.reconnect_or_restore(agent_id, record).await {
+        Ok(_) => panic!("an unprovable original process must fail closed"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        HostedAgentRuntimeError::CodeModeRecovery(_)
+    ));
 
     service
         .reconnect(AgentReconnectRequest {
@@ -183,15 +193,17 @@ async fn reconnect_rollback_unregisters_without_releasing_existing_lease() {
             idempotency_key: format!("hosted-agent:{agent_id}:verify-active-lease"),
         })
         .await
-        .expect("reconnect rollback must preserve existing lease");
+        .expect_err("uncertain reconnect must release the existing lease");
 }
 
 #[tokio::test]
 async fn missing_lease_restores_original_record_and_rollback_releases_new_lease() {
     let service = Arc::new(FakeHostedAgentService::default());
     let environment_manager = Arc::new(EnvironmentManager::without_environments());
-    let provisioner =
-        HostedAgentProvisioner::new(Arc::clone(&service), Arc::clone(&environment_manager));
+    let provisioner = HostedAgentProvisioner::new_without_code_mode_for_tests(
+        Arc::clone(&service),
+        Arc::clone(&environment_manager),
+    );
     let agent_id = ThreadId::new();
     let owner_agent_id = ThreadId::new();
     let runtime = provisioner
@@ -259,7 +271,7 @@ async fn missing_lease_restores_original_record_and_rollback_releases_new_lease(
 #[tokio::test]
 async fn reconnect_or_restore_requires_a_durable_snapshot() {
     let service = Arc::new(FakeHostedAgentService::default());
-    let provisioner = HostedAgentProvisioner::new(
+    let provisioner = HostedAgentProvisioner::new_without_code_mode_for_tests(
         Arc::clone(&service),
         Arc::new(EnvironmentManager::without_environments()),
     );
@@ -273,6 +285,7 @@ async fn reconnect_or_restore_requires_a_durable_snapshot() {
                 sandbox_template: "general-v1".to_string(),
                 lease_id: "missing".to_string(),
                 environment_id: "stale".to_string(),
+                connection_generation: 0,
                 base_snapshot_id: "base".to_string(),
                 latest_snapshot_id: None,
                 last_exported_patch: None,

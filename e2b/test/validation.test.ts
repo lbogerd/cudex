@@ -47,6 +47,7 @@ const provisioned = () => ({
   cwd: 'file:///workspace/roots/0/project/src',
   workspaceRoots: ['file:///workspace/roots/0/project', 'file:///workspace/roots/1/other'],
   baseSnapshotId: 'snapshot_a',
+  connectionGeneration: 0,
   toolPolicy: {
     allowedDomains: ['agentEnvironment', 'controlPlane'],
     allowedTools: [{ name: 'exec_command', namespace: null }, { name: 'tool', namespace: 'provider' }],
@@ -223,6 +224,11 @@ test('provisioned-agent response failures are 503 and reject extra fields or inv
   rejectsStatus(503, () => validateProvisionedAgent({ ...provisioned(), workspaceRoots: [] }))
   rejectsStatus(503, () => validateProvisionedAgent({ ...provisioned(), workspaceRoots: ['file:///workspace/root', 'file:///workspace/root'] }))
   rejectsStatus(503, () => validateProvisionedAgent({ ...provisioned(), connection: { ...provisioned().connection, extra: true } }))
+  for (const connectionGeneration of [-1, 0.5, Number.MAX_SAFE_INTEGER + 1, Number.POSITIVE_INFINITY, '0', null]) {
+    rejectsStatus(503, () => validateProvisionedAgent({ ...provisioned(), connectionGeneration }))
+  }
+  const missing = provisioned() as Record<string, unknown>; delete missing.connectionGeneration
+  rejectsStatus(503, () => validateProvisionedAgent(missing))
 })
 
 test('exec connection must be canonical WSS with one opaque ticket for the returned lease', () => {

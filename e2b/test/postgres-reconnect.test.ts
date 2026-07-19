@@ -229,6 +229,13 @@ function withoutConnection<T extends { connection: unknown }>(value: T): Omit<T,
   return logical
 }
 
+function withoutAccess<T extends { connection: unknown; connectionGeneration: number }>(
+  value: T,
+): Omit<T, 'connection' | 'connectionGeneration'> {
+  const { connection: _connection, connectionGeneration: _connectionGeneration, ...logical } = value
+  return logical
+}
+
 test('durable reconnect serializes duplicate keys across replicas and returns fresh tickets', {
   skip: databaseUrl ? false : 'HOSTED_AGENT_TEST_DATABASE_URL is not set',
 }, async () => {
@@ -244,7 +251,8 @@ test('durable reconnect serializes duplicate keys across replicas and returns fr
     gate.release()
     const [left, right] = await Promise.all([first, duplicate])
 
-    assert.deepEqual(withoutConnection(left), withoutConnection(right))
+    assert.deepEqual(withoutAccess(left), withoutAccess(right))
+    assert.deepEqual([left.connectionGeneration, right.connectionGeneration].sort(), [1, 2])
     assert.notEqual(left.connection.execServerUrl, right.connection.execServerUrl)
     assert.deepEqual({ connects: context.provider.connectAttempts, starts: context.provider.starts,
       probes: context.provider.probes }, { connects: 1, starts: 1, probes: 1 })
@@ -299,6 +307,7 @@ test('distinct reconnect keys serialize on the lease and each rotate its generat
 
     assert.equal(left.leaseId, context.leaseId)
     assert.equal(right.leaseId, context.leaseId)
+    assert.deepEqual([left.connectionGeneration, right.connectionGeneration].sort(), [1, 2])
     assert.deepEqual({ connects: context.provider.connectAttempts, starts: context.provider.starts,
       probes: context.provider.probes }, { connects: 2, starts: 2, probes: 2 })
     assert.equal((await context.states[0].getLease(tenantId, context.leaseId))?.connectionGeneration, 2)
@@ -353,6 +362,7 @@ test('transient reconnect failure preserves lease access for stale reconciliatio
       cwd: 'file:///workspace/project',
       workspaceRoots: ['file:///workspace/project'],
       baseSnapshotId: 'snapshot-base',
+      connectionGeneration: 2,
       toolPolicy: { allowedDomains: ['agentEnvironment'], allowedTools: [] },
     })
     assert.equal((await context.states[0].getLease(tenantId, context.leaseId))?.connectionGeneration, 2)

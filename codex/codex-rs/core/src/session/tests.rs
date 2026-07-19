@@ -5168,7 +5168,9 @@ async fn session_new_fails_when_zsh_fork_enabled_without_packaged_zsh() {
         skills_service,
         plugins_manager,
         mcp_manager,
-        Arc::new(codex_code_mode::InProcessCodeModeSessionProvider),
+        codex_code_mode::CodeModeRuntimePlacement::Local(Arc::new(
+            codex_code_mode::InProcessCodeModeSessionProvider,
+        )),
         Arc::new(codex_extension_api::ExtensionRegistryBuilder::new().build()),
         codex_extension_api::ExtensionDataInit::default(),
         /*supports_openai_form_elicitation*/ false,
@@ -5556,7 +5558,9 @@ async fn make_session_with_config_and_rx(
         skills_service,
         plugins_manager,
         mcp_manager,
-        Arc::new(codex_code_mode::InProcessCodeModeSessionProvider),
+        codex_code_mode::CodeModeRuntimePlacement::Local(Arc::new(
+            codex_code_mode::InProcessCodeModeSessionProvider,
+        )),
         Arc::new(codex_extension_api::ExtensionRegistryBuilder::new().build()),
         codex_extension_api::ExtensionDataInit::default(),
         /*supports_openai_form_elicitation*/ false,
@@ -5671,7 +5675,9 @@ async fn make_session_with_history_source_and_agent_control_and_rx(
         skills_service,
         plugins_manager,
         mcp_manager,
-        Arc::new(codex_code_mode::InProcessCodeModeSessionProvider),
+        codex_code_mode::CodeModeRuntimePlacement::Local(Arc::new(
+            codex_code_mode::InProcessCodeModeSessionProvider,
+        )),
         Arc::new(codex_extension_api::ExtensionRegistryBuilder::new().build()),
         codex_extension_api::ExtensionDataInit::default(),
         /*supports_openai_form_elicitation*/ false,

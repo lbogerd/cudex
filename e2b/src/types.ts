@@ -48,7 +48,7 @@ export interface ToolPolicy {
 }
 export interface ProvisionedAgent {
   leaseId: string; environmentId: string; connection: { execServerUrl: string }; cwd: string
-  workspaceRoots: string[]; baseSnapshotId: string; toolPolicy: ToolPolicy
+  workspaceRoots: string[]; baseSnapshotId: string; connectionGeneration: number; toolPolicy: ToolPolicy
 }
 export interface LeaseRecord {
   leaseId: string; environmentId: string; sandboxId: string; agentId: string

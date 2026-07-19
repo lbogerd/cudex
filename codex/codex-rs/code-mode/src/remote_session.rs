@@ -63,6 +63,9 @@ pub struct HostedEnvironmentCodeModeSessionProvider {
     process_identity: String,
     process_host: Arc<OwnedProcessHost>,
     session_created: AtomicBool,
+    stopping: AtomicBool,
+    session: StdMutex<Option<Arc<ProcessOwnedCodeModeSession>>>,
+    shutdown_result: tokio::sync::OnceCell<Result<(), String>>,
 }
 
 impl HostedEnvironmentCodeModeSessionProvider {
@@ -129,6 +132,9 @@ impl HostedEnvironmentCodeModeSessionProvider {
             process_identity: process_identity.clone(),
             process_host: Arc::new(OwnedProcessHost::with_connection(Arc::new(connection))),
             session_created: AtomicBool::new(false),
+            stopping: AtomicBool::new(false),
+            session: StdMutex::new(None),
+            shutdown_result: tokio::sync::OnceCell::new(),
         })
         .inspect(|provider| {
             tracing::info!(
@@ -145,6 +151,76 @@ impl HostedEnvironmentCodeModeSessionProvider {
 
     pub fn identity(&self) -> &HostedCodeModeRuntimeIdentity {
         &self.identity
+    }
+
+    /// Returns whether the verified remote connection is still accepting work.
+    pub fn is_healthy(&self) -> bool {
+        !self.stopping.load(Ordering::Acquire)
+            && self
+                .process_host
+                .connection_snapshot()
+                .is_some_and(|connection| connection.is_alive())
+    }
+
+    /// Returns whether exec-server has confirmed that the remote process group is quiescent.
+    pub fn is_quiesced(&self) -> bool {
+        self.process_host
+            .connection_snapshot()
+            .is_some_and(|connection| connection.is_quiesced())
+    }
+
+    /// Gracefully closes the logical session, then contains and quiesces the remote host.
+    ///
+    /// The operation is idempotent. Once it begins, no new logical session or cell is accepted.
+    pub async fn shutdown(&self) -> Result<(), String> {
+        self.stopping.store(true, Ordering::Release);
+        self.shutdown_result
+            .get_or_init(|| async {
+                tracing::info!(
+                    event = "hosted_code_mode_shutdown_requested",
+                    thread_id = %self.identity.thread_id,
+                    lease_id = %self.identity.lease_id,
+                    environment_id = %self.identity.environment_id,
+                    connection_generation = self.identity.connection_generation,
+                    process_identity = %self.process_identity,
+                );
+                let session = self
+                    .session
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                let session_result = match session {
+                    Some(session) => session.shutdown().await,
+                    None => Ok(()),
+                };
+                let connection_result =
+                    match self.process_host.connection_snapshot() {
+                        Some(connection) => connection.shutdown_remote().await,
+                        None => Err("hosted code-mode connection is unavailable during shutdown"
+                            .to_string()),
+                    };
+                let shutdown_result = match (session_result, connection_result) {
+                    (Ok(()), Ok(())) => Ok(()),
+                    (Err(session), Ok(())) => Err(session),
+                    (Ok(()), Err(connection)) => Err(connection),
+                    (Err(session), Err(connection)) => Err(format!(
+                        "{session}; remote process shutdown failed: {connection}"
+                    )),
+                };
+                if shutdown_result.is_ok() {
+                    tracing::info!(
+                        event = "hosted_code_mode_quiesced",
+                        thread_id = %self.identity.thread_id,
+                        lease_id = %self.identity.lease_id,
+                        environment_id = %self.identity.environment_id,
+                        connection_generation = self.identity.connection_generation,
+                        process_identity = %self.process_identity,
+                    );
+                }
+                shutdown_result
+            })
+            .await
+            .clone()
     }
 }
 
@@ -167,17 +243,28 @@ impl CodeModeSessionProvider for HostedEnvironmentCodeModeSessionProvider {
         delegate: Arc<dyn CodeModeSessionDelegate>,
     ) -> CodeModeSessionProviderFuture<'a> {
         Box::pin(async move {
+            if self.stopping.load(Ordering::Acquire) {
+                return Err("hosted code-mode provider is shutting down".to_string());
+            }
             if self.session_created.swap(true, Ordering::AcqRel) {
                 return Err(
                     "hosted code-mode provider permits one logical agent session".to_string(),
                 );
             }
-            let session = ProcessOwnedCodeModeSession::with_process_host(
+            let session = Arc::new(ProcessOwnedCodeModeSession::with_process_host(
                 delegate,
                 Arc::clone(&self.process_host),
-            );
+            ));
             session.connection().await?;
-            Ok(Arc::new(session) as Arc<dyn CodeModeSession>)
+            if self.stopping.load(Ordering::Acquire) {
+                let _ = session.shutdown().await;
+                return Err("hosted code-mode provider is shutting down".to_string());
+            }
+            *self
+                .session
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&session));
+            Ok(session as Arc<dyn CodeModeSession>)
         })
     }
 }
@@ -314,6 +401,13 @@ impl OwnedProcessHost {
             .as_ref()
             .filter(|connection| connection.is_alive())
             .cloned()
+    }
+
+    fn connection_snapshot(&self) -> Option<Arc<Connection>> {
+        self.connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     fn allocate_session_id(&self) -> SessionId {

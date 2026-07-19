@@ -184,7 +184,7 @@ async fn hosted_thread_manager_with_durable_store_for_tests(
         Arc::clone(&environment_manager),
     );
     let hosted_service = Arc::new(codex_hosted_agent::FakeHostedAgentService::default());
-    let provisioner = Arc::new(HostedAgentProvisioner::new(
+    let provisioner = Arc::new(HostedAgentProvisioner::new_without_code_mode_for_tests(
         Arc::clone(&hosted_service),
         environment_manager,
     ));
@@ -280,6 +280,7 @@ async fn hosted_runtime_is_durable_and_checkpoints_only_successful_turns() {
             sandbox_template: request.sandbox_template,
             lease_id: lease_id.clone(),
             environment_id: hosted_service.provisioned_environment_ids()[0].clone(),
+            connection_generation: 0,
             base_snapshot_id: initial_record.base_snapshot_id.clone(),
             latest_snapshot_id: Some(initial_record.base_snapshot_id.clone()),
             last_exported_patch: None,
@@ -1680,7 +1681,7 @@ async fn hosted_root_and_spawned_threads_own_distinct_provisioned_environments()
         Arc::clone(&environment_manager),
     );
     let hosted_service = Arc::new(codex_hosted_agent::FakeHostedAgentService::default());
-    let provisioner = Arc::new(HostedAgentProvisioner::new(
+    let provisioner = Arc::new(HostedAgentProvisioner::new_without_code_mode_for_tests(
         Arc::clone(&hosted_service),
         Arc::clone(&environment_manager),
     ));

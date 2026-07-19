@@ -44,6 +44,7 @@ interface LogicalRestoreResponse {
   cwd: string
   workspaceRoots: string[]
   baseSnapshotId: string
+  connectionGeneration: number
   toolPolicy: ToolPolicy
 }
 
@@ -88,6 +89,7 @@ function logicalFromLease(lease: Lease): LogicalRestoreResponse {
     cwd: lease.cwdUri,
     workspaceRoots: [...lease.workspaceRootUris],
     baseSnapshotId: lease.baseSnapshotId,
+    connectionGeneration: lease.connectionGeneration,
     toolPolicy: policy(lease.toolPolicy),
   }
 }
@@ -356,6 +358,7 @@ export class PostgresRestoreCoordinator {
     connectionGeneration: number): Promise<ProvisionedAgent> {
     return validateProvisionedAgent({
       ...logical,
+      connectionGeneration,
       connection: {
         execServerUrl: await this.tickets.issue(
           logical.leaseId, gatewayConnectTicketPurpose, connectionGeneration),

@@ -16,7 +16,7 @@ its existing process-owned/in-process behavior; hosted Codex must fail closed.
 - [x] Build, checksum, publish, install, and label both `codex` and
   `codex-code-mode-host` without retaining the legacy top-level checksum.
 - [x] Add a non-protocol `--help` check and a hosted singleton launcher mode.
-- [ ] Complete singleton path hardening and collision/crash tests.
+- [x] Complete singleton path hardening and collision/crash tests.
 - [ ] Configure or document the provider CPU and memory limits used by the POC.
 
 ### Transport, provider, and identity
@@ -26,12 +26,14 @@ its existing process-owned/in-process behavior; hosted Codex must fail closed.
 - [x] Add the immutable non-secret runtime identity and deterministic process ID.
 - [x] Add eager remote process startup and protocol handshake before hosted
   thread creation, with a distinct child provider.
-- [ ] Remove the hosted test bypass and make provider placement structurally
-  explicit so a hosted path cannot select the shared local provider.
-- [ ] Add verified same-generation recovery, replacement invalidation, and the
-  stable replacement error using the service's real connection generation.
-- [ ] Add explicit graceful provider shutdown, active-cell termination, and
-  confirmed exec-server process-group quiescence before lease cleanup succeeds.
+- [x] Make provider placement structurally explicit so production hosted paths
+  cannot select the shared local provider. Unit-only provisioning uses an
+  explicit constructor that disables runtime startup rather than `cfg!(test)`.
+- [ ] Add verified same-generation recovery. Unprovable same-environment
+  reconnects already fail closed and release instead of starting a duplicate;
+  replacement environments use the service's authoritative generation.
+- [x] Add explicit graceful provider shutdown, active-cell termination, and
+  confirmed exec-server process-group quiescence before lease cleanup continues.
 
 ### Authorization and dispatch
 

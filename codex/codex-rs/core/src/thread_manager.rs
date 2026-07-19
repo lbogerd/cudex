@@ -27,6 +27,7 @@ use codex_agent_graph_store::LocalAgentGraphStore;
 use codex_analytics::AnalyticsEventsClient;
 use codex_app_server_protocol::ThreadHistoryBuilder;
 use codex_app_server_protocol::TurnStatus;
+use codex_code_mode::CodeModeRuntimePlacement;
 use codex_code_mode::CodeModeSessionProvider;
 use codex_code_mode::InProcessCodeModeSessionProvider;
 use codex_code_mode::ProcessOwnedCodeModeSessionProvider;
@@ -126,13 +127,18 @@ type SharedCapturedOps = Arc<std::sync::Mutex<CapturedOps>>;
 
 struct HostedAgentRuntimeEntry {
     runtime: std::sync::Mutex<HostedAgentRuntime>,
+    code_mode_provider: Option<Arc<codex_code_mode::HostedEnvironmentCodeModeSessionProvider>>,
     operation_lock: Arc<Semaphore>,
 }
 
 impl HostedAgentRuntimeEntry {
-    fn new(runtime: HostedAgentRuntime) -> Self {
+    fn new(
+        runtime: HostedAgentRuntime,
+        code_mode_provider: Option<Arc<codex_code_mode::HostedEnvironmentCodeModeSessionProvider>>,
+    ) -> Self {
         Self {
             runtime: std::sync::Mutex::new(runtime),
+            code_mode_provider,
             operation_lock: Arc::new(Semaphore::new(1)),
         }
     }
@@ -1468,13 +1474,13 @@ impl ThreadManagerState {
                             .reconnect_or_restore(thread_id, record)
                             .await
                             .map_err(|error| CodexErr::Fatal(error.to_string()))?;
-                        let runtime = self
+                        let (runtime, code_mode_provider) = self
                             .persist_pending_hosted_runtime(thread_id, pending)
                             .await?;
-                        self.hosted_agent_runtimes
-                            .write()
-                            .await
-                            .insert(thread_id, Arc::new(HostedAgentRuntimeEntry::new(runtime)));
+                        self.hosted_agent_runtimes.write().await.insert(
+                            thread_id,
+                            Arc::new(HostedAgentRuntimeEntry::new(runtime, code_mode_provider)),
+                        );
                         self.record_active_hosted_lease_count().await;
                     }
                     let recovered_state = self.retry_pending_hosted_finalization(thread_id).await?;
@@ -1586,13 +1592,13 @@ impl ThreadManagerState {
         thread_id: ThreadId,
         pending: PendingHostedAgentRuntime,
     ) -> CodexResult<()> {
-        let runtime = self
+        let (runtime, code_mode_provider) = self
             .persist_pending_hosted_runtime(thread_id, pending)
             .await?;
-        self.hosted_agent_runtimes
-            .write()
-            .await
-            .insert(thread_id, Arc::new(HostedAgentRuntimeEntry::new(runtime)));
+        self.hosted_agent_runtimes.write().await.insert(
+            thread_id,
+            Arc::new(HostedAgentRuntimeEntry::new(runtime, code_mode_provider)),
+        );
         self.record_active_hosted_lease_count().await;
         Ok(())
     }
@@ -1620,7 +1626,10 @@ impl ThreadManagerState {
         &self,
         thread_id: ThreadId,
         mut pending: PendingHostedAgentRuntime,
-    ) -> CodexResult<HostedAgentRuntime> {
+    ) -> CodexResult<(
+        HostedAgentRuntime,
+        Option<Arc<codex_code_mode::HostedEnvironmentCodeModeSessionProvider>>,
+    )> {
         if let Err(error) = pending.retain().await {
             let message = format!(
                 "failed to retain hosted-agent durable state for thread {thread_id}: {error}"
@@ -1648,7 +1657,7 @@ impl ThreadManagerState {
             }
             return Err(CodexErr::Fatal(message));
         }
-        Ok(pending.commit())
+        Ok(pending.commit_with_provider())
     }
 
     pub(crate) async fn checkpoint_hosted_runtime(
@@ -1981,6 +1990,11 @@ impl ThreadManagerState {
                 codex_hosted_agent::HostedAgentLifecycleState::Active
                 | codex_hosted_agent::HostedAgentLifecycleState::Completed
                 | codex_hosted_agent::HostedAgentLifecycleState::ReleasePending => {}
+            }
+            if let Some(provider) = &runtime.code_mode_provider
+                && let Err(error) = provider.shutdown().await
+            {
+                warn!(%error, %thread_id, "hosted code-mode runtime did not quiesce before forced lease cleanup");
             }
             let cleanup_result = match &self.hosted_agent_provisioner {
                 Ok(Some(provisioner)) => {
@@ -2553,11 +2567,23 @@ impl ThreadManagerState {
         let hosted_tool_authorization = pending_hosted_runtime
             .as_ref()
             .map(PendingHostedAgentRuntime::tool_authorization);
-        let code_mode_session_provider: Arc<dyn CodeModeSessionProvider> = pending_hosted_runtime
-            .as_ref()
-            .and_then(PendingHostedAgentRuntime::code_mode_provider)
-            .map(|provider| provider as Arc<dyn CodeModeSessionProvider>)
-            .unwrap_or_else(|| Arc::clone(&self.code_mode_session_provider));
+        let code_mode_runtime_placement = match pending_hosted_runtime.as_ref() {
+            Some(pending) => match pending.code_mode_provider() {
+                Some(provider) => CodeModeRuntimePlacement::HostedEnvironment(provider),
+                #[cfg(test)]
+                None => {
+                    CodeModeRuntimePlacement::Local(Arc::clone(&self.code_mode_session_provider))
+                }
+                #[cfg(not(test))]
+                None => {
+                    return Err(CodexErr::Fatal(
+                        "hosted thread has no verified environment-bound code-mode provider"
+                            .to_string(),
+                    ));
+                }
+            },
+            None => CodeModeRuntimePlacement::Local(Arc::clone(&self.code_mode_session_provider)),
+        };
         let session_result = Box::pin(Session::spawn(SessionSpawnArgs {
             thread_id,
             config,
@@ -2570,7 +2596,7 @@ impl ThreadManagerState {
             skills_service: Arc::clone(&self.skills_service),
             plugins_manager: Arc::clone(&self.plugins_manager),
             mcp_manager: Arc::clone(&self.mcp_manager),
-            code_mode_session_provider,
+            code_mode_runtime_placement,
             extensions: Arc::clone(&self.extensions),
             conversation_history: initial_history,
             requested_history_mode: history_mode,
@@ -2697,9 +2723,11 @@ impl ThreadManagerState {
                     session_source,
                 ));
                 e.insert(thread.clone());
-                if let Some(runtime) = hosted_runtime {
-                    hosted_agent_runtimes
-                        .insert(thread_id, Arc::new(HostedAgentRuntimeEntry::new(runtime)));
+                if let Some((runtime, code_mode_provider)) = hosted_runtime {
+                    hosted_agent_runtimes.insert(
+                        thread_id,
+                        Arc::new(HostedAgentRuntimeEntry::new(runtime, code_mode_provider)),
+                    );
                 }
                 return Ok(NewThread {
                     thread_id,
@@ -2714,7 +2742,9 @@ impl ThreadManagerState {
         }
         self.release_removed_hosted_runtime(
             thread_id,
-            hosted_runtime.map(|runtime| Arc::new(HostedAgentRuntimeEntry::new(runtime))),
+            hosted_runtime.map(|(runtime, code_mode_provider)| {
+                Arc::new(HostedAgentRuntimeEntry::new(runtime, code_mode_provider))
+            }),
         )
         .await;
         Err(CodexErr::InvalidRequest(format!(

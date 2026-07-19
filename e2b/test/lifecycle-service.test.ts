@@ -6,6 +6,7 @@ import { ServiceError } from '../src/types.js'
 
 const response: ProvisionedAgent = {
   leaseId: 'lease', environmentId: 'environment', baseSnapshotId: 'snapshot',
+  connectionGeneration: 0,
   connection: { execServerUrl: 'wss://gateway.example/leases/lease?ticket=ticket' },
   cwd: 'file:///workspace/root', workspaceRoots: ['file:///workspace/root'],
   toolPolicy: { allowedDomains: [], allowedTools: [] },
