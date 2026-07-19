@@ -14,6 +14,7 @@ pub use types::AgentPatchArtifact;
 pub use types::AgentPatchExportRequest;
 pub use types::AgentProvisionRequest;
 pub use types::AgentReconnectRequest;
+pub use types::AgentReferenceClearRequest;
 pub use types::AgentReleaseRequest;
 pub use types::AgentRetention;
 pub use types::AgentRetentionRequest;

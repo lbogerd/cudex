@@ -15,6 +15,7 @@ use crate::AgentPatchArtifact;
 use crate::AgentPatchExportRequest;
 use crate::AgentProvisionRequest;
 use crate::AgentReconnectRequest;
+use crate::AgentReferenceClearRequest;
 use crate::AgentReleaseRequest;
 use crate::AgentRetention;
 use crate::AgentRetentionRequest;
@@ -355,19 +356,33 @@ impl HostedAgentService for HttpHostedAgentService {
 
     async fn retain(&self, request: AgentRetentionRequest) -> Result<AgentRetention> {
         let retained: AgentRetention = self.post("v1/agents/retain", &request).await?;
-        if retained.revision == 0
-            || retained.desired_hash.len() != 64
-            || !retained
-                .desired_hash
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
-            return Err(HostedAgentError::invalid_response(
-                "service returned invalid retained state",
-            ));
-        }
+        validate_retention(&retained)?;
         Ok(retained)
     }
+
+    async fn clear_references(
+        &self,
+        request: AgentReferenceClearRequest,
+    ) -> Result<AgentRetention> {
+        let retained: AgentRetention = self.post("v1/agents/references/clear", &request).await?;
+        validate_retention(&retained)?;
+        Ok(retained)
+    }
+}
+
+fn validate_retention(retained: &AgentRetention) -> Result<()> {
+    if retained.revision == 0
+        || retained.desired_hash.len() != 64
+        || !retained
+            .desired_hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(HostedAgentError::invalid_response(
+            "service returned invalid retained state",
+        ));
+    }
+    Ok(())
 }
 
 async fn decode_response<Response>(mut response: reqwest::Response) -> Result<Response>

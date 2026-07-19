@@ -35,8 +35,8 @@ transient runtime items.
 
 The small `codex-hosted-agent` crate owns the provider-neutral types, native
 RPITIT `HostedAgentService` trait, production HTTP client, and bounded in-memory
-fake. Its six operations are `provision`, `reconnect`, `checkpoint`,
-`export_patch`, `apply_patch`, and `release`. The client enforces HTTPS control
+fake. Its eight operations are `provision`, `reconnect`, `checkpoint`,
+`export_patch`, `apply_patch`, `retain`, `clear_references`, and `release`. The client enforces HTTPS control
 transport, WSS executor transport, environment bearer authentication, bounded
 timeouts/responses, disabled redirects, response validation, duplicate
 lease/environment rejection, and redacted diagnostics.
@@ -672,11 +672,28 @@ root. Exact stale replays return the cleared revision/hash, while wrong-lease,
 future/stale active revisions, and every attempt to retain after clear fail
 closed. The control row remains as the non-resurrection tombstone.
 
-This remains a fail-closed foundation rather than the completed deletion
-lifecycle. Before collection is enabled, Codex still needs a durable local
-deletion outbox recorded before local removal and drained only after that removal.
-Focused migration, authorization, exact-set, stale-writer, permanent-clear, HTTP,
-Rust contract, expiry, apply, and lifecycle tests pass. The complete
+SQLite migration 0042 completes the local deletion lifecycle with a standalone
+subtree outbox that has no cascading dependency on thread rows. App-server first
+stops every subtree member and completes hosted release, then records the entire
+validated membership—including non-hosted members and each hosted lease/revision—
+before deleting any rollout. A missing hosted reference revision fails before
+local removal. The batch becomes remotely clearable only when none of its member
+rows remains in SQLite, so crashes cannot clear service roots while local thread
+data still exists.
+
+Ready batches drain after local deletion and at app-server startup, with sustained
+in-process retries capped at a 60-second backoff. Failed batches receive a durable
+attempt timestamp and rotate behind untouched work, preventing an unavailable or
+poison batch from starving later deletions. Partial multi-thread clear is safe
+because the service clear is idempotent; the local batch is deleted only after
+every hosted member succeeds. Failure to persist a successful release revision
+keeps hosted cleanup pending, so deletion cannot enqueue a stale remote fence.
+Durable membership also lets a repeated `thread/delete` finish after rollout,
+spawn-edge, or thread-row loss. State tests cover grouped readiness, survival,
+fair retry ordering, replay, completion, and missing-revision refusal; app-server
+coverage proves the normal subtree path leaves no outbox residue; hosted service/
+core tests cover permanent clear, exact replay, and forwarding the durable fence.
+The affected local suites pass 236 tests with no skips; the complete hosted
 Docker/PostgreSQL suite passes 288 tests with no skips.
 
 ### Canonical workspace comparison foundation

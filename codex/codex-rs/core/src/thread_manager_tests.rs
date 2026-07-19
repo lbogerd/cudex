@@ -1998,6 +1998,79 @@ async fn hosted_root_and_spawned_threads_own_distinct_provisioned_environments()
         .expect_err("manager shutdown must release the root lease");
 }
 
+#[tokio::test]
+async fn deleted_hosted_reference_clear_forwards_the_durable_revision() {
+    let (_temp_dir, config, manager, _hosted_service) = hosted_thread_manager_for_tests().await;
+    let state_db = codex_state::StateRuntime::init(
+        config.sqlite_home.clone(),
+        config.model_provider_id.clone(),
+    )
+    .await
+    .expect("open state db");
+    let root = manager
+        .start_thread_with_options(start_thread_options(config))
+        .await
+        .expect("start hosted root");
+    let record = manager
+        .state
+        .thread_store
+        .get_hosted_agent_runtime(root.thread_id)
+        .await
+        .expect("read hosted runtime")
+        .expect("hosted runtime record");
+    let expected_revision = record
+        .reference_revision
+        .expect("hosted runtime has a retained revision");
+    root.thread
+        .shutdown_and_wait()
+        .await
+        .expect("stop hosted root");
+    assert!(manager.remove_thread(&root.thread_id).await.is_some());
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while manager.has_hosted_runtime(root.thread_id).await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("hosted release timed out");
+    assert!(
+        manager
+            .clear_deleted_hosted_references(
+                root.thread_id,
+                record.lease_id.clone(),
+                expected_revision,
+            )
+            .await
+            .is_err(),
+        "remote references must remain while the local rollout exists"
+    );
+    manager
+        .state
+        .thread_store
+        .delete_thread(codex_thread_store::DeleteThreadParams {
+            thread_id: root.thread_id,
+        })
+        .await
+        .expect("delete hosted rollout before reference clear");
+    state_db
+        .delete_thread(root.thread_id)
+        .await
+        .expect("delete hosted state row before reference clear");
+
+    let cleared = manager
+        .clear_deleted_hosted_references(root.thread_id, record.lease_id.clone(), expected_revision)
+        .await
+        .expect("clear deleted references");
+    assert_eq!(cleared, expected_revision + 1);
+    assert_eq!(
+        manager
+            .clear_deleted_hosted_references(root.thread_id, record.lease_id, expected_revision,)
+            .await
+            .expect("replay deleted reference clear"),
+        cleared
+    );
+}
+
 #[test]
 fn effective_originator_prefers_thread_scoped_sources_before_env_originator() {
     for (metrics_service_name, persisted_originator, inherited_originator, expected_originator) in [

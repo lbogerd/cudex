@@ -12,6 +12,7 @@ use crate::AgentPatchArtifact;
 use crate::AgentPatchExportRequest;
 use crate::AgentProvisionRequest;
 use crate::AgentReconnectRequest;
+use crate::AgentReferenceClearRequest;
 use crate::AgentReleaseRequest;
 use crate::AgentRetention;
 use crate::AgentRetentionRequest;
@@ -81,6 +82,7 @@ struct Artifact {
 struct RetainedState {
     request: AgentRetentionRequest,
     revision: u64,
+    cleared: bool,
 }
 
 #[derive(Clone)]
@@ -686,6 +688,11 @@ impl HostedAgentService for FakeHostedAgentService {
                 ));
             }
             Some(previous) => {
+                if previous.cleared {
+                    return Err(HostedAgentError::invalid_response(
+                        "references were permanently cleared",
+                    ));
+                }
                 let same_desired = previous.request.lease_id == request.lease_id
                     && previous.request.base_snapshot_id == request.base_snapshot_id
                     && previous.request.latest_snapshot_id == request.latest_snapshot_id
@@ -701,11 +708,48 @@ impl HostedAgentService for FakeHostedAgentService {
                 }
             }
         };
-        state
-            .retained
-            .insert(key, RetainedState { request, revision });
+        state.retained.insert(
+            key,
+            RetainedState {
+                request,
+                revision,
+                cleared: false,
+            },
+        );
         Ok(AgentRetention {
             revision,
+            desired_hash: "0".repeat(64),
+        })
+    }
+
+    async fn clear_references(
+        &self,
+        request: AgentReferenceClearRequest,
+    ) -> Result<AgentRetention> {
+        let mut state = self.lock();
+        let retained = state
+            .retained
+            .get_mut(&request.agent_id.to_string())
+            .ok_or_else(|| {
+                HostedAgentError::new(
+                    HostedAgentErrorCategory::SnapshotMissing,
+                    "references are missing",
+                )
+            })?;
+        if retained.request.lease_id != request.lease_id
+            || request.expected_revision > retained.revision
+            || (!retained.cleared && request.expected_revision != retained.revision)
+        {
+            return Err(HostedAgentError::invalid_response(
+                "reference revision is stale",
+            ));
+        }
+        if !retained.cleared {
+            retained.revision = retained.revision.saturating_add(1);
+            retained.cleared = true;
+        }
+        Ok(AgentRetention {
+            revision: retained.revision,
             desired_hash: "0".repeat(64),
         })
     }

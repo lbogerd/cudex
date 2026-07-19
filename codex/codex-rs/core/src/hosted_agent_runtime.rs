@@ -13,6 +13,7 @@ use codex_hosted_agent::AgentPatchArtifact;
 use codex_hosted_agent::AgentPatchExportRequest;
 use codex_hosted_agent::AgentProvisionRequest;
 use codex_hosted_agent::AgentReconnectRequest;
+use codex_hosted_agent::AgentReferenceClearRequest;
 use codex_hosted_agent::AgentReleaseRequest;
 use codex_hosted_agent::AgentRetention;
 use codex_hosted_agent::AgentRetentionRequest;
@@ -140,6 +141,10 @@ trait ErasedHostedAgentService: Send + Sync {
 
     fn release(&self, request: AgentReleaseRequest) -> HostedServiceFuture<'_, ()>;
     fn retain(&self, request: AgentRetentionRequest) -> HostedServiceFuture<'_, AgentRetention>;
+    fn clear_references(
+        &self,
+        request: AgentReferenceClearRequest,
+    ) -> HostedServiceFuture<'_, AgentRetention>;
 }
 
 impl<Service> ErasedHostedAgentService for Service
@@ -188,6 +193,13 @@ where
     fn retain(&self, request: AgentRetentionRequest) -> HostedServiceFuture<'_, AgentRetention> {
         Box::pin(HostedAgentService::retain(self, request))
     }
+
+    fn clear_references(
+        &self,
+        request: AgentReferenceClearRequest,
+    ) -> HostedServiceFuture<'_, AgentRetention> {
+        Box::pin(HostedAgentService::clear_references(self, request))
+    }
 }
 
 /// Coordinates hosted service leases with dynamic exec-server registrations.
@@ -203,6 +215,22 @@ impl HostedAgentProvisioner {
         runtime: &HostedAgentRuntime,
     ) -> Result<AgentRetention, HostedAgentRuntimeError> {
         retain_runtime(agent_id, runtime, self.service.as_ref()).await
+    }
+
+    pub(crate) async fn clear_references(
+        &self,
+        agent_id: codex_protocol::ThreadId,
+        lease_id: String,
+        expected_revision: u64,
+    ) -> Result<AgentRetention, HostedAgentRuntimeError> {
+        self.service
+            .clear_references(AgentReferenceClearRequest {
+                agent_id,
+                lease_id,
+                expected_revision,
+            })
+            .await
+            .map_err(HostedAgentRuntimeError::Retention)
     }
     pub(crate) fn new<Service>(
         service: Arc<Service>,
@@ -405,7 +433,7 @@ impl HostedAgentProvisioner {
         &self,
         agent_id: codex_protocol::ThreadId,
         runtime: HostedAgentRuntime,
-    ) -> Result<(), HostedAgentRuntimeError> {
+    ) -> Result<AgentRetention, HostedAgentRuntimeError> {
         let is_cleanup_retry = runtime.lifecycle_state == HostedAgentLifecycleState::ReleasePending;
         let cleanup_result = cleanup_runtime(
             agent_id,
@@ -425,7 +453,7 @@ impl HostedAgentProvisioner {
         &self,
         agent_id: codex_protocol::ThreadId,
         record: HostedAgentRuntimeRecord,
-    ) -> Result<(), HostedAgentRuntimeError> {
+    ) -> Result<AgentRetention, HostedAgentRuntimeError> {
         let cleanup_result = cleanup_runtime(
             agent_id,
             HostedAgentRuntime {
@@ -604,15 +632,14 @@ impl PendingHostedAgentRuntime {
                     environment_id: self.runtime.environment_id,
                     source,
                 }),
-            PendingRuntimeRollback::ReleaseLease => {
-                cleanup_runtime(
-                    self.agent_id,
-                    self.runtime,
-                    self.environment_manager.as_ref(),
-                    self.service.as_ref(),
-                )
-                .await
-            }
+            PendingRuntimeRollback::ReleaseLease => cleanup_runtime(
+                self.agent_id,
+                self.runtime,
+                self.environment_manager.as_ref(),
+                self.service.as_ref(),
+            )
+            .await
+            .map(|_| ()),
         }
     }
 }
@@ -654,8 +681,8 @@ async fn cleanup_runtime(
     runtime: HostedAgentRuntime,
     environment_manager: &EnvironmentManager,
     service: &dyn ErasedHostedAgentService,
-) -> Result<(), HostedAgentRuntimeError> {
-    retain_runtime(agent_id, &runtime, service).await?;
+) -> Result<AgentRetention, HostedAgentRuntimeError> {
+    let retained = retain_runtime(agent_id, &runtime, service).await?;
     let release_idempotency_key = release_idempotency_key(agent_id, &runtime.lease_id);
     let unregister_result = environment_manager
         .remove_environment(&runtime.environment_id)
@@ -673,7 +700,7 @@ async fn cleanup_runtime(
             source,
         }),
         (Ok(_), Err(error)) => Err(HostedAgentRuntimeError::Release(error)),
-        (Ok(_), Ok(())) => Ok(()),
+        (Ok(_), Ok(())) => Ok(retained),
     }
 }
 

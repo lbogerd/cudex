@@ -1099,6 +1099,49 @@ impl ThreadManager {
         self.state.remove_thread(thread_id).await
     }
 
+    /// Permanently clears service-side durable references after local thread deletion.
+    pub async fn clear_deleted_hosted_references(
+        &self,
+        thread_id: ThreadId,
+        lease_id: String,
+        expected_revision: u64,
+    ) -> CodexResult<u64> {
+        match self
+            .state
+            .thread_store
+            .read_thread(ReadThreadParams {
+                thread_id,
+                include_archived: true,
+                include_history: false,
+            })
+            .await
+        {
+            Ok(_) => {
+                return Err(CodexErr::InvalidRequest(format!(
+                    "hosted references cannot be cleared while thread {thread_id} still exists"
+                )));
+            }
+            Err(ThreadStoreError::ThreadNotFound { .. }) => {}
+            Err(ThreadStoreError::InvalidRequest { message })
+                if message == format!("no rollout found for thread id {thread_id}") => {}
+            Err(error) => return Err(thread_store_rollout_read_error(error)),
+        }
+        let provisioner = match &self.state.hosted_agent_provisioner {
+            Ok(Some(provisioner)) => provisioner,
+            Ok(None) => {
+                return Err(CodexErr::Fatal(
+                    "hosted-agent provisioner is unavailable during reference clear".to_string(),
+                ));
+            }
+            Err(error) => return Err(CodexErr::Fatal(error.to_string())),
+        };
+        provisioner
+            .clear_references(thread_id, lease_id, expected_revision)
+            .await
+            .map(|retained| retained.revision)
+            .map_err(|error| CodexErr::Fatal(error.to_string()))
+    }
+
     /// Returns whether a hosted runtime is still retained for finalization or cleanup retry.
     pub async fn hosted_runtime_cleanup_pending(&self, thread_id: ThreadId) -> bool {
         self.state
@@ -1449,7 +1492,8 @@ impl ThreadManagerState {
                     }
                     let mut updated_record = record.clone();
                     match provisioner.release_durable_record(thread_id, record).await {
-                        Ok(()) => {
+                        Ok(retained) => {
+                            updated_record.reference_revision = Some(retained.revision);
                             updated_record.lifecycle_state =
                                 codex_hosted_agent::HostedAgentLifecycleState::Released;
                         }
@@ -1954,44 +1998,56 @@ impl ThreadManagerState {
                     crate::hosted_agent_runtime::HostedAgentRuntimeError::Release(error.clone()),
                 ),
             };
-            if let Err(error) = cleanup_result {
-                runtime_value.lifecycle_state =
-                    codex_hosted_agent::HostedAgentLifecycleState::ReleasePending;
-                runtime.replace(runtime_value.clone());
-                if let Err(persistence_error) = self
-                    .thread_store
-                    .set_hosted_agent_runtime(thread_id, runtime_value.durable_record())
-                    .await
-                {
-                    warn!(
-                        %persistence_error,
-                        %thread_id,
-                        "failed to persist hosted runtime pending release"
-                    );
-                }
-                warn!(
-                    %error,
-                    %thread_id,
-                    "failed to release hosted runtime during thread removal"
-                );
-                self.hosted_agent_runtimes
-                    .write()
-                    .await
-                    .entry(thread_id)
-                    .or_insert(runtime);
-            } else {
-                runtime_value.lifecycle_state =
-                    codex_hosted_agent::HostedAgentLifecycleState::Released;
-                if let Err(error) = self
-                    .thread_store
-                    .set_hosted_agent_runtime(thread_id, runtime_value.durable_record())
-                    .await
-                {
+            match cleanup_result {
+                Err(error) => {
+                    runtime_value.lifecycle_state =
+                        codex_hosted_agent::HostedAgentLifecycleState::ReleasePending;
+                    runtime.replace(runtime_value.clone());
+                    if let Err(persistence_error) = self
+                        .thread_store
+                        .set_hosted_agent_runtime(thread_id, runtime_value.durable_record())
+                        .await
+                    {
+                        warn!(
+                            %persistence_error,
+                            %thread_id,
+                            "failed to persist hosted runtime pending release"
+                        );
+                    }
                     warn!(
                         %error,
                         %thread_id,
-                        "failed to persist released hosted runtime"
+                        "failed to release hosted runtime during thread removal"
                     );
+                    self.hosted_agent_runtimes
+                        .write()
+                        .await
+                        .entry(thread_id)
+                        .or_insert(runtime);
+                }
+                Ok(retained) => {
+                    runtime_value.reference_revision = Some(retained.revision);
+                    runtime_value.lifecycle_state =
+                        codex_hosted_agent::HostedAgentLifecycleState::Released;
+                    if let Err(error) = self
+                        .thread_store
+                        .set_hosted_agent_runtime(thread_id, runtime_value.durable_record())
+                        .await
+                    {
+                        warn!(
+                            %error,
+                            %thread_id,
+                            "failed to persist released hosted runtime"
+                        );
+                        runtime_value.lifecycle_state =
+                            codex_hosted_agent::HostedAgentLifecycleState::ReleasePending;
+                        runtime.replace(runtime_value);
+                        self.hosted_agent_runtimes
+                            .write()
+                            .await
+                            .entry(thread_id)
+                            .or_insert(runtime);
+                    }
                 }
             }
             self.record_active_hosted_lease_count().await;

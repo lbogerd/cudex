@@ -177,6 +177,14 @@ pub struct AgentRetentionRequest {
     pub expected_revision: Option<u64>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentReferenceClearRequest {
+    pub agent_id: ThreadId,
+    pub lease_id: String,
+    pub expected_revision: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentRetention {
@@ -315,6 +323,11 @@ pub trait HostedAgentService: Send + Sync {
     fn retain(
         &self,
         request: AgentRetentionRequest,
+    ) -> impl Future<Output = Result<AgentRetention>> + Send;
+    /// Permanently clears the durable references for a locally deleted Codex thread.
+    fn clear_references(
+        &self,
+        request: AgentReferenceClearRequest,
     ) -> impl Future<Output = Result<AgentRetention>> + Send;
     /// Releases the service resources associated with a lease.
     fn release(&self, request: AgentReleaseRequest) -> impl Future<Output = Result<()>> + Send;

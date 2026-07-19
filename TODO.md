@@ -74,7 +74,7 @@ production backend. Stable decisions, evidence, and wire schemas are in
   archives, manifests, content blobs, and patch artifacts.
 - [x] Make object stores report their exact durable bucket/key locator so
   PostgreSQL registrations cannot drift from physical writes.
-- [ ] Add reference retention so snapshots/artifacts outlive lease release while
+- [x] Add reference retention so snapshots/artifacts outlive lease release while
   Codex references them.
   - [x] Add the strict retain wire, tenant/agent-authorized exact-set PostgreSQL
     roots, Codex persistence/release synchronization, and a production release
@@ -88,7 +88,7 @@ production backend. Stable decisions, evidence, and wire schemas are in
   - [x] Add a tenant/lease-bound, revision-fenced permanent-clear route and
     service tombstone that atomically removes every direct Codex root, accepts
     exact clear replays, and rejects reference resurrection.
-  - [ ] Add a durable local thread-deletion outbox that is recorded before local
+  - [x] Add a durable local thread-deletion outbox that is recorded before local
     deletion and drains the remote clear only after local deletion before
     enabling collection.
 - [ ] Reconcile abandoned operations, sandboxes, snapshots, capture sandboxes,

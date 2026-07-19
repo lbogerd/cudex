@@ -177,6 +177,45 @@ async fn fake_lifecycle_is_idempotent_and_restorable() {
 }
 
 #[tokio::test]
+async fn fake_reference_clear_is_revisioned_idempotent_and_permanent() {
+    let service = FakeHostedAgentService::default();
+    let request = root_request("reference-clear");
+    let agent_id = request.agent_id;
+    let provisioned = service
+        .provision(request)
+        .await
+        .expect("provision succeeds");
+    let mut retention_request = AgentRetentionRequest {
+        agent_id,
+        lease_id: provisioned.lease_id.clone(),
+        base_snapshot_id: provisioned.base_snapshot_id.clone(),
+        latest_snapshot_id: provisioned.base_snapshot_id,
+        artifact_id: None,
+        expected_revision: None,
+    };
+    let retained = service
+        .retain(retention_request.clone())
+        .await
+        .expect("retain succeeds");
+    let clear = AgentReferenceClearRequest {
+        agent_id,
+        lease_id: provisioned.lease_id,
+        expected_revision: retained.revision,
+    };
+    let cleared = service
+        .clear_references(clear.clone())
+        .await
+        .expect("clear succeeds");
+    assert_eq!(cleared.revision, retained.revision + 1);
+    assert_eq!(
+        service.clear_references(clear).await.expect("clear replay"),
+        cleared
+    );
+    retention_request.expected_revision = Some(cleared.revision);
+    assert!(service.retain(retention_request).await.is_err());
+}
+
+#[tokio::test]
 async fn fake_reports_missing_and_released_leases() {
     let service = FakeHostedAgentService::default();
     let unknown_lease_id = "unknown-lease".to_string();

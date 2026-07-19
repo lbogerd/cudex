@@ -432,6 +432,7 @@ pub(crate) struct ThreadRequestProcessor {
     pub(super) state_db: Option<StateDbHandle>,
     pub(super) log_db: Option<LogDbLayer>,
     pub(super) background_tasks: TaskTracker,
+    pub(super) deletion_outbox_shutdown: CancellationToken,
     pub(super) skills_watcher: Arc<SkillsWatcher>,
     pub(super) initial_config_warnings: Arc<Vec<ConfigWarningNotification>>,
 }
@@ -467,7 +468,7 @@ impl ThreadRequestProcessor {
         skills_watcher: Arc<SkillsWatcher>,
         initial_config_warnings: Vec<ConfigWarningNotification>,
     ) -> Self {
-        Self {
+        let processor = Self {
             auth_manager,
             thread_manager,
             outgoing,
@@ -483,9 +484,27 @@ impl ThreadRequestProcessor {
             state_db,
             log_db,
             background_tasks: TaskTracker::new(),
+            deletion_outbox_shutdown: CancellationToken::new(),
             skills_watcher,
             initial_config_warnings: Arc::new(initial_config_warnings),
+        };
+        if let Some(state_db) = processor.state_db.clone() {
+            let thread_manager = Arc::clone(&processor.thread_manager);
+            let shutdown = processor.deletion_outbox_shutdown.clone();
+            processor.background_tasks.spawn(async move {
+                if super::thread_delete::drain_thread_deletion_outbox(&state_db, &thread_manager)
+                    .await
+                {
+                    super::thread_delete::retry_thread_deletion_outbox(
+                        state_db,
+                        thread_manager,
+                        shutdown,
+                    )
+                    .await;
+                }
+            });
         }
+        processor
     }
 
     pub(crate) async fn thread_start(
@@ -1107,6 +1126,7 @@ impl ThreadRequestProcessor {
     }
 
     pub(crate) async fn drain_background_tasks(&self) {
+        self.deletion_outbox_shutdown.cancel();
         self.background_tasks.close();
         if tokio::time::timeout(Duration::from_secs(10), self.background_tasks.wait())
             .await

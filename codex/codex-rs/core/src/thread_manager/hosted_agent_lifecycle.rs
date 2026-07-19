@@ -147,7 +147,8 @@ impl ThreadManagerState {
         });
 
         match provisioner.release(agent_id, value.clone()).await {
-            Ok(()) => {
+            Ok(retained) => {
+                value.reference_revision = Some(retained.revision);
                 value.lifecycle_state = HostedAgentLifecycleState::Released;
                 if let Err(error) = self
                     .persist_finalization_state(agent_id, &runtime, &value)

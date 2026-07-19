@@ -108,6 +108,13 @@ async fn thread_delete_deletes_spawned_descendants() -> Result<()> {
             .await?,
         Vec::<ThreadId>::new()
     );
+    assert!(
+        state_db
+            .thread_deletion_outbox_members(parent_thread_id)
+            .await?
+            .is_empty(),
+        "a locally complete non-hosted batch should drain its outbox"
+    );
     Ok(())
 }
 
