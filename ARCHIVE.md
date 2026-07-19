@@ -522,8 +522,30 @@ collisions fail before provider mutation. The focused planner tests and the full
 PostgreSQL-backed suite passed (227 tests, no skips). Provider mutation remains
 unwired until durable apply-source resolution, archive staging, rollback phases,
 checkpoint persistence, and crash reconciliation are implemented.
-Durable apply-source resolution and live workspace mutation remain subsequent
-lifecycle work.
+Live workspace mutation remains subsequent lifecycle work.
+
+PostgreSQL patch application now has a read-only durable-source resolver. It
+takes the same transaction-scoped advisory lock and row lock used by lifecycle
+writers, requires an active or paused target with an exact latest snapshot, and
+authorizes an artifact only when its released-or-live source child records both
+the target lease and target agent as owner. Tenant, expiry, and wrong-owner-lease
+cases do not disclose artifact existence. Under that fence it verifies the
+artifact's owner, snapshot, and object-reference graph; object kind, state,
+expiry, locator, size, and SHA-256 against physical bytes; canonical artifact and
+manifest parsing; embedded versus durable lineage metadata; and the complete
+target and changed-content sets before invoking the mutation-free planner. The
+resolver returns verified content bytes for later staging and composes with a
+caller-owned transaction so the same lease fence can cover subsequent apply
+phases.
+
+Five live PostgreSQL tests cover clean planning after child release, conflict
+planning, exact owner-lease isolation even for another lease of the same agent,
+expiry and tenant non-disclosure, missing/corrupt/dishonestly located material,
+and a two-pool checkpoint race that cannot advance the target while the apply
+resolver's transaction owns its fence. The full suite passed 232 tests with no
+skips. The resolver is deliberately not exposed at HTTP until deterministic
+archive assembly and the durable rollback/stage/swap/checkpoint phase ledger are
+implemented.
 
 ### Durable patch-artifact repository
 

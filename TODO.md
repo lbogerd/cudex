@@ -271,9 +271,12 @@ Exit criterion: a durable checksummed artifact remains usable after child releas
   256-path cap, and UTF-8-safe 4 KiB rejection bounds.
 - [x] Add a mutation-free patch-application planner that verifies complete
   manifest/content material and produces the full prospective workspace.
+- [x] Resolve patch application from a transaction-locked PostgreSQL target,
+  enforcing the exact owner-lease lineage and checksum-verifying every referenced
+  artifact, manifest, and content object from durable storage.
 - [ ] Implement `POST v1/agents/patch/apply` and `applied`, `conflict`, and
   `rejected` responses.
-- [ ] Validate artifact checksum, authorization, expiry, paths, quotas, base, and
+- [x] Validate artifact checksum, authorization, expiry, paths, quotas, base, and
   target before mutation.
 - [x] Compare artifact base/current and target current for every changed path;
   collect all conflicts before mutation.
