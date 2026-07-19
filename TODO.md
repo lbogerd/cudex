@@ -274,6 +274,8 @@ Exit criterion: a durable checksummed artifact remains usable after child releas
 - [x] Resolve patch application from a transaction-locked PostgreSQL target,
   enforcing the exact owner-lease lineage and checksum-verifying every referenced
   artifact, manifest, and content object from durable storage.
+- [x] Assemble ready plans into deterministic bounded Linux workspace tar files,
+  verify every body, and reparse the result to prove the full manifest round-trip.
 - [ ] Implement `POST v1/agents/patch/apply` and `applied`, `conflict`, and
   `rejected` responses.
 - [x] Validate artifact checksum, authorization, expiry, paths, quotas, base, and

@@ -547,6 +547,18 @@ skips. The resolver is deliberately not exposed at HTTP until deterministic
 archive assembly and the durable rollback/stage/swap/checkpoint phase ledger are
 implemented.
 
+Ready patch plans can now be assembled into deterministic uncompressed Linux
+workspace tar files without touching a sandbox. The builder accepts exactly one
+verified body per planned file, rechecks logical object reuse, SHA-256, size,
+path, mode, and complete content-set identity, emits stable uid/gid/time metadata,
+and uses deterministic PAX records when canonical Unicode paths or links exceed
+ustar fields. It bounds the archive as records are emitted, then reparses the
+finished bytes through the existing no-extraction archive boundary and requires
+the complete manifest to round-trip exactly. Tests cover binary and empty files,
+executable/directory modes, symlinks, long PAX paths, deterministic repetition,
+missing/extra/duplicate/dishonest content, inconsistent object reuse, and archive
+quota overflow. The full suite passed 235 tests with no skips.
+
 ### Durable patch-artifact repository
 
 Patch export now has a verified immutable-source boundary. Canonical manifest
