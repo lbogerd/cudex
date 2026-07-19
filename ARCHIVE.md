@@ -5,6 +5,36 @@ architecture decisions, and spike results for the hosted-agent E2B backend. It
 is reference material, not a work queue. Remaining implementation work is in
 [`TODO.md`](TODO.md).
 
+## Local hosted-Codex POC foundation (2026-07-19)
+
+The Linux-only POC uses a host Node.js control service and a disposable Compose
+stack containing only PostgreSQL 17 and Garage 2.3.0. Garage runs with
+`--single-node --default-bucket`, replication factor one, generated per-run S3
+credentials, and named metadata/data volumes removed by `down --volumes`.
+PostgreSQL, Garage S3, and control ports bind only to `127.0.0.1`; occupied fixed
+ports fail preflight.
+
+All generated state lives below ignored `e2b/.state/poc/<run-id>`. Runtime and
+Compose environment files and private keys use mode `0600`. The service stays on
+the production PostgreSQL/S3 path: `HOSTED_AGENT_DEVELOPMENT` is absent, Garage
+uses path-style S3 at region `garage`, and the service receives exact per-run
+tenant, worker, bearer, and `managedBy` identities. Docker never receives Codex
+authentication material.
+
+TLS is an ephemeral two-day CA plus localhost server certificate with DNS
+`localhost` and IP `127.0.0.1` SANs. The POC creates a combined bundle from the
+system Debian CA bundle and its local CA; it does not mutate system trust or Rust
+sources. Startup checks unauthenticated HTTPS denial, authenticated HTTP routing,
+certificate validation, and WSS missing-ticket denial before any E2B allocation.
+
+The new public foundation commands are `preflight`, `up`, `status`, and `down`
+through `e2b/scripts/hosted-codex-poc.sh`. Unit evidence: strict env defaults,
+unknown-key/auth/port rejection, runtime-file modes/secret separation, required
+TLS SANs, combined trust, and certificate verification. Local Docker evidence:
+both pinned services reached healthy state, Garage passed scoped S3 `HeadBucket`,
+and all checksummed migrations ran before the deliberately credential-free
+foundation service startup check. No `codex/codex-rs` file changed.
+
 The Codex-side sources of truth are:
 
 - `codex/codex-rs/hosted-agent/src/types.rs` for wire and lifecycle types;

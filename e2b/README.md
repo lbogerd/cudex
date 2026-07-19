@@ -1,5 +1,8 @@
 # Custom Codex CubeSandbox template
 
+For the Linux-only real-client owner/child proof, start with
+[`poc/README.md`](poc/README.md).
+
 Run these commands from the repository root. The pipeline builds the local Codex fork, creates an OCI image, publishes a CubeSandbox template, and verifies it through the E2B TypeScript SDK.
 
 ## One-time setup

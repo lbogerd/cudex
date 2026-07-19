@@ -1,0 +1,46 @@
+name: ${POC_COMPOSE_PROJECT}
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: cudex_poc
+      POSTGRES_USER: cudex_poc
+      POSTGRES_PASSWORD: ${POC_POSTGRES_PASSWORD}
+    ports:
+      - "127.0.0.1:${POC_POSTGRES_PORT}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cudex_poc -d cudex_poc"]
+      interval: 1s
+      timeout: 5s
+      retries: 60
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  garage:
+    image: dxflrs/garage:v2.3.0
+    command: ["/garage", "server", "--single-node", "--default-bucket"]
+    environment:
+      GARAGE_CONFIG_FILE: /etc/garage.toml
+      GARAGE_RPC_SECRET: ${POC_GARAGE_RPC_SECRET}
+      GARAGE_ADMIN_TOKEN: ${POC_GARAGE_ADMIN_TOKEN}
+      GARAGE_METRICS_TOKEN: ${POC_GARAGE_METRICS_TOKEN}
+      GARAGE_DEFAULT_ACCESS_KEY: ${POC_GARAGE_ACCESS_KEY}
+      GARAGE_DEFAULT_SECRET_KEY: ${POC_GARAGE_SECRET_KEY}
+      GARAGE_DEFAULT_BUCKET: ${POC_GARAGE_BUCKET}
+    ports:
+      - "127.0.0.1:${POC_GARAGE_PORT}:3900"
+    healthcheck:
+      test: ["CMD", "/garage", "status"]
+      interval: 1s
+      timeout: 5s
+      retries: 60
+    volumes:
+      - ${POC_GARAGE_CONFIG}:/etc/garage.toml:ro
+      - garage-meta:/var/lib/garage/meta
+      - garage-data:/var/lib/garage/data
+
+volumes:
+  postgres-data:
+  garage-meta:
+  garage-data:

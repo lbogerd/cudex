@@ -6,7 +6,10 @@
     "build": "tsc -p tsconfig.json",
     "migrate": "npm run build && node dist/src/migrate.js",
     "test": "npm run build && node --test dist/test/*.test.js",
-    "start": "node dist/src/main.js"
+    "start": "node dist/src/main.js",
+    "poc:preflight": "npm run build && node dist/src/poc-runner.js preflight",
+    "poc:automated": "npm run build && node dist/src/poc-runner.js automated",
+    "poc:interactive": "npm run build && node dist/src/poc-runner.js interactive"
   },
   "engines": {
     "node": ">=22"

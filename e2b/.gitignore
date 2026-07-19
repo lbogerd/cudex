@@ -3,3 +3,4 @@ template/.build/
 node_modules/
 dist/
 .state/
+poc/.env
