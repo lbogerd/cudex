@@ -1192,6 +1192,48 @@ journaling is discovered and deleted before its sandbox; the suite is 201/201.
 This closes restore-specific stale cleanup, while the still-broader allocation
 boundary for an object-store put before its durable registration remains queued.
 
+### Durable child-capture coordinator foundation
+
+Migration 0010 adds an immutable nullable operation subtype. Child creation
+retains the public `provision` idempotency namespace while persisting subtype
+`child`; replay must match it exactly. Stale claims can select either child or
+unsubtyped operations, and the general reconciler explicitly excludes child
+rows. This prevents a source-bound child operation from being mistaken for a
+restore and provides an unambiguous recovery selector even if the process dies
+before its first allocation is journaled.
+
+An unwired PostgreSQL child coordinator now claims the exact owner lease and
+holds its session advisory lock across the complete capture. It authorizes the
+active/paused owner agent, latest snapshot, provider sandbox, and connection
+generation; takes a deterministically named owner snapshot; restores only a
+temporary metadata-marked capture sandbox; exports workspace bytes; and destroys
+both inherited resources before allocating the child. The exposed result always
+comes from a clean trusted-role template with a fresh runtime identity. Capture
+snapshot, capture sandbox, result sandbox, and result snapshot are journaled
+immediately under provider-resource locks. Cleanup retries tolerate already
+missing sandboxes, and an outage leaves the exact operation and allocations in
+progress rather than falsely reporting terminal cleanup.
+
+The workspace-preparation intent now has a mutually exclusive child source mode
+that binds the owner lease and its exact latest snapshot. Final commit repeats
+authorization against the exact owner provider sandbox and connection
+generation, requires both temporary allocations to be durably reclaimed,
+verifies the complete provider/object allocation set, atomically creates the
+child lease and base snapshot, adopts only result resources, and completes with
+a secret-free logical response. A ticket is issued only after commit. Two-pool
+coverage proves duplicate replay, clean-template state without inherited session
+identity, exact owner rejection before provider mutation, complete ordinary
+failure cleanup, durable cleanup-pending state, operation-subtype isolation, and
+owner-lock exclusion against another lifecycle mutation.
+The complete Docker-backed PostgreSQL suite passes 260 tests with no skips.
+
+This is the allocation/commit foundation, not completed crash recovery. A child
+stale reconciler must still discover unledgered deterministic snapshots and
+metadata-marked sandboxes, abort partial workspace publication, preserve a fully
+committed result, and retry cleanup outages before the main child TODO can be
+closed. Command execution also does not yet participate in the lease gate, so a
+command-consistent capture instant remains separate work.
+
 ### Bounded PostgreSQL reconciliation foundation
 
 An intentionally unwired `PostgresReconciler` now claims stale operations only

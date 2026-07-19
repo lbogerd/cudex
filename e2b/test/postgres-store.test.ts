@@ -84,6 +84,40 @@ live('changed request hash or tenant is rejected before a second claim', async c
   assert.equal(count.rows[0]!.count, '1')
 })
 
+live('child operation subtype is immutable, replay-exact, and stale-claim filterable', async context => {
+  const child = {
+    operation: 'provision', idempotencyKey: 'child-subtype', tenantId: 'tenant-1',
+    requestHash: canonicalRequestHash({ source: 'owner' }), workerId: 'child-worker',
+    operationSubtype: 'child' as const,
+  }
+  assert.equal((await context.first.claimOperation(child)).kind, 'claimed')
+  const { operationSubtype: _subtype, ...withoutSubtype } = child
+  await assert.rejects(context.second.claimOperation(withoutSubtype), OperationRequestMismatchError)
+  await assert.rejects(context.firstPool.query(`
+    UPDATE hosted_agent_operations SET operation_subtype = NULL
+    WHERE operation = 'provision' AND idempotency_key = 'child-subtype'
+  `), /operation subtype is immutable/)
+
+  const ordinary = {
+    operation: 'provision', idempotencyKey: 'ordinary-subtype', tenantId: 'tenant-1',
+    requestHash: canonicalRequestHash({ source: 'immutable' }), workerId: 'ordinary-worker',
+  }
+  assert.equal((await context.first.claimOperation(ordinary)).kind, 'claimed')
+  await context.firstPool.query(`
+    UPDATE hosted_agent_operations SET heartbeat_at = now() - interval '1 hour'
+  `)
+  const childOnly = await context.second.claimStaleOperations(
+    new Date(), 10, 'child-reconciler', 'tenant-1', 'provision', 'child')
+  assert.equal(childOnly.length, 1)
+  assert.equal(childOnly[0]!.idempotencyKey, child.idempotencyKey)
+  assert.equal(childOnly[0]!.operationSubtype, 'child')
+  const remaining = await context.first.claimStaleOperations(
+    new Date(), 10, 'general-reconciler', 'tenant-1', 'provision', 'none')
+  assert.equal(remaining.length, 1)
+  assert.equal(remaining[0]!.idempotencyKey, ordinary.idempotencyKey)
+  assert.equal(remaining[0]!.operationSubtype, null)
+})
+
 live('journal validation, heartbeat, terminal failure, and database identities are enforced', async context => {
   await assert.rejects(context.first.claimOperation({
     operation: 'release', idempotencyKey: 'bad-hash', tenantId: 'tenant-1',

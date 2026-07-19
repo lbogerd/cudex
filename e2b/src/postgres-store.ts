@@ -19,6 +19,7 @@ export interface OperationClaimInput extends OperationIdentity {
   requestHash: string
   workerId: string
   primaryLeaseId?: string
+  operationSubtype?: 'child'
 }
 
 export type OperationClaim =
@@ -40,6 +41,7 @@ export interface OperationAllocation {
 }
 
 export interface StaleOperation extends OperationIdentity {
+  operationSubtype: 'child' | null
   requestHash: string
   generation: number
   previousWorkerId: string | null
@@ -119,6 +121,7 @@ function validateGeneration(generation: number): void {
 
 interface OperationRow {
   tenant_id: string
+  operation_subtype: 'child' | null
   request_hash: string
   state: 'in_progress' | 'succeeded' | 'failed_terminal'
   logical_response: unknown
@@ -149,23 +152,25 @@ export class PostgresJournal {
       const inserted = input.primaryLeaseId === undefined
         ? await client.query<{ generation: string }>(`
             INSERT INTO hosted_agent_operations
-              (operation, idempotency_key, tenant_id, request_hash, state, worker_id, heartbeat_at)
-            VALUES ($1, $2, $3, $4, 'in_progress', $5, now())
+              (operation, idempotency_key, tenant_id, request_hash, state, worker_id, heartbeat_at,
+               operation_subtype)
+            VALUES ($1, $2, $3, $4, 'in_progress', $5, now(), $6)
             ON CONFLICT (operation, idempotency_key) DO NOTHING
             RETURNING generation
-          `, [input.operation, input.idempotencyKey, input.tenantId, input.requestHash, input.workerId])
+          `, [input.operation, input.idempotencyKey, input.tenantId, input.requestHash,
+            input.workerId, input.operationSubtype ?? null])
         : await client.query<{ generation: string }>(`
             INSERT INTO hosted_agent_operations
               (operation, idempotency_key, tenant_id, request_hash, state, worker_id,
-               heartbeat_at, primary_lease_id)
-            SELECT $1, $2, $3, $4, 'in_progress', $5, now(), lease_id
+               heartbeat_at, primary_lease_id, operation_subtype)
+            SELECT $1, $2, $3, $4, 'in_progress', $5, now(), lease_id, $7
             FROM hosted_agent_leases WHERE tenant_id = $3 AND lease_id = $6
             ON CONFLICT (operation, idempotency_key) DO NOTHING
             RETURNING generation
           `, [input.operation, input.idempotencyKey, input.tenantId, input.requestHash,
-            input.workerId, input.primaryLeaseId])
+            input.workerId, input.primaryLeaseId, input.operationSubtype ?? null])
       const result = await client.query<OperationRow>(`
-        SELECT tenant_id, request_hash, state, logical_response, error_code, error_message,
+        SELECT tenant_id, operation_subtype, request_hash, state, logical_response, error_code, error_message,
                generation::text, heartbeat_at, primary_lease_id, result_lease_id
         FROM hosted_agent_operations
         WHERE operation = $1 AND idempotency_key = $2
@@ -175,6 +180,9 @@ export class PostgresJournal {
       if (!row && input.primaryLeaseId !== undefined) throw new OperationTargetNotFoundError()
       if (!row) throw new Error('operation claim disappeared')
       if (row.tenant_id !== input.tenantId || row.request_hash !== input.requestHash) {
+        throw new OperationRequestMismatchError()
+      }
+      if (row.operation_subtype !== (input.operationSubtype ?? null)) {
         throw new OperationRequestMismatchError()
       }
       if (input.primaryLeaseId !== undefined && row.primary_lease_id !== input.primaryLeaseId) {
@@ -197,7 +205,7 @@ export class PostgresJournal {
     for (;;) {
       options.signal?.throwIfAborted()
       const result = await this.pool.query<OperationRow>(`
-        SELECT tenant_id, request_hash, state, logical_response, error_code, error_message,
+        SELECT tenant_id, operation_subtype, request_hash, state, logical_response, error_code, error_message,
                generation::text, heartbeat_at, primary_lease_id, result_lease_id
         FROM hosted_agent_operations
         WHERE operation = $1 AND idempotency_key = $2
@@ -431,7 +439,8 @@ export class PostgresJournal {
   }
 
   async claimStaleOperations(staleBefore: Date, limit: number, workerId: string,
-    tenantId?: string, operationFilter?: string): Promise<StaleOperation[]> {
+    tenantId?: string, operationFilter?: string,
+    operationSubtypeFilter?: 'child' | 'none'): Promise<StaleOperation[]> {
     if (!Number.isInteger(limit) || limit < 1 || limit > 1000) throw new Error('invalid stale-operation limit')
     validateWorkerId(workerId)
     if (tenantId !== undefined) {
@@ -442,6 +451,10 @@ export class PostgresJournal {
         throw new Error('invalid operation filter')
       }
     }
+    if (operationSubtypeFilter !== undefined
+      && operationSubtypeFilter !== 'child' && operationSubtypeFilter !== 'none') {
+      throw new Error('invalid operation subtype filter')
+    }
     return this.transaction(async client => {
       const result = await client.query<StaleRow>(`
         WITH candidates AS (
@@ -451,6 +464,8 @@ export class PostgresJournal {
             AND COALESCE(heartbeat_at, started_at) < $1
             AND ($4::text IS NULL OR tenant_id = $4)
             AND ($5::text IS NULL OR operation = $5)
+            AND ($6::text IS NULL OR ($6 = 'none' AND operation_subtype IS NULL)
+              OR operation_subtype = $6)
           ORDER BY COALESCE(heartbeat_at, started_at), operation, idempotency_key
           FOR UPDATE SKIP LOCKED
           LIMIT $2
@@ -463,12 +478,14 @@ export class PostgresJournal {
           AND operation.idempotency_key = candidates.idempotency_key
           AND operation.tenant_id = candidates.tenant_id
         RETURNING operation.operation, operation.idempotency_key, operation.tenant_id,
-                  operation.request_hash, operation.generation::text,
+                  operation.operation_subtype, operation.request_hash, operation.generation::text,
                   candidates.worker_id AS previous_worker_id, operation.worker_id,
                   operation.primary_lease_id, operation.result_lease_id
-      `, [staleBefore, limit, workerId, tenantId ?? null, operationFilter ?? null])
+      `, [staleBefore, limit, workerId, tenantId ?? null, operationFilter ?? null,
+        operationSubtypeFilter ?? null])
       return result.rows.map(row => ({
         operation: row.operation,
+        operationSubtype: row.operation_subtype,
         idempotencyKey: row.idempotency_key,
         tenantId: row.tenant_id,
         requestHash: row.request_hash,
@@ -616,6 +633,7 @@ function allocationFromRow(row: AllocationRow): OperationAllocation {
 
 interface StaleRow {
   operation: string
+  operation_subtype: 'child' | null
   idempotency_key: string
   tenant_id: string
   request_hash: string

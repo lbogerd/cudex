@@ -119,7 +119,8 @@ export interface WorkspaceSnapshotPublisherOptions {
 type DurableWorkspaceState = Pick<PostgresDurableState,
   'withObjectLocationLock' | 'registerObject' | 'createLeaseWithBaseSnapshot' | 'appendCheckpoint'>
   & Partial<Pick<PostgresDurableState,
-    'getLease' | 'lockAuthorizedSourceSnapshot' | 'createRestoredLeaseWithBaseSnapshot'>>
+    'getLease' | 'lockAuthorizedSourceSnapshot' | 'createRestoredLeaseWithBaseSnapshot'
+    | 'createChildLeaseWithBaseSnapshot'>>
 
 interface PlannedObject {
   bytes: Uint8Array
@@ -272,10 +273,13 @@ export class WorkspaceSnapshotPublisher {
     const checkpointSource = input.expectedLatestSnapshotId != null
     const immutablePaired = input.sourceSnapshotId != null && input.expectedSourceChecksum !== null
     const restorePaired = input.restoreSourceLeaseId != null && input.restoreSourceSnapshotId != null
+    const childSource = input.ownerAgentId != null && input.ownerLeaseId != null
+      && checkpointSource && !immutableSource && !restoreSource
     const validSourceMode = input.fence.operation === 'checkpoint'
       || input.fence.operation === 'patch_apply'
       ? checkpointSource && !immutableSource && !restoreSource
-      : !checkpointSource && ((immutablePaired && !restoreSource) || (restorePaired && !immutableSource))
+      : (!checkpointSource && ((immutablePaired && !restoreSource) || (restorePaired && !immutableSource)))
+        || childSource
     if (!validSourceMode) throw new ServiceError(400, 'invalid workspace preparation source mode')
     const tenantId = opaque('tenant ID', input.tenantId)
     if (tenantId !== input.fence.tenantId) throw new ServiceError(400, 'workspace preparation tenant mismatch')
@@ -291,7 +295,7 @@ export class WorkspaceSnapshotPublisher {
         restoreSourceLeaseId: input.restoreSourceLeaseId ?? null,
         restoreSourceSnapshotId: input.restoreSourceSnapshotId ?? null,
         expectedLatestSnapshotId: (input.fence.operation === 'checkpoint'
-          || input.fence.operation === 'patch_apply')
+          || input.fence.operation === 'patch_apply' || childSource)
           ? input.expectedLatestSnapshotId ?? null : null,
         providerSandboxId: input.providerSandboxId, sandboxTemplate: input.sandboxTemplate,
         cwdUri: input.cwdUri, workspaceRootUris: [...input.workspaceRootUris],
@@ -440,6 +444,61 @@ export class WorkspaceSnapshotPublisher {
       if (error instanceof ServiceError) throw error
       if (error instanceof DurableStateConflictError) throw new ServiceError(409, error.message)
       if (error instanceof DurableStateNotFoundError) throw new ServiceError(404, 'snapshot missing')
+      throw new ServiceError(503, 'workspace snapshot service unavailable')
+    }
+  }
+
+  async commitDurableChild(fence: PreparationFence,
+    prepared: PreparedDurableBaseWorkspaceSnapshot,
+    source: { ownerProviderSandboxId: string; ownerConnectionGeneration: number },
+    executor: PoolClient): Promise<CommittedDurableBaseWorkspaceSnapshot> {
+    const coordinator = this.options.durablePreparation
+    if (!coordinator) throw new ServiceError(503, 'durable workspace preparation is unavailable')
+    if (fence.operation !== 'provision') throw new ServiceError(400, 'invalid workspace preparation operation')
+    try {
+      const locked = await coordinator.preparations.lockForCommit(
+        fence, prepared.preparation.preparationId, prepared.intent, executor)
+      const intent = locked.preparation.intent
+      if (intent.sourceSnapshotId !== null || intent.expectedSourceChecksum !== null
+        || intent.restoreSourceLeaseId !== null || intent.restoreSourceSnapshotId !== null
+        || intent.expectedLatestSnapshotId === null || intent.ownerAgentId === null
+        || intent.ownerLeaseId === null) throw new Error('invalid child source preparation')
+      if (!this.state.createChildLeaseWithBaseSnapshot) {
+        throw new Error('durable child commit is unavailable')
+      }
+      const archive = locked.objects.find(object => object.purpose === 'workspace_archive')
+      const manifest = locked.objects.find(object => object.purpose === 'manifest')
+      if (!archive || !manifest) throw new Error('prepared workspace object set is incomplete')
+      const snapshotInput: SnapshotInput = {
+        snapshotId: intent.snapshotId, providerSnapshotId: intent.providerSnapshotId,
+        workspaceArchiveObjectId: archive.objectId, manifestObjectId: manifest.objectId,
+        manifestChecksum: intent.manifestChecksum,
+        contentObjectIds: locked.objects.filter(object => object.purpose === 'content_blob')
+          .map(object => object.objectId).sort(),
+        expiresAt: intent.snapshotExpiresAt === null ? null : new Date(intent.snapshotExpiresAt),
+      }
+      const created = await this.state.createChildLeaseWithBaseSnapshot({
+        leaseId: intent.leaseId, environmentId: intent.environmentId, tenantId: intent.tenantId,
+        agentId: intent.agentId, ownerAgentId: intent.ownerAgentId,
+        ownerLeaseId: intent.ownerLeaseId,
+        expectedOwnerLatestSnapshotId: intent.expectedLatestSnapshotId,
+        expectedOwnerProviderSandboxId: source.ownerProviderSandboxId,
+        expectedOwnerConnectionGeneration: source.ownerConnectionGeneration,
+        sourceSnapshotId: null, providerSandboxId: intent.providerSandboxId,
+        sandboxTemplate: intent.sandboxTemplate, cwdUri: intent.cwdUri,
+        workspaceRootUris: [...intent.workspaceRootUris],
+        toolPolicy: structuredClone(intent.toolPolicy), policyVersion: intent.policyVersion,
+        baseSnapshot: snapshotInput,
+      }, executor)
+      verifySnapshot(created.snapshot, intent.tenantId, intent.leaseId, snapshotInput)
+      await coordinator.preparations.markCommitted(
+        fence, prepared.preparation.preparationId, prepared.intent, executor)
+      return { lease: created.lease, snapshot: created.snapshot,
+        objectAllocationIds: locked.objects.map(object => object.allocationId) }
+    } catch (error) {
+      if (error instanceof ServiceError) throw error
+      if (error instanceof DurableStateConflictError) throw new ServiceError(409, error.message)
+      if (error instanceof DurableStateNotFoundError) throw new ServiceError(404, 'owner lease missing')
       throw new ServiceError(503, 'workspace snapshot service unavailable')
     }
   }

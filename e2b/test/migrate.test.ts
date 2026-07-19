@@ -6,7 +6,7 @@ import { loadMigrations, runMigrations } from '../src/migrate.js'
 
 test('migration files load in version order with stable checksums', async () => {
   const migrations = await loadMigrations()
-  assert.deepEqual(migrations.map(migration => migration.version), [1, 2, 3, 4, 5, 6, 7, 8, 9])
+  assert.deepEqual(migrations.map(migration => migration.version), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
   assert.equal(migrations[0]!.filename, '0001_control_plane.sql')
   assert.match(migrations[0]!.checksum, /^sha256:[0-9a-f]{64}$/)
 })
@@ -20,7 +20,7 @@ test('PostgreSQL migrations are transactional, repeatable, and enforce identity 
   try {
     await Promise.all([runMigrations(pool), runMigrations(pool)])
     const applied = await pool.query<{ version: number }>('SELECT version FROM hosted_agent_schema_migrations ORDER BY version')
-    assert.deepEqual(applied.rows.map(row => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9])
+    assert.deepEqual(applied.rows.map(row => row.version), [1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
 
     const tableNames = await pool.query<{ table_name: string }>(`
       SELECT table_name FROM information_schema.tables
@@ -51,6 +51,20 @@ test('PostgreSQL migrations are transactional, repeatable, and enforce identity 
         (operation, idempotency_key, tenant_id, request_hash, state, heartbeat_at)
       VALUES ('provision', 'bad-hash', 'tenant', 'not-a-checksum', 'in_progress', now())
     `), error => (error as { code?: string }).code === '23514')
+    await pool.query(`
+      INSERT INTO hosted_agent_operations
+        (operation, idempotency_key, tenant_id, request_hash, state, heartbeat_at, operation_subtype)
+      VALUES ('provision', 'child-key', 'tenant', $1, 'in_progress', now(), 'child')
+    `, [digest])
+    await assert.rejects(pool.query(`
+      INSERT INTO hosted_agent_operations
+        (operation, idempotency_key, tenant_id, request_hash, state, heartbeat_at, operation_subtype)
+      VALUES ('provision', 'invalid-subtype', 'tenant', $1, 'in_progress', now(), 'restore')
+    `, [digest]), error => (error as { code?: string }).code === '23514')
+    await assert.rejects(pool.query(`
+      UPDATE hosted_agent_operations SET operation_subtype = NULL
+      WHERE operation = 'provision' AND idempotency_key = 'child-key'
+    `), /operation subtype is immutable/)
   } finally {
     await pool.end()
     await admin.query(`DROP SCHEMA ${schema} CASCADE`)

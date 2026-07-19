@@ -10,6 +10,7 @@ import { FakeProvider } from './fake-provider.js'
 
 const operation: StaleOperation = {
   operation: 'provision', idempotencyKey: 'stale', tenantId: 'tenant-1',
+  operationSubtype: null,
   requestHash: canonicalRequestHash({ operation: 'provision' }), generation: 1,
   previousWorkerId: 'dead', workerId: 'reconciler', primaryLeaseId: null,
   resultLeaseId: null,

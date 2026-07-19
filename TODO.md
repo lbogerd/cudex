@@ -42,6 +42,10 @@ production backend. Stable decisions, evidence, and wire schemas are in
 - [x] Add an unwired PostgreSQL clean-restore coordinator with source-bound
   journal claims, deterministic replacement identities, continuous fencing,
   clean-template allocation, exact lineage replay, and cleanup-safe commit.
+- [x] Add an unwired PostgreSQL child coordinator with an immutable operation
+  subtype, owner session locking, exact owner/snapshot/sandbox reauthorization,
+  immediately ledgered capture/result resources, clean-template isolation,
+  durable workspace preparation, and result-only allocation adoption.
 - [x] Reconcile stale restore preparations and deterministic provider snapshots
   before sandbox teardown, including unledgered post-snapshot crash recovery,
   bounded object reclamation, and fail-closed committed-result protection.

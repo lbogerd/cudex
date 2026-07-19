@@ -103,6 +103,14 @@ export interface CreateRestoredLeaseInput extends CreateLeaseInput {
   restoreSourceSnapshotId: string
 }
 
+export interface CreateChildLeaseInput extends CreateLeaseInput {
+  ownerAgentId: string
+  ownerLeaseId: string
+  expectedOwnerLatestSnapshotId: string
+  expectedOwnerProviderSandboxId: string
+  expectedOwnerConnectionGeneration: number
+}
+
 export interface RestoreSourceAuthorization {
   tenantId: string
   sourceLeaseId: string
@@ -453,6 +461,30 @@ export class PostgresDurableState {
           `, [source.leaseId, input.tenantId])
         }
         return created
+      }
+      return executor ? await create(executor) : await this.transaction(create)
+    } catch (error) { return postgresError(error) }
+  }
+
+  async createChildLeaseWithBaseSnapshot(input: CreateChildLeaseInput,
+    executor?: PoolClient): Promise<{ lease: Lease; snapshot: Snapshot }> {
+    validateLeaseInput(input); validateSnapshotInput(input.baseSnapshot)
+    validateId('expected owner snapshot ID', input.expectedOwnerLatestSnapshotId)
+    validateId('expected owner provider sandbox ID', input.expectedOwnerProviderSandboxId)
+    if (!Number.isSafeInteger(input.expectedOwnerConnectionGeneration)
+      || input.expectedOwnerConnectionGeneration < 0) throw new Error('invalid owner connection generation')
+    if (input.agentId === input.ownerAgentId) throw new Error('child and owner agents must be distinct')
+    try {
+      const create = async (client: PoolClient) => {
+        const owner = await this.lockLease(client, input.tenantId, input.ownerLeaseId)
+        if (!['active', 'paused'].includes(owner.state)
+          || owner.agentId !== input.ownerAgentId
+          || owner.latestSnapshotId !== input.expectedOwnerLatestSnapshotId
+          || owner.providerSandboxId !== input.expectedOwnerProviderSandboxId
+          || owner.connectionGeneration !== input.expectedOwnerConnectionGeneration) {
+          throw new DurableStateNotFoundError('authorized child owner was not found')
+        }
+        return this.createLeaseWithBaseSnapshot(input, client)
       }
       return executor ? await create(executor) : await this.transaction(create)
     } catch (error) { return postgresError(error) }
