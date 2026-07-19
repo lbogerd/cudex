@@ -1226,14 +1226,30 @@ coverage proves duplicate replay, clean-template state without inherited session
 identity, exact owner rejection before provider mutation, complete ordinary
 failure cleanup, durable cleanup-pending state, operation-subtype isolation, and
 owner-lock exclusion against another lifecycle mutation.
-The complete Docker-backed PostgreSQL suite passes 260 tests with no skips.
 
-This is the allocation/commit foundation, not completed crash recovery. A child
-stale reconciler must still discover unledgered deterministic snapshots and
-metadata-marked sandboxes, abort partial workspace publication, preserve a fully
-committed result, and retry cleanup outages before the main child TODO can be
-closed. Command execution also does not yet participate in the lease gate, so a
-command-consistent capture instant remains separate work.
+A dedicated child-only stale reconciler now claims only `provision`/`child`
+operations and holds the owner session lock throughout recovery. A committed
+child is completed only after reconstructing the exact deterministic lease,
+snapshot, preparation, provider-allocation, object-allocation, request-hash, and
+metadata graph. Any mismatch remains in progress without provider mutation.
+An uncommitted operation must instead match the coordinator's exact allocation
+prefix and preparation intent before cleanup begins. Recovery aborts partial
+workspace publication, reclaims associated and stray objects, retries ledgered
+provider cleanup, and discovers resources whose provider RPC succeeded before
+its response was journaled. Sandboxes are scoped by service, tenant, child lease,
+owner lease, and capture/result purpose; snapshots use operation-derived names.
+Every discovered resource is rechecked under the global provider lock against
+all durable leases, snapshots, and unfinished allocations before deletion, and
+absence is observed before terminal failure. Provider and object-store work is
+heartbeat-fenced and each pass is bounded.
+
+Two-pool tests cover ledgered cleanup retry, lost capture-snapshot and
+capture-sandbox responses, explicit unledgered inventory, exact committed
+response reconstruction, and fail-closed corrupted-graph handling. The complete
+Docker-backed PostgreSQL suite passes 266 tests with no skips. This closes the
+durable child allocation/recovery invariant. Command execution still does not
+participate in the lease gate, so a command-consistent capture instant and
+production startup wiring remain separate work.
 
 ### Bounded PostgreSQL reconciliation foundation
 

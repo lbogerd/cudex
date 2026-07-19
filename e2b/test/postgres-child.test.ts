@@ -9,17 +9,18 @@ import {
   deterministicChildId,
   PostgresChildCoordinator,
 } from '../src/postgres-child.js'
+import { PostgresChildReconciler } from '../src/postgres-child-reconciler.js'
 import { runMigrations } from '../src/migrate.js'
 import { PostgresObjectReclaimer } from '../src/postgres-object-reclaimer.js'
 import { PostgresDurableState } from '../src/postgres-state.js'
-import { PostgresJournal } from '../src/postgres-store.js'
+import { canonicalRequestHash, PostgresJournal } from '../src/postgres-store.js'
 import { PostgresTicketIssuer } from '../src/postgres-tickets.js'
 import { PostgresWorkspacePreparations } from '../src/postgres-workspace-preparations.js'
 import type { ProvisionRequest } from '../src/types.js'
 import { ServiceError } from '../src/types.js'
 import { WorkspaceSnapshotPublisher } from '../src/workspace-snapshots.js'
 import { FakeProvider } from './fake-provider.js'
-import type { ProviderSnapshotOptions } from '../src/provider.js'
+import type { CreatedSandbox, ProviderSnapshotOptions } from '../src/provider.js'
 
 const databaseUrl = process.env.HOSTED_AGENT_TEST_DATABASE_URL
 const tenantId = 'tenant-child'
@@ -93,6 +94,33 @@ class GatedCaptureProvider extends FakeProvider {
       await this.captureGate
     }
     return super.snapshot(sandboxId, options)
+  }
+}
+
+class LostCaptureSnapshotResponseProvider extends FakeProvider {
+  private loseResponse = true
+
+  override async snapshot(sandboxId: string, options: ProviderSnapshotOptions = {}): Promise<string> {
+    const snapshotId = await super.snapshot(sandboxId, options)
+    if (this.loseResponse && options.name?.startsWith('child-capture-')) {
+      this.loseResponse = false
+      throw new Error('lost capture snapshot response')
+    }
+    return snapshotId
+  }
+}
+
+class LostCaptureSandboxResponseProvider extends FakeProvider {
+  private loseResponse = true
+
+  override async restore(snapshotId: string,
+    metadata: Record<string, string> = {}): Promise<CreatedSandbox> {
+    const sandbox = await super.restore(snapshotId, metadata)
+    if (this.loseResponse) {
+      this.loseResponse = false
+      throw new Error('lost capture sandbox response')
+    }
+    return sandbox
   }
 }
 
@@ -185,6 +213,28 @@ async function close(context: Fixture): Promise<void> {
   await Promise.all(context.pools.map(pool => pool.end()))
   await context.admin.query(`DROP SCHEMA ${context.schema} CASCADE`)
   await context.admin.end()
+}
+
+function childReconciler(context: Fixture): PostgresChildReconciler {
+  return new PostgresChildReconciler(
+    context.journals[1], context.states[1], context.provider,
+    {
+      preparations: new PostgresWorkspacePreparations(context.pools[1]),
+      reclaimer: new PostgresObjectReclaimer(context.pools[1], context.objects),
+    },
+    {
+      tenantId, managedBy: 'cudex', workerId: 'child-recovery-worker',
+      staleAfterMs: 20, heartbeatIntervalMs: 5,
+    },
+  )
+}
+
+async function ageChildOperation(context: Fixture, idempotencyKey: string): Promise<void> {
+  await context.pools[0].query(`
+    UPDATE hosted_agent_operations
+    SET heartbeat_at = now() - interval '1 hour'
+    WHERE operation = 'provision' AND idempotency_key = $1 AND tenant_id = $2
+  `, [idempotencyKey, tenantId])
 }
 
 test('durable child captures once, uses a clean template, and replays across replicas', {
@@ -337,6 +387,182 @@ test('temporary cleanup outage remains durably in progress for reconciliation', 
     assert.deepEqual(graph.rows[0], {
       state: 'in_progress', allocated: '1', reclaimed: '1',
     })
+  } finally { await close(context) }
+})
+
+test('stale child recovery reclaims a ledgered cleanup outage and terminalizes failure', {
+  skip: databaseUrl ? false : 'HOSTED_AGENT_TEST_DATABASE_URL is not set',
+}, async () => {
+  const context = await fixture()
+  try {
+    context.provider.failAt = 'deleteSnapshot'
+    await assert.rejects(context.coordinators[0].provision(context.request),
+      (error: unknown) => error instanceof ServiceError
+        && error.message === 'durable child cleanup pending')
+    context.provider.failAt = undefined
+    await ageChildOperation(context, context.request.idempotencyKey)
+
+    assert.deepEqual(await childReconciler(context).runOnce(), {
+      operationsClaimed: 1,
+      operationsCompleted: 0,
+      operationsFailed: 1,
+      allocationsReclaimed: 1,
+      allocationsPending: 0,
+      protectedResources: 0,
+    })
+    assert.deepEqual(context.provider.live(), [context.ownerSandboxId])
+    assert.equal(context.provider.snapshots.size, 1)
+    const graph = await context.pools[0].query(`
+      SELECT operation.state, operation.error_code,
+             bool_and(allocation.state = 'reclaimed') AS all_reclaimed
+      FROM hosted_agent_operations AS operation
+      JOIN hosted_agent_operation_allocations AS allocation
+        USING (operation, idempotency_key, tenant_id)
+      WHERE operation.operation = 'provision' AND operation.idempotency_key = $1
+      GROUP BY operation.state, operation.error_code
+    `, [context.request.idempotencyKey])
+    assert.deepEqual(graph.rows[0], {
+      state: 'failed_terminal', error_code: 'reconciled_abandoned', all_reclaimed: true,
+    })
+  } finally { await close(context) }
+})
+
+for (const [label, provider] of [
+  ['snapshot', () => new LostCaptureSnapshotResponseProvider()],
+  ['sandbox', () => new LostCaptureSandboxResponseProvider()],
+] as const) {
+  test(`stale child recovery discovers an unjournaled capture ${label} after a lost response`, {
+    skip: databaseUrl ? false : 'HOSTED_AGENT_TEST_DATABASE_URL is not set',
+  }, async () => {
+    const context = await fixture(provider())
+    try {
+      await assert.rejects(context.coordinators[0].provision(context.request),
+        (error: unknown) => error instanceof ServiceError
+          && error.message === 'durable child cleanup pending')
+      assert.ok(context.provider.live().length > 1 || context.provider.snapshots.size > 1)
+      await ageChildOperation(context, context.request.idempotencyKey)
+
+      const result = await childReconciler(context).runOnce()
+      assert.equal(result.operationsClaimed, 1)
+      assert.equal(result.operationsFailed, 1)
+      assert.equal(result.allocationsPending, 0)
+      assert.deepEqual(context.provider.live(), [context.ownerSandboxId])
+      assert.equal(context.provider.snapshots.size, 1)
+      const operation = await context.pools[0].query(`
+        SELECT state, error_code FROM hosted_agent_operations
+        WHERE operation = 'provision' AND idempotency_key = $1 AND tenant_id = $2
+      `, [context.request.idempotencyKey, tenantId])
+      assert.deepEqual(operation.rows[0], {
+        state: 'failed_terminal', error_code: 'reconciled_abandoned',
+      })
+    } finally { await close(context) }
+  })
+}
+
+test('stale child recovery reconstructs only an exact committed child graph', {
+  skip: databaseUrl ? false : 'HOSTED_AGENT_TEST_DATABASE_URL is not set',
+}, async () => {
+  const context = await fixture()
+  try {
+    const child = await context.coordinators[0].provision(context.request)
+    await context.pools[0].query(`
+      UPDATE hosted_agent_operations
+      SET state = 'in_progress', logical_response = NULL, completed_at = NULL,
+          heartbeat_at = now() - interval '1 hour', worker_id = 'interrupted-child-worker'
+      WHERE operation = 'provision' AND idempotency_key = $1 AND tenant_id = $2
+    `, [context.request.idempotencyKey, tenantId])
+
+    assert.deepEqual(await childReconciler(context).runOnce(), {
+      operationsClaimed: 1,
+      operationsCompleted: 1,
+      operationsFailed: 0,
+      allocationsReclaimed: 0,
+      allocationsPending: 0,
+      protectedResources: 0,
+    })
+    const operation = await context.pools[0].query(`
+      SELECT state, logical_response FROM hosted_agent_operations
+      WHERE operation = 'provision' AND idempotency_key = $1 AND tenant_id = $2
+    `, [context.request.idempotencyKey, tenantId])
+    assert.equal(operation.rows[0].state, 'succeeded')
+    assert.deepEqual(operation.rows[0].logical_response, {
+      leaseId: child.leaseId,
+      environmentId: child.environmentId,
+      baseSnapshotId: child.baseSnapshotId,
+      cwd: child.cwd,
+      workspaceRoots: child.workspaceRoots,
+      toolPolicy: child.toolPolicy,
+    })
+    assert.equal(context.provider.live().length, 2)
+    assert.equal(context.provider.snapshots.size, 2)
+  } finally { await close(context) }
+})
+
+test('stale child recovery leaves a non-exact committed graph untouched', {
+  skip: databaseUrl ? false : 'HOSTED_AGENT_TEST_DATABASE_URL is not set',
+}, async () => {
+  const context = await fixture()
+  try {
+    await context.coordinators[0].provision(context.request)
+    await context.pools[0].query(`
+      UPDATE hosted_agent_operation_allocations
+      SET metadata = metadata || '{"unexpected":"value"}'::jsonb
+      WHERE operation = 'provision' AND idempotency_key = $1 AND tenant_id = $2
+        AND allocation_kind = 'sandbox'
+    `, [context.request.idempotencyKey, tenantId])
+    await context.pools[0].query(`
+      UPDATE hosted_agent_operations
+      SET state = 'in_progress', logical_response = NULL, completed_at = NULL,
+          heartbeat_at = now() - interval '1 hour', worker_id = 'interrupted-child-worker'
+      WHERE operation = 'provision' AND idempotency_key = $1 AND tenant_id = $2
+    `, [context.request.idempotencyKey, tenantId])
+
+    const result = await childReconciler(context).runOnce()
+    assert.equal(result.operationsClaimed, 1)
+    assert.equal(result.operationsCompleted, 0)
+    assert.equal(result.operationsFailed, 0)
+    assert.equal(result.allocationsPending, 1)
+    const operation = await context.pools[0].query(`
+      SELECT state FROM hosted_agent_operations
+      WHERE operation = 'provision' AND idempotency_key = $1 AND tenant_id = $2
+    `, [context.request.idempotencyKey, tenantId])
+    assert.equal(operation.rows[0].state, 'in_progress')
+    assert.equal(context.provider.live().length, 2)
+    assert.equal(context.provider.snapshots.size, 2)
+  } finally { await close(context) }
+})
+
+test('stale child recovery discovers deterministic unledgered inventory', {
+  skip: databaseUrl ? false : 'HOSTED_AGENT_TEST_DATABASE_URL is not set',
+}, async () => {
+  const context = await fixture()
+  try {
+    const identity = {
+      operation: 'provision', idempotencyKey: 'manual-ambiguous-child', tenantId,
+    }
+    const request = { ...context.request, idempotencyKey: identity.idempotencyKey }
+    const claim = await context.journals[0].claimOperation({
+      ...identity, requestHash: canonicalRequestHash(request), workerId: 'lost-worker',
+      primaryLeaseId: context.ownerLeaseId, operationSubtype: 'child',
+    })
+    assert.equal(claim.kind, 'claimed')
+    const childLeaseId = deterministicChildId('lease', identity)
+    const captureSnapshotId = await context.provider.snapshot(context.ownerSandboxId, {
+      name: childProviderSnapshotName('capture', identity),
+    })
+    const capture = await context.provider.restore(captureSnapshotId, {
+      managedBy: 'cudex', tenantId, childLeaseId, resourcePurpose: 'capture',
+      ownerLeaseId: context.ownerLeaseId,
+    })
+    await ageChildOperation(context, identity.idempotencyKey)
+
+    const result = await childReconciler(context).runOnce()
+    assert.equal(result.operationsClaimed, 1)
+    assert.equal(result.operationsFailed, 1)
+    assert.equal(context.provider.sandboxes.get(capture.sandboxId)!.alive, false)
+    assert.equal(context.provider.snapshots.has(captureSnapshotId), false)
+    assert.deepEqual(context.provider.live(), [context.ownerSandboxId])
+    assert.equal(context.provider.snapshots.size, 1)
   } finally { await close(context) }
 })
 

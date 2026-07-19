@@ -30,7 +30,7 @@ production backend. Stable decisions, evidence, and wire schemas are in
   target-bound claims, generation-bound access rotation, secret-free replay,
   confirmed-loss terminalization, and explicit stale takeover without invented
   resource allocations.
-- [ ] Extend the same journal/allocation protocol through restore, child capture,
+- [x] Extend the same journal/allocation protocol through restore, child capture,
   and patch.
 - [x] Add the durable clean-restore lineage foundation: distinct operation source
   and result leases, schema-enforced source lease/snapshot pairing, terminal/
@@ -46,6 +46,9 @@ production backend. Stable decisions, evidence, and wire schemas are in
   subtype, owner session locking, exact owner/snapshot/sandbox reauthorization,
   immediately ledgered capture/result resources, clean-template isolation,
   durable workspace preparation, and result-only allocation adoption.
+- [x] Reconcile stale child operations by exact committed-graph reconstruction or
+  bounded reclamation of partial objects, ledgered resources, deterministic
+  snapshots, and metadata-marked sandboxes under global ownership guards.
 - [x] Reconcile stale restore preparations and deterministic provider snapshots
   before sandbox teardown, including unledgered post-snapshot crash recovery,
   bounded object reclamation, and fail-closed committed-result protection.
@@ -226,7 +229,7 @@ tickets always fail, and secrets never enter durable or observable state.
   creation into the PostgreSQL lifecycle transaction and cross-replica locks.
 - [x] Reclaim child-capture sandboxes and provider snapshots after successful
   workspace-only capture and ordinary restore/export failure paths.
-- [ ] Make child creation atomically snapshot the owner, create only a clean
+- [x] Make child creation atomically snapshot the owner, create only a clean
   trusted-role sandbox, and durably ledger/reconcile temporary captures so
   provider cleanup outages cannot leak snapshots or sandboxes.
 - [ ] Reconcile pause with `autoResume:false`; choose active/paused timeouts from
