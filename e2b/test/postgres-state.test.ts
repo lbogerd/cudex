@@ -280,6 +280,22 @@ live('Codex reference sync is exact, authorized, idempotent, and release-safe', 
     artifactId: null, expectedRevision: null as number | null }
   const replays = await Promise.all([retention.retain(request), retention.retain(request)])
   assert.equal(replays[0].revision, 1); assert.deepEqual(replays[1], replays[0])
+  const tenantTwoIds = await objects(context, 'tenant-2', '-tenant-two-retained')
+  const tenantTwoLease = await context.first.createLeaseWithBaseSnapshot(leaseInput(tenantTwoIds, {
+    tenantId: 'tenant-2', leaseId: 'lease-tenant-2', environmentId: 'env-tenant-2',
+    providerSandboxId: 'sandbox-tenant-2', baseSnapshot: {
+      snapshotId: 'snapshot-tenant-2', providerSnapshotId: 'provider-tenant-2',
+      workspaceArchiveObjectId: tenantTwoIds.archive.objectId,
+      manifestObjectId: tenantTwoIds.manifest.objectId,
+      manifestChecksum: tenantTwoIds.manifest.checksum,
+    },
+  }))
+  const tenantTwoRetention = new PostgresReferenceRetention(context.firstPool, 'tenant-2')
+  await tenantTwoRetention.retain({
+    agentId: 'agent-1', leaseId: tenantTwoLease.lease.leaseId,
+    baseSnapshotId: tenantTwoLease.snapshot.snapshotId,
+    latestSnapshotId: tenantTwoLease.snapshot.snapshotId, artifactId: null, expectedRevision: null,
+  })
   await assert.rejects(retention.retain({ ...request, agentId: 'agent-other' }))
   await assert.rejects(new PostgresReferenceRetention(context.firstPool, 'tenant-2').retain(request))
   const nextIds = await objects(context, 'tenant-1', '-retained-next')
@@ -302,18 +318,24 @@ live('Codex reference sync is exact, authorized, idempotent, and release-safe', 
   await context.first.releaseLease('tenant-1', created.lease.leaseId)
   await retention.retain(request)
   const references = await context.firstPool.query<{ count: string }>(`
-    SELECT count(*)::text AS count FROM hosted_agent_snapshot_references
-    WHERE reference_kind = 'codex_thread' AND reference_id = $1
+    SELECT count(*)::text AS count FROM hosted_agent_snapshot_references AS reference
+    JOIN hosted_agent_snapshots AS snapshot ON snapshot.snapshot_id = reference.snapshot_id
+    WHERE snapshot.tenant_id = 'tenant-1'
+      AND reference.reference_kind = 'codex_thread' AND reference.reference_id = $1
   `, [request.agentId])
   assert.equal(references.rows[0]!.count, '2')
   const objectReferences = await context.firstPool.query<{ count: string }>(`
-    SELECT count(*)::text AS count FROM hosted_agent_object_references
-    WHERE reference_kind = 'codex_thread' AND reference_id = $1
+    SELECT count(*)::text AS count FROM hosted_agent_object_references AS reference
+    JOIN hosted_agent_objects AS object_row ON object_row.object_id = reference.object_id
+    WHERE object_row.tenant_id = 'tenant-1'
+      AND reference.reference_kind = 'codex_thread' AND reference.reference_id = $1
   `, [request.agentId])
   assert.equal(objectReferences.rows[0]!.count, '4')
   await context.firstPool.query(`DELETE FROM hosted_agent_object_references
     WHERE ctid IN (SELECT ctid FROM hosted_agent_object_references
-      WHERE reference_kind = 'codex_thread' AND reference_id = $1 LIMIT 1)`, [request.agentId])
+      WHERE reference_kind = 'codex_thread' AND reference_id = $1
+        AND object_id IN (SELECT object_id FROM hosted_agent_objects WHERE tenant_id = 'tenant-1')
+      LIMIT 1)`, [request.agentId])
   const broken = await context.firstPool.connect()
   try {
     await broken.query('BEGIN')
@@ -332,6 +354,38 @@ live('Codex reference sync is exact, authorized, idempotent, and release-safe', 
     WHERE reference_id = $1 AND reference_kind IN ('lease_base', 'lease_latest')
   `, [request.leaseId])
   assert.equal(leaseReferences.rows[0]!.count, '0')
+  const clearRequest = { agentId: request.agentId, leaseId: request.leaseId, expectedRevision: 2 }
+  await assert.rejects(retention.clear({ ...clearRequest, expectedRevision: 1 }))
+  await assert.rejects(retention.clear({ ...clearRequest, leaseId: 'lease-other' }))
+  await assert.rejects(new PostgresReferenceRetention(context.firstPool, 'tenant-2').clear(clearRequest))
+  const cleared = await retention.clear(clearRequest)
+  assert.equal(cleared.revision, 3)
+  assert.deepEqual(await retention.clear(clearRequest), cleared)
+  await assert.rejects(retention.retain(request))
+  const clearedReferences = await context.firstPool.query<{ count: string }>(`
+    SELECT count(*)::text AS count FROM (
+      SELECT reference.snapshot_id::text FROM hosted_agent_snapshot_references AS reference
+        JOIN hosted_agent_snapshots AS snapshot ON snapshot.snapshot_id = reference.snapshot_id
+        WHERE snapshot.tenant_id = 'tenant-1'
+          AND reference.reference_kind = 'codex_thread' AND reference.reference_id = $1
+      UNION ALL SELECT reference.artifact_id::text FROM hosted_agent_artifact_references AS reference
+        JOIN hosted_agent_artifacts AS artifact ON artifact.artifact_id = reference.artifact_id
+        WHERE artifact.tenant_id = 'tenant-1'
+          AND reference.reference_kind = 'codex_thread' AND reference.reference_id = $1
+      UNION ALL SELECT reference.object_id::text FROM hosted_agent_object_references AS reference
+        JOIN hosted_agent_objects AS object_row ON object_row.object_id = reference.object_id
+        WHERE object_row.tenant_id = 'tenant-1'
+          AND reference.reference_kind = 'codex_thread' AND reference.reference_id = $1
+    ) retained_roots
+  `, [request.agentId])
+  assert.equal(clearedReferences.rows[0]!.count, '0')
+  const tenantTwoReferences = await context.firstPool.query<{ count: string }>(`
+    SELECT count(*)::text AS count FROM hosted_agent_object_references AS reference
+    JOIN hosted_agent_objects AS object_row ON object_row.object_id = reference.object_id
+    WHERE object_row.tenant_id = 'tenant-2'
+      AND reference.reference_kind = 'codex_thread' AND reference.reference_id = $1
+  `, [request.agentId])
+  assert.equal(tenantTwoReferences.rows[0]!.count, '2')
 })
 
 live('snapshot transactions reject content objects that are no longer available', async context => {

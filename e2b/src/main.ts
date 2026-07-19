@@ -127,6 +127,9 @@ const retention = durableRetention ?? (development ? {
   async retain(request: { expectedRevision: number | null }) {
     return { revision: request.expectedRevision ?? 1, desiredHash: '0'.repeat(64) }
   },
+  async clear(request: { expectedRevision: number }) {
+    return { revision: request.expectedRevision + 1, desiredHash: '0'.repeat(64) }
+  },
 } : undefined)
 const patchExport = sourceRuntime
   ? new PostgresPatchExportCoordinator(

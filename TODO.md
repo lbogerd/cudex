@@ -85,8 +85,12 @@ production backend. Stable decisions, evidence, and wire schemas are in
   - [x] Add monotonic reference revisions and service-computed desired-set hashes,
     persist the acknowledged revision with Codex runtime state, and reject stale
     different-set writers while accepting exact crash replays.
-  - [ ] Add a durable thread-deletion tombstone/outbox that clears the remote set
-    only after local thread deletion before enabling collection.
+  - [x] Add a tenant/lease-bound, revision-fenced permanent-clear route and
+    service tombstone that atomically removes every direct Codex root, accepts
+    exact clear replays, and rejects reference resurrection.
+  - [ ] Add a durable local thread-deletion outbox that is recorded before local
+    deletion and drains the remote clear only after local deletion before
+    enabling collection.
 - [ ] Reconcile abandoned operations, sandboxes, snapshots, capture sandboxes,
   tickets, archives, and expired blobs after crashes and timeouts.
 - [x] Add bounded, tenant-scoped PostgreSQL reclamation for registered object

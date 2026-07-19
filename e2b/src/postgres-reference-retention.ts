@@ -1,6 +1,6 @@
 import type { Pool, PoolClient } from 'pg'
 import { createHash } from 'node:crypto'
-import type { RetentionRequest, RetentionResponse } from './types.js'
+import type { ReferenceClearRequest, RetentionRequest, RetentionResponse } from './types.js'
 import { ServiceError } from './types.js'
 
 function validId(value: string): boolean {
@@ -32,8 +32,8 @@ export class PostgresReferenceRetention {
       const desiredHash = createHash('sha256').update(JSON.stringify([
         input.agentId, input.leaseId, input.baseSnapshotId, input.latestSnapshotId, input.artifactId,
       ])).digest('hex')
-      const existing = await client.query<{ revision: string; desired_hash: string }>(`
-        SELECT revision::text, desired_hash FROM hosted_agent_codex_reference_sets
+      const existing = await client.query<{ revision: string; desired_hash: string; cleared_at: Date | null }>(`
+        SELECT revision::text, desired_hash, cleared_at FROM hosted_agent_codex_reference_sets
         WHERE tenant_id = $1 AND agent_id = $2 FOR UPDATE
       `, [this.tenantId, input.agentId])
       let revision: number
@@ -48,6 +48,9 @@ export class PostgresReferenceRetention {
         `, [this.tenantId, input.agentId, input.leaseId, input.baseSnapshotId,
           input.latestSnapshotId, input.artifactId, revision, desiredHash])
       } else {
+        if (existing.rows[0].cleared_at !== null) {
+          throw new ServiceError(409, 'references were permanently cleared')
+        }
         const currentRevision = Number(existing.rows[0].revision)
         if (!Number.isSafeInteger(currentRevision) || currentRevision <= 0
           || (input.expectedRevision !== null && input.expectedRevision > currentRevision)
@@ -98,8 +101,11 @@ export class PostgresReferenceRetention {
             AND reference.reference_kind = 'codex_thread' AND reference.reference_id = $2
             AND reference.artifact_id <> $3`, [this.tenantId, input.agentId, input.artifactId])
       }
-      await client.query(`DELETE FROM hosted_agent_object_references
-        WHERE reference_kind = 'codex_thread' AND reference_id = $1`, [input.agentId])
+      await client.query(`DELETE FROM hosted_agent_object_references AS reference
+        USING hosted_agent_objects AS object_row
+        WHERE reference.object_id = object_row.object_id AND object_row.tenant_id = $1
+          AND reference.reference_kind = 'codex_thread' AND reference.reference_id = $2`,
+      [this.tenantId, input.agentId])
       await client.query(`
         INSERT INTO hosted_agent_object_references
           (object_id, reference_kind, reference_id, purpose)
@@ -135,6 +141,68 @@ export class PostgresReferenceRetention {
     } finally { client.release() }
   }
 
+  /** Permanently clears one deleted Codex thread's exact roots with revision fencing. */
+  async clear(input: ReferenceClearRequest): Promise<RetentionResponse> {
+    if (![input.agentId, input.leaseId].every(validId)
+      || !Number.isSafeInteger(input.expectedRevision) || input.expectedRevision <= 0) {
+      throw new ServiceError(400, 'invalid reference clear request')
+    }
+    const client = await this.pool.connect()
+    try {
+      await client.query('BEGIN')
+      await client.query("SET LOCAL lock_timeout = '30s'")
+      await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
+        [`codex-reference:${this.tenantId}:${input.agentId}`])
+      const existing = await client.query<{
+        lease_id: string; revision: string; desired_hash: string; cleared_at: Date | null
+      }>(`
+        SELECT lease_id, revision::text, desired_hash, cleared_at
+        FROM hosted_agent_codex_reference_sets
+        WHERE tenant_id = $1 AND agent_id = $2 FOR UPDATE
+      `, [this.tenantId, input.agentId])
+      const row = existing.rows[0]
+      if (!row || row.lease_id !== input.leaseId) throw new ServiceError(404, 'references missing')
+      const currentRevision = Number(row.revision)
+      if (!Number.isSafeInteger(currentRevision) || currentRevision <= 0
+        || input.expectedRevision > currentRevision
+        || (row.cleared_at === null && input.expectedRevision !== currentRevision)) {
+        throw new ServiceError(409, 'reference revision mismatch')
+      }
+      let revision = currentRevision
+      let desiredHash = row.desired_hash
+      if (row.cleared_at === null) {
+        revision = currentRevision + 1
+        if (!Number.isSafeInteger(revision)) throw new ServiceError(503, 'reference revision exhausted')
+        desiredHash = createHash('sha256').update(JSON.stringify([input.agentId])).digest('hex')
+        await client.query(`UPDATE hosted_agent_codex_reference_sets
+          SET revision = $3, desired_hash = $4, cleared_at = now()
+          WHERE tenant_id = $1 AND agent_id = $2`,
+        [this.tenantId, input.agentId, revision, desiredHash])
+      }
+      await client.query(`DELETE FROM hosted_agent_snapshot_references AS reference
+        USING hosted_agent_snapshots AS snapshot
+        WHERE reference.snapshot_id = snapshot.snapshot_id AND snapshot.tenant_id = $1
+          AND reference.reference_kind = 'codex_thread' AND reference.reference_id = $2`,
+      [this.tenantId, input.agentId])
+      await client.query(`DELETE FROM hosted_agent_artifact_references AS reference
+        USING hosted_agent_artifacts AS artifact
+        WHERE reference.artifact_id = artifact.artifact_id AND artifact.tenant_id = $1
+          AND reference.reference_kind = 'codex_thread' AND reference.reference_id = $2`,
+      [this.tenantId, input.agentId])
+      await client.query(`DELETE FROM hosted_agent_object_references AS reference
+        USING hosted_agent_objects AS object_row
+        WHERE reference.object_id = object_row.object_id AND object_row.tenant_id = $1
+          AND reference.reference_kind = 'codex_thread' AND reference.reference_id = $2`,
+      [this.tenantId, input.agentId])
+      await client.query('COMMIT')
+      return { revision, desiredHash }
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined)
+      if (error instanceof ServiceError) throw error
+      throw new ServiceError(503, 'service unavailable')
+    } finally { client.release() }
+  }
+
   async assertSynchronized(client: PoolClient, leaseId: string): Promise<void> {
     const result = await client.query(`
       SELECT 1
@@ -143,6 +211,7 @@ export class PostgresReferenceRetention {
         ON retained.tenant_id = lease.tenant_id AND retained.lease_id = lease.lease_id
         AND retained.agent_id = lease.agent_id
       WHERE lease.tenant_id = $1 AND lease.lease_id = $2
+        AND retained.cleared_at IS NULL
         AND retained.latest_snapshot_id = lease.latest_snapshot_id
         AND EXISTS (
           SELECT 1 FROM hosted_agent_snapshot_references

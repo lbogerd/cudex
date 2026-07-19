@@ -9,6 +9,7 @@ import type {
   ProvisionedAgent,
   ProvisionRequest,
   ReconnectRequest,
+  ReferenceClearRequest,
   ReleaseRequest,
   RetentionRequest,
   RetentionResponse,
@@ -206,6 +207,19 @@ export function validateRetentionResponse(value: unknown): RetentionResponse {
     record.revision, Number.MAX_SAFE_INTEGER, responseFailure, 'reference revision')
   if (revision === 0) responseFailure('reference revision is invalid')
   return { revision, desiredHash }
+}
+
+export function validateReferenceClearRequest(value: unknown): ReferenceClearRequest {
+  const record = object(value, ['agentId', 'leaseId', 'expectedRevision'], requestFailure,
+    'reference clear request')
+  const expectedRevision = boundedNonnegativeInteger(
+    record.expectedRevision, Number.MAX_SAFE_INTEGER, requestFailure, 'reference revision')
+  if (expectedRevision === 0) requestFailure('reference revision is invalid')
+  return {
+    agentId: opaqueId(record.agentId, requestFailure, 'agent ID'),
+    leaseId: opaqueId(record.leaseId, requestFailure, 'lease ID'),
+    expectedRevision,
+  }
 }
 
 export function validatePatchExportRequest(value: unknown): PatchExportRequest {

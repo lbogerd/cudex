@@ -11,6 +11,7 @@ import {
   validateProvisionedAgent,
   validateProvisionRequest,
   validateReconnectRequest,
+  validateReferenceClearRequest,
   validateRetentionRequest,
   validateRetentionResponse,
   validateReleaseRequest,
@@ -28,6 +29,10 @@ test('retention request is an exact bounded durable set', () => {
   rejectsStatus(400, () => validateRetentionRequest({ ...request, artifactId: '' }))
   rejectsStatus(400, () => validateRetentionRequest({ ...request, expectedRevision: 0 }))
   rejectsStatus(503, () => validateRetentionResponse({ revision: 0, desiredHash: 'a'.repeat(64) }))
+  const clear = { agentId: 'agent', leaseId: 'lease', expectedRevision: 2 }
+  assert.deepEqual(validateReferenceClearRequest(clear), clear)
+  rejectsStatus(400, () => validateReferenceClearRequest({ ...clear, expectedRevision: 0 }))
+  rejectsStatus(400, () => validateReferenceClearRequest({ ...clear, extra: true }))
 })
 
 const rootProvision = () => ({

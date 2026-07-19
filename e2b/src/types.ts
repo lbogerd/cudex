@@ -16,6 +16,9 @@ export interface RetentionRequest {
   artifactId: string | null; expectedRevision: number | null
 }
 export interface RetentionResponse { revision: number; desiredHash: string }
+export interface ReferenceClearRequest {
+  agentId: string; leaseId: string; expectedRevision: number
+}
 export interface PatchExportRequest {
   leaseId: string
   agentId: string

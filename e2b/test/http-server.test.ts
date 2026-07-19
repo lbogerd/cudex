@@ -84,6 +84,8 @@ test('HTTP retention route strictly dispatches the exact durable set', async t =
     host: '127.0.0.1', port: 0, bearerToken: 'test-token', allowInsecureHttp: true,
     retention: { async retain(request) {
       seen.push(request); return { revision: 1, desiredHash: 'a'.repeat(64) }
+    }, async clear(request) {
+      seen.push(request); return { revision: 2, desiredHash: 'b'.repeat(64) }
     } },
   })
   t.after(() => server.close())
@@ -94,6 +96,11 @@ test('HTTP retention route strictly dispatches the exact durable set', async t =
   assert.equal(response.status, 200)
   assert.deepEqual(JSON.parse(response.body), { revision: 1, desiredHash: 'a'.repeat(64) })
   assert.deepEqual(seen, [request])
+  const clear = { agentId: 'agent', leaseId: 'lease', expectedRevision: 1 }
+  const cleared = await post(port, '/v1/agents/references/clear', JSON.stringify(clear))
+  assert.equal(cleared.status, 200)
+  assert.deepEqual(JSON.parse(cleared.body), { revision: 2, desiredHash: 'b'.repeat(64) })
+  assert.deepEqual(seen, [request, clear])
 })
 
 test('HTTP rejects oversized declared and streamed bodies before service dispatch', async t => {

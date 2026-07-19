@@ -17,6 +17,7 @@ import {
   validateProvisionedAgent,
   validateProvisionRequest,
   validateReconnectRequest,
+  validateReferenceClearRequest,
   validateRetentionRequest,
   validateRetentionResponse,
   validateReleaseRequest,
@@ -42,6 +43,7 @@ interface ServerOptions {
   }
   retention?: {
     retain: (request: ReturnType<typeof validateRetentionRequest>) => Promise<unknown>
+    clear: (request: ReturnType<typeof validateReferenceClearRequest>) => Promise<unknown>
   }
 }
 const maxRequestBytes = 1024 * 1024
@@ -53,8 +55,9 @@ const routes = new Map([
   ['/v1/agents/patch/apply', 'applyPatch'],
   ['/v1/agents/release', 'release'],
   ['/v1/agents/retain', 'retain'],
+  ['/v1/agents/references/clear', 'clearReferences'],
 ] as const)
-type Method = 'provision' | 'reconnect' | 'checkpoint' | 'exportPatch' | 'applyPatch' | 'release' | 'retain'
+type Method = 'provision' | 'reconnect' | 'checkpoint' | 'exportPatch' | 'applyPatch' | 'release' | 'retain' | 'clearReferences'
 
 function validateInput(method: Method, value: unknown): unknown {
   switch (method) {
@@ -65,6 +68,7 @@ function validateInput(method: Method, value: unknown): unknown {
     case 'applyPatch': return validatePatchApplyRequest(value)
     case 'release': return validateReleaseRequest(value)
     case 'retain': return validateRetentionRequest(value)
+    case 'clearReferences': return validateReferenceClearRequest(value)
   }
 }
 
@@ -77,6 +81,7 @@ function validateOutput(method: Method, value: unknown): unknown {
     case 'applyPatch': return validatePatchApplyResponse(value)
     case 'release': return value
     case 'retain': return validateRetentionResponse(value)
+    case 'clearReferences': return validateRetentionResponse(value)
   }
 }
 
@@ -154,8 +159,9 @@ export async function startServer(service: AgentLifecycleService, gateway: ExecG
       const input = validateInput(method, await body(request))
       const patchExport = options.patchExport
       const patchApply = options.patchApply
-      const dispatch = method === 'retain'
-        ? options.retention && ((value: never) => options.retention!.retain(value))
+      const dispatch = method === 'retain' || method === 'clearReferences'
+        ? options.retention && ((value: never) => method === 'retain'
+          ? options.retention!.retain(value) : options.retention!.clear(value))
         : method === 'exportPatch'
         ? patchExport && ((value: never) => patchExport.exportPatch(value))
         : method === 'applyPatch'

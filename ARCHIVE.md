@@ -664,12 +664,20 @@ including checkpoint, patch-apply, and final artifact synchronization; legacy
 records safely default to no revision. The fake service mirrors the compare-and-
 swap and replay semantics.
 
+Migration 0016 and `POST /v1/agents/references/clear` add the remote half of
+thread deletion. A clear is tenant-, agent-, lease-, and revision-bound. Its
+transaction advances the revision once, records a permanent clear timestamp and
+empty-set hash, and removes every snapshot, artifact, and object `codex_thread`
+root. Exact stale replays return the cleared revision/hash, while wrong-lease,
+future/stale active revisions, and every attempt to retain after clear fail
+closed. The control row remains as the non-resurrection tombstone.
+
 This remains a fail-closed foundation rather than the completed deletion
-lifecycle. Before collection is enabled, it still needs a durable deletion
-tombstone/outbox that clears the remote set only after local thread deletion.
-Focused migration, authorization, exact-set, stale-writer, HTTP, Rust contract,
-expiry, apply, and lifecycle tests pass. The complete Docker/PostgreSQL suite
-passes 288 tests with no skips.
+lifecycle. Before collection is enabled, Codex still needs a durable local
+deletion outbox recorded before local removal and drained only after that removal.
+Focused migration, authorization, exact-set, stale-writer, permanent-clear, HTTP,
+Rust contract, expiry, apply, and lifecycle tests pass. The complete
+Docker/PostgreSQL suite passes 288 tests with no skips.
 
 ### Canonical workspace comparison foundation
 
