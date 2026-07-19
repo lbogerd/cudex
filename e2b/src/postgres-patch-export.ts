@@ -3,6 +3,7 @@ import type { ObjectStore } from './blob-store.js'
 import {
   PatchArtifactConflictError,
   PatchArtifactNotFoundError,
+  type PatchArtifact,
   type PostgresPatchArtifactRepository,
 } from './postgres-artifacts.js'
 import {
@@ -38,6 +39,15 @@ export interface PostgresPatchExportOptions {
 }
 
 const operation = 'patch_export'
+
+export function logicalPatchExportFromArtifact(artifact: Pick<PatchArtifact,
+  'artifactId' | 'agentId' | 'baseSnapshotId' | 'checksum' | 'changedFiles' | 'sizeBytes'>): AgentPatchArtifact {
+  return validatePatchExportResponse({
+    artifactId: artifact.artifactId, agentId: artifact.agentId,
+    baseSnapshotId: artifact.baseSnapshotId, checksum: artifact.checksum,
+    changedFiles: artifact.changedFiles, sizeBytes: artifact.sizeBytes,
+  })
+}
 
 function bounded(label: string, value: string): string {
   if (!value.trim() || value !== value.trim() || Buffer.byteLength(value) > 512
@@ -206,11 +216,7 @@ export class PostgresPatchExportCoordinator {
         await this.journal.bindLeaseAndAdoptAllocations(
           identity, fence.generation, fence.workerId, request.leaseId,
           [allocation!.allocationId], client)
-        const logical = validatePatchExportResponse({
-          artifactId: artifact.artifactId, agentId: artifact.agentId,
-          baseSnapshotId: artifact.baseSnapshotId, checksum: artifact.checksum,
-          changedFiles: artifact.changedFiles, sizeBytes: artifact.sizeBytes,
-        })
+        const logical = logicalPatchExportFromArtifact(artifact)
         await this.journal.completeOperation(
           identity, fence.generation, fence.workerId, logical, client)
         return logical

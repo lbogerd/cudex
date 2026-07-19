@@ -144,6 +144,28 @@ test('a durable checkpoint snapshot is adopted and its logical response is recov
   assert.deepEqual(completed, { snapshotId: 'snapshot-durable' })
 })
 
+test('stale patch export fails closed on an allocation that does not match deterministic metadata', async () => {
+  const malformed = allocation('1', 'object', 'object-wrong')
+  malformed.metadata = { artifactId: 'artifact-wrong', checksum: `sha256:${'a'.repeat(64)}` }
+  const stale = { ...operation, operation: 'patch_export', primaryLeaseId: 'lease-child' }
+  const journal = {
+    claimStaleOperations: async () => [stale],
+    listAllocations: async () => [malformed],
+    failOperation: async () => assert.fail('malformed patch export must not be terminalized'),
+    hasUnreclaimedAllocation: async () => false,
+    withProviderResourceLock: withoutProviderContention,
+  } as unknown as PostgresJournal
+  const state = { cleanupTickets: async () => 0 } as unknown as PostgresDurableState
+  const result = await new PostgresReconciler(journal, state, new FakeProvider(), {
+    managedBy: 'cudex', tenantId: 'tenant-1', workerId: 'reconciler', staleAfterMs: 1,
+    patchExportRecovery: {
+      artifacts: { async findForReconciliation() { assert.fail('malformed allocation must not be read') } },
+      reclaimer: { async reclaimOperationObjects() { assert.fail('malformed allocation must not be reclaimed') } },
+    },
+  }).runOnce()
+  assert.equal(result.allocationsPending, 1)
+})
+
 test('runOnce coalesces concurrent calls and polling never overlaps', async () => {
   let active = 0; let maximum = 0; let runs = 0
   const journal = {

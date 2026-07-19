@@ -6,6 +6,11 @@ import { logicalReconnectFromLease } from './postgres-reconnect.js'
 import { deterministicRestoreId, restoreProviderSnapshotName } from './postgres-restore.js'
 import type { PostgresObjectReclaimer } from './postgres-object-reclaimer.js'
 import type { PostgresWorkspacePreparations } from './postgres-workspace-preparations.js'
+import type { PostgresPatchArtifactRepository } from './postgres-artifacts.js'
+import {
+  deterministicPatchExportId,
+  logicalPatchExportFromArtifact,
+} from './postgres-patch-export.js'
 import {
   OperationOwnershipError,
   type OperationAllocation,
@@ -31,6 +36,10 @@ export interface PostgresReconcilerOptions {
     preparations: Pick<PostgresWorkspacePreparations, 'getForOperation' | 'beginAbort'>
     reclaimer: Pick<PostgresObjectReclaimer,
       'reclaimPreparationObjects' | 'reclaimOperationObjects'>
+  }
+  patchExportRecovery?: {
+    artifacts: Pick<PostgresPatchArtifactRepository, 'findForReconciliation'>
+    reclaimer: Pick<PostgresObjectReclaimer, 'reclaimOperationObjects'>
   }
   onError?: (error: unknown) => void
 }
@@ -63,10 +72,26 @@ function positiveInteger(label: string, value: number, maximum: number): void {
   if (!Number.isSafeInteger(value) || value <= 0 || value > maximum) throw new Error(`invalid ${label}`)
 }
 
+function patchExportAllocationIdentity(allocation: OperationAllocation,
+  identity: OperationIdentity): { artifactId: string; checksum: string } | null {
+  const metadata = allocation.metadata
+  const metadataKeys = Object.keys(metadata).sort()
+  const artifactId = metadata.artifactId
+  const checksum = metadata.checksum
+  const expectedArtifactId = deterministicPatchExportId('artifact', identity)
+  if (allocation.allocationKind !== 'object'
+    || metadataKeys.length !== 2 || metadataKeys[0] !== 'artifactId' || metadataKeys[1] !== 'checksum'
+    || artifactId !== expectedArtifactId || typeof checksum !== 'string'
+    || !/^sha256:[0-9a-f]{64}$/u.test(checksum)
+    || allocation.resourceId !== deterministicPatchExportId('object', identity, checksum)) return null
+  return { artifactId: expectedArtifactId, checksum }
+}
+
 export class PostgresReconciler {
   private readonly options: Required<Omit<PostgresReconcilerOptions,
-    'connections' | 'workspaceRecovery' | 'onError'>>
-    & Pick<PostgresReconcilerOptions, 'connections' | 'workspaceRecovery' | 'onError'>
+    'connections' | 'workspaceRecovery' | 'patchExportRecovery' | 'onError'>>
+    & Pick<PostgresReconcilerOptions,
+      'connections' | 'workspaceRecovery' | 'patchExportRecovery' | 'onError'>
   private timer: ReturnType<typeof setTimeout> | undefined
   private running: Promise<ReconcileRunResult> | undefined
   private stopped = true
@@ -159,6 +184,10 @@ export class PostgresReconciler {
       await this.reconcileReconnect(operation, allocations, result)
       return
     }
+    if (operation.operation === 'patch_export') {
+      await this.reconcilePatchExport(operation, allocations, result)
+      return
+    }
     if (operation.operation === 'provision' && operation.primaryLeaseId) {
       if (!this.options.workspaceRecovery) {
         result.allocationsPending += 1
@@ -195,6 +224,82 @@ export class PostgresReconciler {
       } catch (error) {
         if (!(error instanceof OperationOwnershipError)) throw error
       }
+    }
+  }
+
+  private async reconcilePatchExport(operation: StaleOperation,
+    allocations: OperationAllocation[], result: ReconcileRunResult): Promise<void> {
+    const identity: OperationIdentity = operation
+    const recovery = this.options.patchExportRecovery
+    const leaseId = operation.primaryLeaseId
+    if (!recovery || !leaseId || operation.resultLeaseId !== null || allocations.length > 1) {
+      result.allocationsPending += 1
+      return
+    }
+    if (allocations.length === 0) {
+      await this.failReconciledOperation(operation)
+      return
+    }
+    const allocation = allocations[0]!
+    const expected = patchExportAllocationIdentity(allocation, identity)
+    if (!expected) {
+      result.allocationsPending += 1
+      return
+    }
+    if (allocation.state === 'adopted') {
+      if (allocation.leaseId !== leaseId) { result.allocationsPending += 1; return }
+      try {
+        await this.journal.withLeaseLocks(operation.tenantId, [leaseId], async client => {
+          if (!await this.journal.heartbeatOperation(
+            identity, operation.generation, operation.workerId, client)) throw new OperationOwnershipError()
+          const current = await this.journal.listAllocations(
+            identity, this.options.maxAllocationsPerOperation + 1, client)
+          const currentIdentity = current[0]
+            ? patchExportAllocationIdentity(current[0], identity)
+            : null
+          if (current.length !== 1 || current[0]!.allocationId !== allocation.allocationId
+            || current[0]!.state !== 'adopted' || current[0]!.leaseId !== leaseId
+            || currentIdentity?.artifactId !== expected.artifactId
+            || currentIdentity?.checksum !== expected.checksum) {
+            throw new OperationOwnershipError()
+          }
+          const artifact = await recovery.artifacts.findForReconciliation(
+            operation.tenantId, expected.artifactId, client)
+          if (!artifact || artifact.sourceLeaseId !== leaseId
+            || artifact.artifactObjectId !== allocation.resourceId
+            || artifact.checksum !== expected.checksum) throw new OperationOwnershipError()
+          await this.journal.completeOperation(identity, operation.generation, operation.workerId,
+            logicalPatchExportFromArtifact(artifact), client)
+        })
+      } catch { result.allocationsPending += 1 }
+      return
+    }
+    if (allocation.leaseId !== null) { result.allocationsPending += 1; return }
+    if (allocation.state !== 'reclaimed') {
+      try {
+        const reclaimed = await recovery.reclaimer.reclaimOperationObjects(
+          identity, operation.generation, operation.workerId,
+          this.options.maxAllocationsPerOperation)
+        result.allocationsReclaimed += reclaimed.reclaimed
+        result.protectedResources += reclaimed.retained
+      } catch { result.allocationsPending += 1; return }
+    }
+    const final = await this.journal.listAllocations(
+      identity, this.options.maxAllocationsPerOperation + 1)
+    if (final.length !== 1 || final[0]!.allocationId !== allocation.allocationId
+      || final[0]!.state !== 'reclaimed') {
+      result.allocationsPending += 1
+      return
+    }
+    await this.failReconciledOperation(operation)
+  }
+
+  private async failReconciledOperation(operation: StaleOperation): Promise<void> {
+    try {
+      await this.journal.failOperation(operation, operation.generation, operation.workerId,
+        'reconciled_abandoned', 'abandoned operation allocations were reclaimed')
+    } catch (error) {
+      if (!(error instanceof OperationOwnershipError)) throw error
     }
   }
 

@@ -13,10 +13,12 @@ import {
 } from '../src/postgres-patch-export.js'
 import { PostgresPatchExportSourceResolver } from '../src/postgres-patch-export-source.js'
 import { PostgresObjectReclaimer } from '../src/postgres-object-reclaimer.js'
+import { PostgresReconciler } from '../src/postgres-reconciler.js'
 import { PostgresDurableState, type StoredObject } from '../src/postgres-state.js'
 import {
   type OperationClaim,
   type OperationClaimInput,
+  canonicalRequestHash,
   PostgresJournal,
 } from '../src/postgres-store.js'
 import { ServiceError, type PatchExportRequest } from '../src/types.js'
@@ -26,6 +28,7 @@ import {
   type WorkspaceEntry,
   type WorkspaceManifest,
 } from '../src/workspace-manifest.js'
+import { FakeProvider } from './fake-provider.js'
 
 const databaseUrl = process.env.HOSTED_AGENT_TEST_DATABASE_URL
 const tenantId = 'tenant-1'
@@ -258,6 +261,136 @@ live('two replicas export one exact artifact and replay without another put', as
   assert.deepEqual(durable.rows[0], {
     operation_state: 'succeeded', artifacts: '1', allocations: '1', adopted: '1', references: '5',
   })
+})
+
+live('stale reconciliation reconstructs an adopted patch artifact logical response exactly', async context => {
+  const expected = await context.coordinators[0].exportPatch(context.request)
+  const deletes = context.objects.deletes
+  await context.pools[0].query(`
+    UPDATE hosted_agent_operations SET state = 'in_progress', logical_response = NULL,
+        completed_at = NULL, worker_id = 'dead-worker', heartbeat_at = now() - interval '1 hour'
+    WHERE operation = 'patch_export' AND idempotency_key = $1 AND tenant_id = $2
+  `, [context.request.idempotencyKey, tenantId])
+  const result = await new PostgresReconciler(
+    context.journals[1], context.states[1], new FakeProvider(), {
+      managedBy: 'cudex', tenantId, workerId: 'patch-export-reconciler', staleAfterMs: 1,
+      patchExportRecovery: {
+        artifacts: context.artifacts[1],
+        reclaimer: new PostgresObjectReclaimer(context.pools[1], context.objects),
+      },
+    },
+  ).runOnce()
+  assert.equal(result.operationsClaimed, 1)
+  assert.equal(result.allocationsPending, 0)
+  assert.equal(context.objects.deletes, deletes)
+  const replay = await context.journals[0].claimOperation({
+    operation: 'patch_export', idempotencyKey: context.request.idempotencyKey, tenantId,
+    requestHash: canonicalRequestHash(context.request), workerId: 'observer',
+    primaryLeaseId: context.request.leaseId,
+  })
+  assert.equal(replay.kind, 'succeeded')
+  if (replay.kind === 'succeeded') assert.deepEqual(replay.response, expected)
+})
+
+live('stale reconciliation reclaims an unadopted patch object before terminal failure', async context => {
+  const request = { ...context.request, idempotencyKey: 'abandoned-patch-export' }
+  const identity = { operation: 'patch_export', idempotencyKey: request.idempotencyKey, tenantId }
+  const claim = await context.journals[0].claimOperation({
+    ...identity, requestHash: canonicalRequestHash(request), workerId: 'dead-worker',
+    primaryLeaseId: request.leaseId,
+  })
+  assert.equal(claim.kind, 'claimed')
+  if (claim.kind !== 'claimed') return
+  const bytes = encoded('abandoned patch artifact')
+  const physicalId = await context.objects.put(bytes)
+  const objectId = deterministicPatchExportId('object', identity, checksum(bytes))
+  await context.states[0].registerObject({
+    objectId, tenantId, kind: 'patch_artifact', ...context.objects.location(physicalId),
+    checksum: checksum(bytes), sizeBytes: bytes.byteLength, state: 'available', expiresAt: null,
+  })
+  await context.journals[0].recordAllocation(identity, claim.generation, 'dead-worker', {
+    kind: 'object', resourceId: objectId,
+    metadata: {
+      artifactId: deterministicPatchExportId('artifact', identity), checksum: checksum(bytes),
+    },
+  })
+  await context.pools[0].query(`
+    UPDATE hosted_agent_operations SET heartbeat_at = now() - interval '1 hour'
+    WHERE operation = $1 AND idempotency_key = $2 AND tenant_id = $3
+  `, [identity.operation, identity.idempotencyKey, identity.tenantId])
+  const deletes = context.objects.deletes
+  const result = await new PostgresReconciler(
+    context.journals[1], context.states[1], new FakeProvider(), {
+      managedBy: 'cudex', tenantId, workerId: 'patch-export-reconciler', staleAfterMs: 1,
+      patchExportRecovery: {
+        artifacts: context.artifacts[1],
+        reclaimer: new PostgresObjectReclaimer(context.pools[1], context.objects),
+      },
+    },
+  ).runOnce()
+  assert.equal(result.operationsClaimed, 1)
+  assert.equal(result.allocationsReclaimed, 1)
+  assert.equal(result.allocationsPending, 0)
+  assert.equal(context.objects.deletes, deletes + 1)
+  assert.equal(context.objects.values.has(physicalId), false)
+  const allocations = await context.journals[0].listAllocations(identity)
+  assert.equal(allocations[0]!.state, 'reclaimed')
+  const replay = await context.journals[0].claimOperation({
+    ...identity, requestHash: canonicalRequestHash(request), workerId: 'observer',
+  })
+  assert.equal(replay.kind, 'failed_terminal')
+  if (replay.kind === 'failed_terminal') {
+    assert.equal(replay.errorCode, 'reconciled_abandoned')
+  }
+  assert.equal(await context.journals[0].heartbeatOperation(
+    identity, claim.generation, 'dead-worker'), false)
+})
+
+live('stale reconciliation never deletes an adopted patch object without its exact artifact', async context => {
+  const request = { ...context.request, idempotencyKey: 'incomplete-adopted-patch-export' }
+  const identity = { operation: 'patch_export', idempotencyKey: request.idempotencyKey, tenantId }
+  const claim = await context.journals[0].claimOperation({
+    ...identity, requestHash: canonicalRequestHash(request), workerId: 'dead-worker',
+    primaryLeaseId: request.leaseId,
+  })
+  assert.equal(claim.kind, 'claimed')
+  if (claim.kind !== 'claimed') return
+  const bytes = encoded('adopted patch object without artifact')
+  const physicalId = await context.objects.put(bytes)
+  const objectId = deterministicPatchExportId('object', identity, checksum(bytes))
+  await context.states[0].registerObject({
+    objectId, tenantId, kind: 'patch_artifact', ...context.objects.location(physicalId),
+    checksum: checksum(bytes), sizeBytes: bytes.byteLength, state: 'available', expiresAt: null,
+  })
+  const allocation = await context.journals[0].recordAllocation(
+    identity, claim.generation, 'dead-worker', {
+      kind: 'object', resourceId: objectId,
+      metadata: {
+        artifactId: deterministicPatchExportId('artifact', identity), checksum: checksum(bytes),
+      },
+    })
+  await context.journals[0].bindLeaseAndAdoptAllocations(
+    identity, claim.generation, 'dead-worker', request.leaseId, [allocation.allocationId])
+  await context.pools[0].query(`
+    UPDATE hosted_agent_operations SET heartbeat_at = now() - interval '1 hour'
+    WHERE operation = $1 AND idempotency_key = $2 AND tenant_id = $3
+  `, [identity.operation, identity.idempotencyKey, identity.tenantId])
+  const deletes = context.objects.deletes
+  const result = await new PostgresReconciler(
+    context.journals[1], context.states[1], new FakeProvider(), {
+      managedBy: 'cudex', tenantId, workerId: 'patch-export-reconciler', staleAfterMs: 1,
+      patchExportRecovery: {
+        artifacts: context.artifacts[1],
+        reclaimer: new PostgresObjectReclaimer(context.pools[1], context.objects),
+      },
+    },
+  ).runOnce()
+  assert.equal(result.operationsClaimed, 1)
+  assert.equal(result.allocationsPending, 1)
+  assert.equal(context.objects.deletes, deletes)
+  assert.equal(context.objects.values.has(physicalId), true)
+  const allocations = await context.journals[0].listAllocations(identity)
+  assert.equal(allocations[0]!.state, 'adopted')
 })
 
 live('authorization and base mismatch fail before artifact publication', async context => {

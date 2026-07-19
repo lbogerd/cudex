@@ -260,7 +260,7 @@ identity remains isolated, and lifecycle replay never duplicates resources.
   directories, and safe symlinks without requiring Git.
 - [x] Return verified checksum, changed-file count, and size.
 - [x] Enforce authorization, expiry, path, file, byte, and manifest quotas.
-- [ ] Reconcile stale patch-export operations after process loss, including
+- [x] Reconcile stale patch-export operations after process loss, including
   exact adopted-artifact logical completion and fenced object reclamation.
 
 Exit criterion: a durable checksummed artifact remains usable after child release.

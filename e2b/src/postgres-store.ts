@@ -323,10 +323,11 @@ export class PostgresJournal {
     return allocationFromRow(row)
   }
 
-  async listAllocations(identity: OperationIdentity, limit = 10_000): Promise<OperationAllocation[]> {
+  async listAllocations(identity: OperationIdentity, limit = 10_000,
+    executor: Pick<PoolClient, 'query'> = this.pool): Promise<OperationAllocation[]> {
     validateIdentity(identity)
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 10_001) throw new Error('invalid allocation limit')
-    const result = await this.pool.query<AllocationRow>(`
+    const result = await executor.query<AllocationRow>(`
       SELECT allocation_id::text, allocation_kind, resource_id, lease_id, state,
              metadata, allocated_at, updated_at, reclaimed_at
       FROM hosted_agent_operation_allocations

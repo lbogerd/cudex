@@ -282,6 +282,22 @@ export class PostgresPatchArtifactRepository {
     return result.rows[0] ? fromRow(result.rows[0]) : null
   }
 
+  /** Exact tenant-scoped durable read for fenced recovery; wall-clock expiry does not rewrite commit history. */
+  async findForReconciliation(tenantId: string, artifactId: string,
+    executor: Pick<PoolClient, 'query'> = this.pool): Promise<PatchArtifact | null> {
+    validateId('tenant ID', tenantId); validateId('artifact ID', artifactId)
+    const result = await executor.query<ArtifactRow>(`
+      SELECT ${artifactColumns}
+      FROM hosted_agent_artifacts a
+      JOIN hosted_agent_leases l ON l.lease_id = a.source_lease_id AND l.tenant_id = a.tenant_id
+      JOIN hosted_agent_objects o ON o.object_id = a.artifact_object_id AND o.tenant_id = a.tenant_id
+      WHERE a.artifact_id = $1 AND a.tenant_id = $2 AND a.state = 'available'
+        AND o.kind = 'patch_artifact' AND o.state = 'available' AND o.checksum = a.checksum
+      FOR SHARE OF a, o
+    `, [artifactId, tenantId])
+    return result.rows[0] ? fromRow(result.rows[0]) : null
+  }
+
   async addReference(input: { tenantId: string; artifactId: string; referenceKind: 'codex_thread' | 'owner_agent' | 'operation'; referenceId: string; retainUntil?: Date | null }): Promise<void> {
     validateId('tenant ID', input.tenantId); validateId('artifact ID', input.artifactId); validateId('reference ID', input.referenceId)
     if (input.retainUntil) validateDate('retention expiry', input.retainUntil)

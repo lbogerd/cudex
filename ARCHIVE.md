@@ -555,6 +555,26 @@ seven days and is bounded by the coordinator. Focused route tests cover valid
 dispatch, tenant-field spoofing, and unavailable durable service behavior. The
 complete Docker/PostgreSQL 17 TypeScript suite passes 219/219 with no skips.
 
+The bounded PostgreSQL reconciler now understands stale `patch_export`
+operations. It accepts only the coordinator's one exact deterministic object
+allocation and exact `{artifactId,checksum}` metadata; malformed, extra,
+cross-lease, or otherwise inconsistent state remains pending without deletion.
+For an adopted allocation, recovery holds the source-lease lock, rechecks the
+current generation and complete allocation identity, verifies the tenant-scoped
+available artifact and artifact object under the same transaction, and writes
+the same validator-built logical response as the normal commit path. For an
+unadopted allocation, it uses the existing generation-fenced, reference-safe,
+shared-locator-safe object reclaimer and terminalizes only after the allocation
+is durably reclaimed. An adopted object without its exact artifact fails closed
+and remains untouched. Transaction-composable allocation reads and a dedicated
+artifact reconciliation lookup keep these checks inside the recovery lock.
+Focused malformed-state coverage plus two-replica PostgreSQL tests prove exact
+logical reconstruction, old-worker fencing, physical cleanup before terminal
+failure, and no deletion of inconsistent adopted state. The complete
+Docker/PostgreSQL 17 TypeScript suite passes 223/223 with no skips. The general
+reconciler remains intentionally unwired from production startup until the
+remaining lifecycle writers share its locking protocol.
+
 The PostgreSQL patch repository validates a canonical base/current manifest pair
 against the source lease's exact tenant, child agent, owner, immutable base, and
 latest snapshot. It derives the changed-path count and current regular-file byte
