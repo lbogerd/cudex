@@ -525,8 +525,24 @@ configured bucket/key, and match its durable size and digest. Artifact creation
 and snapshot reads can now join a caller-owned transaction, and artifact
 validation rejects unavailable or expired snapshots. Live PostgreSQL and parser
 coverage exercise authorization, locator/content corruption, expiry, canonical
-shape, and rollback visibility; all 213 tests pass. The journaled patch-export
-coordinator, artifact-object publication, stale cleanup, and HTTP wiring remain.
+shape, and rollback visibility; all 213 tests pass. At that stage the journaled
+coordinator, artifact-object publication, stale cleanup, and HTTP wiring remained.
+
+The unwired PostgreSQL patch-export coordinator now claims `patch_export`
+against the exact source lease and derives deterministic artifact and logical
+object IDs from tenant/operation/idempotency identity plus the serialized
+checksum. It resolves and verifies the immutable base/latest graph, maps every
+changed current file to one exact retained content object, serializes canonical
+artifact bytes, and immediately registers and journals the content-addressed
+put. Under the source-lease lock it repeats the complete authorization and
+serialization, then creates all artifact references, adopts the object
+allocation, and stores the bounded logical response in one transaction. Replay
+checks the durable artifact's tenant, lease, agent, base, checksum, count, and
+size without another put. Caught failures reclaim the unreferenced object, and
+ambiguous commit acknowledgement preserves durable success. Two-replica,
+authorization, storage-failure, final-lineage-race, cleanup, and ambiguous-commit
+coverage bring the live PostgreSQL suite to 218/218. Explicit stale-operation
+takeover/reconciliation and the HTTP/startup route remain before production use.
 
 The PostgreSQL patch repository validates a canonical base/current manifest pair
 against the source lease's exact tenant, child agent, owner, immutable base, and
@@ -544,7 +560,8 @@ every artifact identity column immutable even to direct SQL while permitting
 lifecycle state transitions. All four repository suites passed against
 PostgreSQL 17, covering concurrency, tenant/owner isolation, release retention,
 direct-SQL immutability, and expiry. Artifact serialization/upload and the HTTP
-export/apply orchestration remain lifecycle work.
+export/apply orchestration were the next lifecycle work; serialization and
+durable upload are now supplied by the unwired coordinator described above.
 
 The canonical artifact format now bundles the exact base/current snapshot IDs
 and manifests, complete sorted changed paths, nullable content-object IDs for

@@ -243,18 +243,24 @@ identity remains isolated, and lifecycle replay never duplicates resources.
 - [x] Add strict canonical manifest-byte parsing, verified tenant/snapshot
   material resolution, and caller-transaction artifact/snapshot repository APIs
   needed by durable patch export.
+- [x] Add an unwired PostgreSQL patch-export coordinator with source-bound
+  claims, deterministic artifact/object identities, fenced publication,
+  same-transaction artifact/adoption/completion, exact replay, and caught-failure
+  object reclamation.
 - [ ] Implement `POST v1/agents/patch/export` using the archived contract.
 - [x] Build canonical sorted manifests with path, type, mode, link target or
   content digest, and immutable base/current identities.
-- [ ] Persist content-addressed blobs and the canonical artifact before returning.
+- [x] Persist content-addressed blobs and the canonical artifact before returning.
 - [x] Use tenant-scoped logical content-object IDs throughout snapshot retention,
   canonical artifact serialization, and PostgreSQL artifact validation while
   safely sharing identical physical content across tenants.
 - [x] Compare the exact requested base snapshot with the latest checkpoint.
 - [x] Cover additions, modifications, deletions, binaries, executable modes,
   directories, and safe symlinks without requiring Git.
-- [ ] Return verified checksum, changed-file count, and size.
-- [ ] Enforce authorization, expiry, path, file, byte, and manifest quotas.
+- [x] Return verified checksum, changed-file count, and size.
+- [x] Enforce authorization, expiry, path, file, byte, and manifest quotas.
+- [ ] Reconcile stale patch-export operations after process loss, including
+  exact adopted-artifact logical completion and fenced object reclamation.
 
 Exit criterion: a durable checksummed artifact remains usable after child release.
 
