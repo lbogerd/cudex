@@ -427,7 +427,11 @@ live('atomically applies, checkpoints, cleans rollback, and replays without muta
       targetLeaseId: context.targetLeaseId, artifactId: context.artifactId,
       idempotencyKey: 'apply-clean',
     }
-    const result = await context.coordinators[0].applyPatch(request)
+    const [result, concurrent] = await Promise.all([
+      context.coordinators[0].applyPatch(request),
+      context.coordinators[1].applyPatch(request),
+    ])
+    assert.deepEqual(concurrent, result)
     assert.equal(result.type, 'applied')
     if (result.type !== 'applied') return
     const durable = await context.states[1].getLease(tenantId, context.targetLeaseId)

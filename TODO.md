@@ -111,7 +111,7 @@ production backend. Stable decisions, evidence, and wire schemas are in
 - [x] Prove immutable-source provision idempotency across two service replicas,
   including one provider mutation, exact logical replay, and terminal replay
   after partial-publication cleanup.
-- [ ] Prove restart recovery and the remaining lifecycle mutations with multiple
+- [x] Prove restart recovery and the remaining lifecycle mutations with multiple
   service replicas.
 
 Exit criterion: concurrent replay causes one logical/provider mutation and no

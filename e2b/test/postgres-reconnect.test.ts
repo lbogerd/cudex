@@ -195,6 +195,29 @@ async function close(context: Fixture): Promise<void> {
   await context.admin.end()
 }
 
+async function restartFirstReplica(context: Fixture): Promise<void> {
+  await context.pools[0].end()
+  const pool = new Pool({
+    connectionString: databaseUrl,
+    options: `-c search_path=${context.schema}`,
+    max: 6,
+  })
+  const state = new PostgresDurableState(pool)
+  const journal = new ObservedJournal(pool)
+  const tickets = new PostgresTicketIssuer(state, tenantId, 'wss://gateway.example')
+  const revoker = new ConnectionRevoker()
+  context.pools[0] = pool
+  context.states[0] = state
+  context.journals[0] = journal
+  context.tickets[0] = tickets
+  context.revokers[0] = revoker
+  context.coordinators[0] = new PostgresReconnectCoordinator(
+    journal, state, context.provider, tickets, {
+      tenantId, workerId: 'reconnect-worker-restarted', waitTimeoutMs: 2_000,
+      connections: revoker,
+    })
+}
+
 function ticketFrom(url: string): string {
   const ticket = new URL(url).searchParams.get('ticket')
   assert.ok(ticket)
@@ -314,15 +337,16 @@ test('transient reconnect failure preserves lease access for stale reconciliatio
     await context.pools[0].query(`UPDATE hosted_agent_operations
       SET heartbeat_at = now() - interval '1 hour'
       WHERE operation = 'reconnect' AND idempotency_key = $1`, [request.idempotencyKey])
+    await restartFirstReplica(context)
     const reconciler = new PostgresReconciler(
-      context.journals[1], context.states[1], context.provider, {
+      context.journals[0], context.states[0], context.provider, {
         managedBy: 'cudex', tenantId, workerId: 'reconnect-reconciler', staleAfterMs: 1,
-        connections: context.revokers[1],
+        connections: context.revokers[0],
       })
     const result = await reconciler.runOnce()
     assert.equal(result.operationsClaimed, 1)
     assert.equal((await context.states[0].getLease(tenantId, context.leaseId))?.connectionGeneration, 1)
-    assert.deepEqual(context.revokers[1].leases, [context.leaseId])
+    assert.deepEqual(context.revokers[0].leases, [context.leaseId])
     assert.deepEqual(withoutConnection(await context.coordinators[0].reconnect(request)), {
       leaseId: context.leaseId,
       environmentId: 'environment-reconnect',

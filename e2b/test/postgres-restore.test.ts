@@ -248,7 +248,11 @@ test('durable restore uses one clean template, exact archive, and replay allocat
 }, async () => {
   const context = await fixture()
   try {
-    const restored = await context.coordinators[0].restore(context.request)
+    const [restored, concurrent] = await Promise.all([
+      context.coordinators[0].restore(context.request),
+      context.coordinators[1].restore(context.request),
+    ])
+    assert.equal(concurrent.leaseId, restored.leaseId)
     assert.equal(context.provider.creates, 1)
     assert.equal(context.provider.restores, 0)
     assert.equal(context.provider.live().length, 1)

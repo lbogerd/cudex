@@ -708,6 +708,18 @@ Workspace publication plus PostgreSQL provision, restore, child, export, and
 apply suites cover these paths. The remaining-work checkbox predated the later
 production coordinator wiring and is now reconciled as complete.
 
+The PostgreSQL lifecycle replica matrix is complete. Immutable provision,
+checkpoint, release, reconnect, child creation, patch export, restore, and patch
+application all exercise independent pools/coordinators with operation and lease
+fencing. Clean restore and clean patch application now start identical requests
+concurrently on two replicas and assert one provider mutation plus exact logical
+replay. The reconnect recovery test closes the originating pool after an
+external-boundary failure, reconstructs its state, journal, ticket issuer,
+revoker, and coordinator from the durable schema, then uses the fresh runtime to
+claim and reconcile the stale operation without losing access or duplicating the
+provider transition. Existing ambiguous-commit and stale-allocation tests cover
+the remaining restart boundaries and cleanup/adoption outcomes.
+
 ### Canonical workspace comparison foundation
 
 Patch lifecycle code now has a provider-independent canonical workspace model
