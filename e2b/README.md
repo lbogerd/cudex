@@ -107,8 +107,10 @@ Use the returned `sourceSnapshotId` and checksum in
 `[hosted_agents.source_snapshot]` so root provisioning contains no client-host
 path.
 
-Patch export is served from the same durable runtime at
-`POST /v1/agents/patch/export`; it never falls back to the JSON control plane.
+Patch export and application are served from the same durable runtime at
+`POST /v1/agents/patch/export` and `POST /v1/agents/patch/apply`; neither falls
+back to the JSON control plane. Apply returns the exact tagged `applied`,
+`conflict`, or `rejected` result, and a normal conflict is HTTP 200.
 `HOSTED_AGENT_ARTIFACT_TTL_MS` controls artifact retention and defaults to seven
 days.
 

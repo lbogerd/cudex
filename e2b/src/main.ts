@@ -16,6 +16,11 @@ import { PostgresObjectReclaimer } from './postgres-object-reclaimer.js'
 import { PostgresPatchArtifactRepository } from './postgres-artifacts.js'
 import { PostgresPatchExportSourceResolver } from './postgres-patch-export-source.js'
 import { PostgresPatchExportCoordinator } from './postgres-patch-export.js'
+import { PostgresPatchApplySourceResolver } from './postgres-patch-apply-source.js'
+import { PostgresPatchApplicationRepository } from './postgres-patch-applications.js'
+import { PostgresPatchApplyCoordinator } from './postgres-patch-apply.js'
+import { PostgresWorkspacePreparations } from './postgres-workspace-preparations.js'
+import { WorkspaceSnapshotPublisher } from './workspace-snapshots.js'
 
 function required(name: string): string { const value = process.env[name]; if (!value) throw new Error(`${name} is required`); return value }
 function positiveInteger(name: string, fallback: number): number {
@@ -79,17 +84,21 @@ const sourceRuntime = await createSourceSnapshotRuntime({
   maxRoots: ingress.maxRoots,
   maxTtlMs: positiveInteger('HOSTED_AGENT_SOURCE_MAX_TTL_MS', 24 * 60 * 60_000),
 })
+const durableJournal = sourceRuntime ? new PostgresJournal(sourceRuntime.pool) : undefined
+const durableState = sourceRuntime ? new PostgresDurableState(sourceRuntime.pool) : undefined
+const durableReclaimer = sourceRuntime ? new PostgresObjectReclaimer(sourceRuntime.pool, blobs) : undefined
+const durableWorkerId = sourceRuntime ? required('HOSTED_AGENT_WORKER_ID') : undefined
 const patchExport = sourceRuntime
   ? new PostgresPatchExportCoordinator(
-      new PostgresJournal(sourceRuntime.pool),
-      new PostgresDurableState(sourceRuntime.pool),
+      durableJournal!,
+      durableState!,
       new PostgresPatchExportSourceResolver(sourceRuntime.pool, blobs),
       new PostgresPatchArtifactRepository(sourceRuntime.pool),
       blobs,
-      new PostgresObjectReclaimer(sourceRuntime.pool, blobs),
+      durableReclaimer!,
       {
         tenantId: sourceRuntime.principal.tenantId,
-        workerId: required('HOSTED_AGENT_WORKER_ID'),
+        workerId: durableWorkerId!,
         artifactTtlMs: positiveInteger('HOSTED_AGENT_ARTIFACT_TTL_MS', 7 * 24 * 60 * 60_000),
       },
     )
@@ -102,6 +111,32 @@ const provider = new E2BProvider(connection, 120_000, {
   maxRoots: ingress.maxRoots,
   observe: observeWorkspaceTransfer,
 })
+const patchApplyPublisher = sourceRuntime
+  ? new WorkspaceSnapshotPublisher(durableState!, blobs, {
+      archiveLimits,
+      reclaimer: {
+        async reclaimUnreferencedWorkspaceObject(): Promise<void> {
+          throw new Error('durable workspace publication requires preparation cleanup')
+        },
+      },
+      durablePreparation: {
+        journal: durableJournal!,
+        preparations: new PostgresWorkspacePreparations(sourceRuntime.pool),
+        reclaimer: durableReclaimer!,
+      },
+    })
+  : undefined
+const patchApply = sourceRuntime
+  ? new PostgresPatchApplyCoordinator(
+      durableJournal!,
+      durableState!,
+      new PostgresPatchApplySourceResolver(sourceRuntime.pool, blobs),
+      new PostgresPatchApplicationRepository(sourceRuntime.pool),
+      patchApplyPublisher!,
+      provider,
+      { tenantId: sourceRuntime.principal.tenantId, workerId: durableWorkerId! },
+    )
+  : undefined
 const gatewayUrl = new URL(required('HOSTED_AGENT_GATEWAY_URL'))
 if (gatewayUrl.protocol !== 'wss:' && !(development && gatewayUrl.protocol === 'ws:')) throw new Error('HOSTED_AGENT_GATEWAY_URL must use WSS outside development')
 if (gatewayUrl.username || gatewayUrl.password || gatewayUrl.search || gatewayUrl.hash) throw new Error('HOSTED_AGENT_GATEWAY_URL must not contain credentials, query, or fragment')
@@ -136,5 +171,6 @@ await startServer(service, gateway, { host, port, bearerToken: required('CODEX_H
     maxArchiveBytes: archiveLimits.maxArchiveBytes,
   } } : {}),
   ...(patchExport ? { patchExport } : {}),
+  ...(patchApply ? { patchApply } : {}),
   allowInsecureHttp: development })
 console.log(JSON.stringify({ event: 'control_plane_started', host, port, tls: Boolean(process.env.HOSTED_AGENT_TLS_CERT) }))

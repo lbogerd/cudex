@@ -610,8 +610,19 @@ Three PostgreSQL integration tests cover clean apply/checkpoint/replay, complete
 conflict immutability, and a one-time provider failure after swap that restores
 the exact original archive and latest-snapshot identity. A separate two-pool
 test proves the session lease lock remains exclusive across an intermediate
-commit. The full suite passed 243 tests with no skips. HTTP/startup wiring and
-stale phase reconciliation remain outstanding.
+commit.
+
+The authenticated `POST /v1/agents/patch/apply` boundary now exact-validates the
+tenant-free request, dispatches only to the tenant-bound PostgreSQL coordinator,
+exact-validates the logical response, and returns `applied`, `conflict`, and
+`rejected` as successful tagged JSON results. Production startup shares one
+journal, durable state, and object reclaimer between patch export and apply,
+constructs durable checkpoint preparation with deployment archive limits, and
+fails closed when the PostgreSQL runtime is absent rather than calling the JSON
+control plane. Focused HTTP tests cover every result tag, extra tenant-field
+rejection before dispatch, malformed coordinator output, and unavailable durable
+service behavior. The full PostgreSQL-backed suite passed 244 tests with no
+skips. Stale apply-phase reconciliation remains outstanding.
 
 ### Durable patch-artifact repository
 

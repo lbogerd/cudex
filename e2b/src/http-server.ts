@@ -10,6 +10,8 @@ import type { AuthenticatedTenant } from './source-snapshots.js'
 import {
   validateCheckpointRequest,
   validateCheckpointResponse,
+  validatePatchApplyRequest,
+  validatePatchApplyResponse,
   validatePatchExportRequest,
   validatePatchExportResponse,
   validateProvisionedAgent,
@@ -28,6 +30,9 @@ interface ServerOptions {
   patchExport?: {
     exportPatch: (request: ReturnType<typeof validatePatchExportRequest>) => Promise<unknown>
   }
+  patchApply?: {
+    applyPatch: (request: ReturnType<typeof validatePatchApplyRequest>) => Promise<unknown>
+  }
   sourceSnapshots?: {
     principal: AuthenticatedTenant
     api: Pick<AuthenticatedSourceSnapshotApi, 'create'>
@@ -40,9 +45,10 @@ export const sourceSnapshotContentType = 'application/vnd.codex.source-snapshot.
 const routes = new Map([
   ['/v1/agents/provision', 'provision'], ['/v1/agents/reconnect', 'reconnect'],
   ['/v1/agents/checkpoint', 'checkpoint'], ['/v1/agents/patch/export', 'exportPatch'],
+  ['/v1/agents/patch/apply', 'applyPatch'],
   ['/v1/agents/release', 'release'],
 ] as const)
-type Method = 'provision' | 'reconnect' | 'checkpoint' | 'exportPatch' | 'release'
+type Method = 'provision' | 'reconnect' | 'checkpoint' | 'exportPatch' | 'applyPatch' | 'release'
 
 function validateInput(method: Method, value: unknown): unknown {
   switch (method) {
@@ -50,6 +56,7 @@ function validateInput(method: Method, value: unknown): unknown {
     case 'reconnect': return validateReconnectRequest(value)
     case 'checkpoint': return validateCheckpointRequest(value)
     case 'exportPatch': return validatePatchExportRequest(value)
+    case 'applyPatch': return validatePatchApplyRequest(value)
     case 'release': return validateReleaseRequest(value)
   }
 }
@@ -60,6 +67,7 @@ function validateOutput(method: Method, value: unknown): unknown {
     case 'reconnect': return validateProvisionedAgent(value)
     case 'checkpoint': return validateCheckpointResponse(value)
     case 'exportPatch': return validatePatchExportResponse(value)
+    case 'applyPatch': return validatePatchApplyResponse(value)
     case 'release': return value
   }
 }
@@ -137,10 +145,13 @@ export async function startServer(service: ControlPlane, gateway: ExecGateway, o
       if (!method) throw new ServiceError(404, 'not found')
       const input = validateInput(method, await body(request))
       const patchExport = options.patchExport
+      const patchApply = options.patchApply
       const dispatch = method === 'exportPatch'
         ? patchExport && ((value: never) => patchExport.exportPatch(value))
+        : method === 'applyPatch'
+          ? patchApply && ((value: never) => patchApply.applyPatch(value))
         : (value: never) => (service[method] as (input: never) => Promise<unknown>)(value)
-      if (!dispatch) throw new ServiceError(503, 'patch export service unavailable')
+      if (!dispatch) throw new ServiceError(503, 'durable patch service unavailable')
       const result = validateOutput(method, await dispatch(input as never))
       response.statusCode = method === 'release' ? 204 : 200
       response.setHeader('content-type', 'application/json'); response.end(method === 'release' ? undefined : JSON.stringify(result))

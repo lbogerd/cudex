@@ -280,7 +280,7 @@ Exit criterion: a durable checksummed artifact remains usable after child releas
   allocation-bound rollback identity and explicit swap/checkpoint/rollback phases.
 - [x] Coordinate the clean apply path through rollback capture, validated atomic
   provider upload, observed-result verification, durable checkpoint, and replay.
-- [ ] Implement `POST v1/agents/patch/apply` and `applied`, `conflict`, and
+- [x] Implement `POST v1/agents/patch/apply` and `applied`, `conflict`, and
   `rejected` responses.
 - [x] Validate artifact checksum, authorization, expiry, paths, quotas, base, and
   target before mutation.
