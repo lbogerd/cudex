@@ -18,6 +18,8 @@ its existing process-owned/in-process behavior; hosted Codex must fail closed.
 - [x] Add a non-protocol `--help` check and a hosted singleton launcher mode.
 - [x] Complete singleton path hardening and collision/crash tests.
 - [x] Configure and record the POC template's provider CPU and memory limits.
+- [x] Keep the Linux/musl LTO artifact build within rustc's explicit bounded
+  query recursion limit.
 
 ### Transport, provider, and identity
 

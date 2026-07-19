@@ -2194,6 +2194,13 @@ IDs. The negative local-placement assertion walks only the app-server's Linux
 `/proc` descendant tree and rejects a local `codex-code-mode-host`; sandbox `ps`
 output and model prose are not accepted as evidence.
 
+The Linux/musl release build uses linker-plugin LTO across the full CLI graph.
+With the pinned Rust toolchain, the hosted additions push the CLI layout query
+past rustc's default recursion depth; `cli/src/main.rs` therefore declares the
+same bounded recursion limit (`256`) already used by app-server. This is a
+compile-time query limit only and does not change runtime stack or sandbox
+limits.
+
 ### Child creation
 
 Snapshot the owner atomically, restore into a temporary capture sandbox, export
