@@ -28,6 +28,19 @@ export interface LeaseQuiescenceGate {
     executor: Pick<PoolClient, 'query'>): Promise<void>
 }
 
+export interface LeaseInteractionLedger extends LeaseQuiescenceGate {
+  begin(identity: LeaseInteractionIdentity): Promise<LeaseInteraction>
+  resume(identity: LeaseInteractionIdentity): Promise<LeaseInteraction>
+  reattach(identity: LeaseInteractionIdentity, currentConnectionGeneration: number):
+    Promise<LeaseInteraction>
+  detach(identity: LeaseInteractionIdentity): Promise<LeaseInteraction>
+  finish(identity: LeaseInteractionIdentity): Promise<LeaseInteraction>
+  listUnfinishedProcesses(tenantId: string, leaseId: string, connectionGeneration: number,
+    sessionId: string): Promise<LeaseInteractionIdentity[]>
+  listUnfinishedFilesystem(tenantId: string, leaseId: string, connectionGeneration: number,
+    sessionId: string): Promise<LeaseInteractionIdentity[]>
+}
+
 interface InteractionRow {
   interaction_id: string
   tenant_id: string
@@ -101,7 +114,7 @@ function exact(value: LeaseInteraction, identity: LeaseInteractionIdentity): boo
 }
 
 /** Durable command admission that shares the lifecycle advisory lease gate. */
-export class PostgresLeaseInteractionGate implements LeaseQuiescenceGate {
+export class PostgresLeaseInteractionGate implements LeaseInteractionLedger {
   constructor(
     private readonly journal: Pick<PostgresJournal, 'withLeaseLocks'>,
     private readonly state: Pick<PostgresDurableState, 'getLease'>,
@@ -152,6 +165,22 @@ export class PostgresLeaseInteractionGate implements LeaseQuiescenceGate {
     })
   }
 
+  async reattach(untrusted: LeaseInteractionIdentity,
+    currentConnectionGeneration: number): Promise<LeaseInteraction> {
+    const identity = validate(untrusted)
+    generation(currentConnectionGeneration)
+    return this.journal.withLeaseLocks(identity.tenantId, [identity.leaseId], async client => {
+      const lease = await this.state.getLease(identity.tenantId, identity.leaseId, client)
+      if (!lease || lease.state !== 'active'
+        || lease.connectionGeneration !== currentConnectionGeneration) {
+        throw new LeaseInteractionConflictError()
+      }
+      const value = await this.transition(identity, 'active', client)
+      if (value.state !== 'active') throw new LeaseInteractionConflictError()
+      return value
+    })
+  }
+
   detach(identity: LeaseInteractionIdentity): Promise<LeaseInteraction> {
     return this.finishLike(validate(identity), 'detached')
   }
@@ -177,6 +206,47 @@ export class PostgresLeaseInteractionGate implements LeaseQuiescenceGate {
       LIMIT 1
     `, [tenantId, leaseId])
     if (result.rowCount !== 0) throw new LeaseNotQuiescentError()
+  }
+
+  async listUnfinishedProcesses(tenantId: string, leaseId: string,
+    connectionGeneration: number, sessionId: string): Promise<LeaseInteractionIdentity[]> {
+    return this.listUnfinished(tenantId, leaseId, connectionGeneration, sessionId, 'process')
+  }
+
+  async listUnfinishedFilesystem(tenantId: string, leaseId: string,
+    connectionGeneration: number, sessionId: string): Promise<LeaseInteractionIdentity[]> {
+    return this.listUnfinished(tenantId, leaseId, connectionGeneration, sessionId, 'filesystem')
+  }
+
+  private async listUnfinished(tenantId: string, leaseId: string,
+    connectionGeneration: number, sessionId: string,
+    kind: LeaseInteractionKind): Promise<LeaseInteractionIdentity[]> {
+    bounded('tenant ID', tenantId)
+    bounded('lease ID', leaseId)
+    generation(connectionGeneration)
+    bounded('session ID', sessionId)
+    const result = await this.journal.withLeaseLocks(tenantId, [leaseId], async client => {
+      const lease = await this.state.getLease(tenantId, leaseId, client)
+      if (!lease || lease.state !== 'active'
+        || lease.connectionGeneration !== connectionGeneration) {
+        throw new LeaseInteractionConflictError()
+      }
+      return client.query<InteractionRow>(`
+        SELECT ${columns} FROM hosted_agent_lease_interactions
+        WHERE tenant_id = $1 AND lease_id = $2
+          AND session_id = $3 AND interaction_kind = $4 AND state <> 'finished'
+        ORDER BY interaction_id
+        FOR UPDATE
+      `, [tenantId, leaseId, sessionId, kind])
+    })
+    return result.rows.map(row => {
+      const value = interaction(row)
+      return {
+        interactionId: value.interactionId, tenantId: value.tenantId,
+        leaseId: value.leaseId, connectionGeneration: value.connectionGeneration,
+        sessionId: value.sessionId, kind: value.kind, processId: value.processId,
+      }
+    })
   }
 
   private async finishLike(identity: LeaseInteractionIdentity,

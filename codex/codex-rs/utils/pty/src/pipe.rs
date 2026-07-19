@@ -34,6 +34,17 @@ struct PipeChildTerminator {
 }
 
 impl ChildTerminator for PipeChildTerminator {
+    fn process_group_id(&self) -> Option<u32> {
+        #[cfg(unix)]
+        {
+            Some(self.process_group_id)
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+
     fn signal(&mut self, signal: ProcessSignal) -> io::Result<()> {
         match signal {
             ProcessSignal::Interrupt => {

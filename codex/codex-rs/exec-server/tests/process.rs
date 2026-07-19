@@ -11,10 +11,98 @@ use codex_exec_server::TerminateResponse;
 use codex_exec_server::WriteResponse;
 use codex_exec_server::WriteStatus;
 use codex_exec_server_protocol::JSONRPCMessage;
+use codex_exec_server_protocol::JSONRPCNotification;
 use codex_exec_server_protocol::JSONRPCResponse;
 use codex_utils_path_uri::PathUri;
 use common::exec_server::exec_server;
 use pretty_assertions::assert_eq;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quiesced_is_emitted_only_after_background_descendants_are_gone() -> anyhow::Result<()> {
+    let temporary = tempfile::tempdir()?;
+    let pid_path = temporary.path().join("background.pid");
+    let mut server = exec_server().await?;
+    let initialize_id = server
+        .send_request(
+            "initialize",
+            serde_json::to_value(InitializeParams {
+                client_name: "exec-server-quiescence-test".to_string(),
+                resume_session_id: None,
+            })?,
+        )
+        .await?;
+    let _ = server
+        .wait_for_event(|event| {
+            matches!(event, JSONRPCMessage::Response(JSONRPCResponse { id, .. })
+                if id == &initialize_id)
+        })
+        .await?;
+    server
+        .send_notification("initialized", serde_json::json!({}))
+        .await?;
+
+    let start_id = server
+        .send_request(
+            "process/start",
+            serde_json::json!({
+                "processId": "proc-background",
+                "argv": ["/bin/sh", "-c",
+                    "sleep 30 >/dev/null 2>&1 & printf '%s' \"$!\" > \"$PID_PATH\""],
+                "cwd": PathUri::from_host_native_path(std::env::current_dir()?)?,
+                "env": { "PID_PATH": pid_path.to_string_lossy() },
+                "tty": false,
+                "pipeStdin": false,
+                "arg0": null
+            }),
+        )
+        .await?;
+    let _ = server
+        .wait_for_event(|event| {
+            matches!(event, JSONRPCMessage::Response(JSONRPCResponse { id, .. })
+                if id == &start_id)
+        })
+        .await?;
+    let _ = server
+        .wait_for_event(|event| {
+            matches!(event, JSONRPCMessage::Notification(JSONRPCNotification { method, .. })
+                if method == "process/quiesced")
+        })
+        .await?;
+
+    let background_pid = std::fs::read_to_string(&pid_path)?;
+    assert!(
+        !std::process::Command::new("kill")
+            .args(["-0", background_pid.as_str()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?
+            .success()
+    );
+    let read_id = server
+        .send_request(
+            "process/read",
+            serde_json::json!({
+                "processId": "proc-background",
+                "afterSeq": null,
+                "maxBytes": null,
+                "waitMs": 0
+            }),
+        )
+        .await?;
+    let response = server
+        .wait_for_event(|event| {
+            matches!(event, JSONRPCMessage::Response(JSONRPCResponse { id, .. })
+                if id == &read_id)
+        })
+        .await?;
+    let JSONRPCMessage::Response(JSONRPCResponse { result, .. }) = response else {
+        panic!("expected process/read response");
+    };
+    assert!(serde_json::from_value::<ReadResponse>(result)?.quiesced);
+
+    server.shutdown().await?;
+    Ok(())
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exec_server_starts_process_over_websocket() -> anyhow::Result<()> {

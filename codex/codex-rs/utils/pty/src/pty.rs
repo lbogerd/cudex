@@ -57,6 +57,17 @@ struct PtyChildTerminator {
 }
 
 impl ChildTerminator for PtyChildTerminator {
+    fn process_group_id(&self) -> Option<u32> {
+        #[cfg(unix)]
+        {
+            self.process_group_id
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+
     fn signal(&mut self, signal: ProcessSignal) -> std::io::Result<()> {
         match signal {
             ProcessSignal::Interrupt => {
@@ -97,6 +108,10 @@ struct RawPidTerminator {
 
 #[cfg(unix)]
 impl ChildTerminator for RawPidTerminator {
+    fn process_group_id(&self) -> Option<u32> {
+        Some(self.process_group_id)
+    }
+
     fn signal(&mut self, signal: ProcessSignal) -> std::io::Result<()> {
         match signal {
             ProcessSignal::Interrupt => {

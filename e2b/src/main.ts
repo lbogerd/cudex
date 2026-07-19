@@ -32,6 +32,7 @@ import { PostgresReleaseCoordinator } from './postgres-release.js'
 import { PostgresLifecycleService, type AgentLifecycleService } from './lifecycle-service.js'
 import { PostgresReconciler } from './postgres-reconciler.js'
 import { PostgresChildReconciler } from './postgres-child-reconciler.js'
+import { PostgresChildCoordinator } from './postgres-child.js'
 import { parseTrustedRoles } from './trusted-roles.js'
 import type { ActiveLeaseDirectory } from './gateway.js'
 import { PostgresLeaseInteractionGate } from './postgres-lease-interactions.js'
@@ -207,6 +208,9 @@ const gateway = new ExecGateway(tickets, leases, provider, {
   maxPendingBytes: positiveInteger('HOSTED_AGENT_GATEWAY_MAX_PENDING_BYTES', 1024 * 1024),
   maxBufferedBytes: positiveInteger('HOSTED_AGENT_GATEWAY_MAX_BUFFERED_BYTES', 1024 * 1024),
   leaseRevalidationMs: positiveInteger('HOSTED_AGENT_GATEWAY_LEASE_REVALIDATION_MS', 5_000),
+}, false, development ? undefined : {
+  tenantId: sourceRuntime!.principal.tenantId,
+  ledger: durableInteractionGate!,
 })
 const developmentService = development
   ? new ControlPlane(store!, provider, tickets, blobs, {
@@ -232,7 +236,12 @@ const productionService = !development
           principal: sourceRuntime!.principal, managedBy: durableManagedBy!,
           workerId: durableWorkerId!, roles: durableRoles!,
         }),
-      // Child capture remains fail-closed until command traffic participates in the lease gate.
+      child: new PostgresChildCoordinator(
+        durableJournal!, durableState!, durablePublisher!, provider, tickets, {
+          principal: sourceRuntime!.principal, managedBy: durableManagedBy!,
+          workerId: durableWorkerId!, roles: durableRoles!,
+          interactionGate: durableInteractionGate!,
+        }),
       reconnect: new PostgresReconnectCoordinator(
         durableJournal!, durableState!, provider, tickets, {
           tenantId: sourceRuntime!.principal.tenantId,

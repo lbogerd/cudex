@@ -25,6 +25,7 @@ pub const EXEC_TERMINATE_METHOD: &str = "process/terminate";
 pub const EXEC_OUTPUT_DELTA_METHOD: &str = "process/output";
 pub const EXEC_EXITED_METHOD: &str = "process/exited";
 pub const EXEC_CLOSED_METHOD: &str = "process/closed";
+pub const EXEC_QUIESCED_METHOD: &str = "process/quiesced";
 pub const ENVIRONMENT_INFO_METHOD: &str = "environment/info";
 pub const ENVIRONMENT_STATUS_METHOD: &str = "environment/status";
 pub const FS_READ_FILE_METHOD: &str = "fs/readFile";
@@ -219,6 +220,9 @@ pub struct ReadResponse {
     pub exited: bool,
     pub exit_code: Option<i32>,
     pub closed: bool,
+    /// The complete managed process group has been killed and is confirmed gone.
+    #[serde(default)]
+    pub quiesced: bool,
     pub failure: Option<String>,
     /// Whether the executor classified the process failure as a sandbox denial.
     #[serde(default)]
@@ -681,6 +685,12 @@ pub struct ExecExitedNotification {
 pub struct ExecClosedNotification {
     pub process_id: ProcessId,
     pub seq: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecQuiescedNotification {
+    pub process_id: ProcessId,
 }
 
 mod base64_bytes {

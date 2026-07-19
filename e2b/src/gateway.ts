@@ -5,6 +5,10 @@ import type { Duplex } from 'node:stream'
 import WebSocket, { WebSocketServer } from 'ws'
 import { validateExecUpstream, type ProviderAdapter } from './provider.js'
 import type { TicketAuthority } from './tickets.js'
+import {
+  ExecInteractionTracker,
+  type ExecInteractionContext,
+} from './exec-interaction-tracker.js'
 
 export interface ActiveLeaseDirectory {
   activeLeaseTarget(leaseId: string): Promise<ActiveLeaseTarget | undefined>
@@ -53,6 +57,7 @@ export class ExecGateway {
     private readonly provider: ProviderAdapter,
     limits: Partial<GatewayLimits> = {},
     private readonly allowInsecureUpstream = false,
+    private readonly interactions?: ExecInteractionContext,
   ) {
     this.limits = { ...defaultLimits, ...limits }
     for (const [name, value] of Object.entries(this.limits)) {
@@ -124,13 +129,21 @@ export class ExecGateway {
     let revalidation: NodeJS.Timeout | undefined
     let revalidationPending = false
     let pendingBytes = 0
-    const pending: Array<{ data: WebSocket.RawData; binary: boolean }> = []
+    let upstreamReady = false
+    const pending: Array<{
+      data: WebSocket.RawData; binary: boolean; trackingKey: string | null
+    }> = []
+    const tracker = this.interactions
+      ? new ExecInteractionTracker(this.interactions, leaseId, target.connectionGeneration)
+      : undefined
+    let clientFrames = Promise.resolve()
     const cleanup = (code?: number, reason?: string) => {
       if (closed) return
       closed = true
       if (revalidation) clearInterval(revalidation)
       pending.splice(0)
       pendingBytes = 0
+      void clientFrames.finally(() => tracker?.detach())
       connections.delete(client)
       if (connections.size === 0 && this.active.get(leaseId) === connections) this.active.delete(leaseId)
       if (client.readyState === WebSocket.OPEN) client.close(code, reason)
@@ -173,19 +186,31 @@ export class ExecGateway {
     catch { cleanup(1013, 'gateway upstream unavailable'); return }
 
     client.on('message', (data, binary) => {
-      if (closed || !upstream) return
-      const size = bytes(data)
-      if (upstream.readyState === WebSocket.OPEN) {
-        if (upstream.bufferedAmount + size > this.limits.maxBufferedBytes) cleanup(1013, 'gateway backpressure')
-        else upstream.send(data, { binary }, error => { if (error) cleanup(1013, 'gateway upstream unavailable') })
-      } else if (upstream.readyState === WebSocket.CONNECTING) {
-        if (pending.length >= this.limits.maxPendingMessages || pendingBytes + size > this.limits.maxPendingBytes) {
-          cleanup(1009, 'gateway buffer limit exceeded')
-        } else {
-          pending.push({ data, binary })
-          pendingBytes += size
-        }
-      } else cleanup(1013, 'gateway upstream unavailable')
+      clientFrames = clientFrames.then(async () => {
+        if (closed || !upstream) return
+        const trackingKey = await tracker?.clientFrame(data, binary) ?? null
+        if (closed) return
+        const size = bytes(data)
+        if (upstream.readyState === WebSocket.OPEN && upstreamReady) {
+          if (upstream.bufferedAmount + size > this.limits.maxBufferedBytes) {
+            cleanup(1013, 'gateway backpressure')
+          } else {
+            tracker?.markForwarded(trackingKey)
+            upstream.send(data, { binary }, error => {
+              if (error) cleanup(1013, 'gateway upstream unavailable')
+            })
+          }
+        } else if (upstream.readyState === WebSocket.CONNECTING
+          || upstream.readyState === WebSocket.OPEN) {
+          if (pending.length >= this.limits.maxPendingMessages
+            || pendingBytes + size > this.limits.maxPendingBytes) {
+            cleanup(1009, 'gateway buffer limit exceeded')
+          } else {
+            pending.push({ data, binary, trackingKey })
+            pendingBytes += size
+          }
+        } else cleanup(1013, 'gateway upstream unavailable')
+      }).catch(() => cleanup(1008, 'invalid exec protocol'))
     })
     upstream.once('open', () => {
       void (async () => {
@@ -200,13 +225,20 @@ export class ExecGateway {
             cleanup(1013, 'gateway backpressure')
             return
           }
+          tracker?.markForwarded(frame.trackingKey)
           upstream.send(frame.data, { binary: frame.binary }, error => { if (error) cleanup(1013, 'gateway upstream unavailable') })
         }
+        upstreamReady = true
+        let upstreamFrames = Promise.resolve()
         upstream.on('message', (data, binary) => {
-          const size = bytes(data)
-          if (client.readyState !== WebSocket.OPEN) return
-          if (client.bufferedAmount + size > this.limits.maxBufferedBytes) cleanup(1013, 'gateway backpressure')
-          else client.send(data, { binary }, error => { if (error) cleanup() })
+          upstreamFrames = upstreamFrames.then(async () => {
+            await tracker?.serverFrame(data, binary)
+            const size = bytes(data)
+            if (client.readyState !== WebSocket.OPEN) return
+            if (client.bufferedAmount + size > this.limits.maxBufferedBytes) {
+              cleanup(1013, 'gateway backpressure')
+            } else client.send(data, { binary }, error => { if (error) cleanup() })
+          }).catch(() => cleanup(1008, 'invalid exec protocol'))
         })
       })().catch(() => cleanup(1013, 'gateway unavailable'))
     })

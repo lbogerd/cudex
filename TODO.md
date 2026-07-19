@@ -202,7 +202,7 @@ tickets always fail, and secrets never enter durable or observable state.
   the exact existing sandbox, atomically rotates durable access only after
   health, replays with a fresh generation-bound ticket, preserves access on
   transient connect failure, and marks confirmed loss atomically.
-- [ ] Extend cleanup-safe provision through child/restore sources and wire it to
+- [x] Extend cleanup-safe provision through child/restore sources and wire it to
   production startup with reconciler recovery for process loss at every external
   allocation boundary.
 - [x] Serialize durable checkpoint capture and commit per lease across replicas.
@@ -210,13 +210,13 @@ tickets always fail, and secrets never enter durable or observable state.
   per lease while using the same deterministic provider-resource lock order.
 - [x] Serialize durable reconnect against checkpoint, release, and other
   reconnect operations per lease using the common lease/provider lock order.
-- [ ] Serialize child capture, patch, and command interaction per lease; command
+- [x] Serialize child capture, patch, and command interaction per lease; command
   execution must share the checkpoint gate before capture can claim a command-
   consistent instant.
   - [x] Add a generation-fenced PostgreSQL interaction ledger whose admission
     shares the lifecycle lease lock, and make checkpoint, child capture, patch
     apply, and interrupted patch rollback refuse every unfinished interaction.
-  - [ ] Track exec-server process and filesystem mutations at the production
+  - [x] Track exec-server process and filesystem mutations at the production
     gateway, including detach/resume and authoritative completion, before
     enabling production child dispatch.
 - [x] Persist checksummed base/current workspace manifests with the unwired

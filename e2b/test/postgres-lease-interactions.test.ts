@@ -77,6 +77,9 @@ test('lease interaction transitions are exact, idempotent, and terminal', {
     assert.equal((await context.gates[1].resume(identity)).state, 'active')
     assert.equal((await context.gates[0].finish(identity)).state, 'finished')
     assert.equal((await context.gates[1].finish(identity)).state, 'finished')
+    const reused = { ...identity, interactionId: 'reused-process-interaction' }
+    assert.equal((await context.gates[0].begin(reused)).state, 'active')
+    assert.equal((await context.gates[1].finish(reused)).state, 'finished')
     await context.journals[0].withLeaseLocks(tenantId, [identity.leaseId], client =>
       context.gates[0].assertQuiescent(tenantId, identity.leaseId, 0, client))
     await assert.rejects(context.gates[0].resume(identity), LeaseInteractionConflictError)
@@ -135,6 +138,9 @@ test('interaction admission and quiescence are generation fenced', {
 }, async () => {
   const context = await fixture()
   try {
+    const detached = processInteraction('interaction-before-rotation')
+    await context.gates[0].begin(detached)
+    await context.gates[0].detach(detached)
     await context.pools[0].query(`
       UPDATE hosted_agent_leases SET connection_generation = 1 WHERE lease_id = 'lease-active'
     `)
@@ -144,11 +150,17 @@ test('interaction admission and quiescence are generation fenced', {
       tenantId, ['lease-active'], client =>
         context.gates[0].assertQuiescent(tenantId, 'lease-active', 0, client)),
     LeaseInteractionConflictError)
+    assert.deepEqual(await context.gates[1].listUnfinishedProcesses(
+      tenantId, 'lease-active', 1, detached.sessionId), [detached])
+    assert.equal((await context.gates[1].reattach(detached, 1)).state, 'active')
+    await context.gates[0].finish(detached)
     const filesystem: LeaseInteractionIdentity = {
       tenantId, leaseId: 'lease-active', interactionId: 'filesystem-request',
       connectionGeneration: 1, sessionId: 'session-2', kind: 'filesystem', processId: null,
     }
     assert.equal((await context.gates[1].begin(filesystem)).state, 'active')
+    assert.deepEqual(await context.gates[0].listUnfinishedFilesystem(
+      tenantId, 'lease-active', 1, filesystem.sessionId), [filesystem])
     assert.equal((await context.gates[0].finish(filesystem)).state, 'finished')
   } finally { await close(context) }
 })

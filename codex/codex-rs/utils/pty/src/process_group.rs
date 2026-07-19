@@ -173,6 +173,63 @@ pub fn kill_process_group(_process_group_id: u32) -> io::Result<()> {
 }
 
 #[cfg(unix)]
+/// Return whether a process group still has any members.
+pub fn process_group_exists(process_group_id: u32) -> io::Result<bool> {
+    signal_process_group_id(process_group_id as libc::pid_t, 0)
+}
+
+#[cfg(not(unix))]
+/// Process-group confirmation is unavailable on non-Unix platforms.
+pub fn process_group_exists(_process_group_id: u32) -> io::Result<bool> {
+    Ok(false)
+}
+
+#[cfg(target_os = "linux")]
+/// Return whether every remaining member of a process group is a terminal zombie.
+///
+/// A zombie can keep `killpg(pgid, 0)` successful while being incapable of any
+/// further userspace execution. Treat other states as live so SIGKILL delivery is
+/// confirmed before callers publish workspace quiescence.
+pub fn process_group_is_quiescent(process_group_id: u32) -> io::Result<bool> {
+    for entry in std::fs::read_dir("/proc")? {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy().parse::<u32>().is_err() {
+            continue;
+        }
+        let stat = match std::fs::read_to_string(entry.path().join("stat")) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let Some(after_command) = stat.rsplit_once(')').map(|(_, rest)| rest.trim()) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid /proc stat",
+            ));
+        };
+        let fields = after_command.split_whitespace().collect::<Vec<_>>();
+        if fields.len() < 3 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid /proc stat",
+            ));
+        }
+        if fields[2].parse::<u32>().ok() == Some(process_group_id)
+            && !matches!(fields[0], "Z" | "X")
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(not(target_os = "linux"))]
+/// Process-group quiescence confirmation is currently Linux-only.
+pub fn process_group_is_quiescent(_process_group_id: u32) -> io::Result<bool> {
+    Ok(false)
+}
+
+#[cfg(unix)]
 /// Kill the process group for a tokio child (best-effort).
 pub fn kill_child_process_group(child: &mut Child) -> io::Result<()> {
     if let Some(pid) = child.id() {

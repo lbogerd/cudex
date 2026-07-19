@@ -118,8 +118,9 @@ Each connection follows this sequence:
 If the server receives any notification other than `initialized`, it replies
 with an error using request id `-1`.
 
-If the websocket connection closes, the server terminates any remaining managed
-processes for that client connection.
+If the websocket connection closes, the server detaches the session for up to
+30 seconds so a client can reconnect with `resumeSessionId`. Session expiry
+terminates the remaining managed process groups.
 
 ## API
 
@@ -138,8 +139,13 @@ Request params:
 Response:
 
 ```json
-{}
+{
+  "sessionId": "550e8400-e29b-41d4-a716-446655440000"
+}
 ```
+
+Pass that value as `resumeSessionId` on a replacement connection to reattach a
+detached session.
 
 ### `initialized`
 
@@ -227,6 +233,7 @@ Response:
   "exited": false,
   "exitCode": null,
   "closed": false,
+  "quiesced": false,
   "failure": null
 }
 ```
@@ -343,6 +350,23 @@ Params:
   "seq": 3
 }
 ```
+
+### `process/quiesced`
+
+Notification emitted after output is closed, the complete Linux process group
+has been killed, and `/proc` confirms that no group member can execute further
+userspace code:
+
+```json
+{
+  "processId": "proc-1"
+}
+```
+
+`process/read` also reports `quiesced: true`, allowing a resumed connection to
+recover a notification that arrived while its session was detached. Consumers
+that capture mutable workspace state must use quiescence, not leader exit or
+output closure, as the terminal command boundary.
 
 ## Filesystem RPCs
 

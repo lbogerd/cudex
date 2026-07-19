@@ -60,6 +60,7 @@ impl SessionState {
             closed,
             failure,
             sandbox_denied,
+            quiesced: _,
         } = response;
         if let Some(message) = failure {
             return Err(ExecServerError::Protocol(format!(

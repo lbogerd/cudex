@@ -146,6 +146,7 @@ fn recovery_handles_dense_tail_output_and_newer_notification() {
                 exited: true,
                 exit_code: Some(17),
                 closed: false,
+                quiesced: false,
                 failure: None,
                 sandbox_denied: false,
             })
@@ -181,6 +182,7 @@ fn recovery_rejects_output_at_closed_sequence() {
             exited: false,
             exit_code: None,
             closed: true,
+            quiesced: false,
             failure: None,
             sandbox_denied: false,
         })
@@ -217,6 +219,7 @@ async fn recovery_adds_sandbox_denial_to_pending_exit_event() {
             exited: true,
             exit_code: Some(1),
             closed: false,
+            quiesced: false,
             failure: None,
             sandbox_denied: true,
         })

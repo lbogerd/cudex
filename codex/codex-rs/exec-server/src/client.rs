@@ -1266,6 +1266,7 @@ impl SessionState {
             exited: true,
             exit_code: None,
             closed: true,
+            quiesced: false,
             failure: Some(message),
             sandbox_denied: false,
         }
@@ -2454,6 +2455,7 @@ mod tests {
                         exited: false,
                         exit_code: None,
                         closed: false,
+                        quiesced: false,
                         failure: None,
                         sandbox_denied: false,
                     })

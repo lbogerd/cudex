@@ -540,10 +540,11 @@ agent type. Each role contains only `sandboxTemplate`, `providerTemplateId`,
 `toolPolicy`, and positive `policyVersion`; names, policy domains/tools, counts,
 and UTF-8 byte lengths are bounded. Duplicate sandbox templates are rejected so
 restore cannot ambiguously select a policy. Local `rootWorkspace` ingress stays
-disabled in production. Child provision is deliberately not supplied to the
-production dispatcher yet: it returns a stable 503 until command traffic shares
-the lease gate, preventing a durable but command-inconsistent capture from being
-exposed.
+disabled in production. At this stage child provision was deliberately not
+supplied to the production dispatcher: it returned a stable 503 until command
+traffic shared the lease gate, preventing a durable but command-inconsistent
+capture from being exposed. The later production command-quiescence milestone
+below closes that gap.
 
 Startup runs the generic, child, and patch-apply reconcilers once before
 listening and then starts their non-overlapping bounded pollers. Generic stale
@@ -568,8 +569,9 @@ Migration 0012 adds a tenant/lease/generation/session-scoped interaction ledger
 for process and filesystem mutations. Admission takes the same PostgreSQL lease
 advisory lock as lifecycle mutation, verifies the exact active lease generation,
 and records an active interaction before returning. Exact detach, resume, and
-finish transitions are idempotent; finished rows are terminal, process identity
-cannot be reused within a session, and identity fields are immutable. Lifecycle
+finish transitions are idempotent; finished rows are terminal, unfinished
+process identity cannot be reused within a session, and identity fields are
+immutable. Lifecycle
 quiescence fails closed on every unfinished row, including an older generation,
 so rotation cannot hide work with an ambiguous outcome.
 
@@ -589,6 +591,39 @@ authoritative exec-server response or notification. Production child dispatch
 therefore remains disabled until that gateway wiring is complete. Migration,
 transition, exclusion, and lifecycle refusal coverage brings the complete
 Docker-backed PostgreSQL suite to 278 passing tests with no skips.
+
+### Production command quiescence and child dispatch
+
+The production WebSocket gateway now recognizes an exact allowlist of the
+exec-server protocol and fails closed on unknown message shapes, methods,
+duplicate request IDs, and unsafe numeric IDs. It durably admits every process
+start and filesystem mutation through the generation-fenced interaction ledger
+before forwarding the frame. Filesystem operations finish only after the matching
+response or error. A disconnect keeps forwarded work detached; successful
+session resume finishes older-generation filesystem entries only after the old
+handler has completed filesystem shutdown, while process entries are listed and
+reattached across connection generations.
+
+Process completion has a stronger Linux-only contract than process exit. The
+exec-server retains late stdout/stderr, terminates the whole process group, scans
+`/proc` until no non-zombie group member remains, and only then emits the new
+`process/quiesced` notification. `process/read` also reports the quiesced state so
+a reconnect can recover a notification missed during disconnect. The gateway
+finishes a process ledger entry only from one of those two authoritative signals;
+`process/exited`, `process/closed`, and termination responses are deliberately
+insufficient. Migration 0013 permits a reused client process ID only after its
+previous interaction is terminal and gives every execution a fresh immutable
+interaction identity.
+
+Production startup now supplies the durable child coordinator, so child capture
+is enabled behind the same lease/quiescence fence as checkpoint and patch apply.
+Gateway ordering tests prove admission precedes forwarding and durable finish
+precedes client-visible quiescence. Reconnect tests cover binary JSON, missed
+terminal notifications, older-generation process reattachment, and filesystem
+shutdown settlement. Linux integration coverage proves redirected background
+descendants are gone before quiescence, while existing late-output coverage
+remains green. The exec-server protocol's 12 tests and the complete
+Docker/PostgreSQL-backed E2B suite pass, the latter at 283 tests with no skips.
 
 ### Canonical workspace comparison foundation
 

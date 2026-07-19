@@ -52,6 +52,10 @@ pub(crate) trait ChildTerminator: Send + Sync {
     fn signal(&mut self, signal: ProcessSignal) -> io::Result<()>;
 
     fn kill(&mut self) -> io::Result<()>;
+
+    fn process_group_id(&self) -> Option<u32> {
+        None
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,6 +115,7 @@ type ResizeFn = Box<dyn FnMut(TerminalSize) -> anyhow::Result<()> + Send>;
 pub struct ProcessHandle {
     writer_tx: StdMutex<Option<mpsc::Sender<Vec<u8>>>>,
     killer: StdMutex<Option<Box<dyn ChildTerminator>>>,
+    process_group_id: Option<u32>,
     reader_handle: StdMutex<Option<JoinHandle<()>>>,
     reader_abort_handles: StdMutex<Vec<AbortHandle>>,
     writer_handle: StdMutex<Option<JoinHandle<()>>>,
@@ -145,9 +150,11 @@ impl ProcessHandle {
         pty_handles: Option<PtyHandles>,
         resizer: Option<ResizeFn>,
     ) -> Self {
+        let process_group_id = killer.process_group_id();
         Self {
             writer_tx: StdMutex::new(Some(writer_tx)),
             killer: StdMutex::new(Some(killer)),
+            process_group_id,
             reader_handle: StdMutex::new(Some(reader_handle)),
             reader_abort_handles: StdMutex::new(reader_abort_handles),
             writer_handle: StdMutex::new(Some(writer_handle)),
@@ -223,6 +230,28 @@ impl ProcessHandle {
             && let Some(mut killer) = killer_opt.take()
         {
             let _ = killer.kill();
+        }
+    }
+
+    /// Kill the complete process group and wait until the kernel confirms it is gone.
+    ///
+    /// A direct child exit is insufficient: descendants can outlive their leader and
+    /// continue mutating the workspace. Linux callers use this confirmation before
+    /// publishing a command-quiesced event.
+    pub async fn terminate_confirmed(&self) -> io::Result<bool> {
+        self.request_terminate();
+        let Some(process_group_id) = self.process_group_id else {
+            return Ok(false);
+        };
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if crate::process_group::process_group_is_quiescent(process_group_id)? {
+                return Ok(true);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(false);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     }
 
