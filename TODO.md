@@ -247,7 +247,8 @@ identity remains isolated, and lifecycle replay never duplicates resources.
   claims, deterministic artifact/object identities, fenced publication,
   same-transaction artifact/adoption/completion, exact replay, and caught-failure
   object reclamation.
-- [ ] Implement `POST v1/agents/patch/export` using the archived contract.
+- [x] Implement `POST v1/agents/patch/export` using the archived contract and
+  wire the durable coordinator into production startup.
 - [x] Build canonical sorted manifests with path, type, mode, link target or
   content digest, and immutable base/current identities.
 - [x] Persist content-addressed blobs and the canonical artifact before returning.

@@ -126,6 +126,49 @@ test('HTTP strictly validates requests before dispatch and validates service res
   assert.deepEqual(JSON.parse(invalidCheckpoint.body), { error: 'service unavailable' })
 })
 
+test('patch export route validates the exact wire and dispatches only to the durable service', async t => {
+  const calls: unknown[] = []
+  const gateway = { attach() {} } as unknown as ExecGateway
+  const server = await startServer({} as ControlPlane, gateway, {
+    host: '127.0.0.1', port: 0, bearerToken: 'test-token', allowInsecureHttp: true,
+    patchExport: {
+      async exportPatch(request) {
+        calls.push(request)
+        return {
+          artifactId: 'artifact_123', agentId: request.agentId,
+          baseSnapshotId: request.baseSnapshotId, checksum: `sha256:${'a'.repeat(64)}`,
+          changedFiles: 2, sizeBytes: 128,
+        }
+      },
+    },
+  }); t.after(() => server.close())
+  const port = (server.address() as import('node:net').AddressInfo).port
+  const request = {
+    leaseId: 'lease_child', agentId: 'agent_child', baseSnapshotId: 'snapshot_base',
+    idempotencyKey: 'patch-export-1',
+  }
+
+  const exported = await post(port, '/v1/agents/patch/export', JSON.stringify(request))
+  assert.equal(exported.status, 200)
+  assert.deepEqual(JSON.parse(exported.body), {
+    artifactId: 'artifact_123', agentId: 'agent_child', baseSnapshotId: 'snapshot_base',
+    checksum: `sha256:${'a'.repeat(64)}`, changedFiles: 2, sizeBytes: 128,
+  })
+  assert.deepEqual(calls, [request])
+
+  const spoofed = await post(port, '/v1/agents/patch/export', JSON.stringify({
+    ...request, tenantId: 'spoofed',
+  }))
+  assert.equal(spoofed.status, 400)
+  assert.equal(calls.length, 1)
+
+  const unavailable = await fixture({})
+  t.after(() => unavailable.server.close())
+  const missing = await post(unavailable.port, '/v1/agents/patch/export', JSON.stringify(request))
+  assert.equal(missing.status, 503)
+  assert.deepEqual(JSON.parse(missing.body), { error: 'service unavailable' })
+})
+
 test('source snapshot upload uses bounded binary framing and trusted tenant context', async t => {
   const principal = { tenantId: 'tenant-from-auth' }; const archive = Buffer.from('archive bytes')
   const checksum = `sha256:${'a'.repeat(64)}`; const manifestChecksum = `sha256:${'b'.repeat(64)}`

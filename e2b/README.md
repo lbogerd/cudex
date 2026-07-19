@@ -77,7 +77,8 @@ small required set. Architecture results and remaining production work are in
 
 Production deployments must set `HOSTED_AGENT_OBJECT_BUCKET`,
 `HOSTED_AGENT_DATABASE_URL` (or `DATABASE_URL`), and the trusted single-tenant
-identity `HOSTED_AGENT_TENANT_ID`. They may set
+identity `HOSTED_AGENT_TENANT_ID`. Every replica must also have a unique stable
+`HOSTED_AGENT_WORKER_ID` for durable operation fencing. They may set
 `HOSTED_AGENT_OBJECT_PREFIX`, `HOSTED_AGENT_OBJECT_REGION`, and
 `HOSTED_AGENT_OBJECT_ENDPOINT` for an S3-compatible service. The standard AWS
 credential provider chain supplies authenticated access; objects are encrypted
@@ -105,6 +106,11 @@ maps to `HOSTED_AGENT_TENANT_ID`; tenant identity is never accepted in the body.
 Use the returned `sourceSnapshotId` and checksum in
 `[hosted_agents.source_snapshot]` so root provisioning contains no client-host
 path.
+
+Patch export is served from the same durable runtime at
+`POST /v1/agents/patch/export`; it never falls back to the JSON control plane.
+`HOSTED_AGENT_ARTIFACT_TTL_MS` controls artifact retention and defaults to seven
+days.
 
 Production mode requires a TLS certificate/key pair and a `wss:`
 `HOSTED_AGENT_GATEWAY_URL`. Plain HTTP and `ws:` are accepted only when

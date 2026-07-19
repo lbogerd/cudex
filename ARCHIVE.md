@@ -542,7 +542,18 @@ size without another put. Caught failures reclaim the unreferenced object, and
 ambiguous commit acknowledgement preserves durable success. Two-replica,
 authorization, storage-failure, final-lineage-race, cleanup, and ambiguous-commit
 coverage bring the live PostgreSQL suite to 218/218. Explicit stale-operation
-takeover/reconciliation and the HTTP/startup route remain before production use.
+takeover/reconciliation remained before production use.
+
+The authenticated `POST /v1/agents/patch/export` boundary now exact-validates
+the archived request before dispatch, invokes the tenant-bound PostgreSQL
+coordinator configured by production startup, exact-validates the secret-free
+logical response, and returns the canonical artifact metadata. The route is
+unavailable rather than falling back to the JSON control plane when the durable
+runtime is absent. Production instances require an explicit unique
+`HOSTED_AGENT_WORKER_ID` for journal fencing; artifact retention defaults to
+seven days and is bounded by the coordinator. Focused route tests cover valid
+dispatch, tenant-field spoofing, and unavailable durable service behavior. The
+complete Docker/PostgreSQL 17 TypeScript suite passes 219/219 with no skips.
 
 The PostgreSQL patch repository validates a canonical base/current manifest pair
 against the source lease's exact tenant, child agent, owner, immutable base, and

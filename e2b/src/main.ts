@@ -10,6 +10,12 @@ import { BlobStore, S3BlobStore } from './blob-store.js'
 import { defaultArchiveManifestLimits, type ArchiveManifestLimits } from './archive-manifest.js'
 import type { WorkspaceTransferMetric } from './workspace-transfer.js'
 import { createSourceSnapshotRuntime } from './source-runtime.js'
+import { PostgresJournal } from './postgres-store.js'
+import { PostgresDurableState } from './postgres-state.js'
+import { PostgresObjectReclaimer } from './postgres-object-reclaimer.js'
+import { PostgresPatchArtifactRepository } from './postgres-artifacts.js'
+import { PostgresPatchExportSourceResolver } from './postgres-patch-export-source.js'
+import { PostgresPatchExportCoordinator } from './postgres-patch-export.js'
 
 function required(name: string): string { const value = process.env[name]; if (!value) throw new Error(`${name} is required`); return value }
 function positiveInteger(name: string, fallback: number): number {
@@ -73,6 +79,21 @@ const sourceRuntime = await createSourceSnapshotRuntime({
   maxRoots: ingress.maxRoots,
   maxTtlMs: positiveInteger('HOSTED_AGENT_SOURCE_MAX_TTL_MS', 24 * 60 * 60_000),
 })
+const patchExport = sourceRuntime
+  ? new PostgresPatchExportCoordinator(
+      new PostgresJournal(sourceRuntime.pool),
+      new PostgresDurableState(sourceRuntime.pool),
+      new PostgresPatchExportSourceResolver(sourceRuntime.pool, blobs),
+      new PostgresPatchArtifactRepository(sourceRuntime.pool),
+      blobs,
+      new PostgresObjectReclaimer(sourceRuntime.pool, blobs),
+      {
+        tenantId: sourceRuntime.principal.tenantId,
+        workerId: required('HOSTED_AGENT_WORKER_ID'),
+        artifactTtlMs: positiveInteger('HOSTED_AGENT_ARTIFACT_TTL_MS', 7 * 24 * 60 * 60_000),
+      },
+    )
+  : undefined
 function observeWorkspaceTransfer(metric: WorkspaceTransferMetric): void {
   console.log(JSON.stringify({ event: 'workspace_transfer_phase', ...metric }))
 }
@@ -114,5 +135,6 @@ await startServer(service, gateway, { host, port, bearerToken: required('CODEX_H
     api: sourceRuntime.api,
     maxArchiveBytes: archiveLimits.maxArchiveBytes,
   } } : {}),
+  ...(patchExport ? { patchExport } : {}),
   allowInsecureHttp: development })
 console.log(JSON.stringify({ event: 'control_plane_started', host, port, tls: Boolean(process.env.HOSTED_AGENT_TLS_CERT) }))

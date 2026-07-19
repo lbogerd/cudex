@@ -10,6 +10,8 @@ import type { AuthenticatedTenant } from './source-snapshots.js'
 import {
   validateCheckpointRequest,
   validateCheckpointResponse,
+  validatePatchExportRequest,
+  validatePatchExportResponse,
   validateProvisionedAgent,
   validateProvisionRequest,
   validateReconnectRequest,
@@ -23,6 +25,9 @@ interface ServerOptions {
   tlsCertPath?: string
   tlsKeyPath?: string
   allowInsecureHttp?: boolean
+  patchExport?: {
+    exportPatch: (request: ReturnType<typeof validatePatchExportRequest>) => Promise<unknown>
+  }
   sourceSnapshots?: {
     principal: AuthenticatedTenant
     api: Pick<AuthenticatedSourceSnapshotApi, 'create'>
@@ -34,15 +39,17 @@ const maxSourceMetadataBytes = 64 * 1024
 export const sourceSnapshotContentType = 'application/vnd.codex.source-snapshot.v1'
 const routes = new Map([
   ['/v1/agents/provision', 'provision'], ['/v1/agents/reconnect', 'reconnect'],
-  ['/v1/agents/checkpoint', 'checkpoint'], ['/v1/agents/release', 'release'],
+  ['/v1/agents/checkpoint', 'checkpoint'], ['/v1/agents/patch/export', 'exportPatch'],
+  ['/v1/agents/release', 'release'],
 ] as const)
-type Method = 'provision' | 'reconnect' | 'checkpoint' | 'release'
+type Method = 'provision' | 'reconnect' | 'checkpoint' | 'exportPatch' | 'release'
 
 function validateInput(method: Method, value: unknown): unknown {
   switch (method) {
     case 'provision': return validateProvisionRequest(value)
     case 'reconnect': return validateReconnectRequest(value)
     case 'checkpoint': return validateCheckpointRequest(value)
+    case 'exportPatch': return validatePatchExportRequest(value)
     case 'release': return validateReleaseRequest(value)
   }
 }
@@ -52,6 +59,7 @@ function validateOutput(method: Method, value: unknown): unknown {
     case 'provision':
     case 'reconnect': return validateProvisionedAgent(value)
     case 'checkpoint': return validateCheckpointResponse(value)
+    case 'exportPatch': return validatePatchExportResponse(value)
     case 'release': return value
   }
 }
@@ -128,7 +136,12 @@ export async function startServer(service: ControlPlane, gateway: ExecGateway, o
       const method = routes.get(url.pathname as '/v1/agents/provision')
       if (!method) throw new ServiceError(404, 'not found')
       const input = validateInput(method, await body(request))
-      const result = validateOutput(method, await (service[method] as (input: never) => Promise<unknown>)(input as never))
+      const patchExport = options.patchExport
+      const dispatch = method === 'exportPatch'
+        ? patchExport && ((value: never) => patchExport.exportPatch(value))
+        : (value: never) => (service[method] as (input: never) => Promise<unknown>)(value)
+      if (!dispatch) throw new ServiceError(503, 'patch export service unavailable')
+      const result = validateOutput(method, await dispatch(input as never))
       response.statusCode = method === 'release' ? 204 : 200
       response.setHeader('content-type', 'application/json'); response.end(method === 'release' ? undefined : JSON.stringify(result))
     } catch (error) {
