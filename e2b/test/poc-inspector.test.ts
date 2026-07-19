@@ -27,7 +27,8 @@ test('database inspector scopes every SQL lookup to the exact run tenant', async
 
 test('functional inspector requires distinct owned child, durable artifact, and advanced applied snapshot', () => {
   const evidence: PocAppServerEvidence = { rootThreadId: 'root-agent', childThreadId: 'child-agent',
-    rootThreadStarted: true, rootEnvironmentReady: true, spawnAgentCompleted: true, spawnAgentCount: 1,
+    rootThreadStarted: true, rootEnvironmentReady: true, noLocalHostedCodeModeProcess: true,
+    spawnAgentCompleted: true, spawnAgentCount: 1,
     spawnCallIds: ['spawn-call'], waitCompleted: true,
     rootPatchAvailable: true, childPatchAvailable: true, rootTurnCompleted: true, finalMarker: true,
     deletedThreadIds: [] }
@@ -41,6 +42,10 @@ test('functional inspector requires distinct owned child, durable artifact, and 
     operations: [], snapshots: [{ snapshotId: 'result', leaseId: 'root-lease',
       providerSnapshotId: 'provider-result', state: 'available' }],
     allocations: [], liveTicketCount: 0, unfinishedInteractionCount: 0,
+    interactions: [
+      { leaseId: 'root-lease', connectionGeneration: 1, processId: 'hosted-code-mode-root', state: 'active' },
+      { leaseId: 'child-lease', connectionGeneration: 1, processId: 'hosted-code-mode-child', state: 'finished' },
+    ],
     artifacts: [{ artifactId: 'artifact', agentId: 'child-agent', sourceLeaseId: 'child-lease', state: 'available' }],
     patchApplications: [{ applicationId: 'application', targetLeaseId: 'root-lease', artifactId: 'artifact',
       sourceTargetSnapshotId: 'before-apply', resultSnapshotId: 'result', phase: 'checkpointed' }],
@@ -60,8 +65,14 @@ test('report serializer rejects secret fields, exact taint, tickets, and connect
 test('cleanup evaluation requires terminal database state and an empty exact provider scope', () => {
   const database: PocDatabaseInspection = { leases: [{ leaseId: 'lease', environmentId: 'environment', agentId: 'agent',
     ownerAgentId: null, ownerLeaseId: null, providerSandboxId: 'sandbox', baseSnapshotId: 'base', latestSnapshotId: 'latest',
-    state: 'released' }], operations: [{ operation: 'release', state: 'succeeded', primaryLeaseId: 'lease', resultLeaseId: null }],
-    snapshots: [], artifacts: [], patchApplications: [], allocations: [], liveTicketCount: 0, unfinishedInteractionCount: 0 }
+    state: 'released' }, { leaseId: 'child-lease', environmentId: 'child-environment', agentId: 'child-agent',
+    ownerAgentId: 'agent', ownerLeaseId: 'lease', providerSandboxId: 'child-sandbox', baseSnapshotId: 'child-base',
+    latestSnapshotId: 'child-latest', state: 'released' }],
+    operations: [{ operation: 'release', state: 'succeeded', primaryLeaseId: 'lease', resultLeaseId: null }],
+    snapshots: [], artifacts: [], patchApplications: [], allocations: [], liveTicketCount: 0, unfinishedInteractionCount: 0,
+    interactions: [{ leaseId: 'lease', connectionGeneration: 1,
+      processId: 'hosted-code-mode-root', state: 'finished' }, { leaseId: 'child-lease', connectionGeneration: 1,
+      processId: 'hosted-code-mode-child', state: 'finished' }] }
   assert.ok(Object.values(evaluatePocCleanupInspection(database, { managedSandboxIds: [], knownProviderSnapshotIds: [] })).every(Boolean))
   assert.equal(evaluatePocCleanupInspection({ ...database, liveTicketCount: 1 }, {
     managedSandboxIds: [], knownProviderSnapshotIds: [],
@@ -86,7 +97,7 @@ test('provider inspection and cleanup use only the exact run ownership scope and
     ownerAgentId: null, ownerLeaseId: null, providerSandboxId: 'sandbox-exact', baseSnapshotId: 'base', latestSnapshotId: 'latest',
     state: 'released' }], operations: [], snapshots: [{ snapshotId: 'snapshot', leaseId: 'lease',
       providerSnapshotId: 'snapshot-exact', state: 'available' }], artifacts: [], patchApplications: [], allocations: [],
-    liveTicketCount: 0, unfinishedInteractionCount: 0 }
+    liveTicketCount: 0, unfinishedInteractionCount: 0, interactions: [] }
   assert.deepEqual(await inspector.inspect(database), {
     managedSandboxIds: ['sandbox-exact'], knownProviderSnapshotIds: ['snapshot-exact'],
   })
@@ -113,7 +124,7 @@ test('exact provider cleanup is idempotent', async () => {
     ownerAgentId: null, ownerLeaseId: null, providerSandboxId: 'sandbox', baseSnapshotId: 'base', latestSnapshotId: 'latest',
     state: 'released' }], operations: [], snapshots: [{ snapshotId: 'durable', leaseId: 'lease',
       providerSnapshotId: 'snapshot', state: 'available' }], artifacts: [], patchApplications: [], allocations: [],
-    liveTicketCount: 0, unfinishedInteractionCount: 0 }
+    liveTicketCount: 0, unfinishedInteractionCount: 0, interactions: [] }
   assert.equal(await inspector.forceCleanup(database), true)
   assert.equal(await inspector.forceCleanup(database), false)
 })

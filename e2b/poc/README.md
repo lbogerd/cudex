@@ -47,11 +47,20 @@ server-owned role policy authorizes the matching namespaced spawn/wait tools.
 This is explicit because current Codex defaults namespace these tools; patch
 application remains a plain hosted-only tool by design.
 
-Set `POC_CODEX_MODEL` to a model that supports direct tools. At the time of
-this proof, the listed `gpt-5.6-*` defaults are code-mode-only, while `gpt-5.5`
-supports the restricted `exec_command`/`write_stdin` policy. Automated mode
-checks the authenticated catalog and the exact artifact's cached tool mode
-before `thread/start`, so an incompatible model fails before E2B allocation.
+`POC_CODEX_MODEL` may select either a direct-tool model or a listed
+`code_mode_only` model. Preflight checks the authenticated catalog, the exact
+artifact's bounded capability cache, both binary checksums, and the root/child
+`environmentBoundCodeMode` grants before any CubeSandbox allocation. Keep the
+checked-in example at `gpt-5.5` until a full code-mode-only acceptance report
+passes; only then should the default move to the selected `gpt-5.6-*` model.
+
+Template publication explicitly defaults each sandbox to 2000 CPU millicores
+and 2000 MB memory. Override these provider-enforced limits with
+`CUBE_CPU_MILLICORES` and `CUBE_MEMORY_MB` when publishing; both values are
+recorded in template metadata and preflight rejects missing or invalid limits.
+The hosted process itself additionally permits one logical session, one active
+cell, 256 pending delegate calls, 128 queued protocol messages, and 64 MiB
+maximum protocol frames. Per-cell output token limits remain unchanged.
 
 An access token is passed only to Codex and is never copied into `CODEX_HOME`.
 An auth JSON source is validated without following symlinks, copied to the
@@ -82,7 +91,11 @@ Each live proof creates at least a root and child E2B sandbox and may create
 provider snapshots, so normal E2B compute/storage costs apply. On interruption,
 run `status` and then `down`. Cleanup is strictly scoped to the run's tenant and
 `managedBy` marker; the POC never inventories or deletes unaffiliated resources.
-Retained reports contain only lifecycle IDs and assertion booleans. Exit 0 means
+Retained reports contain only lifecycle IDs and assertion booleans. Runtime
+placement comes from the trusted gateway's durable process-interaction ledger;
+the local-process assertion inspects only the app-server's Linux `/proc`
+descendant tree. Neither assertion relies on model prose or sandbox `ps` output.
+Exit 0 means
 functional and service-owned cleanup acceptance passed, exit 1 means a
 functional/lifecycle failure, exit 2 means preflight/configuration failure, and
 exit 3 means the functional flow passed but exact provider cleanup needed forced

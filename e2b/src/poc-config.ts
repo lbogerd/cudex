@@ -36,6 +36,8 @@ export interface PocProvenance {
   codexSha256: string
   codeModeHostSha256: string
   templateId: string
+  cpuMillicores: number
+  memoryMb: number
   binaryPath: string
   codeModeHostPath: string
   metadataPath: string
@@ -120,6 +122,13 @@ function metadataString(value: unknown, label: string, pattern: RegExp, max = 51
   return value
 }
 
+function metadataPositiveInteger(value: unknown, label: string): number {
+  if (!Number.isSafeInteger(value) || Number(value) <= 0 || Number(value) > 1_000_000) {
+    throw new Error(`template metadata has an invalid ${label}`)
+  }
+  return Number(value)
+}
+
 export async function validatePocProvenance(repositoryRoot: string, metadataPath: string): Promise<PocProvenance> {
   let parsed: unknown
   try { parsed = JSON.parse(await readFile(metadataPath, 'utf8')) } catch { throw new Error('template metadata is not valid JSON') }
@@ -130,6 +139,8 @@ export async function validatePocProvenance(repositoryRoot: string, metadataPath
   const codexSha256 = metadataString(record.codexSha256, 'Codex checksum', /^[0-9a-f]{64}$/u)
   const codeModeHostSha256 = metadataString(record.codeModeHostSha256, 'code-mode host checksum', /^[0-9a-f]{64}$/u)
   const templateId = metadataString(record.templateId, 'template ID', /^[A-Za-z0-9._-]{1,512}$/u)
+  const cpuMillicores = metadataPositiveInteger(record.cpuMillicores, 'CPU limit')
+  const memoryMb = metadataPositiveInteger(record.memoryMb, 'memory limit')
   const binaryPath = resolve(repositoryRoot, 'e2b', '.artifacts', 'codex', buildId, 'codex')
   const codeModeHostPath = resolve(repositoryRoot, 'e2b', '.artifacts', 'codex', buildId, 'codex-code-mode-host')
   const validateBinary = async (path: string, expected: string, label: string): Promise<void> => {
@@ -153,7 +164,8 @@ export async function validatePocProvenance(repositoryRoot: string, metadataPath
   }
   await validateBinary(binaryPath, codexSha256, 'Codex')
   await validateBinary(codeModeHostPath, codeModeHostSha256, 'code-mode host')
-  return { buildId, revision, codexSha256, codeModeHostSha256, templateId, binaryPath, codeModeHostPath, metadataPath }
+  return { buildId, revision, codexSha256, codeModeHostSha256, templateId, cpuMillicores, memoryMb,
+    binaryPath, codeModeHostPath, metadataPath }
 }
 
 export function createTrustedRoles(templateId: string): Record<string, unknown> {

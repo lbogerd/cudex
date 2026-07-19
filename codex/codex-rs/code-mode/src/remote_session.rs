@@ -74,6 +74,7 @@ impl HostedEnvironmentCodeModeSessionProvider {
         backend: Arc<dyn ExecBackend>,
         cwd: PathUri,
     ) -> Result<Self, String> {
+        let started_at = std::time::Instant::now();
         let process_identity = hosted_process_identity(&identity);
         tracing::info!(
             event = "hosted_code_mode_start_requested",
@@ -82,6 +83,7 @@ impl HostedEnvironmentCodeModeSessionProvider {
             environment_id = %identity.environment_id,
             connection_generation = identity.connection_generation,
             process_identity = %process_identity,
+            outcome = "requested",
         );
         let mut env = HashMap::new();
         env.insert("CODEX_HOSTED_CODE_MODE".to_string(), "1".to_string());
@@ -97,7 +99,7 @@ impl HostedEnvironmentCodeModeSessionProvider {
             "CODEX_HOSTED_CONNECTION_GENERATION".to_string(),
             identity.connection_generation.to_string(),
         );
-        let started = backend
+        let started = match backend
             .start(ExecParams {
                 process_id: ProcessId::new(format!("hosted-code-mode-{process_identity}")),
                 argv: vec![
@@ -123,10 +125,42 @@ impl HostedEnvironmentCodeModeSessionProvider {
                 managed_network: None,
             })
             .await
-            .map_err(|error| format!("failed to start hosted code-mode runtime: {error}"))?;
-        let connection = Connection::from_exec_process(Arc::clone(&started.process))
-            .await
-            .map_err(|error| error.to_string())?;
+        {
+            Ok(started) => started,
+            Err(error) => {
+                tracing::warn!(
+                    event = "hosted_code_mode_failed",
+                    thread_id = %identity.thread_id,
+                    lease_id = %identity.lease_id,
+                    environment_id = %identity.environment_id,
+                    connection_generation = identity.connection_generation,
+                    process_identity = %process_identity,
+                    protocol_version = "v1",
+                    duration_ms = started_at.elapsed().as_millis() as u64,
+                    outcome = "failed",
+                    error_category = "process_start",
+                );
+                return Err(format!("failed to start hosted code-mode runtime: {error}"));
+            }
+        };
+        let connection = match Connection::from_exec_process(Arc::clone(&started.process)).await {
+            Ok(connection) => connection,
+            Err(error) => {
+                tracing::warn!(
+                    event = "hosted_code_mode_failed",
+                    thread_id = %identity.thread_id,
+                    lease_id = %identity.lease_id,
+                    environment_id = %identity.environment_id,
+                    connection_generation = identity.connection_generation,
+                    process_identity = %process_identity,
+                    protocol_version = "v1",
+                    duration_ms = started_at.elapsed().as_millis() as u64,
+                    outcome = "failed",
+                    error_category = "protocol_handshake",
+                );
+                return Err(error.to_string());
+            }
+        };
         Ok(Self {
             identity,
             process_identity: process_identity.clone(),
@@ -145,6 +179,8 @@ impl HostedEnvironmentCodeModeSessionProvider {
                 connection_generation = provider.identity.connection_generation,
                 process_identity = %provider.process_identity,
                 protocol_version = "v1",
+                duration_ms = started_at.elapsed().as_millis() as u64,
+                outcome = "ready",
             );
         })
     }
@@ -176,6 +212,7 @@ impl HostedEnvironmentCodeModeSessionProvider {
         self.stopping.store(true, Ordering::Release);
         self.shutdown_result
             .get_or_init(|| async {
+                let shutdown_started_at = std::time::Instant::now();
                 tracing::info!(
                     event = "hosted_code_mode_shutdown_requested",
                     thread_id = %self.identity.thread_id,
@@ -183,6 +220,8 @@ impl HostedEnvironmentCodeModeSessionProvider {
                     environment_id = %self.identity.environment_id,
                     connection_generation = self.identity.connection_generation,
                     process_identity = %self.process_identity,
+                    protocol_version = "v1",
+                    outcome = "requested",
                 );
                 let session = self
                     .session
@@ -215,6 +254,22 @@ impl HostedEnvironmentCodeModeSessionProvider {
                         environment_id = %self.identity.environment_id,
                         connection_generation = self.identity.connection_generation,
                         process_identity = %self.process_identity,
+                        protocol_version = "v1",
+                        duration_ms = shutdown_started_at.elapsed().as_millis() as u64,
+                        outcome = "quiesced",
+                    );
+                } else {
+                    tracing::warn!(
+                        event = "hosted_code_mode_failed",
+                        thread_id = %self.identity.thread_id,
+                        lease_id = %self.identity.lease_id,
+                        environment_id = %self.identity.environment_id,
+                        connection_generation = self.identity.connection_generation,
+                        process_identity = %self.process_identity,
+                        protocol_version = "v1",
+                        duration_ms = shutdown_started_at.elapsed().as_millis() as u64,
+                        outcome = "failed",
+                        error_category = "shutdown_quiescence",
                     );
                 }
                 shutdown_result
@@ -226,14 +281,20 @@ impl HostedEnvironmentCodeModeSessionProvider {
 
 impl Drop for HostedEnvironmentCodeModeSessionProvider {
     fn drop(&mut self) {
-        tracing::info!(
-            event = "hosted_code_mode_shutdown_requested",
-            thread_id = %self.identity.thread_id,
-            lease_id = %self.identity.lease_id,
-            environment_id = %self.identity.environment_id,
-            connection_generation = self.identity.connection_generation,
-            process_identity = %self.process_identity,
-        );
+        if !self.stopping.load(Ordering::Acquire) {
+            tracing::warn!(
+                event = "hosted_code_mode_failed",
+                thread_id = %self.identity.thread_id,
+                lease_id = %self.identity.lease_id,
+                environment_id = %self.identity.environment_id,
+                connection_generation = self.identity.connection_generation,
+                process_identity = %self.process_identity,
+                protocol_version = "v1",
+                duration_ms = 0_u64,
+                outcome = "failed",
+                error_category = "provider_dropped_without_shutdown",
+            );
+        }
     }
 }
 

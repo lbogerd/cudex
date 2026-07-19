@@ -17,6 +17,10 @@ if (!expected || typeof expected !== 'object' || Array.isArray(expected)
   || typeof expected.templateId !== 'string' || !expected.templateId) {
   throw new Error('template metadata is invalid')
 }
+if (!Number.isSafeInteger(expected.cpuMillicores) || expected.cpuMillicores <= 0
+  || !Number.isSafeInteger(expected.memoryMb) || expected.memoryMb <= 0) {
+  throw new Error('template metadata has invalid resource limits')
+}
 if (!process.env.E2B_API_KEY || !process.env.E2B_API_URL) {
   throw new Error('E2B_API_KEY and E2B_API_URL are required')
 }

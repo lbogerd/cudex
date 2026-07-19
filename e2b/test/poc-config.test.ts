@@ -42,6 +42,7 @@ test('strict config validation redacts the hosted bearer from subprocess errors'
   await mkdir(paths.codexHome)
   await assert.rejects(validateGeneratedCodexConfiguration({ buildId: 'build', revision: 'a'.repeat(40),
     codexSha256: 'b'.repeat(64), codeModeHostSha256: 'c'.repeat(64), templateId: 'template',
+    cpuMillicores: 2000, memoryMb: 2000,
     binaryPath: binary, codeModeHostPath: binary, metadataPath: 'metadata' },
   paths, '/tmp/ca.pem', 'never-print-this-bearer'), error => {
     assert.ok(!String(error).includes('never-print-this-bearer'))
@@ -66,7 +67,8 @@ async function fakeProvenanceRoot(): Promise<{ repositoryRoot: string; metadataP
   const metadataPath = join(templateDirectory, `${buildId}.json`)
   await writeFile(metadataPath, JSON.stringify({ buildId, revision: 'a'.repeat(40),
     codexSha256: createHash('sha256').update(binary).digest('hex'),
-    codeModeHostSha256: createHash('sha256').update(binary).digest('hex'), templateId: 'tpl-test' }))
+    codeModeHostSha256: createHash('sha256').update(binary).digest('hex'), templateId: 'tpl-test',
+    cpuMillicores: 2000, memoryMb: 2000 }))
   return { repositoryRoot, metadataPath, binaryPath, codeModeHostPath }
 }
 

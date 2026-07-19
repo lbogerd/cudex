@@ -21,7 +21,7 @@ import {
 import { generatePocTls, validateProviderCaCertificate, type PocTlsMaterial } from './poc-tls.js'
 import { archiveWorkspace } from './ingress.js'
 import { uploadSourceSnapshot } from './source-snapshot-client.js'
-import { deleteThreadTree, initializeAndReadAccount, runAutomatedTurn, startPocAppServer,
+import { assertHostedModelCompatibility, deleteThreadTree, initializeAndReadAccount, runAutomatedTurn, startPocAppServer,
   type PocAppServerEvidence, type PocAppServerProcess } from './poc-app-server-client.js'
 import { evaluatePocCleanupInspection, evaluatePocFunctionalInspection, openPocDatabaseInspector,
   PocProviderInspector, retainedFilesAreRedacted, serializePocReport,
@@ -92,7 +92,10 @@ async function preflight(configured?: PocEnvironment): Promise<void> {
     const appServer = startPocAppServer({ provenance, paths, caBundlePath: tls.combinedCaBundlePath,
       hostedBearer: 'preflight-nonsecret-bearer', ...(env.accessToken ? { accessToken: env.accessToken } : {}),
       stderrLogPath: `${temporaryRoot}/app-server.log` })
-    try { await initializeAndReadAccount(appServer) } finally { await appServer.stop() }
+    try {
+      await initializeAndReadAccount(appServer)
+      await assertHostedModelCompatibility(appServer, paths.codexHome, env.codexModel)
+    } finally { await appServer.stop() }
   } finally { await rm(temporaryRoot, { recursive: true, force: true }) }
   if (env.verifyTemplate) {
     await exec(process.execPath, [`${e2bRoot}/scripts/verify-template.mjs`, env.templateMetadata], {
@@ -332,6 +335,7 @@ function appAssertions(evidence: PocAppServerEvidence | undefined): Record<strin
   return {
     rootThreadStarted: evidence?.rootThreadStarted === true,
     rootEnvironmentReady: evidence?.rootEnvironmentReady === true,
+    noLocalHostedCodeModeProcess: evidence?.noLocalHostedCodeModeProcess === true,
     spawnAgentCompleted: evidence?.spawnAgentCompleted === true,
     spawnAgentCalledExactlyOnce: evidence?.spawnAgentCount === 1,
     distinctChildThread: Boolean(evidence?.childThreadId && evidence.childThreadId !== evidence.rootThreadId),

@@ -26,6 +26,7 @@ export interface PocDatabaseInspection {
   allocations: Array<{ allocationKind: string; resourceId: string; leaseId: string | null; state: string }>
   liveTicketCount: number
   unfinishedInteractionCount: number
+  interactions: Array<{ leaseId: string; connectionGeneration: number; processId: string | null; state: string }>
 }
 
 interface Queryable {
@@ -77,8 +78,8 @@ export class PocDatabaseInspector {
         JOIN hosted_agent_leases AS lease ON lease.lease_id = ticket.lease_id
         WHERE lease.tenant_id = $1 AND ticket.revoked_at IS NULL AND ticket.consumed_at IS NULL
           AND ticket.expires_at > now()`, [this.tenantId]),
-      this.database.query(`SELECT count(*)::text AS count FROM hosted_agent_lease_interactions
-        WHERE tenant_id = $1 AND finished_at IS NULL`, [this.tenantId]),
+      this.database.query(`SELECT lease_id, connection_generation::text, process_id, state
+        FROM hosted_agent_lease_interactions WHERE tenant_id = $1 ORDER BY created_at`, [this.tenantId]),
     ])
     return {
       leases,
@@ -96,7 +97,10 @@ export class PocDatabaseInspector {
       allocations: allocations.rows.map(row => ({ allocationKind: String(row.allocation_kind),
         resourceId: String(row.resource_id), leaseId: row.lease_id === null ? null : String(row.lease_id), state: String(row.state) })),
       liveTicketCount: numberValue(tickets.rows[0]?.count),
-      unfinishedInteractionCount: numberValue(interactions.rows[0]?.count),
+      interactions: interactions.rows.map(row => ({ leaseId: String(row.lease_id),
+        connectionGeneration: numberValue(row.connection_generation),
+        processId: row.process_id === null ? null : String(row.process_id), state: String(row.state) })),
+      unfinishedInteractionCount: interactions.rows.filter(row => row.state !== 'finished').length,
     }
   }
 }
@@ -118,12 +122,20 @@ export function evaluatePocFunctionalInspection(
   const artifact = childLease ? database.artifacts.find(item => item.sourceLeaseId === childLease.leaseId && item.state === 'available') : undefined
   const application = rootLease && artifact ? database.patchApplications.find(item =>
     item.targetLeaseId === rootLease.leaseId && item.artifactId === artifact.artifactId) : undefined
+  const codeModeProcesses = database.interactions.filter(interaction =>
+    interaction.processId?.startsWith('hosted-code-mode-'))
+  const rootCodeMode = rootLease ? codeModeProcesses.filter(item => item.leaseId === rootLease.leaseId) : []
+  const childCodeMode = childLease ? codeModeProcesses.filter(item => item.leaseId === childLease.leaseId) : []
   const assertions = {
     rootLeaseExists: Boolean(rootLease), childLeaseExists: Boolean(childLease),
     distinctLeaseIds: Boolean(rootLease && childLease && rootLease.leaseId !== childLease.leaseId),
     distinctEnvironmentIds: Boolean(rootLease && childLease && rootLease.environmentId !== childLease.environmentId),
     distinctProviderSandboxIds: Boolean(rootLease?.providerSandboxId && childLease?.providerSandboxId
       && rootLease.providerSandboxId !== childLease.providerSandboxId),
+    rootCodeModeRuntimeReady: rootCodeMode.length === 1,
+    childCodeModeRuntimeReady: childCodeMode.length === 1,
+    distinctCodeModeEnvironmentIds: Boolean(rootCodeMode.length === 1 && childCodeMode.length === 1
+      && rootLease && childLease && rootLease.environmentId !== childLease.environmentId),
     childOwnedByRoot: Boolean(rootLease && childLease && childLease.ownerLeaseId === rootLease.leaseId
       && childLease.ownerAgentId === rootLease.agentId),
     childReleased: childLease?.state === 'released',
@@ -146,6 +158,13 @@ export interface PocProviderInspection {
 export function evaluatePocCleanupInspection(
   database: PocDatabaseInspection, provider: PocProviderInspection,
 ): Record<string, boolean> {
+  const rootLease = database.leases.find(lease => lease.ownerLeaseId === null)
+  const childLease = database.leases.find(lease => lease.ownerLeaseId !== null)
+  const codeModeProcesses = database.interactions.filter(interaction =>
+    interaction.processId?.startsWith('hosted-code-mode-'))
+  const quiesced = (leaseId: string | undefined) => Boolean(leaseId)
+    && codeModeProcesses.some(item => item.leaseId === leaseId)
+    && codeModeProcesses.filter(item => item.leaseId === leaseId).every(item => item.state === 'finished')
   return {
     allLeasesReleased: database.leases.every(lease => lease.state === 'released'),
     noInProgressOperations: database.operations.every(operation => operation.state !== 'in_progress'),
@@ -153,6 +172,8 @@ export function evaluatePocCleanupInspection(
       && allocation.state !== 'reclaim_pending'),
     noLiveTickets: database.liveTicketCount === 0,
     noUnfinishedInteractions: database.unfinishedInteractionCount === 0,
+    rootCodeModeRuntimeQuiesced: quiesced(rootLease?.leaseId),
+    childCodeModeRuntimeQuiesced: quiesced(childLease?.leaseId),
     noManagedProviderSandboxes: provider.managedSandboxIds.length === 0,
     noKnownProviderSnapshots: provider.knownProviderSnapshotIds.length === 0,
   }

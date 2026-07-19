@@ -498,6 +498,7 @@ test('stale child recovery reconstructs only an exact committed child graph', {
     assert.deepEqual(operation.rows[0].logical_response, {
       leaseId: child.leaseId,
       environmentId: child.environmentId,
+      connectionGeneration: child.connectionGeneration,
       baseSnapshotId: child.baseSnapshotId,
       cwd: child.cwd,
       workspaceRoots: child.workspaceRoots,

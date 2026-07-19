@@ -66,6 +66,7 @@ test('JSON-RPC client rejects malformed and oversized server messages', async ()
 
 test('event collector accepts interleaved root/child evidence and terminal ordering', () => {
   const evidence: PocAppServerEvidence = { rootThreadId: 'root', rootThreadStarted: true, rootEnvironmentReady: true,
+    noLocalHostedCodeModeProcess: true,
     spawnAgentCompleted: false, spawnAgentCount: 0, spawnCallIds: [], waitCompleted: false, rootPatchAvailable: false,
     childPatchAvailable: false, rootTurnCompleted: false, finalMarker: false, deletedThreadIds: [] }
   const event = (method: string, params: unknown) => collectAppServerNotification(evidence, { method, params })
@@ -80,7 +81,8 @@ test('event collector accepts interleaved root/child evidence and terminal order
   assert.equal(event('turn/completed', { threadId: 'root', turn: { status: 'completed' } }), true)
   event('thread/deleted', { threadId: 'child' }); event('thread/deleted', { threadId: 'root' })
   assert.deepEqual(evidence, { rootThreadId: 'root', childThreadId: 'child', artifactId: 'artifact',
-    rootThreadStarted: true, rootEnvironmentReady: true, spawnAgentCompleted: true, spawnAgentCount: 1,
+    rootThreadStarted: true, rootEnvironmentReady: true, noLocalHostedCodeModeProcess: true,
+    spawnAgentCompleted: true, spawnAgentCount: 1,
     spawnCallIds: ['spawn-call'], waitCompleted: true,
     rootPatchAvailable: true, childPatchAvailable: true, rootTurnCompleted: true, finalMarker: true,
     lastRootAgentMessage: 'done\nHOSTED_CODEX_POC_OK', deletedThreadIds: ['child', 'root'] })
@@ -106,6 +108,7 @@ readline.on('line', line => {
   const stderrLogPath = join(paths.logsDirectory, 'app-server.log')
   const app = startPocAppServer({ provenance: { buildId: 'build', revision: 'a'.repeat(40),
     codexSha256: 'b'.repeat(64), codeModeHostSha256: 'c'.repeat(64), templateId: 'template',
+    cpuMillicores: 2000, memoryMb: 2000,
     binaryPath: binary, codeModeHostPath: binary, metadataPath: 'metadata' },
   paths, caBundlePath: '/tmp/ca.pem', hostedBearer: 'hosted', accessToken: 'access', stderrLogPath })
   try { await initializeAndReadAccount(app) } finally { await app.stop() }

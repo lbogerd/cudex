@@ -17,7 +17,7 @@ its existing process-owned/in-process behavior; hosted Codex must fail closed.
   `codex-code-mode-host` without retaining the legacy top-level checksum.
 - [x] Add a non-protocol `--help` check and a hosted singleton launcher mode.
 - [x] Complete singleton path hardening and collision/crash tests.
-- [ ] Configure or document the provider CPU and memory limits used by the POC.
+- [x] Configure and record the POC template's provider CPU and memory limits.
 
 ### Transport, provider, and identity
 
@@ -47,10 +47,12 @@ its existing process-owned/in-process behavior; hosted Codex must fail closed.
 
 ### Evidence and acceptance
 
-- [ ] Complete non-secret start/reconnect/shutdown/failure/quiescence telemetry.
+- [ ] Complete non-secret reconnect telemetry after verified same-generation
+  recovery exists. Start, ready, failure, shutdown, and quiescence events now
+  carry bounded non-secret identity, protocol, duration, and outcome fields.
 - [ ] Add transport, provider, provisioning, authorization, reconnect, and
   shutdown tests without bypassing remote startup.
-- [ ] Add trusted runtime-placement evidence and the six code-mode booleans to
+- [x] Add trusted runtime-placement evidence and the six code-mode booleans to
   retained POC reports.
 - [ ] Run the real root/child CubeSandbox scenarios, including CPU placement,
   stored-value isolation, nested command routing, independent failure/shutdown,

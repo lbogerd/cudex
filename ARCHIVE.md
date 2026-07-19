@@ -2172,6 +2172,28 @@ the provider environment. The outer `exec` grant therefore neither authorizes a
 nested tool nor permits a command to be redirected to a parent, child, restored,
 or otherwise attached environment.
 
+### Code-mode limits, telemetry, and POC evidence
+
+Hosted mode is detected by the host's minimal identity environment and changes
+the host limit from 128 active cells to one. The common bounded protocol keeps a
+64 MiB maximum frame, 128-message channels, 256 pending delegate calls, bounded
+request-ID history, and existing per-cell output-token limits. Template
+publication passes explicit provider limits (defaults: 2000 CPU millicores and
+2000 MB memory) and records them in provenance; preflight rejects missing or
+invalid values. CPU and memory exhaustion therefore stays inside CubeSandbox.
+
+Start, ready, failure, shutdown, and quiescence logs contain only the thread,
+lease, environment, generation, hashed process identity, protocol version,
+duration, outcome, and bounded error category. They never include process
+environment, connection URLs, credentials, tool arguments, or JavaScript.
+
+The POC's runtime-ready and quiesced assertions use process IDs and terminal
+state from the trusted exec-gateway interaction ledger. Root and child entries
+must each have exactly one `hosted-code-mode-*` process and distinct environment
+IDs. The negative local-placement assertion walks only the app-server's Linux
+`/proc` descendant tree and rejects a local `codex-code-mode-host`; sandbox `ps`
+output and model prose are not accepted as evidence.
+
 ### Child creation
 
 Snapshot the owner atomically, restore into a temporary capture sandbox, export

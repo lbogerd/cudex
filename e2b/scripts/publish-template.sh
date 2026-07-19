@@ -23,6 +23,12 @@ codex_sha256=$(jq -er '.codexSha256' "${image_metadata}")
 code_mode_host_sha256=$(jq -er '.codeModeHostSha256' "${image_metadata}")
 
 writable_layer_size=${CUBE_WRITABLE_LAYER_SIZE:-20Gi}
+cpu_millicores=${CUBE_CPU_MILLICORES:-2000}
+memory_mb=${CUBE_MEMORY_MB:-2000}
+if [[ ! "${cpu_millicores}" =~ ^[1-9][0-9]{0,8}$ ]] || [[ ! "${memory_mb}" =~ ^[1-9][0-9]{0,8}$ ]]; then
+  echo "CUBE_CPU_MILLICORES and CUBE_MEMORY_MB must be positive bounded integers" >&2
+  exit 1
+fi
 template_dir="${e2b_dir}/.artifacts/templates"
 mkdir -p "${template_dir}"
 output_file=$(mktemp /tmp/cudex-template-output.XXXXXX)
@@ -33,6 +39,8 @@ echo "Publishing CubeSandbox template from ${image_ref}"
 sudo cubemastercli tpl create-from-image \
   --image "${image_ref}" \
   --writable-layer-size "${writable_layer_size}" \
+  --cpu "${cpu_millicores}" \
+  --memory "${memory_mb}" \
   --expose-port 49983 \
   --expose-port 22101 \
   --probe 49983 \
@@ -56,8 +64,10 @@ jq -n \
   --arg revision "${revision}" \
   --arg codexSha256 "${codex_sha256}" \
   --arg codeModeHostSha256 "${code_mode_host_sha256}" \
+  --argjson cpuMillicores "${cpu_millicores}" \
+  --argjson memoryMb "${memory_mb}" \
   --arg publishedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  '{buildId: $buildId, templateId: $templateId, jobId: $jobId, artifactId: $artifactId, image: $image, revision: $revision, codexSha256: $codexSha256, codeModeHostSha256: $codeModeHostSha256, publishedAt: $publishedAt}' \
+  '{buildId: $buildId, templateId: $templateId, jobId: $jobId, artifactId: $artifactId, image: $image, revision: $revision, codexSha256: $codexSha256, codeModeHostSha256: $codeModeHostSha256, cpuMillicores: $cpuMillicores, memoryMb: $memoryMb, publishedAt: $publishedAt}' \
   >"${template_dir}/${build_id}.json"
 
 printf 'template_id=%s\nmetadata=%s\n' "${template_id}" "${template_dir}/${build_id}.json"

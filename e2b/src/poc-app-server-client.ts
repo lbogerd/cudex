@@ -273,6 +273,7 @@ export interface PocAppServerEvidence {
   artifactId?: string
   rootThreadStarted: boolean
   rootEnvironmentReady: boolean
+  noLocalHostedCodeModeProcess: boolean
   spawnAgentCompleted: boolean
   spawnAgentCount: number
   spawnCallIds: string[]
@@ -283,6 +284,34 @@ export interface PocAppServerEvidence {
   finalMarker: boolean
   lastRootAgentMessage?: string
   deletedThreadIds: string[]
+}
+
+async function descendantProcessIds(rootPid: number): Promise<number[]> {
+  const discovered: number[] = []
+  const pending = [rootPid]
+  const seen = new Set(pending)
+  while (pending.length > 0 && seen.size <= 1024) {
+    const pid = pending.shift()!
+    const children = await readFile(`/proc/${pid}/task/${pid}/children`, 'utf8').catch(() => '')
+    for (const raw of children.trim().split(/\s+/u)) {
+      if (!raw) continue
+      const child = Number(raw)
+      if (!Number.isSafeInteger(child) || child <= 0 || seen.has(child)) continue
+      seen.add(child); discovered.push(child); pending.push(child)
+    }
+  }
+  return discovered
+}
+
+async function hasLocalHostedCodeModeProcess(process: PocAppServerProcess): Promise<boolean> {
+  const pid = process.child.pid
+  if (!pid) throw new Error('app-server process has no PID')
+  for (const descendant of await descendantProcessIds(pid)) {
+    const command = await readFile(`/proc/${descendant}/cmdline`).catch(() => Buffer.alloc(0))
+    if (command.toString('utf8').split('\0').some(value =>
+      value.endsWith('/codex-code-mode-host') || value === 'codex-code-mode-host')) return true
+  }
+  return false
 }
 
 function optionalString(value: unknown): string | undefined {
@@ -407,6 +436,7 @@ export async function runAutomatedTurn(input: {
   const rootThreadId = optionalString(thread.id)
   if (!rootThreadId) throw new Error('thread/start returned no root thread ID')
   const evidence: PocAppServerEvidence = { rootThreadId, rootThreadStarted: true, rootEnvironmentReady: false,
+    noLocalHostedCodeModeProcess: false,
     spawnAgentCompleted: false, spawnAgentCount: 0, spawnCallIds: [], waitCompleted: false,
     rootPatchAvailable: false, childPatchAvailable: false, rootTurnCompleted: false,
     finalMarker: false, deletedThreadIds: [] }
@@ -422,6 +452,7 @@ export async function runAutomatedTurn(input: {
     throw new Error('hosted root environment shell is invalid')
   }
   evidence.rootEnvironmentReady = true
+  evidence.noLocalHostedCodeModeProcess = !(await hasLocalHostedCodeModeProcess(input.process))
   input.onEvidence?.(evidence)
   await input.process.client.request('turn/start', { threadId: rootThreadId,
     input: [{ type: 'text', text: input.prompt, textElements: [] }] })

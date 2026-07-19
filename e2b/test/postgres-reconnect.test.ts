@@ -272,7 +272,7 @@ test('durable reconnect serializes duplicate keys across replicas and returns fr
     assert.equal(durable.rows[0]?.state, 'succeeded')
     assert.equal(durable.rows[0]?.live_tickets, '1')
     const encoded = JSON.stringify(durable.rows[0]?.logical_response)
-    assert.equal(encoded.includes('connection'), false)
+    assert.equal(Object.hasOwn(durable.rows[0]?.logical_response ?? {}, 'connection'), false)
     assert.equal(/ticket|token|credential|api.?key/iu.test(encoded), false)
     assert.equal(await context.tickets[0].validate(context.leaseId,
       ticketFrom(context.initialTicketUrl)), null)
@@ -427,7 +427,7 @@ test('ambiguous reconnect commit replays durable success without a second provid
       WHERE operation = 'reconnect' AND idempotency_key = $1
     `, [request.idempotencyKey])
     assert.equal(durable.rows[0]?.state, 'succeeded')
-    assert.equal(JSON.stringify(durable.rows[0]?.logical_response).includes('connection'), false)
+    assert.equal(Object.hasOwn(durable.rows[0]?.logical_response ?? {}, 'connection'), false)
   } finally { await close(context) }
 })
 
@@ -453,7 +453,7 @@ test('ticket issuance failure preserves durable success and replay repairs acces
       WHERE operation = 'reconnect' AND idempotency_key = $1
     `, [request.idempotencyKey])
     assert.equal(durable.rows[0]?.state, 'succeeded')
-    assert.equal(JSON.stringify(durable.rows[0]?.logical_response).includes('connection'), false)
+    assert.equal(Object.hasOwn(durable.rows[0]?.logical_response ?? {}, 'connection'), false)
 
     const replay = await context.coordinators[1].reconnect(request)
     assert.equal(replay.leaseId, context.leaseId)

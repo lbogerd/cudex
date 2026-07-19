@@ -329,7 +329,7 @@ test('durable provision serializes two replicas and replays one adopted allocati
       leases: '1', snapshots: '1', preparations: '1', allocations: '5', adopted: '5',
     })
     const encoded = JSON.stringify(row.logical_response)
-    assert.equal(encoded.includes('connection'), false)
+    assert.equal(Object.hasOwn(durable.rows[0]?.logical_response ?? {}, 'connection'), false)
     assert.equal(/ticket|token|credential|api.?key/iu.test(encoded), false)
   } finally { await close(context) }
 })
