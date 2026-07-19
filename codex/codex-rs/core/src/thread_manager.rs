@@ -1584,6 +1584,16 @@ impl ThreadManagerState {
         thread_id: ThreadId,
         pending: PendingHostedAgentRuntime,
     ) -> CodexResult<HostedAgentRuntime> {
+        if let Err(error) = pending.retain().await {
+            let message = format!(
+                "failed to retain hosted-agent durable state for thread {thread_id}: {error}"
+            );
+            if let Err(cleanup_error) = pending.rollback().await {
+                warn!(error = %cleanup_error, %thread_id,
+                    "failed to roll back hosted runtime after retention failed");
+            }
+            return Err(CodexErr::Fatal(message));
+        }
         let record = pending.durable_record();
         let persistence_result = self
             .thread_store
@@ -1655,6 +1665,10 @@ impl ThreadManagerState {
                 ))
             })?;
         runtime.set_latest_snapshot_id(checkpoint.snapshot_id);
+        provisioner
+            .retain(thread_id, &runtime.snapshot())
+            .await
+            .map_err(|error| CodexErr::Fatal(error.to_string()))?;
         Ok(())
     }
 

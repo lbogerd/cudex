@@ -13,6 +13,7 @@ use crate::AgentPatchExportRequest;
 use crate::AgentProvisionRequest;
 use crate::AgentReconnectRequest;
 use crate::AgentReleaseRequest;
+use crate::AgentRetentionRequest;
 use crate::AgentToolPolicy;
 use crate::HostedAgentError;
 use crate::HostedAgentErrorCategory;
@@ -636,6 +637,27 @@ impl HostedAgentService for FakeHostedAgentService {
         state
             .releases
             .insert(request.idempotency_key.clone(), request);
+        Ok(())
+    }
+
+    async fn retain(&self, request: AgentRetentionRequest) -> Result<()> {
+        let state = self.lock();
+        let lease = state.leases.get(&request.lease_id).ok_or_else(|| {
+            HostedAgentError::new(HostedAgentErrorCategory::LeaseMissing, "lease is missing")
+        })?;
+        if lease.provisioned.lease_id != request.lease_id
+            || !state.snapshots.contains_key(&request.base_snapshot_id)
+            || !state.snapshots.contains_key(&request.latest_snapshot_id)
+            || request
+                .artifact_id
+                .as_ref()
+                .is_some_and(|id| !state.artifacts.contains_key(id))
+        {
+            return Err(HostedAgentError::new(
+                HostedAgentErrorCategory::SnapshotMissing,
+                "retained durable state is missing",
+            ));
+        }
         Ok(())
     }
 }

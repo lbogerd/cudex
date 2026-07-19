@@ -17,6 +17,7 @@ import {
   validateProvisionedAgent,
   validateProvisionRequest,
   validateReconnectRequest,
+  validateRetentionRequest,
   validateReleaseRequest,
 } from './validation.js'
 
@@ -38,6 +39,9 @@ interface ServerOptions {
     api: Pick<AuthenticatedSourceSnapshotApi, 'create'>
     maxArchiveBytes: number
   }
+  retention?: {
+    retain: (request: ReturnType<typeof validateRetentionRequest>) => Promise<void>
+  }
 }
 const maxRequestBytes = 1024 * 1024
 const maxSourceMetadataBytes = 64 * 1024
@@ -47,8 +51,9 @@ const routes = new Map([
   ['/v1/agents/checkpoint', 'checkpoint'], ['/v1/agents/patch/export', 'exportPatch'],
   ['/v1/agents/patch/apply', 'applyPatch'],
   ['/v1/agents/release', 'release'],
+  ['/v1/agents/retain', 'retain'],
 ] as const)
-type Method = 'provision' | 'reconnect' | 'checkpoint' | 'exportPatch' | 'applyPatch' | 'release'
+type Method = 'provision' | 'reconnect' | 'checkpoint' | 'exportPatch' | 'applyPatch' | 'release' | 'retain'
 
 function validateInput(method: Method, value: unknown): unknown {
   switch (method) {
@@ -58,6 +63,7 @@ function validateInput(method: Method, value: unknown): unknown {
     case 'exportPatch': return validatePatchExportRequest(value)
     case 'applyPatch': return validatePatchApplyRequest(value)
     case 'release': return validateReleaseRequest(value)
+    case 'retain': return validateRetentionRequest(value)
   }
 }
 
@@ -69,6 +75,7 @@ function validateOutput(method: Method, value: unknown): unknown {
     case 'exportPatch': return validatePatchExportResponse(value)
     case 'applyPatch': return validatePatchApplyResponse(value)
     case 'release': return value
+    case 'retain': return value
   }
 }
 
@@ -146,15 +153,18 @@ export async function startServer(service: AgentLifecycleService, gateway: ExecG
       const input = validateInput(method, await body(request))
       const patchExport = options.patchExport
       const patchApply = options.patchApply
-      const dispatch = method === 'exportPatch'
+      const dispatch = method === 'retain'
+        ? options.retention && ((value: never) => options.retention!.retain(value))
+        : method === 'exportPatch'
         ? patchExport && ((value: never) => patchExport.exportPatch(value))
         : method === 'applyPatch'
           ? patchApply && ((value: never) => patchApply.applyPatch(value))
         : (value: never) => (service[method] as (input: never) => Promise<unknown>)(value)
       if (!dispatch) throw new ServiceError(503, 'durable patch service unavailable')
       const result = validateOutput(method, await dispatch(input as never))
-      response.statusCode = method === 'release' ? 204 : 200
-      response.setHeader('content-type', 'application/json'); response.end(method === 'release' ? undefined : JSON.stringify(result))
+      response.statusCode = method === 'release' || method === 'retain' ? 204 : 200
+      response.setHeader('content-type', 'application/json')
+      response.end(method === 'release' || method === 'retain' ? undefined : JSON.stringify(result))
     } catch (error) {
       const status = error instanceof ServiceError ? error.status : 503
       response.statusCode = status; response.setHeader('content-type', 'application/json')

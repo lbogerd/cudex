@@ -1,4 +1,5 @@
 import type { ProviderAdapter } from './provider.js'
+import type { PoolClient } from 'pg'
 import { ProviderSandboxMissingError } from './provider.js'
 import type { PostgresDurableState } from './postgres-state.js'
 import {
@@ -21,6 +22,7 @@ export interface PostgresReleaseOptions {
   workerId: string
   waitTimeoutMs?: number
   connections?: ReleaseConnectionRevoker
+  referenceRetention?: { assertSynchronized(client: PoolClient, leaseId: string): Promise<void> }
 }
 
 const operation = 'release'
@@ -93,6 +95,7 @@ export class PostgresReleaseCoordinator {
         if (!await this.journal.heartbeatOperation(fence, fence.generation, fence.workerId, client)) {
           throw new Error('release operation ownership changed')
         }
+        if (lease.state !== 'released') await this.options.referenceRetention?.assertSynchronized(client, lease.leaseId)
         await this.journal.bindLeaseAndAdoptAllocations(
           identity, fence.generation, fence.workerId, lease.leaseId, [], client)
         const pending = await this.state.beginRelease(this.tenantId, lease.leaseId, client)

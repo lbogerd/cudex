@@ -14,6 +14,7 @@ use codex_hosted_agent::AgentPatchExportRequest;
 use codex_hosted_agent::AgentProvisionRequest;
 use codex_hosted_agent::AgentReconnectRequest;
 use codex_hosted_agent::AgentReleaseRequest;
+use codex_hosted_agent::AgentRetentionRequest;
 use codex_hosted_agent::AgentToolPolicy;
 use codex_hosted_agent::HostedAgentError;
 use codex_hosted_agent::HostedAgentLifecycleState;
@@ -135,6 +136,7 @@ trait ErasedHostedAgentService: Send + Sync {
     ) -> HostedServiceFuture<'_, PatchApplyResult>;
 
     fn release(&self, request: AgentReleaseRequest) -> HostedServiceFuture<'_, ()>;
+    fn retain(&self, request: AgentRetentionRequest) -> HostedServiceFuture<'_, ()>;
 }
 
 impl<Service> ErasedHostedAgentService for Service
@@ -179,6 +181,10 @@ where
     fn release(&self, request: AgentReleaseRequest) -> HostedServiceFuture<'_, ()> {
         Box::pin(HostedAgentService::release(self, request))
     }
+
+    fn retain(&self, request: AgentRetentionRequest) -> HostedServiceFuture<'_, ()> {
+        Box::pin(HostedAgentService::retain(self, request))
+    }
 }
 
 /// Coordinates hosted service leases with dynamic exec-server registrations.
@@ -188,6 +194,13 @@ pub(crate) struct HostedAgentProvisioner {
 }
 
 impl HostedAgentProvisioner {
+    pub(crate) async fn retain(
+        &self,
+        agent_id: codex_protocol::ThreadId,
+        runtime: &HostedAgentRuntime,
+    ) -> Result<(), HostedAgentRuntimeError> {
+        retain_runtime(agent_id, runtime, self.service.as_ref()).await
+    }
     pub(crate) fn new<Service>(
         service: Arc<Service>,
         environment_manager: Arc<EnvironmentManager>,
@@ -568,6 +581,10 @@ impl PendingHostedAgentRuntime {
         self.runtime.durable_record()
     }
 
+    pub(crate) async fn retain(&self) -> Result<(), HostedAgentRuntimeError> {
+        retain_runtime(self.agent_id, &self.runtime, self.service.as_ref()).await
+    }
+
     pub(crate) async fn rollback(self) -> Result<(), HostedAgentRuntimeError> {
         match self.rollback {
             PendingRuntimeRollback::KeepLease => self
@@ -612,6 +629,8 @@ pub(crate) enum HostedAgentRuntimeError {
     ExportPatch(HostedAgentError),
     #[error("failed to apply hosted-agent patch: {0}")]
     ApplyPatch(HostedAgentError),
+    #[error("failed to synchronize hosted-agent durable references: {0}")]
+    Retention(HostedAgentError),
     #[error("failed to unregister hosted environment `{environment_id}`: {source}")]
     Unregister {
         environment_id: String,
@@ -628,6 +647,7 @@ async fn cleanup_runtime(
     environment_manager: &EnvironmentManager,
     service: &dyn ErasedHostedAgentService,
 ) -> Result<(), HostedAgentRuntimeError> {
+    retain_runtime(agent_id, &runtime, service).await?;
     let release_idempotency_key = release_idempotency_key(agent_id, &runtime.lease_id);
     let unregister_result = environment_manager
         .remove_environment(&runtime.environment_id)
@@ -647,6 +667,31 @@ async fn cleanup_runtime(
         (Ok(_), Err(error)) => Err(HostedAgentRuntimeError::Release(error)),
         (Ok(_), Ok(())) => Ok(()),
     }
+}
+
+async fn retain_runtime(
+    agent_id: codex_protocol::ThreadId,
+    runtime: &HostedAgentRuntime,
+    service: &dyn ErasedHostedAgentService,
+) -> Result<(), HostedAgentRuntimeError> {
+    let latest_snapshot_id = runtime.latest_snapshot_id.clone().ok_or_else(|| {
+        HostedAgentRuntimeError::RestoreUnavailable(
+            "hosted-agent runtime has no durable snapshot".to_string(),
+        )
+    })?;
+    service
+        .retain(AgentRetentionRequest {
+            agent_id,
+            lease_id: runtime.lease_id.clone(),
+            base_snapshot_id: runtime.base_snapshot_id.clone(),
+            latest_snapshot_id,
+            artifact_id: runtime
+                .last_exported_patch
+                .as_ref()
+                .map(|artifact| artifact.artifact_id.clone()),
+        })
+        .await
+        .map_err(HostedAgentRuntimeError::Retention)
 }
 
 fn release_idempotency_key(agent_id: codex_protocol::ThreadId, lease_id: &str) -> String {

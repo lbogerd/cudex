@@ -10,6 +10,7 @@ import type {
   ProvisionRequest,
   ReconnectRequest,
   ReleaseRequest,
+  RetentionRequest,
   SnapshotSource,
   ToolPolicy,
 } from './types.js'
@@ -178,6 +179,19 @@ function validateLeaseRequest(value: unknown, kind: string): { leaseId: string; 
 export function validateReconnectRequest(value: unknown): ReconnectRequest { return validateLeaseRequest(value, 'reconnect') }
 export function validateCheckpointRequest(value: unknown): CheckpointRequest { return validateLeaseRequest(value, 'checkpoint') }
 export function validateReleaseRequest(value: unknown): ReleaseRequest { return validateLeaseRequest(value, 'release') }
+
+export function validateRetentionRequest(value: unknown): RetentionRequest {
+  const record = object(value,
+    ['agentId', 'leaseId', 'baseSnapshotId', 'latestSnapshotId', 'artifactId'], requestFailure,
+    'retention request')
+  return {
+    agentId: opaqueId(record.agentId, requestFailure, 'agent ID'),
+    leaseId: opaqueId(record.leaseId, requestFailure, 'lease ID'),
+    baseSnapshotId: opaqueId(record.baseSnapshotId, requestFailure, 'base snapshot ID'),
+    latestSnapshotId: opaqueId(record.latestSnapshotId, requestFailure, 'latest snapshot ID'),
+    artifactId: record.artifactId === null ? null : opaqueId(record.artifactId, requestFailure, 'artifact ID'),
+  }
+}
 
 export function validatePatchExportRequest(value: unknown): PatchExportRequest {
   const record = object(value, ['leaseId', 'agentId', 'baseSnapshotId', 'idempotencyKey'],

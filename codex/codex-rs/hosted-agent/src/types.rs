@@ -168,6 +168,16 @@ pub struct AgentReleaseRequest {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AgentRetentionRequest {
+    pub agent_id: ThreadId,
+    pub lease_id: String,
+    pub base_snapshot_id: String,
+    pub latest_snapshot_id: String,
+    pub artifact_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentPatchArtifact {
     pub artifact_id: String,
     pub agent_id: ThreadId,
@@ -291,6 +301,8 @@ pub trait HostedAgentService: Send + Sync {
         &self,
         request: AgentPatchApplyRequest,
     ) -> impl Future<Output = Result<PatchApplyResult>> + Send;
+    /// Synchronizes the exact durable snapshot and artifact set retained by Codex.
+    fn retain(&self, request: AgentRetentionRequest) -> impl Future<Output = Result<()>> + Send;
     /// Releases the service resources associated with a lease.
     fn release(&self, request: AgentReleaseRequest) -> impl Future<Output = Result<()>> + Send;
 }

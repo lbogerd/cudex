@@ -76,6 +76,12 @@ production backend. Stable decisions, evidence, and wire schemas are in
   PostgreSQL registrations cannot drift from physical writes.
 - [ ] Add reference retention so snapshots/artifacts outlive lease release while
   Codex references them.
+  - [x] Add the strict retain wire, tenant/agent-authorized exact-set PostgreSQL
+    roots, Codex persistence/release synchronization, and a production release
+    fence that refuses an unsynchronized latest snapshot.
+  - [ ] Add monotonic reference revisions and desired-set hashes, direct retained
+    object-graph roots, retained-artifact TTL overrides, exact lease-root removal,
+    and a durable thread-deletion tombstone/outbox before enabling collection.
 - [ ] Reconcile abandoned operations, sandboxes, snapshots, capture sandboxes,
   tickets, archives, and expired blobs after crashes and timeouts.
 - [x] Add bounded, tenant-scoped PostgreSQL reclamation for registered object

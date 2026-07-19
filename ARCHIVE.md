@@ -625,6 +625,33 @@ descendants are gone before quiescence, while existing late-output coverage
 remains green. The exec-server protocol's 12 tests and the complete
 Docker/PostgreSQL-backed E2B suite pass, the latter at 283 tests with no skips.
 
+### Codex durable-reference synchronization foundation
+
+Migration 0014 adds one tenant/thread desired-reference row for the exact base
+snapshot, latest snapshot, optional patch artifact, and current lease recorded by
+Codex. The new strict `POST /v1/agents/retain` route authorizes the lease to the
+authenticated tenant and agent, authorizes both snapshots through that agent's
+lease lineage, authorizes the optional artifact to the agent or its owner, and
+atomically replaces only that tenant/thread's `codex_thread` roots. Sync is
+idempotent and remains available after lease release.
+
+The Rust hosted-service contract now exposes the same retention operation. Codex
+syncs initial durable state before committing startup, syncs turn and patch-apply
+checkpoints after local persistence, and unconditionally syncs the complete final
+record before release. Production release checks the synchronized latest
+snapshot under its existing lease transaction before it can revoke or destroy
+the sandbox. A failure therefore preserves the lease instead of crossing a local
+persistence/service-retention crash window. This work also fixed a core read
+destructure exposed by the new exec-server `quiesced` response field.
+
+This is a fail-closed foundation, not the completed retention lifecycle. Before
+collection is enabled, sync still needs monotonic revisions and desired hashes;
+direct object-graph roots; retained-artifact authorization beyond its normal TTL;
+precise released-lease root removal; and a durable deletion tombstone/outbox that
+clears the remote set only after local thread deletion. Focused migration,
+authorization, exact-set, HTTP, Rust contract, and lifecycle tests pass, and the
+complete Docker/PostgreSQL suite reached 286 tests with no skips.
+
 ### Canonical workspace comparison foundation
 
 Patch lifecycle code now has a provider-independent canonical workspace model

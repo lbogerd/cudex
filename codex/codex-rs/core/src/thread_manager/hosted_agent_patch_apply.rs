@@ -220,6 +220,10 @@ impl ThreadManagerState {
                         ))
                     })?;
                 target_runtime.set_latest_snapshot_id(checkpoint.snapshot_id);
+                provisioner
+                    .retain(requesting_agent_id, &target_runtime.snapshot())
+                    .await
+                    .map_err(|error| CodexErr::Fatal(error.to_string()))?;
                 Ok(HostedAgentPatchApplyResult::Applied)
             }
             PatchApplyResult::Conflict { paths } if paths.len() <= MAX_PATCH_CONFLICT_PATHS => {

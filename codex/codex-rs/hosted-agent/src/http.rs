@@ -16,6 +16,7 @@ use crate::AgentPatchExportRequest;
 use crate::AgentProvisionRequest;
 use crate::AgentReconnectRequest;
 use crate::AgentReleaseRequest;
+use crate::AgentRetentionRequest;
 use crate::HostedAgentError;
 use crate::HostedAgentErrorCategory;
 use crate::HostedAgentService;
@@ -348,6 +349,11 @@ impl HostedAgentService for HttpHostedAgentService {
 
     async fn release(&self, request: AgentReleaseRequest) -> Result<()> {
         self.send("v1/agents/release", &request).await?;
+        Ok(())
+    }
+
+    async fn retain(&self, request: AgentRetentionRequest) -> Result<()> {
+        self.send("v1/agents/retain", &request).await?;
         Ok(())
     }
 }

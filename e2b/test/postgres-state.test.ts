@@ -7,6 +7,7 @@ import { DurableStateConflictError, DurableStateNotFoundError, PostgresDurableSt
   type CreateLeaseInput, type CreateRestoredLeaseInput, type StoredObject } from '../src/postgres-state.js'
 import { canonicalRequestHash, PostgresJournal } from '../src/postgres-store.js'
 import { PostgresTicketIssuer } from '../src/postgres-tickets.js'
+import { PostgresReferenceRetention } from '../src/postgres-reference-retention.js'
 
 const databaseUrl = process.env.HOSTED_AGENT_TEST_DATABASE_URL
 interface Fixture { admin: Pool; firstPool: Pool; secondPool: Pool; first: PostgresDurableState; second: PostgresDurableState; schema: string }
@@ -261,6 +262,39 @@ live('checkpoint references and durable data survive release', async context => 
     WHERE object_id = $1 AND reference_kind = 'snapshot' AND reference_id = $2 AND purpose = 'content_blob'
   `, [checkpointContent.objectId, checkpoint.snapshotId])
   assert.equal(contentReference.rows[0]!.count, '1')
+})
+
+live('Codex reference sync is exact, authorized, idempotent, and release-safe', async context => {
+  const ids = await objects(context)
+  const created = await context.first.createLeaseWithBaseSnapshot(leaseInput(ids))
+  const checkpointIds = await objects(context, 'tenant-1', '-retained')
+  const checkpoint = await context.first.appendCheckpoint('tenant-1', created.lease.leaseId, {
+    snapshotId: 'snapshot-retained', providerSnapshotId: 'provider-retained',
+    workspaceArchiveObjectId: checkpointIds.archive.objectId,
+    manifestObjectId: checkpointIds.manifest.objectId,
+    manifestChecksum: checkpointIds.manifest.checksum,
+  })
+  const retention = new PostgresReferenceRetention(context.firstPool, 'tenant-1')
+  const request = { agentId: 'agent-1', leaseId: created.lease.leaseId,
+    baseSnapshotId: created.snapshot.snapshotId, latestSnapshotId: checkpoint.snapshotId,
+    artifactId: null }
+  await Promise.all([retention.retain(request), retention.retain(request)])
+  await assert.rejects(retention.retain({ ...request, agentId: 'agent-other' }))
+  await assert.rejects(new PostgresReferenceRetention(context.firstPool, 'tenant-2').retain(request))
+  const client = await context.firstPool.connect()
+  try {
+    await client.query('BEGIN')
+    await retention.assertSynchronized(client, created.lease.leaseId)
+    await client.query('ROLLBACK')
+  } finally { client.release() }
+  await context.first.beginRelease('tenant-1', created.lease.leaseId)
+  await context.first.releaseLease('tenant-1', created.lease.leaseId)
+  await retention.retain(request)
+  const references = await context.firstPool.query<{ count: string }>(`
+    SELECT count(*)::text AS count FROM hosted_agent_snapshot_references
+    WHERE reference_kind = 'codex_thread' AND reference_id = $1
+  `, [request.agentId])
+  assert.equal(references.rows[0]!.count, '2')
 })
 
 live('snapshot transactions reject content objects that are no longer available', async context => {

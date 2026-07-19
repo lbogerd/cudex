@@ -494,6 +494,7 @@ impl UnifiedExecProcess {
                         closed,
                         failure,
                         sandbox_denied,
+                        ..
                     } = response;
                     for chunk in chunks.into_iter().filter(|chunk| chunk.seq > last_seq) {
                         let bytes = chunk.chunk.into_inner();

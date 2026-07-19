@@ -39,6 +39,7 @@ impl MockExecProcess {
                 closed: false,
                 failure: None,
                 sandbox_denied: false,
+                quiesced: false,
             }))
     }
 

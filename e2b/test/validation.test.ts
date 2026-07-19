@@ -11,8 +11,19 @@ import {
   validateProvisionedAgent,
   validateProvisionRequest,
   validateReconnectRequest,
+  validateRetentionRequest,
   validateReleaseRequest,
 } from '../src/validation.js'
+
+test('retention request is an exact bounded durable set', () => {
+  const request = { agentId: 'agent', leaseId: 'lease', baseSnapshotId: 'base',
+    latestSnapshotId: 'latest', artifactId: null }
+  assert.deepEqual(validateRetentionRequest(request), request)
+  assert.deepEqual(validateRetentionRequest({ ...request, artifactId: 'artifact' }),
+    { ...request, artifactId: 'artifact' })
+  rejectsStatus(400, () => validateRetentionRequest({ ...request, extra: true }))
+  rejectsStatus(400, () => validateRetentionRequest({ ...request, artifactId: '' }))
+})
 
 const rootProvision = () => ({
   agentId: 'agent_root', ownerAgentId: null, agentType: 'default', sandboxTemplate: 'general-v1',

@@ -77,6 +77,22 @@ test('HTTP responses disable caching and redact unexpected service errors', asyn
   assert.equal(failure.body.includes('secret'), false)
 })
 
+test('HTTP retention route strictly dispatches the exact durable set', async t => {
+  const seen: unknown[] = []
+  const gateway = { attach() {} } as unknown as ExecGateway
+  const server = await startServer({} as ControlPlane, gateway, {
+    host: '127.0.0.1', port: 0, bearerToken: 'test-token', allowInsecureHttp: true,
+    retention: { async retain(request) { seen.push(request) } },
+  })
+  t.after(() => server.close())
+  const port = (server.address() as import('node:net').AddressInfo).port
+  const request = { agentId: 'agent', leaseId: 'lease', baseSnapshotId: 'base',
+    latestSnapshotId: 'latest', artifactId: 'artifact' }
+  const response = await post(port, '/v1/agents/retain', JSON.stringify(request))
+  assert.equal(response.status, 204)
+  assert.deepEqual(seen, [request])
+})
+
 test('HTTP rejects oversized declared and streamed bodies before service dispatch', async t => {
   let calls = 0
   const service = { async provision() { calls++; return { ok: true } } }

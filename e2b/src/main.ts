@@ -36,6 +36,7 @@ import { PostgresChildCoordinator } from './postgres-child.js'
 import { parseTrustedRoles } from './trusted-roles.js'
 import type { ActiveLeaseDirectory } from './gateway.js'
 import { PostgresLeaseInteractionGate } from './postgres-lease-interactions.js'
+import { PostgresReferenceRetention } from './postgres-reference-retention.js'
 
 function required(name: string): string { const value = process.env[name]; if (!value) throw new Error(`${name} is required`); return value }
 function positiveInteger(name: string, fallback: number): number {
@@ -119,6 +120,10 @@ const durableArtifacts = sourceRuntime
 const durableInteractionGate = sourceRuntime
   ? new PostgresLeaseInteractionGate(durableJournal!, durableState!)
   : undefined
+const durableRetention = sourceRuntime
+  ? new PostgresReferenceRetention(sourceRuntime.pool, sourceRuntime.principal.tenantId)
+  : undefined
+const retention = durableRetention ?? (development ? { async retain(): Promise<void> {} } : undefined)
 const patchExport = sourceRuntime
   ? new PostgresPatchExportCoordinator(
       durableJournal!,
@@ -255,7 +260,7 @@ const productionService = !development
       release: new PostgresReleaseCoordinator(
         durableJournal!, durableState!, provider, {
           tenantId: sourceRuntime!.principal.tenantId,
-          workerId: durableWorkerId!, connections: gateway,
+          workerId: durableWorkerId!, connections: gateway, referenceRetention: durableRetention!,
         }),
     })
   : undefined
@@ -302,5 +307,6 @@ await startServer(service, gateway, { host, port, bearerToken: required('CODEX_H
   } } : {}),
   ...(patchExport ? { patchExport } : {}),
   ...(patchApply ? { patchApply } : {}),
+  ...(retention ? { retention } : {}),
   allowInsecureHttp: development })
 console.log(JSON.stringify({ event: 'control_plane_started', host, port, tls: Boolean(process.env.HOSTED_AGENT_TLS_CERT) }))

@@ -11,6 +11,10 @@ export interface ProvisionRequest {
 export interface ReconnectRequest { leaseId: string; idempotencyKey: string }
 export interface CheckpointRequest { leaseId: string; idempotencyKey: string }
 export interface ReleaseRequest { leaseId: string; idempotencyKey: string }
+export interface RetentionRequest {
+  agentId: string; leaseId: string; baseSnapshotId: string; latestSnapshotId: string
+  artifactId: string | null
+}
 export interface PatchExportRequest {
   leaseId: string
   agentId: string
