@@ -1194,7 +1194,8 @@ boundary for an object-store put before its durable registration remains queued.
 
 ### Durable child-capture coordinator foundation
 
-Migration 0010 adds an immutable nullable operation subtype. Child creation
+Migrations 0010 and 0011 add and constrain an immutable nullable operation
+subtype to source-bound `provision` rows only. Child creation
 retains the public `provision` idempotency namespace while persisting subtype
 `child`; replay must match it exactly. Stale claims can select either child or
 unsubtyped operations, and the general reconciler explicitly excludes child

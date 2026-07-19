@@ -209,6 +209,12 @@ export class PostgresChildCoordinator {
       const leaseId = deterministicChildId('lease', fence)
       const environmentId = deterministicChildId('env', fence)
       const snapshotId = deterministicChildId('snapshot', fence)
+      const childMetadata = {
+        childLeaseId: leaseId, childEnvironmentId: environmentId,
+        childSnapshotId: snapshotId, childAgentId: request.agentId,
+        ownerAgentId: request.ownerAgentId, ownerLeaseId: owner.leaseId,
+        agentType: request.agentType, sandboxTemplate: request.sandboxTemplate,
+      }
 
       allocationOutcomeAmbiguous = true
       const captureSnapshotId = await this.withHeartbeat(fence, () => this.provider.snapshot(
@@ -223,6 +229,7 @@ export class PostgresChildCoordinator {
         name: childProviderSnapshotName('capture', fence), ownerSnapshotId: owner.latestSnapshotId,
         ownerProviderSandboxId: owner.providerSandboxId,
         ownerConnectionGeneration: owner.connectionGeneration,
+        ...childMetadata,
       })
 
       allocationOutcomeAmbiguous = true
@@ -237,6 +244,7 @@ export class PostgresChildCoordinator {
       resources.push(captureSandbox)
       captureSandbox.allocation = await this.recordResource(fence, captureSandbox, client, {
         managedBy: this.managedBy, action: 'child_capture', purpose: 'capture_sandbox',
+        ...childMetadata,
       })
       const workspace = await this.withHeartbeat(
         fence, () => this.provider.exportWorkspace(capture.sandboxId))
@@ -255,7 +263,8 @@ export class PostgresChildCoordinator {
       }
       resources.push(resultSandbox)
       resultSandbox.allocation = await this.recordResource(fence, resultSandbox, client, {
-        managedBy: this.managedBy, action: 'child_result',
+        managedBy: this.managedBy, action: 'child_result', purpose: 'result_sandbox',
+        ...childMetadata,
       })
       await this.withHeartbeat(fence, () => this.provider.uploadArchive(created.sandboxId, workspace))
       await this.withHeartbeat(fence, () => this.provider.startExecServer(created.sandboxId))
@@ -273,7 +282,8 @@ export class PostgresChildCoordinator {
       resources.push(resultSnapshot)
       resultSnapshot.allocation = await this.recordResource(fence, resultSnapshot, client, {
         managedBy: this.managedBy, action: 'child_result',
-        name: childProviderSnapshotName('result', fence),
+        purpose: 'result_snapshot', name: childProviderSnapshotName('result', fence),
+        ...childMetadata,
       })
 
       preparationStarted = true
@@ -371,6 +381,8 @@ export class PostgresChildCoordinator {
     }
     const lease = await this.state.getLease(identity.tenantId, replayLeaseId(claim.response))
     if (!lease || lease.leaseId !== deterministicChildId('lease', identity)
+      || lease.environmentId !== deterministicChildId('env', identity)
+      || lease.baseSnapshotId !== deterministicChildId('snapshot', identity)
       || lease.agentId !== request.agentId || lease.ownerAgentId !== request.ownerAgentId
       || lease.ownerLeaseId !== request.source.ownerLeaseId
       || lease.sandboxTemplate !== request.sandboxTemplate) {

@@ -267,6 +267,23 @@ test('durable child rejects a mismatched owner before capture or clean allocatio
     assert.equal(context.provider.restores, 0)
     assert.equal(context.provider.snapshots.size, beforeSnapshots)
     assert.deepEqual(context.provider.live(), [context.ownerSandboxId])
+    await assert.rejects(context.states[0].createChildLeaseWithBaseSnapshot({
+      leaseId: 'invalid-mixed-child', environmentId: 'invalid-mixed-environment', tenantId,
+      agentId: 'child-agent', ownerAgentId: 'owner-agent', ownerLeaseId: context.ownerLeaseId,
+      expectedOwnerLatestSnapshotId: context.ownerSnapshotId,
+      expectedOwnerProviderSandboxId: context.ownerSandboxId,
+      expectedOwnerConnectionGeneration: 0, sourceSnapshotId: 'mixed-source',
+      providerSandboxId: 'invalid-child-sandbox', sandboxTemplate: role.sandboxTemplate,
+      cwdUri: 'file:///workspace/roots/0/project',
+      workspaceRootUris: ['file:///workspace/roots/0/project'],
+      toolPolicy: role.toolPolicy, policyVersion: role.policyVersion,
+      baseSnapshot: {
+        snapshotId: 'invalid-child-snapshot', providerSnapshotId: null,
+        workspaceArchiveObjectId: 'invalid-child-archive',
+        manifestObjectId: 'invalid-child-manifest',
+        manifestChecksum: `sha256:${'a'.repeat(64)}`,
+      },
+    }), /child lease cannot have another source lineage/)
   } finally { await close(context) }
 })
 

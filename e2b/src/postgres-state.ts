@@ -474,6 +474,8 @@ export class PostgresDurableState {
     if (!Number.isSafeInteger(input.expectedOwnerConnectionGeneration)
       || input.expectedOwnerConnectionGeneration < 0) throw new Error('invalid owner connection generation')
     if (input.agentId === input.ownerAgentId) throw new Error('child and owner agents must be distinct')
+    if (input.sourceSnapshotId != null || input.restoreSourceLeaseId != null
+      || input.restoreSourceSnapshotId != null) throw new Error('child lease cannot have another source lineage')
     try {
       const create = async (client: PoolClient) => {
         const owner = await this.lockLease(client, input.tenantId, input.ownerLeaseId)

@@ -85,10 +85,23 @@ live('changed request hash or tenant is rejected before a second claim', async c
 })
 
 live('child operation subtype is immutable, replay-exact, and stale-claim filterable', async context => {
+  await assert.rejects(context.first.claimOperation({
+    operation: 'provision', idempotencyKey: 'invalid-child', tenantId: 'tenant-1',
+    requestHash: canonicalRequestHash({}), workerId: 'child-worker', operationSubtype: 'child',
+  }), /invalid child operation identity/)
+  await context.firstPool.query(`
+    INSERT INTO hosted_agent_leases
+      (lease_id, environment_id, tenant_id, agent_id, sandbox_template, cwd_uri,
+       workspace_root_uris, state, tool_policy, policy_version)
+    VALUES ('child-owner', 'child-owner-environment', 'tenant-1', 'owner-agent', 'owner-v1',
+      'file:///workspace/root', '["file:///workspace/root"]'::jsonb,
+      'provisioning', '{}'::jsonb, 1)
+  `)
   const child = {
     operation: 'provision', idempotencyKey: 'child-subtype', tenantId: 'tenant-1',
     requestHash: canonicalRequestHash({ source: 'owner' }), workerId: 'child-worker',
     operationSubtype: 'child' as const,
+    primaryLeaseId: 'child-owner',
   }
   assert.equal((await context.first.claimOperation(child)).kind, 'claimed')
   const { operationSubtype: _subtype, ...withoutSubtype } = child

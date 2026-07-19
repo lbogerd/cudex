@@ -109,6 +109,10 @@ function validateClaim(input: OperationClaimInput): void {
     && (!input.primaryLeaseId.trim() || Buffer.byteLength(input.primaryLeaseId) > 512)) {
     throw new Error('invalid primary lease ID')
   }
+  if (input.operationSubtype === 'child'
+    && (input.operation !== 'provision' || input.primaryLeaseId === undefined)) {
+    throw new Error('invalid child operation identity')
+  }
 }
 
 function validateWorkerId(workerId: string): void {
