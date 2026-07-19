@@ -276,6 +276,7 @@ async fn reconnect_or_restore_requires_a_durable_snapshot() {
                 base_snapshot_id: "base".to_string(),
                 latest_snapshot_id: None,
                 last_exported_patch: None,
+                reference_revision: None,
                 lifecycle_state: HostedAgentLifecycleState::Active,
             },
         )

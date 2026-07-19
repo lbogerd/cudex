@@ -123,7 +123,11 @@ const durableInteractionGate = sourceRuntime
 const durableRetention = sourceRuntime
   ? new PostgresReferenceRetention(sourceRuntime.pool, sourceRuntime.principal.tenantId)
   : undefined
-const retention = durableRetention ?? (development ? { async retain(): Promise<void> {} } : undefined)
+const retention = durableRetention ?? (development ? {
+  async retain(request: { expectedRevision: number | null }) {
+    return { revision: request.expectedRevision ?? 1, desiredHash: '0'.repeat(64) }
+  },
+} : undefined)
 const patchExport = sourceRuntime
   ? new PostgresPatchExportCoordinator(
       durableJournal!,

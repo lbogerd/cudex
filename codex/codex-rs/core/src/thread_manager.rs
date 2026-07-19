@@ -144,13 +144,6 @@ impl HostedAgentRuntimeEntry {
             .clone()
     }
 
-    fn set_latest_snapshot_id(&self, snapshot_id: String) {
-        self.runtime
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .latest_snapshot_id = Some(snapshot_id);
-    }
-
     fn replace(&self, runtime: HostedAgentRuntime) {
         *self
             .runtime
@@ -1582,7 +1575,7 @@ impl ThreadManagerState {
     async fn persist_pending_hosted_runtime(
         &self,
         thread_id: ThreadId,
-        pending: PendingHostedAgentRuntime,
+        mut pending: PendingHostedAgentRuntime,
     ) -> CodexResult<HostedAgentRuntime> {
         if let Err(error) = pending.retain().await {
             let message = format!(
@@ -1654,21 +1647,29 @@ impl ThreadManagerState {
             .checkpoint(thread_id, turn_id, &runtime_snapshot)
             .await
             .map_err(|error| CodexErr::Fatal(error.to_string()))?;
-        let mut record = runtime_snapshot.durable_record();
-        record.latest_snapshot_id = Some(checkpoint.snapshot_id.clone());
+        let mut updated_runtime = runtime_snapshot;
+        updated_runtime.latest_snapshot_id = Some(checkpoint.snapshot_id);
         self.thread_store
-            .set_hosted_agent_runtime(thread_id, record)
+            .set_hosted_agent_runtime(thread_id, updated_runtime.durable_record())
             .await
             .map_err(|error| {
                 CodexErr::Fatal(format!(
                     "failed to persist hosted-agent checkpoint for thread {thread_id}: {error}"
                 ))
             })?;
-        runtime.set_latest_snapshot_id(checkpoint.snapshot_id);
-        provisioner
-            .retain(thread_id, &runtime.snapshot())
+        runtime.replace(updated_runtime.clone());
+        let retained = provisioner
+            .retain(thread_id, &updated_runtime)
             .await
             .map_err(|error| CodexErr::Fatal(error.to_string()))?;
+        updated_runtime.reference_revision = Some(retained.revision);
+        self.thread_store
+            .set_hosted_agent_runtime(thread_id, updated_runtime.durable_record())
+            .await
+            .map_err(|error| CodexErr::Fatal(format!(
+                "failed to persist hosted-agent reference revision for thread {thread_id}: {error}"
+            )))?;
+        runtime.replace(updated_runtime);
         Ok(())
     }
 

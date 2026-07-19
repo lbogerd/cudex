@@ -12,17 +12,22 @@ import {
   validateProvisionRequest,
   validateReconnectRequest,
   validateRetentionRequest,
+  validateRetentionResponse,
   validateReleaseRequest,
 } from '../src/validation.js'
 
 test('retention request is an exact bounded durable set', () => {
   const request = { agentId: 'agent', leaseId: 'lease', baseSnapshotId: 'base',
-    latestSnapshotId: 'latest', artifactId: null }
+    latestSnapshotId: 'latest', artifactId: null, expectedRevision: null }
   assert.deepEqual(validateRetentionRequest(request), request)
   assert.deepEqual(validateRetentionRequest({ ...request, artifactId: 'artifact' }),
     { ...request, artifactId: 'artifact' })
+  assert.deepEqual(validateRetentionResponse({ revision: 2, desiredHash: 'a'.repeat(64) }),
+    { revision: 2, desiredHash: 'a'.repeat(64) })
   rejectsStatus(400, () => validateRetentionRequest({ ...request, extra: true }))
   rejectsStatus(400, () => validateRetentionRequest({ ...request, artifactId: '' }))
+  rejectsStatus(400, () => validateRetentionRequest({ ...request, expectedRevision: 0 }))
+  rejectsStatus(503, () => validateRetentionResponse({ revision: 0, desiredHash: 'a'.repeat(64) }))
 })
 
 const rootProvision = () => ({

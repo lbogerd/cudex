@@ -82,8 +82,11 @@ production backend. Stable decisions, evidence, and wire schemas are in
   - [x] Add direct retained object-graph roots, make live Codex references override
     ordinary artifact TTL throughout authorization/apply/expiry, verify the graph
     at release, and remove the released lease's incidental snapshot roots.
-  - [ ] Add monotonic reference revisions and desired-set hashes plus a durable
-    thread-deletion tombstone/outbox before enabling collection.
+  - [x] Add monotonic reference revisions and service-computed desired-set hashes,
+    persist the acknowledged revision with Codex runtime state, and reject stale
+    different-set writers while accepting exact crash replays.
+  - [ ] Add a durable thread-deletion tombstone/outbox that clears the remote set
+    only after local thread deletion before enabling collection.
 - [ ] Reconcile abandoned operations, sandboxes, snapshots, capture sandboxes,
   tickets, archives, and expired blobs after crashes and timeouts.
 - [x] Add bounded, tenant-scoped PostgreSQL reclamation for registered object

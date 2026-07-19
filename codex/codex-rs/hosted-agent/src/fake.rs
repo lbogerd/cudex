@@ -13,6 +13,7 @@ use crate::AgentPatchExportRequest;
 use crate::AgentProvisionRequest;
 use crate::AgentReconnectRequest;
 use crate::AgentReleaseRequest;
+use crate::AgentRetention;
 use crate::AgentRetentionRequest;
 use crate::AgentToolPolicy;
 use crate::HostedAgentError;
@@ -48,6 +49,7 @@ struct State {
     export_failure: Option<HostedAgentError>,
     artifacts: HashMap<String, Artifact>,
     applies: HashMap<String, (AgentPatchApplyRequest, PatchApplyResult)>,
+    retained: HashMap<String, RetainedState>,
     releases: HashMap<String, AgentReleaseRequest>,
     release_failure: Option<HostedAgentError>,
     conflicts: HashMap<String, Vec<PathUri>>,
@@ -73,6 +75,12 @@ struct Snapshot {
 struct Artifact {
     metadata: AgentPatchArtifact,
     changes: Vec<FileChange>,
+}
+
+#[derive(Clone)]
+struct RetainedState {
+    request: AgentRetentionRequest,
+    revision: u64,
 }
 
 #[derive(Clone)]
@@ -131,6 +139,17 @@ impl FakeHostedAgentService {
 
     pub fn clear_patch_conflict(&self, artifact_id: &str) {
         self.lock().conflicts.remove(artifact_id);
+    }
+
+    /// Registers durable patch metadata for lifecycle recovery tests.
+    pub fn register_patch_artifact(&self, artifact: AgentPatchArtifact) {
+        self.lock().artifacts.insert(
+            artifact.artifact_id.clone(),
+            Artifact {
+                metadata: artifact,
+                changes: Vec::new(),
+            },
+        );
     }
 
     pub fn latest_snapshot_id(&self, lease_id: &str) -> Option<String> {
@@ -640,8 +659,8 @@ impl HostedAgentService for FakeHostedAgentService {
         Ok(())
     }
 
-    async fn retain(&self, request: AgentRetentionRequest) -> Result<()> {
-        let state = self.lock();
+    async fn retain(&self, request: AgentRetentionRequest) -> Result<AgentRetention> {
+        let mut state = self.lock();
         let lease = state.leases.get(&request.lease_id).ok_or_else(|| {
             HostedAgentError::new(HostedAgentErrorCategory::LeaseMissing, "lease is missing")
         })?;
@@ -658,6 +677,36 @@ impl HostedAgentService for FakeHostedAgentService {
                 "retained durable state is missing",
             ));
         }
-        Ok(())
+        let key = request.agent_id.to_string();
+        let revision = match state.retained.get(&key) {
+            None if request.expected_revision.is_none() => 1,
+            None => {
+                return Err(HostedAgentError::invalid_response(
+                    "initial retention revision must be absent",
+                ));
+            }
+            Some(previous) => {
+                let same_desired = previous.request.lease_id == request.lease_id
+                    && previous.request.base_snapshot_id == request.base_snapshot_id
+                    && previous.request.latest_snapshot_id == request.latest_snapshot_id
+                    && previous.request.artifact_id == request.artifact_id;
+                if same_desired && request.expected_revision.unwrap_or(0) <= previous.revision {
+                    previous.revision
+                } else if !same_desired && request.expected_revision == Some(previous.revision) {
+                    previous.revision.saturating_add(1)
+                } else {
+                    return Err(HostedAgentError::invalid_response(
+                        "retention revision is stale",
+                    ));
+                }
+            }
+        };
+        state
+            .retained
+            .insert(key, RetainedState { request, revision });
+        Ok(AgentRetention {
+            revision,
+            desired_hash: "0".repeat(64),
+        })
     }
 }

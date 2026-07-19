@@ -1,5 +1,6 @@
 import type { Pool, PoolClient } from 'pg'
-import type { RetentionRequest } from './types.js'
+import { createHash } from 'node:crypto'
+import type { RetentionRequest, RetentionResponse } from './types.js'
 import { ServiceError } from './types.js'
 
 function validId(value: string): boolean {
@@ -13,7 +14,7 @@ export class PostgresReferenceRetention {
     if (!validId(tenantId)) throw new Error('invalid tenant ID')
   }
 
-  async retain(input: RetentionRequest): Promise<void> {
+  async retain(input: RetentionRequest): Promise<RetentionResponse> {
     if (![input.agentId, input.leaseId, input.baseSnapshotId, input.latestSnapshotId]
       .every(validId) || (input.artifactId !== null && !validId(input.artifactId))) {
       throw new ServiceError(400, 'invalid retention request')
@@ -28,16 +29,43 @@ export class PostgresReferenceRetention {
       await this.authorizeSnapshot(client, input.agentId, input.baseSnapshotId)
       await this.authorizeSnapshot(client, input.agentId, input.latestSnapshotId)
       if (input.artifactId !== null) await this.authorizeArtifact(client, input.agentId, input.artifactId)
-      await client.query(`
-        INSERT INTO hosted_agent_codex_reference_sets
-          (tenant_id, agent_id, lease_id, base_snapshot_id, latest_snapshot_id, artifact_id)
-        VALUES ($1, $2, $3, $4, $5, $6)
-        ON CONFLICT (tenant_id, agent_id) DO UPDATE SET
-          lease_id = EXCLUDED.lease_id,
-          base_snapshot_id = EXCLUDED.base_snapshot_id,
-          latest_snapshot_id = EXCLUDED.latest_snapshot_id, artifact_id = EXCLUDED.artifact_id
-      `, [this.tenantId, input.agentId, input.leaseId, input.baseSnapshotId,
-        input.latestSnapshotId, input.artifactId])
+      const desiredHash = createHash('sha256').update(JSON.stringify([
+        input.agentId, input.leaseId, input.baseSnapshotId, input.latestSnapshotId, input.artifactId,
+      ])).digest('hex')
+      const existing = await client.query<{ revision: string; desired_hash: string }>(`
+        SELECT revision::text, desired_hash FROM hosted_agent_codex_reference_sets
+        WHERE tenant_id = $1 AND agent_id = $2 FOR UPDATE
+      `, [this.tenantId, input.agentId])
+      let revision: number
+      if (!existing.rows[0]) {
+        if (input.expectedRevision !== null) throw new ServiceError(409, 'reference revision mismatch')
+        revision = 1
+        await client.query(`
+          INSERT INTO hosted_agent_codex_reference_sets
+            (tenant_id, agent_id, lease_id, base_snapshot_id, latest_snapshot_id,
+             artifact_id, revision, desired_hash)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        `, [this.tenantId, input.agentId, input.leaseId, input.baseSnapshotId,
+          input.latestSnapshotId, input.artifactId, revision, desiredHash])
+      } else {
+        const currentRevision = Number(existing.rows[0].revision)
+        if (!Number.isSafeInteger(currentRevision) || currentRevision <= 0
+          || (input.expectedRevision !== null && input.expectedRevision > currentRevision)
+          || (existing.rows[0].desired_hash !== desiredHash
+            && input.expectedRevision !== currentRevision)) {
+          throw new ServiceError(409, 'reference revision mismatch')
+        }
+        revision = existing.rows[0].desired_hash === desiredHash
+          ? currentRevision : currentRevision + 1
+        if (!Number.isSafeInteger(revision)) throw new ServiceError(503, 'reference revision exhausted')
+        if (revision !== currentRevision) await client.query(`
+          UPDATE hosted_agent_codex_reference_sets SET
+            lease_id = $3, base_snapshot_id = $4, latest_snapshot_id = $5,
+            artifact_id = $6, revision = $7, desired_hash = $8
+          WHERE tenant_id = $1 AND agent_id = $2
+        `, [this.tenantId, input.agentId, input.leaseId, input.baseSnapshotId,
+          input.latestSnapshotId, input.artifactId, revision, desiredHash])
+      }
       await client.query(`
         INSERT INTO hosted_agent_snapshot_references (snapshot_id, reference_kind, reference_id)
         SELECT snapshot_id, 'codex_thread', $3 FROM hosted_agent_snapshots
@@ -99,6 +127,7 @@ export class PostgresReferenceRetention {
         `, [this.tenantId, input.artifactId, input.agentId])
       }
       await client.query('COMMIT')
+      return { revision, desiredHash }
     } catch (error) {
       await client.query('ROLLBACK').catch(() => undefined)
       if (error instanceof ServiceError) throw error

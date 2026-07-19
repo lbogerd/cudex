@@ -82,14 +82,17 @@ test('HTTP retention route strictly dispatches the exact durable set', async t =
   const gateway = { attach() {} } as unknown as ExecGateway
   const server = await startServer({} as ControlPlane, gateway, {
     host: '127.0.0.1', port: 0, bearerToken: 'test-token', allowInsecureHttp: true,
-    retention: { async retain(request) { seen.push(request) } },
+    retention: { async retain(request) {
+      seen.push(request); return { revision: 1, desiredHash: 'a'.repeat(64) }
+    } },
   })
   t.after(() => server.close())
   const port = (server.address() as import('node:net').AddressInfo).port
   const request = { agentId: 'agent', leaseId: 'lease', baseSnapshotId: 'base',
-    latestSnapshotId: 'latest', artifactId: 'artifact' }
+    latestSnapshotId: 'latest', artifactId: 'artifact', expectedRevision: null }
   const response = await post(port, '/v1/agents/retain', JSON.stringify(request))
-  assert.equal(response.status, 204)
+  assert.equal(response.status, 200)
+  assert.deepEqual(JSON.parse(response.body), { revision: 1, desiredHash: 'a'.repeat(64) })
   assert.deepEqual(seen, [request])
 })
 

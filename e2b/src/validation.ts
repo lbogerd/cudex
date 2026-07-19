@@ -11,6 +11,7 @@ import type {
   ReconnectRequest,
   ReleaseRequest,
   RetentionRequest,
+  RetentionResponse,
   SnapshotSource,
   ToolPolicy,
 } from './types.js'
@@ -182,15 +183,29 @@ export function validateReleaseRequest(value: unknown): ReleaseRequest { return 
 
 export function validateRetentionRequest(value: unknown): RetentionRequest {
   const record = object(value,
-    ['agentId', 'leaseId', 'baseSnapshotId', 'latestSnapshotId', 'artifactId'], requestFailure,
+    ['agentId', 'leaseId', 'baseSnapshotId', 'latestSnapshotId', 'artifactId', 'expectedRevision'], requestFailure,
     'retention request')
+  const expectedRevision = record.expectedRevision === null ? null
+    : boundedNonnegativeInteger(record.expectedRevision, Number.MAX_SAFE_INTEGER, requestFailure, 'reference revision')
+  if (expectedRevision === 0) requestFailure('reference revision is invalid')
   return {
     agentId: opaqueId(record.agentId, requestFailure, 'agent ID'),
     leaseId: opaqueId(record.leaseId, requestFailure, 'lease ID'),
     baseSnapshotId: opaqueId(record.baseSnapshotId, requestFailure, 'base snapshot ID'),
     latestSnapshotId: opaqueId(record.latestSnapshotId, requestFailure, 'latest snapshot ID'),
     artifactId: record.artifactId === null ? null : opaqueId(record.artifactId, requestFailure, 'artifact ID'),
+    expectedRevision,
   }
+}
+
+export function validateRetentionResponse(value: unknown): RetentionResponse {
+  const record = object(value, ['revision', 'desiredHash'], responseFailure, 'retention response')
+  const desiredHash = boundedString(record.desiredHash, 64, responseFailure, 'desired reference hash')
+  if (!/^[0-9a-f]{64}$/u.test(desiredHash)) responseFailure('desired reference hash is invalid')
+  const revision = boundedNonnegativeInteger(
+    record.revision, Number.MAX_SAFE_INTEGER, responseFailure, 'reference revision')
+  if (revision === 0) responseFailure('reference revision is invalid')
+  return { revision, desiredHash }
 }
 
 export function validatePatchExportRequest(value: unknown): PatchExportRequest {

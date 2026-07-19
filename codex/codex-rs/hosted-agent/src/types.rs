@@ -174,6 +174,14 @@ pub struct AgentRetentionRequest {
     pub base_snapshot_id: String,
     pub latest_snapshot_id: String,
     pub artifact_id: Option<String>,
+    pub expected_revision: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRetention {
+    pub revision: u64,
+    pub desired_hash: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -218,6 +226,8 @@ pub struct HostedAgentRuntimeRecord {
     pub base_snapshot_id: String,
     pub latest_snapshot_id: Option<String>,
     pub last_exported_patch: Option<AgentPatchArtifact>,
+    #[serde(default)]
+    pub reference_revision: Option<u64>,
     pub lifecycle_state: HostedAgentLifecycleState,
 }
 
@@ -302,7 +312,10 @@ pub trait HostedAgentService: Send + Sync {
         request: AgentPatchApplyRequest,
     ) -> impl Future<Output = Result<PatchApplyResult>> + Send;
     /// Synchronizes the exact durable snapshot and artifact set retained by Codex.
-    fn retain(&self, request: AgentRetentionRequest) -> impl Future<Output = Result<()>> + Send;
+    fn retain(
+        &self,
+        request: AgentRetentionRequest,
+    ) -> impl Future<Output = Result<AgentRetention>> + Send;
     /// Releases the service resources associated with a lease.
     fn release(&self, request: AgentReleaseRequest) -> impl Future<Output = Result<()>> + Send;
 }

@@ -209,21 +209,29 @@ impl ThreadManagerState {
             .map_err(|error| CodexErr::Fatal(error.to_string()))?
         {
             PatchApplyResult::Applied { checkpoint } => {
-                let mut record = target.durable_record();
-                record.latest_snapshot_id = Some(checkpoint.snapshot_id.clone());
+                let mut updated_runtime = target;
+                updated_runtime.latest_snapshot_id = Some(checkpoint.snapshot_id);
                 self.thread_store
-                    .set_hosted_agent_runtime(requesting_agent_id, record)
+                    .set_hosted_agent_runtime(requesting_agent_id, updated_runtime.durable_record())
                     .await
                     .map_err(|error| {
                         CodexErr::Fatal(format!(
                             "failed to persist hosted-agent patch checkpoint for thread {requesting_agent_id}: {error}"
                         ))
                     })?;
-                target_runtime.set_latest_snapshot_id(checkpoint.snapshot_id);
-                provisioner
-                    .retain(requesting_agent_id, &target_runtime.snapshot())
+                target_runtime.replace(updated_runtime.clone());
+                let retained = provisioner
+                    .retain(requesting_agent_id, &updated_runtime)
                     .await
                     .map_err(|error| CodexErr::Fatal(error.to_string()))?;
+                updated_runtime.reference_revision = Some(retained.revision);
+                self.thread_store
+                    .set_hosted_agent_runtime(requesting_agent_id, updated_runtime.durable_record())
+                    .await
+                    .map_err(|error| CodexErr::Fatal(format!(
+                        "failed to persist hosted-agent patch reference revision for thread {requesting_agent_id}: {error}"
+                    )))?;
+                target_runtime.replace(updated_runtime);
                 Ok(HostedAgentPatchApplyResult::Applied)
             }
             PatchApplyResult::Conflict { paths } if paths.len() <= MAX_PATCH_CONFLICT_PATHS => {

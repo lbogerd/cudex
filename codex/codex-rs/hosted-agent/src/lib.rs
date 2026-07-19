@@ -15,6 +15,7 @@ pub use types::AgentPatchExportRequest;
 pub use types::AgentProvisionRequest;
 pub use types::AgentReconnectRequest;
 pub use types::AgentReleaseRequest;
+pub use types::AgentRetention;
 pub use types::AgentRetentionRequest;
 pub use types::AgentToolPolicy;
 pub use types::HostedAgentError;

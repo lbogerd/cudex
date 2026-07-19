@@ -14,6 +14,7 @@ use codex_hosted_agent::AgentPatchExportRequest;
 use codex_hosted_agent::AgentProvisionRequest;
 use codex_hosted_agent::AgentReconnectRequest;
 use codex_hosted_agent::AgentReleaseRequest;
+use codex_hosted_agent::AgentRetention;
 use codex_hosted_agent::AgentRetentionRequest;
 use codex_hosted_agent::AgentToolPolicy;
 use codex_hosted_agent::HostedAgentError;
@@ -48,6 +49,7 @@ pub(crate) struct HostedAgentRuntime {
     pub(crate) base_snapshot_id: String,
     pub(crate) latest_snapshot_id: Option<String>,
     pub(crate) last_exported_patch: Option<codex_hosted_agent::AgentPatchArtifact>,
+    pub(crate) reference_revision: Option<u64>,
     pub(crate) lifecycle_state: HostedAgentLifecycleState,
     pub(crate) tool_policy: AgentToolPolicy,
 }
@@ -97,6 +99,7 @@ impl HostedAgentRuntime {
             base_snapshot_id: self.base_snapshot_id.clone(),
             latest_snapshot_id: self.latest_snapshot_id.clone(),
             last_exported_patch: self.last_exported_patch.clone(),
+            reference_revision: self.reference_revision,
             lifecycle_state: self.lifecycle_state,
         }
     }
@@ -136,7 +139,7 @@ trait ErasedHostedAgentService: Send + Sync {
     ) -> HostedServiceFuture<'_, PatchApplyResult>;
 
     fn release(&self, request: AgentReleaseRequest) -> HostedServiceFuture<'_, ()>;
-    fn retain(&self, request: AgentRetentionRequest) -> HostedServiceFuture<'_, ()>;
+    fn retain(&self, request: AgentRetentionRequest) -> HostedServiceFuture<'_, AgentRetention>;
 }
 
 impl<Service> ErasedHostedAgentService for Service
@@ -182,7 +185,7 @@ where
         Box::pin(HostedAgentService::release(self, request))
     }
 
-    fn retain(&self, request: AgentRetentionRequest) -> HostedServiceFuture<'_, ()> {
+    fn retain(&self, request: AgentRetentionRequest) -> HostedServiceFuture<'_, AgentRetention> {
         Box::pin(HostedAgentService::retain(self, request))
     }
 }
@@ -198,7 +201,7 @@ impl HostedAgentProvisioner {
         &self,
         agent_id: codex_protocol::ThreadId,
         runtime: &HostedAgentRuntime,
-    ) -> Result<(), HostedAgentRuntimeError> {
+    ) -> Result<AgentRetention, HostedAgentRuntimeError> {
         retain_runtime(agent_id, runtime, self.service.as_ref()).await
     }
     pub(crate) fn new<Service>(
@@ -242,6 +245,7 @@ impl HostedAgentProvisioner {
             base_snapshot_id: provisioned.base_snapshot_id.clone(),
             latest_snapshot_id: Some(provisioned.base_snapshot_id),
             last_exported_patch: None,
+            reference_revision: None,
             lifecycle_state: HostedAgentLifecycleState::Active,
             tool_policy: provisioned.tool_policy,
         };
@@ -358,6 +362,7 @@ impl HostedAgentProvisioner {
             base_snapshot_id: record.base_snapshot_id,
             latest_snapshot_id: record.latest_snapshot_id,
             last_exported_patch: record.last_exported_patch,
+            reference_revision: record.reference_revision,
             lifecycle_state: record.lifecycle_state,
             tool_policy: provisioned.tool_policy,
         };
@@ -432,6 +437,7 @@ impl HostedAgentProvisioner {
                 base_snapshot_id: record.base_snapshot_id,
                 latest_snapshot_id: record.latest_snapshot_id,
                 last_exported_patch: record.last_exported_patch,
+                reference_revision: record.reference_revision,
                 lifecycle_state: record.lifecycle_state,
                 tool_policy: AgentToolPolicy::default(),
             },
@@ -581,8 +587,10 @@ impl PendingHostedAgentRuntime {
         self.runtime.durable_record()
     }
 
-    pub(crate) async fn retain(&self) -> Result<(), HostedAgentRuntimeError> {
-        retain_runtime(self.agent_id, &self.runtime, self.service.as_ref()).await
+    pub(crate) async fn retain(&mut self) -> Result<(), HostedAgentRuntimeError> {
+        let retained = retain_runtime(self.agent_id, &self.runtime, self.service.as_ref()).await?;
+        self.runtime.reference_revision = Some(retained.revision);
+        Ok(())
     }
 
     pub(crate) async fn rollback(self) -> Result<(), HostedAgentRuntimeError> {
@@ -673,7 +681,7 @@ async fn retain_runtime(
     agent_id: codex_protocol::ThreadId,
     runtime: &HostedAgentRuntime,
     service: &dyn ErasedHostedAgentService,
-) -> Result<(), HostedAgentRuntimeError> {
+) -> Result<AgentRetention, HostedAgentRuntimeError> {
     let latest_snapshot_id = runtime.latest_snapshot_id.clone().ok_or_else(|| {
         HostedAgentRuntimeError::RestoreUnavailable(
             "hosted-agent runtime has no durable snapshot".to_string(),
@@ -689,6 +697,7 @@ async fn retain_runtime(
                 .last_exported_patch
                 .as_ref()
                 .map(|artifact| artifact.artifact_id.clone()),
+            expected_revision: runtime.reference_revision,
         })
         .await
         .map_err(HostedAgentRuntimeError::Retention)

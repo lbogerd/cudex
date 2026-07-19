@@ -132,6 +132,15 @@ impl ThreadManagerState {
             self.record_active_hosted_lease_count().await;
             return Ok(Some(artifact));
         }
+        let retained = provisioner
+            .retain(agent_id, &value)
+            .await
+            .map_err(|error| CodexErr::Fatal(error.to_string()))?;
+        if value.reference_revision != Some(retained.revision) {
+            value.reference_revision = Some(retained.revision);
+            self.persist_finalization_state(agent_id, &runtime, &value)
+                .await?;
+        }
         let _ = self.patch_available_tx.send(HostedAgentPatchAvailable {
             owner_thread_id,
             artifact: artifact.clone(),

@@ -16,6 +16,7 @@ use crate::AgentPatchExportRequest;
 use crate::AgentProvisionRequest;
 use crate::AgentReconnectRequest;
 use crate::AgentReleaseRequest;
+use crate::AgentRetention;
 use crate::AgentRetentionRequest;
 use crate::HostedAgentError;
 use crate::HostedAgentErrorCategory;
@@ -352,9 +353,20 @@ impl HostedAgentService for HttpHostedAgentService {
         Ok(())
     }
 
-    async fn retain(&self, request: AgentRetentionRequest) -> Result<()> {
-        self.send("v1/agents/retain", &request).await?;
-        Ok(())
+    async fn retain(&self, request: AgentRetentionRequest) -> Result<AgentRetention> {
+        let retained: AgentRetention = self.post("v1/agents/retain", &request).await?;
+        if retained.revision == 0
+            || retained.desired_hash.len() != 64
+            || !retained
+                .desired_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(HostedAgentError::invalid_response(
+                "service returned invalid retained state",
+            ));
+        }
+        Ok(retained)
     }
 }
 

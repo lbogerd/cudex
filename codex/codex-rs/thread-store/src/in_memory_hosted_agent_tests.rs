@@ -20,6 +20,7 @@ fn runtime_record() -> HostedAgentRuntimeRecord {
         base_snapshot_id: "snapshot-base".to_string(),
         latest_snapshot_id: Some("snapshot-latest".to_string()),
         last_exported_patch: None,
+        reference_revision: Some(1),
         lifecycle_state: HostedAgentLifecycleState::Active,
     }
 }

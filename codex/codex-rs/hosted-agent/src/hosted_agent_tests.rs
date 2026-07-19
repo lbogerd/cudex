@@ -80,6 +80,7 @@ fn durable_runtime_record_round_trips_without_transient_data() {
             changed_files: 2,
             size_bytes: 512,
         }),
+        reference_revision: Some(7),
         lifecycle_state: HostedAgentLifecycleState::Completed,
     };
 
@@ -102,6 +103,7 @@ fn durable_runtime_record_round_trips_without_transient_data() {
                 "changedFiles": 2,
                 "sizeBytes": 512,
             },
+            "referenceRevision": 7,
             "lifecycleState": "completed",
         })
     );
@@ -127,6 +129,7 @@ fn durable_runtime_record_defaults_missing_owner_for_legacy_records() {
     .expect("legacy record should deserialize");
 
     assert_eq!(record.owner_agent_id, None);
+    assert_eq!(record.reference_revision, None);
 }
 
 #[tokio::test]

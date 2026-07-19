@@ -13,8 +13,9 @@ export interface CheckpointRequest { leaseId: string; idempotencyKey: string }
 export interface ReleaseRequest { leaseId: string; idempotencyKey: string }
 export interface RetentionRequest {
   agentId: string; leaseId: string; baseSnapshotId: string; latestSnapshotId: string
-  artifactId: string | null
+  artifactId: string | null; expectedRevision: number | null
 }
+export interface RetentionResponse { revision: number; desiredHash: string }
 export interface PatchExportRequest {
   leaseId: string
   agentId: string

@@ -653,12 +653,23 @@ root under the lease fence and removes that released lease's incidental
 `lease_base`, `lease_latest`, and `lease_restore_source` snapshot roots after the
 Codex roots are safe.
 
+Migration 0015 adds a positive monotonic revision and service-computed SHA-256
+desired-set hash to every tenant/thread control row. Initial synchronization must
+omit an expected revision; a different desired set must present the current
+revision and advances it exactly once. Exact crash replays return the stored
+revision and hash even from an older local revision, while stale different-set
+writers fail before roots change. PostgreSQL serializes this decision under the
+tenant/agent lock. Codex persists each acknowledged revision with runtime state,
+including checkpoint, patch-apply, and final artifact synchronization; legacy
+records safely default to no revision. The fake service mirrors the compare-and-
+swap and replay semantics.
+
 This remains a fail-closed foundation rather than the completed deletion
-lifecycle. Before collection is enabled, sync still needs monotonic revisions and
-desired hashes plus a durable deletion tombstone/outbox that clears the remote
-set only after local thread deletion. Focused migration, authorization, exact-set,
-HTTP, Rust contract, expiry, apply, and lifecycle tests pass. The complete
-Docker/PostgreSQL suite passes 288 tests with no skips.
+lifecycle. Before collection is enabled, it still needs a durable deletion
+tombstone/outbox that clears the remote set only after local thread deletion.
+Focused migration, authorization, exact-set, stale-writer, HTTP, Rust contract,
+expiry, apply, and lifecycle tests pass. The complete Docker/PostgreSQL suite
+passes 288 tests with no skips.
 
 ### Canonical workspace comparison foundation
 

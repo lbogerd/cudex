@@ -18,6 +18,7 @@ import {
   validateProvisionRequest,
   validateReconnectRequest,
   validateRetentionRequest,
+  validateRetentionResponse,
   validateReleaseRequest,
 } from './validation.js'
 
@@ -40,7 +41,7 @@ interface ServerOptions {
     maxArchiveBytes: number
   }
   retention?: {
-    retain: (request: ReturnType<typeof validateRetentionRequest>) => Promise<void>
+    retain: (request: ReturnType<typeof validateRetentionRequest>) => Promise<unknown>
   }
 }
 const maxRequestBytes = 1024 * 1024
@@ -75,7 +76,7 @@ function validateOutput(method: Method, value: unknown): unknown {
     case 'exportPatch': return validatePatchExportResponse(value)
     case 'applyPatch': return validatePatchApplyResponse(value)
     case 'release': return value
-    case 'retain': return value
+    case 'retain': return validateRetentionResponse(value)
   }
 }
 
@@ -162,9 +163,9 @@ export async function startServer(service: AgentLifecycleService, gateway: ExecG
         : (value: never) => (service[method] as (input: never) => Promise<unknown>)(value)
       if (!dispatch) throw new ServiceError(503, 'durable patch service unavailable')
       const result = validateOutput(method, await dispatch(input as never))
-      response.statusCode = method === 'release' || method === 'retain' ? 204 : 200
+      response.statusCode = method === 'release' ? 204 : 200
       response.setHeader('content-type', 'application/json')
-      response.end(method === 'release' || method === 'retain' ? undefined : JSON.stringify(result))
+      response.end(method === 'release' ? undefined : JSON.stringify(result))
     } catch (error) {
       const status = error instanceof ServiceError ? error.status : 503
       response.statusCode = status; response.setHeader('content-type', 'application/json')

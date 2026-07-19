@@ -216,7 +216,7 @@ live('Codex retention keeps artifact authorization and objects beyond ordinary T
   await retention.retain({
     agentId: input.agentId, leaseId: input.sourceLeaseId,
     baseSnapshotId: input.baseSnapshotId, latestSnapshotId: input.currentSnapshotId,
-    artifactId: input.artifactId,
+    artifactId: input.artifactId, expectedRevision: null,
   })
   const future = new Date(Date.now() + 120_000)
   assert.equal(await context.first.expireAvailable(input.tenantId, future), 0)

@@ -283,6 +283,7 @@ async fn hosted_runtime_is_durable_and_checkpoints_only_successful_turns() {
             base_snapshot_id: initial_record.base_snapshot_id.clone(),
             latest_snapshot_id: Some(initial_record.base_snapshot_id.clone()),
             last_exported_patch: None,
+            reference_revision: initial_record.reference_revision,
             lifecycle_state: codex_hosted_agent::HostedAgentLifecycleState::Active,
         }
     );
@@ -1174,14 +1175,16 @@ async fn completed_hosted_thread_resume_retries_release_without_restoring() {
         .await
         .expect("read hosted runtime")
         .expect("hosted runtime record");
-    record.last_exported_patch = Some(codex_hosted_agent::AgentPatchArtifact {
+    let artifact = codex_hosted_agent::AgentPatchArtifact {
         artifact_id: "artifact-completed-resume".to_string(),
         agent_id: root.thread_id,
         base_snapshot_id: record.base_snapshot_id.clone(),
         checksum: "sha256:completed-resume".to_string(),
         changed_files: 1,
         size_bytes: 128,
-    });
+    };
+    hosted_service.register_patch_artifact(artifact.clone());
+    record.last_exported_patch = Some(artifact);
     record.lifecycle_state = codex_hosted_agent::HostedAgentLifecycleState::Completed;
     manager
         .state

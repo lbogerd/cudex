@@ -275,12 +275,23 @@ live('Codex reference sync is exact, authorized, idempotent, and release-safe', 
     manifestChecksum: checkpointIds.manifest.checksum,
   })
   const retention = new PostgresReferenceRetention(context.firstPool, 'tenant-1')
-  const request = { agentId: 'agent-1', leaseId: created.lease.leaseId,
+  let request = { agentId: 'agent-1', leaseId: created.lease.leaseId,
     baseSnapshotId: created.snapshot.snapshotId, latestSnapshotId: checkpoint.snapshotId,
-    artifactId: null }
-  await Promise.all([retention.retain(request), retention.retain(request)])
+    artifactId: null, expectedRevision: null as number | null }
+  const replays = await Promise.all([retention.retain(request), retention.retain(request)])
+  assert.equal(replays[0].revision, 1); assert.deepEqual(replays[1], replays[0])
   await assert.rejects(retention.retain({ ...request, agentId: 'agent-other' }))
   await assert.rejects(new PostgresReferenceRetention(context.firstPool, 'tenant-2').retain(request))
+  const nextIds = await objects(context, 'tenant-1', '-retained-next')
+  const next = await context.first.appendCheckpoint('tenant-1', created.lease.leaseId, {
+    snapshotId: 'snapshot-retained-next', providerSnapshotId: 'provider-retained-next',
+    workspaceArchiveObjectId: nextIds.archive.objectId, manifestObjectId: nextIds.manifest.objectId,
+    manifestChecksum: nextIds.manifest.checksum,
+  })
+  const advanced = { ...request, latestSnapshotId: next.snapshotId, expectedRevision: 1 }
+  assert.equal((await retention.retain(advanced)).revision, 2)
+  await assert.rejects(retention.retain(request))
+  request = { ...advanced, expectedRevision: 2 }
   const client = await context.firstPool.connect()
   try {
     await client.query('BEGIN')

@@ -269,7 +269,7 @@ live('a synchronized Codex artifact remains resolvable and excluded from expiry 
   const retention = new PostgresReferenceRetention(context.firstPool, 'tenant-1')
   await retention.retain({
     agentId: 'agent-child', leaseId: 'lease-child', baseSnapshotId: 'snapshot-child-base',
-    latestSnapshotId: 'snapshot-child-current', artifactId: 'artifact-1',
+    latestSnapshotId: 'snapshot-child-current', artifactId: 'artifact-1', expectedRevision: null,
   })
   assert.equal(await context.artifacts.expireAvailable(
     'tenant-1', new Date(Date.now() + 10 * 60_000)), 0)
