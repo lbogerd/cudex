@@ -40,9 +40,9 @@ its existing process-owned/in-process behavior; hosted Codex must fail closed.
 - [x] Add `environmentBoundCodeMode` to Rust and E2B policy schemas and grant
   only outer `exec`/`wait`; nested tools retain their independent role grants.
 - [x] Expose hosted code mode only with an exact verified environment binding.
-- [ ] Carry the full provider identity into turns and validate thread, lease,
+- [x] Carry the full provider identity into turns and validate thread, lease,
   environment, and generation at every nested dispatch.
-- [ ] Assert environment-routed nested commands target the provider's exact
+- [x] Assert environment-routed nested commands target the provider's exact
   environment.
 
 ### Evidence and acceptance

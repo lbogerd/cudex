@@ -62,7 +62,7 @@ pub(crate) struct HostedAgentRuntime {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct HostedToolAuthorization {
     environment_id: String,
-    code_mode_environment_id: Option<String>,
+    code_mode_identity: Option<codex_code_mode::HostedCodeModeRuntimeIdentity>,
     policy: AgentToolPolicy,
 }
 
@@ -70,19 +70,19 @@ impl HostedToolAuthorization {
     pub(crate) fn new(environment_id: String, policy: AgentToolPolicy) -> Self {
         Self {
             environment_id,
-            code_mode_environment_id: None,
+            code_mode_identity: None,
             policy,
         }
     }
 
     fn with_code_mode(
         environment_id: String,
-        code_mode_environment_id: Option<String>,
+        code_mode_identity: Option<codex_code_mode::HostedCodeModeRuntimeIdentity>,
         policy: AgentToolPolicy,
     ) -> Self {
         Self {
             environment_id,
-            code_mode_environment_id,
+            code_mode_identity,
             policy,
         }
     }
@@ -93,9 +93,9 @@ impl HostedToolAuthorization {
                 environment_id == &self.environment_id
             }
             ToolExecutionDomain::EnvironmentBoundCodeMode { environment_id } => self
-                .code_mode_environment_id
+                .code_mode_identity
                 .as_ref()
-                .is_some_and(|bound_environment_id| bound_environment_id == environment_id),
+                .is_some_and(|identity| &identity.environment_id == environment_id),
             ToolExecutionDomain::AmbientMcp { .. } => false,
             ToolExecutionDomain::AgentEnvironment
             | ToolExecutionDomain::ControlPlane
@@ -111,6 +111,12 @@ impl HostedToolAuthorization {
 
     pub(crate) fn environment_id(&self) -> &str {
         &self.environment_id
+    }
+
+    pub(crate) fn code_mode_identity(
+        &self,
+    ) -> Option<&codex_code_mode::HostedCodeModeRuntimeIdentity> {
+        self.code_mode_identity.as_ref()
     }
 }
 
@@ -775,7 +781,7 @@ impl PendingHostedAgentRuntime {
             self.runtime.environment_id.clone(),
             self.code_mode_provider
                 .as_ref()
-                .map(|provider| provider.identity().environment_id.clone()),
+                .map(|provider| provider.identity().clone()),
             self.runtime.tool_policy.clone(),
         )
     }

@@ -1228,9 +1228,11 @@ impl Session {
                         session_configuration.parent_thread_id,
                     ),
                 ),
-                code_mode_service: crate::tools::code_mode::CodeModeService::new(Arc::clone(
-                    &code_mode_runtime_placement.provider(),
-                )),
+                code_mode_service:
+                    crate::tools::code_mode::CodeModeService::new_with_runtime_identity(
+                        Arc::clone(&code_mode_runtime_placement.provider()),
+                        code_mode_runtime_placement.hosted_identity().cloned(),
+                    ),
                 tool_search_handler_cache: Default::default(),
                 turn_environments: Arc::clone(&turn_environments),
             };

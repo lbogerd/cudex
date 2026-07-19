@@ -2163,6 +2163,15 @@ termination and the exact lease's forced cleanup boundary. Provisioning rollback
 uses the same path before unregistering the environment. Hosted paths never fall
 back to the shared local or in-process V8 providers.
 
+Nested calls remain local trusted-dispatch operations, but the dispatch broker
+does not trust possession of the protocol connection by itself. Before routing
+each hosted nested call it compares the provider and turn identities across all
+four immutable fields (thread, lease, environment, connection generation). For
+`exec_command` it additionally requires the turn's primary environment to equal
+the provider environment. The outer `exec` grant therefore neither authorizes a
+nested tool nor permits a command to be redirected to a parent, child, restored,
+or otherwise attached environment.
+
 ### Child creation
 
 Snapshot the owner atomically, restore into a temporary capture sandbox, export

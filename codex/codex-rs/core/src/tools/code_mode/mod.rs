@@ -67,22 +67,38 @@ pub(crate) struct CodeModeService {
     session: OnceCell<Arc<dyn CodeModeSession>>,
     session_provider: Arc<dyn CodeModeSessionProvider>,
     dispatch_broker: Arc<CodeModeDispatchBroker>,
+    runtime_identity: Option<codex_code_mode::HostedCodeModeRuntimeIdentity>,
     shutting_down: AtomicBool,
 }
 
 impl CodeModeService {
+    #[cfg(test)]
     pub(crate) fn new(session_provider: Arc<dyn CodeModeSessionProvider>) -> Self {
+        Self::new_with_runtime_identity(session_provider, None)
+    }
+
+    pub(crate) fn new_with_runtime_identity(
+        session_provider: Arc<dyn CodeModeSessionProvider>,
+        runtime_identity: Option<codex_code_mode::HostedCodeModeRuntimeIdentity>,
+    ) -> Self {
         let dispatch_broker = Arc::new(CodeModeDispatchBroker::new());
         Self {
             session: OnceCell::new(),
             session_provider,
             dispatch_broker,
+            runtime_identity,
             shutting_down: AtomicBool::new(false),
         }
     }
 
     pub(crate) fn session_provider(&self) -> Arc<dyn CodeModeSessionProvider> {
         Arc::clone(&self.session_provider)
+    }
+
+    pub(crate) fn runtime_identity(
+        &self,
+    ) -> Option<&codex_code_mode::HostedCodeModeRuntimeIdentity> {
+        self.runtime_identity.as_ref()
     }
 
     pub(crate) async fn execute(
@@ -273,7 +289,7 @@ fn truncate_code_mode_result(
 }
 
 async fn call_nested_tool(
-    _exec: ExecContext,
+    exec: ExecContext,
     tool_runtime: ToolCallRuntime,
     invocation: CodeModeNestedToolCall,
     cancellation_token: CancellationToken,
@@ -290,6 +306,8 @@ async fn call_nested_tool(
             "{PUBLIC_TOOL_NAME} cannot invoke itself"
         )));
     }
+
+    validate_hosted_nested_dispatch(&exec, &tool_name)?;
 
     let payload = match build_nested_tool_payload(tool_kind, &tool_name, input) {
         Ok(payload) => payload,
@@ -312,6 +330,53 @@ async fn call_nested_tool(
         )
         .await?;
     Ok(result.code_mode_result())
+}
+
+fn validate_hosted_nested_dispatch(
+    exec: &ExecContext,
+    tool_name: &ToolName,
+) -> Result<(), FunctionCallError> {
+    let Some(authorization) = &exec.turn.hosted_tool_authorization else {
+        return Ok(());
+    };
+    let actual = exec.session.services.code_mode_service.runtime_identity();
+    let target_environment_id = exec
+        .turn
+        .environments
+        .primary()
+        .map(|environment| environment.environment_id.as_str());
+    validate_hosted_runtime_identity(
+        authorization.code_mode_identity(),
+        actual,
+        exec.session.thread_id,
+        target_environment_id,
+        tool_name.namespace.is_none() && tool_name.name == "exec_command",
+    )
+    .map_err(FunctionCallError::RespondToModel)
+}
+
+fn validate_hosted_runtime_identity(
+    expected: Option<&codex_code_mode::HostedCodeModeRuntimeIdentity>,
+    actual: Option<&codex_code_mode::HostedCodeModeRuntimeIdentity>,
+    thread_id: codex_protocol::ThreadId,
+    target_environment_id: Option<&str>,
+    requires_environment_target: bool,
+) -> Result<(), String> {
+    let expected = expected.ok_or_else(|| {
+        "hosted code-mode runtime identity is not authorized for this turn".to_string()
+    })?;
+    let actual =
+        actual.ok_or_else(|| "hosted code-mode runtime identity is unavailable".to_string())?;
+    if actual != expected || actual.thread_id != thread_id {
+        return Err("hosted code-mode runtime identity does not match the active turn".to_string());
+    }
+    if requires_environment_target && target_environment_id != Some(actual.environment_id.as_str())
+    {
+        return Err(
+            "hosted code-mode command target does not match its runtime environment".to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn build_nested_tool_payload(
@@ -364,6 +429,7 @@ mod tests {
     use super::CodeModeService;
     use super::build_nested_tool_payload;
     use super::truncate_code_mode_result;
+    use super::validate_hosted_runtime_identity;
     use crate::tools::context::ToolPayload;
     use codex_code_mode::CodeModeToolKind;
     use codex_code_mode::ExecuteRequest;
@@ -425,6 +491,81 @@ mod tests {
                 .to_string(),
             }]
         );
+    }
+
+    #[test]
+    fn hosted_nested_dispatch_requires_the_complete_runtime_identity() {
+        let thread_id = codex_protocol::ThreadId::new();
+        let identity = codex_code_mode::HostedCodeModeRuntimeIdentity {
+            thread_id,
+            lease_id: "lease-root".to_string(),
+            environment_id: "environment-root".to_string(),
+            connection_generation: 4,
+        };
+        validate_hosted_runtime_identity(
+            Some(&identity),
+            Some(&identity),
+            thread_id,
+            Some("environment-root"),
+            true,
+        )
+        .expect("exact identity and command environment should pass");
+
+        for mismatched in [
+            codex_code_mode::HostedCodeModeRuntimeIdentity {
+                thread_id: codex_protocol::ThreadId::new(),
+                ..identity.clone()
+            },
+            codex_code_mode::HostedCodeModeRuntimeIdentity {
+                lease_id: "lease-child".to_string(),
+                ..identity.clone()
+            },
+            codex_code_mode::HostedCodeModeRuntimeIdentity {
+                environment_id: "environment-child".to_string(),
+                ..identity.clone()
+            },
+            codex_code_mode::HostedCodeModeRuntimeIdentity {
+                connection_generation: 5,
+                ..identity.clone()
+            },
+        ] {
+            assert_eq!(
+                validate_hosted_runtime_identity(
+                    Some(&identity),
+                    Some(&mismatched),
+                    thread_id,
+                    Some("environment-root"),
+                    false,
+                ),
+                Err("hosted code-mode runtime identity does not match the active turn".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn hosted_nested_exec_rejects_a_different_or_missing_environment_target() {
+        let thread_id = codex_protocol::ThreadId::new();
+        let identity = codex_code_mode::HostedCodeModeRuntimeIdentity {
+            thread_id,
+            lease_id: "lease-root".to_string(),
+            environment_id: "environment-root".to_string(),
+            connection_generation: 1,
+        };
+        for target in [Some("environment-child"), None] {
+            assert_eq!(
+                validate_hosted_runtime_identity(
+                    Some(&identity),
+                    Some(&identity),
+                    thread_id,
+                    target,
+                    true,
+                ),
+                Err(
+                    "hosted code-mode command target does not match its runtime environment"
+                        .to_string()
+                )
+            );
+        }
     }
 
     #[tokio::test]
