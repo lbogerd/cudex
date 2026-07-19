@@ -15,11 +15,11 @@ complete until a real ChatGPT-authenticated automated run passes.
 
 ## 2. Source/auth/config preparation
 
-- [ ] Validate access-token and auth-JSON modes without credential propagation.
-- [ ] Add device-login auth creation with a secrets-only temporary Codex home.
-- [ ] Add immutable fixture archiving and bounded source-snapshot upload.
-- [ ] Validate template/binary provenance and exact local artifact checksum.
-- [ ] Generate strict isolated Codex configuration and exact trusted role policy.
+- [x] Validate access-token and auth-JSON modes without credential propagation.
+- [x] Add device-login auth creation with a secrets-only temporary Codex home.
+- [x] Add immutable fixture archiving and bounded source-snapshot upload.
+- [x] Validate template/binary provenance and exact local artifact checksum.
+- [x] Generate strict isolated Codex configuration and exact trusted role policy.
 
 ## 3. Automated and interactive drivers
 

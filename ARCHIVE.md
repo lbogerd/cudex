@@ -35,6 +35,41 @@ both pinned services reached healthy state, Garage passed scoped S3 `HeadBucket`
 and all checksummed migrations ran before the deliberately credential-free
 foundation service startup check. No `codex/codex-rs` file changed.
 
+## POC source, authentication, and generated configuration (2026-07-19)
+
+The POC accepts exactly one Codex authentication source. Access-token mode builds
+an allowlisted Codex-only environment containing `PATH`, the isolated
+`CODEX_HOME`, the combined CA, the hosted-service bearer, and the access token.
+Auth-JSON mode rejects paths outside the repository, every symlinked path
+component, non-files, malformed/non-object/empty JSON, and copies the original
+bytes to runtime mode `0600`. Device login uses a temporary ignored directory
+under `e2b/poc/secrets` and replaces only the documented regular-file target.
+
+`source-snapshot-client.ts` computes the archive SHA-256, emits the four-byte
+big-endian metadata envelope, authenticates without tenant data, validates TLS
+through the combined bundle, refuses redirects, bounds request/response bytes,
+and accepts only the exact response shape with matching checksum, expiry, and
+size. The CLI reuses `archiveWorkspace`; the fixture maps exactly to
+`file:///workspace/roots/0/fixture` with a four-hour maximum TTL. A live Docker
+integration uploaded and resolved that fixture through the production HTTPS
+source API backed by PostgreSQL and Garage, in addition to the Garage object
+round trip and repeatable migrations.
+
+Template metadata now gates build ID, 40-hex revision, template ID, checksum,
+matching executable artifact, ELF64 little-endian x86_64 identity, and local
+SHA-256. Generated isolated config enables both hosted agents and multi-agent v2,
+omits the tool namespace to produce plain tool names, selects root by default,
+binds the immutable source, and gives root/child distinct logical templates. The
+server-owned JSON maps both logical roles to the verified provider template with
+policy version one and the exact domain/plain-tool allowlists.
+
+The ignored template metadata currently present in this workspace points to an
+older checksummed binary whose strict-config checker reports
+`hosted_agents.source_snapshot` as unknown. The new preflight correctly fails on
+that mismatch before Docker or E2B allocation. A rebuilt matching Codex artifact
+and hosted template metadata are therefore required for the live proof; no Rust
+source was changed to bypass the check.
+
 The Codex-side sources of truth are:
 
 - `codex/codex-rs/hosted-agent/src/types.rs` for wire and lifecycle types;

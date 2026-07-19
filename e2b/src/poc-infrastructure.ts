@@ -8,7 +8,7 @@ import { parseEnv } from 'node:util'
 import { promisify } from 'node:util'
 import type { PocEnvironment } from './poc-env.js'
 import type { PocRunPaths } from './poc-config.js'
-import { updateRuntimeValue } from './poc-config.js'
+import { createTrustedRoles, updateRuntimeValue } from './poc-config.js'
 import type { PocTlsMaterial } from './poc-tls.js'
 
 const exec = promisify(execFile)
@@ -112,17 +112,6 @@ async function templateIdentity(path: string): Promise<TemplateIdentity> {
   return { templateId }
 }
 
-function trustedRoles(templateId: string): string {
-  const tools = (names: string[]): Array<{ name: string; namespace: null }> => names.map(name => ({ name, namespace: null }))
-  return JSON.stringify({
-    root: { sandboxTemplate: 'poc-root-v1', providerTemplateId: templateId, policyVersion: 1,
-      toolPolicy: { allowedDomains: ['agentEnvironment', 'controlPlane'],
-        allowedTools: tools(['exec_command', 'write_stdin', 'spawn_agent', 'wait_agent', 'apply_agent_patch']) } },
-    child: { sandboxTemplate: 'poc-child-v1', providerTemplateId: templateId, policyVersion: 1,
-      toolPolicy: { allowedDomains: ['agentEnvironment'], allowedTools: tools(['exec_command', 'write_stdin']) } },
-  })
-}
-
 export async function startControlService(
   paths: PocRunPaths, env: PocEnvironment, runtime: Record<string, string>, tls: PocTlsMaterial,
 ): Promise<number> {
@@ -142,7 +131,7 @@ export async function startControlService(
     HOSTED_AGENT_OBJECT_FORCE_PATH_STYLE: 'true', HOSTED_AGENT_OBJECT_REGION: 'garage',
     AWS_ACCESS_KEY_ID: accessKeyId, AWS_SECRET_ACCESS_KEY: secretAccessKey, AWS_REGION: 'garage',
     HOSTED_AGENT_TENANT_ID: `poc-${paths.runId}`, HOSTED_AGENT_WORKER_ID: `poc-worker-${paths.runId}`,
-    HOSTED_AGENT_MANAGED_BY: `cudex-poc-${paths.runId}`, HOSTED_AGENT_ROLES: trustedRoles(metadata.templateId),
+    HOSTED_AGENT_MANAGED_BY: `cudex-poc-${paths.runId}`, HOSTED_AGENT_ROLES: JSON.stringify(createTrustedRoles(metadata.templateId)),
     CODEX_HOSTED_AGENT_TOKEN: bearer, HOSTED_AGENT_GATEWAY_URL: `wss://localhost:${env.controlPort}/`,
     HOSTED_AGENT_HOST: '127.0.0.1', HOSTED_AGENT_PORT: String(env.controlPort),
     HOSTED_AGENT_TLS_CERT: tls.serverCertificatePath, HOSTED_AGENT_TLS_KEY: tls.serverKeyPath,

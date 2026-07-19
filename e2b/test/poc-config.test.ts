@@ -1,9 +1,12 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, stat, writeFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { chmod, mkdir, mkdtemp, readFile, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
-import { generateRuntimeSecrets, pocRunPaths, prepareRunFiles } from '../src/poc-config.js'
+import { createTrustedRoles, generateCodexConfiguration, generateRuntimeSecrets, pocRunPaths,
+  prepareRunFiles, validatePocProvenance } from '../src/poc-config.js'
+import { validateGeneratedCodexConfiguration } from '../src/poc-config.js'
 import type { PocEnvironment } from '../src/poc-env.js'
 
 test('POC runtime files contain distinct generated secrets with mode 0600', async () => {
@@ -27,4 +30,63 @@ test('POC runtime files contain distinct generated secrets with mode 0600', asyn
   const runtime = await readFile(paths.runtimeEnv, 'utf8')
   assert.ok(runtime.includes(secrets.serviceBearer))
   assert.ok(!runtime.includes(env.accessToken!))
+})
+
+test('strict config validation redacts the hosted bearer from subprocess errors', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cudex-poc-validator-'))
+  const binary = join(root, 'codex')
+  await writeFile(binary, '#!/bin/sh\necho "failure $CODEX_HOSTED_AGENT_TOKEN" >&2\nexit 1\n')
+  await chmod(binary, 0o755)
+  const paths = pocRunPaths(root, '20260719120000-fedcba654321')
+  paths.codexHome = join(root, 'codex-home')
+  await mkdir(paths.codexHome)
+  await assert.rejects(validateGeneratedCodexConfiguration({ buildId: 'build', revision: 'a'.repeat(40),
+    codexSha256: 'b'.repeat(64), templateId: 'template', binaryPath: binary, metadataPath: 'metadata' },
+  paths, '/tmp/ca.pem', 'never-print-this-bearer'), error => {
+    assert.ok(!String(error).includes('never-print-this-bearer'))
+    assert.ok(String(error).includes('[REDACTED]'))
+    return true
+  })
+})
+
+async function fakeProvenanceRoot(): Promise<{ repositoryRoot: string; metadataPath: string }> {
+  const repositoryRoot = await mkdtemp(join(tmpdir(), 'cudex-poc-provenance-'))
+  const buildId = 'test-build'
+  const artifactDirectory = join(repositoryRoot, 'e2b', '.artifacts', 'codex', buildId)
+  const templateDirectory = join(repositoryRoot, 'e2b', '.artifacts', 'templates')
+  await Promise.all([mkdir(artifactDirectory, { recursive: true }), mkdir(templateDirectory, { recursive: true })])
+  const binary = Buffer.alloc(64)
+  binary.set([0x7f, 0x45, 0x4c, 0x46, 2, 1], 0); binary.writeUInt16LE(0x3e, 18)
+  const binaryPath = join(artifactDirectory, 'codex')
+  await writeFile(binaryPath, binary); await chmod(binaryPath, 0o755)
+  const metadataPath = join(templateDirectory, `${buildId}.json`)
+  await writeFile(metadataPath, JSON.stringify({ buildId, revision: 'a'.repeat(40),
+    codexSha256: createHash('sha256').update(binary).digest('hex'), templateId: 'tpl-test' }))
+  return { repositoryRoot, metadataPath }
+}
+
+test('provenance and generated configuration contain exact hosted roles and plain tools', async () => {
+  const { repositoryRoot, metadataPath } = await fakeProvenanceRoot()
+  const provenance = await validatePocProvenance(repositoryRoot, metadataPath)
+  const runRoot = join(repositoryRoot, 'run')
+  await mkdir(runRoot)
+  const paths = pocRunPaths(repositoryRoot, '20260719120000-abcdef123456')
+  paths.runDirectory = runRoot; paths.codexHome = join(runRoot, 'codex-home')
+  const env: PocEnvironment = { e2bApiKey: 'key', e2bApiUrl: 'https://e2b.invalid', e2bDomain: 'cube.app',
+    templateMetadata: metadataPath, accessToken: 'auth', codexModel: 'gpt-test', controlPort: 18443,
+    postgresPort: 15432, garagePort: 13900, keepOnFailure: false, verifyTemplate: false }
+  const source = { sourceSnapshotId: `source_${'a'.repeat(32)}`, checksum: `sha256:${'b'.repeat(64)}`,
+    expiresAt: '2026-07-19T12:00:00.000Z', manifestChecksum: `sha256:${'c'.repeat(64)}`, sizeBytes: 10 }
+  const generated = await generateCodexConfiguration(paths, env, source, provenance)
+  const config = await readFile(generated.configPath, 'utf8')
+  for (const expected of ['hosted_agents = true', '[features.multi_agent_v2]', 'enabled = true',
+    'default_agent_type = "root"', 'sandbox_template = "poc-root-v1"', 'sandbox_template = "poc-child-v1"',
+    source.sourceSnapshotId, source.checksum, 'model = "gpt-test"']) assert.ok(config.includes(expected))
+  assert.ok(!config.includes('tool_namespace'))
+  const roles = JSON.parse(await readFile(generated.trustedRolesPath, 'utf8')) as {
+    root: { toolPolicy: { allowedTools: Array<{ namespace: unknown }> } }
+  }
+  assert.deepEqual(roles, createTrustedRoles(provenance.templateId))
+  assert.deepEqual(roles.root.toolPolicy.allowedTools.map(tool => tool.namespace),
+    [null, null, null, null, null])
 })

@@ -59,7 +59,9 @@ export function validatePocEnvironment(raw: RawEnvironment): PocEnvironment {
       throw new Error(`unknown POC configuration key: ${key}`)
     }
   }
-  const accessToken = value(raw, 'CODEX_ACCESS_TOKEN')
+  const accessTokenValue = raw.CODEX_ACCESS_TOKEN
+  const accessToken = accessTokenValue?.trim() ? accessTokenValue : undefined
+  if (accessToken && accessToken !== accessToken.trim()) throw new Error('CODEX_ACCESS_TOKEN must not have surrounding whitespace')
   const authJsonFile = value(raw, 'CODEX_AUTH_JSON_FILE')
   if (Boolean(accessToken) === Boolean(authJsonFile)) {
     throw new Error('configure exactly one of CODEX_ACCESS_TOKEN and CODEX_AUTH_JSON_FILE')

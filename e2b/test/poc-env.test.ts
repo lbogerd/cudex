@@ -18,6 +18,7 @@ test('POC environment rejects unknown scoped keys and invalid ports', () => {
   assert.throws(() => validatePocEnvironment({ ...base, POC_GARAGE_POTR: '12' }), /unknown/)
   assert.throws(() => validatePocEnvironment({ ...base, POC_CONTROL_PORT: '0' }), /TCP port/)
   assert.throws(() => validatePocEnvironment({ ...base, POC_CONTROL_PORT: '15432' }), /distinct/)
+  assert.throws(() => validatePocEnvironment({ ...base, CODEX_ACCESS_TOKEN: ' token ' }), /whitespace/)
 })
 
 test('POC environment requires exactly one authentication source', () => {
