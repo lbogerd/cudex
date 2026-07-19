@@ -562,6 +562,34 @@ interaction gate required before child exposure (and for a fully
 command-consistent patch/checkpoint instant), plus the final live E2B client
 acceptance run.
 
+### Durable command-interaction gate foundation
+
+Migration 0012 adds a tenant/lease/generation/session-scoped interaction ledger
+for process and filesystem mutations. Admission takes the same PostgreSQL lease
+advisory lock as lifecycle mutation, verifies the exact active lease generation,
+and records an active interaction before returning. Exact detach, resume, and
+finish transitions are idempotent; finished rows are terminal, process identity
+cannot be reused within a session, and identity fields are immutable. Lifecycle
+quiescence fails closed on every unfinished row, including an older generation,
+so rotation cannot hide work with an ambiguous outcome.
+
+Durable checkpoint and child capture now assert quiescence while already holding
+their lease lock. Patch apply asserts it before rollback capture or workspace
+mutation, and stale patch recovery repeats the assertion before restoring a
+rollback archive. Cross-replica PostgreSQL tests prove that interaction admission
+and lifecycle capture exclude each other, generation fencing is exact, and all
+three mutation paths leave provider/object/workspace state untouched while a
+command remains unfinished.
+
+This is intentionally a foundation rather than a claim of end-to-end command
+consistency: production gateway traffic does not populate the ledger yet.
+Protocol-aware process/filesystem tracking must record before forwarding, keep
+ambiguous disconnects detached and fail closed, and finish only from an
+authoritative exec-server response or notification. Production child dispatch
+therefore remains disabled until that gateway wiring is complete. Migration,
+transition, exclusion, and lifecycle refusal coverage brings the complete
+Docker-backed PostgreSQL suite to 278 passing tests with no skips.
+
 ### Canonical workspace comparison foundation
 
 Patch lifecycle code now has a provider-independent canonical workspace model

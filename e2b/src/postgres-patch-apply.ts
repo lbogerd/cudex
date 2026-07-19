@@ -41,6 +41,7 @@ import type {
   PreparedDurableBaseWorkspaceSnapshot,
   WorkspaceSnapshotPublisher,
 } from './workspace-snapshots.js'
+import type { LeaseQuiescenceGate } from './postgres-lease-interactions.js'
 
 const operation = 'patch_apply'
 
@@ -49,6 +50,7 @@ export interface PostgresPatchApplyOptions {
   workerId: string
   waitTimeoutMs?: number
   heartbeatIntervalMs?: number
+  interactionGate?: LeaseQuiescenceGate
 }
 
 interface MutationContext {
@@ -136,6 +138,7 @@ export class PostgresPatchApplyCoordinator {
   private readonly workerId: string
   private readonly waitTimeoutMs: number
   private readonly heartbeatIntervalMs: number
+  private readonly interactionGate: LeaseQuiescenceGate | undefined
 
   constructor(
     private readonly journal: PostgresJournal,
@@ -150,6 +153,7 @@ export class PostgresPatchApplyCoordinator {
     this.workerId = bounded('worker ID', options.workerId)
     this.waitTimeoutMs = options.waitTimeoutMs ?? 30_000
     this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? 15_000
+    this.interactionGate = options.interactionGate
     if (!Number.isSafeInteger(this.waitTimeoutMs) || this.waitTimeoutMs <= 0
       || this.waitTimeoutMs > 5 * 60_000) throw new Error('invalid operation wait timeout')
     if (!Number.isSafeInteger(this.heartbeatIntervalMs) || this.heartbeatIntervalMs <= 0
@@ -234,6 +238,8 @@ export class PostgresPatchApplyCoordinator {
           || !['active', 'paused'].includes(lease.state)) {
           throw new ServiceError(409, 'target lease changed before patch application')
         }
+        await this.interactionGate?.assertQuiescent(
+          this.tenantId, lease.leaseId, lease.connectionGeneration, client)
         const resultArchive = await buildPatchApplyArchive(
           source.plan.manifest, plannedArchiveContent(source, source.plan.contentObjects))
         const rollbackArchive = await buildPatchApplyArchive(

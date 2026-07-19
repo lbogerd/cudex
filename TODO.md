@@ -213,6 +213,12 @@ tickets always fail, and secrets never enter durable or observable state.
 - [ ] Serialize child capture, patch, and command interaction per lease; command
   execution must share the checkpoint gate before capture can claim a command-
   consistent instant.
+  - [x] Add a generation-fenced PostgreSQL interaction ledger whose admission
+    shares the lifecycle lease lock, and make checkpoint, child capture, patch
+    apply, and interrupted patch rollback refuse every unfinished interaction.
+  - [ ] Track exec-server process and filesystem mutations at the production
+    gateway, including detach/resume and authoritative completion, before
+    enabling production child dispatch.
 - [x] Persist checksummed base/current workspace manifests with the unwired
   durable provision and checkpoint snapshots and service archives.
 - [ ] Carry the same manifest persistence through the remaining production

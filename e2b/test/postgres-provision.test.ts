@@ -27,6 +27,10 @@ import { ServiceError } from '../src/types.js'
 import { WorkspaceSnapshotPublisher } from '../src/workspace-snapshots.js'
 import { FakeProvider } from './fake-provider.js'
 import { ProviderSandboxMissingError } from '../src/provider.js'
+import {
+  PostgresLeaseInteractionGate,
+  type LeaseInteractionIdentity,
+} from '../src/postgres-lease-interactions.js'
 
 const databaseUrl = process.env.HOSTED_AGENT_TEST_DATABASE_URL
 const tenantId = 'tenant-provision'
@@ -193,6 +197,7 @@ interface Fixture {
   checkpointCoordinators: [PostgresCheckpointCoordinator, PostgresCheckpointCoordinator]
   releaseCoordinators: [PostgresReleaseCoordinator, PostgresReleaseCoordinator]
   releaseRevokers: [ReleaseRevoker, ReleaseRevoker]
+  interactionGates: [PostgresLeaseInteractionGate, PostgresLeaseInteractionGate]
   request: ProvisionRequest
   schema: string
 }
@@ -206,6 +211,9 @@ async function fixture(provider: FakeProvider = new FakeProvider(), failFirstTic
   await runMigrations(pools[0])
   const states = pools.map(pool => new PostgresDurableState(pool)) as [PostgresDurableState, PostgresDurableState]
   const journals: [ObservedJournal, ObservedJournal] = [new ObservedJournal(pools[0]), new ObservedJournal(pools[1])]
+  const interactionGates = journals.map((journal, index) =>
+    new PostgresLeaseInteractionGate(journal, states[index]!)) as
+    [PostgresLeaseInteractionGate, PostgresLeaseInteractionGate]
   const objects = new TrackingObjects()
   const sourceReclaimer = new PostgresObjectReclaimer(pools[0], objects)
   const lifecycle = new SourceSnapshotLifecycle(states[0], objects, { reclaimer: sourceReclaimer })
@@ -243,6 +251,7 @@ async function fixture(provider: FakeProvider = new FakeProvider(), failFirstTic
   const checkpointCoordinators = journals.map((journal, index) =>
     new PostgresCheckpointCoordinator(journal, states[index]!, publishers[index]!, provider, {
       tenantId, workerId: `checkpoint-worker-${index}`,
+      interactionGate: interactionGates[index]!,
     })) as [PostgresCheckpointCoordinator, PostgresCheckpointCoordinator]
   const releaseRevokers: [ReleaseRevoker, ReleaseRevoker] = [new ReleaseRevoker(), new ReleaseRevoker()]
   const releaseCoordinators = journals.map((journal, index) =>
@@ -255,7 +264,8 @@ async function fixture(provider: FakeProvider = new FakeProvider(), failFirstTic
     idempotencyKey: 'durable-provision',
   }
   return { admin, pools, journals, states, provider, objects, lifecycle, coordinators,
-    checkpointCoordinators, releaseCoordinators, releaseRevokers, request, schema }
+    checkpointCoordinators, releaseCoordinators, releaseRevokers, interactionGates,
+    request, schema }
 }
 
 async function close(context: Fixture): Promise<void> {
@@ -458,6 +468,39 @@ test('durable checkpoints serialize per lease across replicas and replay without
       { idempotency_key: secondRequest.idempotencyKey, request_hash: canonicalRequestHash(secondRequest),
         logical_response: secondResult },
     ])
+  } finally { await close(context) }
+})
+
+test('durable checkpoint refuses to capture an unfinished command interaction', {
+  skip: databaseUrl ? false : 'HOSTED_AGENT_TEST_DATABASE_URL is not set',
+}, async () => {
+  const context = await fixture()
+  try {
+    const lease = await context.coordinators[0].provision(context.request)
+    const interaction: LeaseInteractionIdentity = {
+      tenantId, leaseId: lease.leaseId, interactionId: 'checkpoint-command',
+      connectionGeneration: 0, sessionId: 'session-command',
+      kind: 'process', processId: 'process-command',
+    }
+    await context.interactionGates[0].begin(interaction)
+    const before = {
+      exports: context.provider.exports,
+      snapshots: context.provider.snapshots.size,
+      puts: context.objects.puts,
+    }
+    await assert.rejects(context.checkpointCoordinators[1].checkpoint({
+      leaseId: lease.leaseId, idempotencyKey: 'checkpoint-active-command',
+    }), (error: unknown) => error instanceof ServiceError && error.status === 503)
+    assert.deepEqual({
+      exports: context.provider.exports,
+      snapshots: context.provider.snapshots.size,
+      puts: context.objects.puts,
+    }, before)
+    await context.interactionGates[1].finish(interaction)
+    const completed = await context.checkpointCoordinators[1].checkpoint({
+      leaseId: lease.leaseId, idempotencyKey: 'checkpoint-after-command',
+    })
+    assert.notEqual(completed.snapshotId, lease.baseSnapshotId)
   } finally { await close(context) }
 })
 

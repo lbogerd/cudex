@@ -23,6 +23,10 @@ import {
   PostgresPatchApplicationRepository,
 } from '../src/postgres-patch-applications.js'
 import { PostgresObjectReclaimer } from '../src/postgres-object-reclaimer.js'
+import {
+  type LeaseInteractionIdentity,
+  PostgresLeaseInteractionGate,
+} from '../src/postgres-lease-interactions.js'
 import { PostgresDurableState, type StoredObject } from '../src/postgres-state.js'
 import { canonicalRequestHash, PostgresJournal } from '../src/postgres-store.js'
 import { PostgresWorkspacePreparations } from '../src/postgres-workspace-preparations.js'
@@ -94,6 +98,7 @@ interface Fixture {
   pools: [Pool, Pool]
   states: [PostgresDurableState, PostgresDurableState]
   journals: [PostgresJournal, PostgresJournal]
+  interactionGates: [PostgresLeaseInteractionGate, PostgresLeaseInteractionGate]
   reclaimers: [PostgresObjectReclaimer, PostgresObjectReclaimer]
   preparations: [PostgresWorkspacePreparations, PostgresWorkspacePreparations]
   publishers: [WorkspaceSnapshotPublisher, WorkspaceSnapshotPublisher]
@@ -126,6 +131,9 @@ async function fixture(conflictingTarget = false, artifactTtlMs = 60_000): Promi
   const states = pools.map(pool => new PostgresDurableState(pool)) as
     [PostgresDurableState, PostgresDurableState]
   const journals = pools.map(pool => new PostgresJournal(pool)) as [PostgresJournal, PostgresJournal]
+  const interactionGates = journals.map((journal, index) =>
+    new PostgresLeaseInteractionGate(journal, states[index]!)) as
+    [PostgresLeaseInteractionGate, PostgresLeaseInteractionGate]
   const objects = new TrackingObjects()
   const provider = new FailOnceExportProvider()
   const reclaimers = pools.map(pool => new PostgresObjectReclaimer(pool, objects)) as
@@ -246,13 +254,14 @@ async function fixture(conflictingTarget = false, artifactTtlMs = 60_000): Promi
   const coordinators = pools.map((pool, index) => new PostgresPatchApplyCoordinator(
     journals[index]!, states[index]!, new PostgresPatchApplySourceResolver(pool, objects),
     new PostgresPatchApplicationRepository(pool), publishers[index]!, provider,
-    { tenantId, workerId: `apply-worker-${index}`, heartbeatIntervalMs: 100 },
+    { tenantId, workerId: `apply-worker-${index}`, heartbeatIntervalMs: 100,
+      interactionGate: interactionGates[index]! },
   )) as [PostgresPatchApplyCoordinator, PostgresPatchApplyCoordinator]
   const expectedManifest = createWorkspaceManifest('expected-result', [
     ...childCurrentManifest.entries, file('roots/0/owner', ownerBytes),
   ])
   return {
-    admin, pools, states, journals, reclaimers, preparations, publishers,
+    admin, pools, states, journals, interactionGates, reclaimers, preparations, publishers,
     provider, objects, coordinators, targetArchive, targetManifest,
     expectedManifest, targetLeaseId: 'lease-target', targetSandboxId: targetSandbox.sandboxId,
     artifactId: 'artifact-1', schema,
@@ -403,7 +412,8 @@ async function reconcileInterrupted(context: Fixture): Promise<PatchApplyReconci
     context.journals[1], context.states[1],
     new PostgresPatchApplySourceResolver(context.pools[1], context.objects),
     new PostgresPatchApplicationRepository(context.pools[1]), context.provider,
-    { preparations: context.preparations[1], reclaimer: context.reclaimers[1] },
+    { preparations: context.preparations[1], reclaimer: context.reclaimers[1],
+      interactionGate: context.interactionGates[1] },
     { tenantId, workerId: 'patch-apply-reconciler', staleAfterMs: 1_000,
       heartbeatIntervalMs: 100, pollIntervalMs: 1_000 },
   ).runOnce()
@@ -476,6 +486,38 @@ live('returns a normal conflict without provider, ledger, object, or workspace m
       `SELECT 1 FROM hosted_agent_patch_applications WHERE idempotency_key = $1`,
       [request.idempotencyKey])).rowCount, 0)
     assert.deepEqual(await context.coordinators[1].applyPatch(request), result)
+  })
+
+live('refuses to mutate a target with an unfinished command interaction', false,
+  async context => {
+    const interaction: LeaseInteractionIdentity = {
+      tenantId, leaseId: context.targetLeaseId, interactionId: 'patch-target-command',
+      connectionGeneration: 0, sessionId: 'target-session',
+      kind: 'process', processId: 'target-process',
+    }
+    await context.interactionGates[0].begin(interaction)
+    const baseline = {
+      snapshots: context.provider.snapshots.size, deletes: context.provider.snapshotDeletes,
+      puts: context.objects.puts,
+      bytes: Uint8Array.from(context.provider.sandboxes.get(context.targetSandboxId)!.bytes),
+    }
+    await assert.rejects(context.coordinators[1].applyPatch({
+      targetLeaseId: context.targetLeaseId, artifactId: context.artifactId,
+      idempotencyKey: 'apply-active-target-command',
+    }), (error: unknown) => error instanceof ServiceError && error.status === 503)
+    assert.deepEqual(context.provider.sandboxes.get(context.targetSandboxId)!.bytes,
+      baseline.bytes)
+    assert.deepEqual({
+      snapshots: context.provider.snapshots.size, deletes: context.provider.snapshotDeletes,
+      puts: context.objects.puts,
+    }, { snapshots: baseline.snapshots, deletes: baseline.deletes, puts: baseline.puts })
+
+    await context.interactionGates[1].finish(interaction)
+    const result = await context.coordinators[1].applyPatch({
+      targetLeaseId: context.targetLeaseId, artifactId: context.artifactId,
+      idempotencyKey: 'apply-after-target-command',
+    })
+    assert.equal(result.type, 'applied')
   })
 
 live('restores the exact pre-apply archive and terminalizes after a post-swap failure', false,

@@ -17,11 +17,13 @@ import type {
   WorkspaceSnapshotPublisher,
 } from './workspace-snapshots.js'
 import { WorkspacePreparationAbortedError } from './workspace-snapshots.js'
+import type { LeaseQuiescenceGate } from './postgres-lease-interactions.js'
 
 export interface PostgresCheckpointOptions {
   tenantId: string
   workerId: string
   waitTimeoutMs?: number
+  interactionGate?: LeaseQuiescenceGate
 }
 
 const operation = 'checkpoint'
@@ -36,6 +38,7 @@ export class PostgresCheckpointCoordinator {
   private readonly tenantId: string
   private readonly workerId: string
   private readonly waitTimeoutMs: number
+  private readonly interactionGate: LeaseQuiescenceGate | undefined
 
   constructor(
     private readonly journal: PostgresJournal,
@@ -47,6 +50,7 @@ export class PostgresCheckpointCoordinator {
     this.tenantId = bounded('tenant ID', options.tenantId)
     this.workerId = bounded('worker ID', options.workerId)
     this.waitTimeoutMs = options.waitTimeoutMs ?? 30_000
+    this.interactionGate = options.interactionGate
     if (!Number.isSafeInteger(this.waitTimeoutMs) || this.waitTimeoutMs <= 0 || this.waitTimeoutMs > 5 * 60_000) {
       throw new Error('invalid operation wait timeout')
     }
@@ -84,6 +88,8 @@ export class PostgresCheckpointCoordinator {
         if (!lease || !['active', 'paused'].includes(lease.state) || !lease.providerSandboxId) {
           throw new ServiceError(409, 'lease cannot be checkpointed')
         }
+        await this.interactionGate?.assertQuiescent(
+          this.tenantId, lease.leaseId, lease.connectionGeneration, client)
         await this.heartbeat(fence)
         const archive = await this.provider.exportWorkspace(lease.providerSandboxId)
         const snapshotId = `snapshot_${randomUUID().replaceAll('-', '')}`

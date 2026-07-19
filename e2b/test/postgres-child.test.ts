@@ -21,6 +21,10 @@ import { ServiceError } from '../src/types.js'
 import { WorkspaceSnapshotPublisher } from '../src/workspace-snapshots.js'
 import { FakeProvider } from './fake-provider.js'
 import type { CreatedSandbox, ProviderSnapshotOptions } from '../src/provider.js'
+import {
+  PostgresLeaseInteractionGate,
+  type LeaseInteractionIdentity,
+} from '../src/postgres-lease-interactions.js'
 
 const databaseUrl = process.env.HOSTED_AGENT_TEST_DATABASE_URL
 const tenantId = 'tenant-child'
@@ -132,6 +136,7 @@ interface Fixture {
   provider: FakeProvider
   objects: TrackingObjects
   coordinators: [PostgresChildCoordinator, PostgresChildCoordinator]
+  interactionGates: [PostgresLeaseInteractionGate, PostgresLeaseInteractionGate]
   request: ProvisionRequest
   ownerLeaseId: string
   ownerSandboxId: string
@@ -154,6 +159,9 @@ async function fixture(provider: FakeProvider = new FakeProvider()): Promise<Fix
     [PostgresDurableState, PostgresDurableState]
   const journals = pools.map(pool => new PostgresJournal(pool)) as
     [PostgresJournal, PostgresJournal]
+  const interactionGates = journals.map((journal, index) =>
+    new PostgresLeaseInteractionGate(journal, states[index]!)) as
+    [PostgresLeaseInteractionGate, PostgresLeaseInteractionGate]
   const objects = new TrackingObjects()
   const publishers = pools.map((pool, index) => new WorkspaceSnapshotPublisher(
     states[index]!, objects, {
@@ -194,6 +202,7 @@ async function fixture(provider: FakeProvider = new FakeProvider()): Promise<Fix
     {
       principal: { tenantId }, managedBy: 'cudex', workerId: `child-worker-${index}`,
       roles: { child: role }, waitTimeoutMs: 5_000, heartbeatIntervalMs: 20,
+      interactionGate: interactionGates[index]!,
     },
   )) as [PostgresChildCoordinator, PostgresChildCoordinator]
   const request: ProvisionRequest = {
@@ -204,6 +213,7 @@ async function fixture(provider: FakeProvider = new FakeProvider()): Promise<Fix
   }
   return {
     admin, pools, journals, states, provider, objects, coordinators, request,
+    interactionGates,
     ownerLeaseId: 'owner-lease', ownerSandboxId: ownerSandbox.sandboxId,
     ownerSnapshotId, ownerArchive, schema,
   }
@@ -563,6 +573,40 @@ test('stale child recovery discovers deterministic unledgered inventory', {
     assert.equal(context.provider.snapshots.has(captureSnapshotId), false)
     assert.deepEqual(context.provider.live(), [context.ownerSandboxId])
     assert.equal(context.provider.snapshots.size, 1)
+  } finally { await close(context) }
+})
+
+test('durable child refuses to capture an owner with an unfinished command interaction', {
+  skip: databaseUrl ? false : 'HOSTED_AGENT_TEST_DATABASE_URL is not set',
+}, async () => {
+  const context = await fixture()
+  try {
+    const interaction: LeaseInteractionIdentity = {
+      tenantId, leaseId: context.ownerLeaseId, interactionId: 'child-owner-command',
+      connectionGeneration: 0, sessionId: 'owner-session',
+      kind: 'process', processId: 'owner-process',
+    }
+    await context.interactionGates[0].begin(interaction)
+    const before = {
+      creates: context.provider.creates,
+      restores: context.provider.restores,
+      snapshots: context.provider.snapshots.size,
+    }
+    await assert.rejects(context.coordinators[1].provision({
+      ...context.request, idempotencyKey: 'child-active-owner-command',
+    }), (error: unknown) => error instanceof ServiceError && error.status === 503)
+    assert.deepEqual({
+      creates: context.provider.creates,
+      restores: context.provider.restores,
+      snapshots: context.provider.snapshots.size,
+    }, before)
+    await context.interactionGates[1].finish(interaction)
+    const child = await context.coordinators[1].provision({
+      ...context.request, idempotencyKey: 'child-after-owner-command',
+    })
+    assert.equal(child.leaseId, deterministicChildId('lease', {
+      operation: 'provision', idempotencyKey: 'child-after-owner-command', tenantId,
+    }))
   } finally { await close(context) }
 })
 

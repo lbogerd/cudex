@@ -20,6 +20,7 @@ import {
   type StaleOperation,
 } from './postgres-store.js'
 import type { PostgresWorkspacePreparations } from './postgres-workspace-preparations.js'
+import type { LeaseQuiescenceGate } from './postgres-lease-interactions.js'
 import { validatePatchApplyResponse } from './validation.js'
 
 const operationName = 'patch_apply'
@@ -49,6 +50,7 @@ interface RecoveryDependencies {
     'getForOperation' | 'listObjectAllocationIdsForReconciliation' | 'beginAbort'>
   reclaimer: Pick<PostgresObjectReclaimer,
     'reclaimPreparationObjects' | 'reclaimOperationObjects'>
+  interactionGate?: LeaseQuiescenceGate
 }
 
 interface CleanupCounts {
@@ -224,12 +226,22 @@ export class PostgresPatchApplyReconciler {
         fence, application!.applicationId, 'abandoned before provider mutation', client))
     } else if (!['rolled_back', 'failed'].includes(application.phase)) {
       const source = await this.withHeartbeat(fence, () =>
-        this.transaction(client, () => this.sources.resolveRecoveryTarget({
-          tenantId: application!.tenantId,
-          targetLeaseId: application!.targetLeaseId,
-          sourceTargetSnapshotId: application!.sourceTargetSnapshotId,
-          targetProviderSandboxId: application!.targetProviderSandboxId,
-        }, client)))
+        this.transaction(client, async () => {
+          const lease = await this.state.getLease(
+            application!.tenantId, application!.targetLeaseId, client)
+          if (!lease || lease.providerSandboxId !== application!.targetProviderSandboxId) {
+            throw new OperationOwnershipError()
+          }
+          await this.recovery.interactionGate?.assertQuiescent(
+            application!.tenantId, application!.targetLeaseId,
+            lease.connectionGeneration, client)
+          return this.sources.resolveRecoveryTarget({
+            tenantId: application!.tenantId,
+            targetLeaseId: application!.targetLeaseId,
+            sourceTargetSnapshotId: application!.sourceTargetSnapshotId,
+            targetProviderSandboxId: application!.targetProviderSandboxId,
+          }, client)
+        }))
       application = await this.transaction(client, () => this.applications.beginRollback(
         fence, application!.applicationId, 'reconciled after interrupted patch application', client))
       await this.withHeartbeat(fence, () => this.provider.uploadArchive(

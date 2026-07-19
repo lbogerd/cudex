@@ -34,6 +34,7 @@ import { PostgresReconciler } from './postgres-reconciler.js'
 import { PostgresChildReconciler } from './postgres-child-reconciler.js'
 import { parseTrustedRoles } from './trusted-roles.js'
 import type { ActiveLeaseDirectory } from './gateway.js'
+import { PostgresLeaseInteractionGate } from './postgres-lease-interactions.js'
 
 function required(name: string): string { const value = process.env[name]; if (!value) throw new Error(`${name} is required`); return value }
 function positiveInteger(name: string, fallback: number): number {
@@ -114,6 +115,9 @@ const durableRoles = sourceRuntime && !development
 const durableArtifacts = sourceRuntime
   ? new PostgresPatchArtifactRepository(sourceRuntime.pool)
   : undefined
+const durableInteractionGate = sourceRuntime
+  ? new PostgresLeaseInteractionGate(durableJournal!, durableState!)
+  : undefined
 const patchExport = sourceRuntime
   ? new PostgresPatchExportCoordinator(
       durableJournal!,
@@ -160,7 +164,10 @@ const patchApply = sourceRuntime
       new PostgresPatchApplicationRepository(sourceRuntime.pool),
       durablePublisher!,
       provider,
-      { tenantId: sourceRuntime.principal.tenantId, workerId: durableWorkerId! },
+      {
+        tenantId: sourceRuntime.principal.tenantId, workerId: durableWorkerId!,
+        interactionGate: durableInteractionGate!,
+      },
     )
   : undefined
 const patchApplyReconciler = sourceRuntime
@@ -168,7 +175,8 @@ const patchApplyReconciler = sourceRuntime
       durableJournal!, durableState!,
       new PostgresPatchApplySourceResolver(sourceRuntime.pool, blobs),
       new PostgresPatchApplicationRepository(sourceRuntime.pool), provider,
-      { preparations: durablePreparations!, reclaimer: durableReclaimer! },
+      { preparations: durablePreparations!, reclaimer: durableReclaimer!,
+        interactionGate: durableInteractionGate! },
       {
         tenantId: sourceRuntime.principal.tenantId, workerId: durableWorkerId!,
         staleAfterMs: positiveInteger('HOSTED_AGENT_PATCH_APPLY_STALE_MS', 5 * 60_000),
@@ -233,6 +241,7 @@ const productionService = !development
       checkpoint: new PostgresCheckpointCoordinator(
         durableJournal!, durableState!, durablePublisher!, provider, {
           tenantId: sourceRuntime!.principal.tenantId, workerId: durableWorkerId!,
+          interactionGate: durableInteractionGate!,
         }),
       release: new PostgresReleaseCoordinator(
         durableJournal!, durableState!, provider, {

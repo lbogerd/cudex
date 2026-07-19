@@ -23,6 +23,7 @@ import type {
   WorkspaceSnapshotPublisher,
 } from './workspace-snapshots.js'
 import { WorkspacePreparationAbortedError } from './workspace-snapshots.js'
+import type { LeaseQuiescenceGate } from './postgres-lease-interactions.js'
 
 export interface TrustedChildRole {
   sandboxTemplate: string
@@ -38,6 +39,7 @@ export interface PostgresChildOptions {
   roles: Record<string, TrustedChildRole>
   waitTimeoutMs?: number
   heartbeatIntervalMs?: number
+  interactionGate?: LeaseQuiescenceGate
 }
 
 interface LogicalChildResponse {
@@ -204,6 +206,8 @@ export class PostgresChildCoordinator {
         if (!lease || !['active', 'paused'].includes(lease.state)
           || lease.agentId !== request.ownerAgentId || !lease.latestSnapshotId
           || !lease.providerSandboxId) throw new ServiceError(404, 'owner lease missing')
+        await this.options.interactionGate?.assertQuiescent(
+          this.tenantId, lease.leaseId, lease.connectionGeneration, client)
         return lease
       })
       const leaseId = deterministicChildId('lease', fence)
