@@ -34,7 +34,7 @@ export const contractLimits = {
 } as const
 
 const toolDomains = new Set([
-  'agentEnvironment', 'controlPlane', 'providerHosted', 'environmentBoundMcp',
+  'agentEnvironment', 'controlPlane', 'providerHosted', 'environmentBoundMcp', 'environmentBoundCodeMode',
   'ambientMcp', 'clientCallback', 'extension', 'orchestratorProcess',
 ])
 const sha256ChecksumPattern = /^sha256:[0-9a-f]{64}$/

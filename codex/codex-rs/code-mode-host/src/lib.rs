@@ -63,13 +63,14 @@ where
 
     let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<EncodedFrame>(/*max_capacity*/ 128);
     let peer = Arc::new(HostPeer::new(outgoing_tx));
+    let hosted = std::env::var_os("CODEX_HOSTED_CODE_MODE").is_some();
     let state = Arc::new(HostState {
         sessions: Mutex::new(HashMap::new()),
         seen_session_ids: Mutex::new(SeenSessionIds::default()),
         requests: Mutex::new(RequestRegistry::default()),
         request_tasks: TaskTracker::new(),
         request_permits: Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS)),
-        active_cell_permits: Arc::new(Semaphore::new(MAX_ACTIVE_CELLS)),
+        active_cell_permits: Arc::new(Semaphore::new(if hosted { 1 } else { MAX_ACTIVE_CELLS })),
         closing: AtomicBool::new(false),
         peer: Arc::clone(&peer),
     });

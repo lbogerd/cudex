@@ -1106,16 +1106,23 @@ fn prepend_code_mode_executors(
     planned_tools: &mut PlannedTools,
 ) {
     let turn_context = context.step_context.turn.as_ref();
-    if turn_context.hosted_tool_authorization.is_some() {
-        return;
-    }
     let authorized_runtimes = planned_tools
         .runtimes()
         .iter()
         .filter(|runtime| runtime_authorized(turn_context, runtime))
         .cloned()
         .collect::<Vec<_>>();
-    let code_mode_executors = build_code_mode_executors(turn_context, &authorized_runtimes);
+    let mut code_mode_executors = build_code_mode_executors(turn_context, &authorized_runtimes);
+    if let Some(authorization) = &turn_context.hosted_tool_authorization {
+        let domain = ToolExecutionDomain::EnvironmentBoundCodeMode {
+            environment_id: authorization.environment_id().to_string(),
+        };
+        code_mode_executors = code_mode_executors
+            .into_iter()
+            .map(|executor| override_tool_execution_domain(executor, domain.clone()))
+            .filter(|executor| runtime_authorized(turn_context, executor))
+            .collect();
+    }
     planned_tools.runtimes.splice(0..0, code_mode_executors);
 }
 

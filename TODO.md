@@ -4,6 +4,58 @@ This queue tracks the Linux-only development proof. Stable production decisions
 and redacted evidence remain in [`ARCHIVE.md`](ARCHIVE.md). The proof is not
 complete until a real ChatGPT-authenticated automated run passes.
 
+## Dedicated CubeSandbox code-mode runtime
+
+This follow-on is Linux-only. A hosted thread is not complete until its lease,
+environment connection generation, CubeSandbox, exec-server process handle, and
+code-mode protocol connection form one immutable binding. Local Codex retains
+its existing process-owned/in-process behavior; hosted Codex must fail closed.
+
+### Packaging and sandbox host
+
+- [x] Build, checksum, publish, install, and label both `codex` and
+  `codex-code-mode-host` without retaining the legacy top-level checksum.
+- [x] Add a non-protocol `--help` check and a hosted singleton launcher mode.
+- [ ] Complete singleton path hardening and collision/crash tests.
+- [ ] Configure or document the provider CPU and memory limits used by the POC.
+
+### Transport, provider, and identity
+
+- [x] Carry protocol stdin/stdout over the selected environment's existing
+  `ExecProcess`; stderr is diagnostic-only and no new public port is used.
+- [x] Add the immutable non-secret runtime identity and deterministic process ID.
+- [x] Add eager remote process startup and protocol handshake before hosted
+  thread creation, with a distinct child provider.
+- [ ] Remove the hosted test bypass and make provider placement structurally
+  explicit so a hosted path cannot select the shared local provider.
+- [ ] Add verified same-generation recovery, replacement invalidation, and the
+  stable replacement error using the service's real connection generation.
+- [ ] Add explicit graceful provider shutdown, active-cell termination, and
+  confirmed exec-server process-group quiescence before lease cleanup succeeds.
+
+### Authorization and dispatch
+
+- [x] Add `environmentBoundCodeMode` to Rust and E2B policy schemas and grant
+  only outer `exec`/`wait`; nested tools retain their independent role grants.
+- [x] Expose hosted code mode only with an exact verified environment binding.
+- [ ] Carry the full provider identity into turns and validate thread, lease,
+  environment, and generation at every nested dispatch.
+- [ ] Assert environment-routed nested commands target the provider's exact
+  environment.
+
+### Evidence and acceptance
+
+- [ ] Complete non-secret start/reconnect/shutdown/failure/quiescence telemetry.
+- [ ] Add transport, provider, provisioning, authorization, reconnect, and
+  shutdown tests without bypassing remote startup.
+- [ ] Add trusted runtime-placement evidence and the six code-mode booleans to
+  retained POC reports.
+- [ ] Run the real root/child CubeSandbox scenarios, including CPU placement,
+  stored-value isolation, nested command routing, independent failure/shutdown,
+  and exact final cleanup.
+- [ ] Switch the POC default from `gpt-5.5` only after the full code-mode-only
+  acceptance run passes.
+
 ## 1. Local POC infrastructure
 
 - [x] Add the ignored POC runtime layout and strict data-only `.env` parser.

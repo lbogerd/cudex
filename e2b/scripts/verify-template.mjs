@@ -9,6 +9,14 @@ if (!metadataPath) {
   throw new Error('usage: node scripts/verify-template.mjs <template-metadata.json>')
 }
 const expected = JSON.parse(await fs.readFile(metadataPath, 'utf8'))
+const digestPattern = /^[0-9a-f]{64}$/u
+if (!expected || typeof expected !== 'object' || Array.isArray(expected)
+  || typeof expected.revision !== 'string' || !/^[0-9a-f]{40}$/u.test(expected.revision)
+  || typeof expected.codexSha256 !== 'string' || !digestPattern.test(expected.codexSha256)
+  || typeof expected.codeModeHostSha256 !== 'string' || !digestPattern.test(expected.codeModeHostSha256)
+  || typeof expected.templateId !== 'string' || !expected.templateId) {
+  throw new Error('template metadata is invalid')
+}
 if (!process.env.E2B_API_KEY || !process.env.E2B_API_URL) {
   throw new Error('E2B_API_KEY and E2B_API_URL are required')
 }
@@ -62,13 +70,26 @@ try {
   const installed = JSON.parse(Buffer.from(await dataPlane.files.read(
     '/etc/cudex/codex-build.json', { format: 'bytes' },
   )).toString('utf8'))
-  if (installed.revision !== expected.revision || installed.sha256 !== expected.codexSha256) {
-    throw new Error('sandbox Codex metadata does not match template metadata')
+  const installedBinaries = installed?.binaries
+  if (installed.revision !== expected.revision || installedBinaries?.codex?.sha256 !== expected.codexSha256
+    || installedBinaries?.['codex-code-mode-host']?.sha256 !== expected.codeModeHostSha256
+    || Object.hasOwn(installed, 'sha256')) {
+    throw new Error('sandbox binary metadata does not match template metadata')
   }
 
-  const checksum = await dataPlane.commands.run('sha256sum /usr/local/bin/codex')
-  if (checksum.exitCode !== 0 || checksum.stdout.split(/\s+/)[0] !== expected.codexSha256) {
-    throw new Error('sandbox Codex checksum does not match template metadata')
+  const binaryInspection = await dataPlane.commands.run(
+    "set -eu; for p in /usr/local/bin/codex /usr/local/bin/codex-code-mode-host; do test -f \"$p\"; test ! -L \"$p\"; test -x \"$p\"; s=$(stat -c %s \"$p\"); test \"$s\" -ge 20; test \"$s\" -le 536870912; h=$(od -An -tx1 -N20 \"$p\" | tr -d ' \\n'); test \"${h#7f454c460201}\" != \"$h\"; test \"$(printf %s \"$h\" | cut -c37-40)\" = \"3e00\"; done; sha256sum /usr/local/bin/codex /usr/local/bin/codex-code-mode-host",
+  )
+  const checksums = binaryInspection.stdout.trim().split(/\n/u).map(line => line.trim().split(/\s+/u)[0])
+  if (binaryInspection.exitCode !== 0 || checksums.length !== 2
+    || checksums[0] !== expected.codexSha256 || checksums[1] !== expected.codeModeHostSha256) {
+    throw new Error('sandbox binary validation failed')
+  }
+  const hostCheck = await dataPlane.commands.run('/usr/local/bin/codex-code-mode-host --help >/dev/null', {
+    timeoutMs: 10_000,
+  })
+  if (hostCheck.exitCode !== 0) {
+    throw new Error('sandbox code-mode host self-check failed')
   }
 
   const stderr = []
@@ -119,7 +140,8 @@ try {
     templateId: expected.templateId,
     sandboxId: sandbox.sandboxId,
     revision: installed.revision,
-    sha256: installed.sha256,
+    codexSha256: installedBinaries.codex.sha256,
+    codeModeHostSha256: installedBinaries['codex-code-mode-host'].sha256,
     sessionId: initialized.sessionId,
     output,
     verified: true,

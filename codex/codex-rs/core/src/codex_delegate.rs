@@ -125,6 +125,11 @@ pub(crate) async fn run_codex_thread_interactive(
     let hosted_tool_authorization = pending_hosted_runtime
         .as_ref()
         .map(crate::hosted_agent_runtime::PendingHostedAgentRuntime::tool_authorization);
+    let code_mode_session_provider = pending_hosted_runtime
+        .as_ref()
+        .and_then(crate::hosted_agent_runtime::PendingHostedAgentRuntime::code_mode_provider)
+        .map(|provider| provider as Arc<dyn codex_code_mode::CodeModeSessionProvider>)
+        .unwrap_or_else(|| parent_session.services.code_mode_service.session_provider());
     let user_instructions = LoadedUserInstructions {
         instructions: parent_session.user_instructions().await,
         warnings: Vec::new(),
@@ -144,7 +149,7 @@ pub(crate) async fn run_codex_thread_interactive(
         skills_service: Arc::clone(&parent_session.services.skills_service),
         plugins_manager: Arc::clone(&parent_session.services.plugins_manager),
         mcp_manager: Arc::clone(&parent_session.services.mcp_manager),
-        code_mode_session_provider: parent_session.services.code_mode_service.session_provider(),
+        code_mode_session_provider,
         extensions: Arc::clone(&parent_session.services.extensions),
         conversation_history,
         requested_history_mode: None,

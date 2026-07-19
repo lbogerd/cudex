@@ -146,6 +146,34 @@ pub struct ExecProcessEventReceiver {
 }
 
 impl ExecProcessEventReceiver {
+    /// Creates a standalone event channel for executor implementations that do not use the
+    /// built-in retained event log (for example, lightweight embedders and test backends).
+    pub fn channel(
+        capacity: usize,
+    ) -> (
+        broadcast::Sender<ExecProcessEvent>,
+        ExecProcessEventReceiver,
+    ) {
+        let (live_tx, live_rx) = broadcast::channel(capacity.max(1));
+        (
+            live_tx.clone(),
+            Self {
+                replay: VecDeque::new(),
+                live_rx,
+                _keepalive: Some(live_tx),
+            },
+        )
+    }
+
+    /// Subscribes to a standalone channel created by [`Self::channel`].
+    pub fn subscribe(sender: &broadcast::Sender<ExecProcessEvent>) -> Self {
+        Self {
+            replay: VecDeque::new(),
+            live_rx: sender.subscribe(),
+            _keepalive: Some(sender.clone()),
+        }
+    }
+
     /// Returns a receiver that remains open without yielding events.
     pub fn empty() -> Self {
         let (live_tx, live_rx) = broadcast::channel(1);

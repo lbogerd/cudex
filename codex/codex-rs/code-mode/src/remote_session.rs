@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io;
 use std::path::PathBuf;
@@ -18,6 +19,15 @@ use codex_code_mode_protocol::StartedCell;
 use codex_code_mode_protocol::WaitOutcome;
 use codex_code_mode_protocol::WaitRequest;
 use codex_code_mode_protocol::host::SessionId;
+use codex_exec_server::ExecBackend;
+use codex_exec_server::ExecEnvPolicy;
+use codex_exec_server::ExecParams;
+use codex_exec_server::ProcessId;
+use codex_protocol::ThreadId;
+use codex_protocol::config_types::ShellEnvironmentPolicyInherit;
+use codex_utils_path_uri::PathUri;
+use sha2::Digest;
+use sha2::Sha256;
 use tokio::sync::Semaphore;
 use tokio::sync::watch;
 
@@ -36,6 +46,151 @@ type ShutdownResultReceiver = watch::Receiver<Option<Result<(), String>>>;
 /// Creates code-mode sessions backed by one lazily spawned process host.
 pub struct ProcessOwnedCodeModeSessionProvider {
     state: StdMutex<ProviderState>,
+}
+
+/// Immutable, non-secret binding between a hosted thread and its remote runtime.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostedCodeModeRuntimeIdentity {
+    pub thread_id: ThreadId,
+    pub lease_id: String,
+    pub environment_id: String,
+    pub connection_generation: u64,
+}
+
+/// A fail-closed code-mode provider backed by one environment-owned exec process.
+pub struct HostedEnvironmentCodeModeSessionProvider {
+    identity: HostedCodeModeRuntimeIdentity,
+    process_identity: String,
+    process_host: Arc<OwnedProcessHost>,
+    session_created: AtomicBool,
+}
+
+impl HostedEnvironmentCodeModeSessionProvider {
+    pub async fn start(
+        identity: HostedCodeModeRuntimeIdentity,
+        backend: Arc<dyn ExecBackend>,
+        cwd: PathUri,
+    ) -> Result<Self, String> {
+        let process_identity = hosted_process_identity(&identity);
+        tracing::info!(
+            event = "hosted_code_mode_start_requested",
+            thread_id = %identity.thread_id,
+            lease_id = %identity.lease_id,
+            environment_id = %identity.environment_id,
+            connection_generation = identity.connection_generation,
+            process_identity = %process_identity,
+        );
+        let mut env = HashMap::new();
+        env.insert("CODEX_HOSTED_CODE_MODE".to_string(), "1".to_string());
+        env.insert(
+            "CODEX_HOSTED_LEASE_ID".to_string(),
+            identity.lease_id.clone(),
+        );
+        env.insert(
+            "CODEX_HOSTED_ENVIRONMENT_ID".to_string(),
+            identity.environment_id.clone(),
+        );
+        env.insert(
+            "CODEX_HOSTED_CONNECTION_GENERATION".to_string(),
+            identity.connection_generation.to_string(),
+        );
+        let started = backend
+            .start(ExecParams {
+                process_id: ProcessId::new(format!("hosted-code-mode-{process_identity}")),
+                argv: vec![
+                    "/usr/local/bin/codex-code-mode-host".to_string(),
+                    "--hosted-singleton".to_string(),
+                    "--identity".to_string(),
+                    process_identity.clone(),
+                ],
+                cwd,
+                env_policy: Some(ExecEnvPolicy {
+                    inherit: ShellEnvironmentPolicyInherit::None,
+                    ignore_default_excludes: false,
+                    exclude: Vec::new(),
+                    r#set: HashMap::new(),
+                    include_only: Vec::new(),
+                }),
+                env,
+                tty: false,
+                pipe_stdin: true,
+                arg0: None,
+                sandbox: None,
+                enforce_managed_network: false,
+                managed_network: None,
+            })
+            .await
+            .map_err(|error| format!("failed to start hosted code-mode runtime: {error}"))?;
+        let connection = Connection::from_exec_process(Arc::clone(&started.process))
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            identity,
+            process_identity: process_identity.clone(),
+            process_host: Arc::new(OwnedProcessHost::with_connection(Arc::new(connection))),
+            session_created: AtomicBool::new(false),
+        })
+        .inspect(|provider| {
+            tracing::info!(
+                event = "hosted_code_mode_ready",
+                thread_id = %provider.identity.thread_id,
+                lease_id = %provider.identity.lease_id,
+                environment_id = %provider.identity.environment_id,
+                connection_generation = provider.identity.connection_generation,
+                process_identity = %provider.process_identity,
+                protocol_version = "v1",
+            );
+        })
+    }
+
+    pub fn identity(&self) -> &HostedCodeModeRuntimeIdentity {
+        &self.identity
+    }
+}
+
+impl Drop for HostedEnvironmentCodeModeSessionProvider {
+    fn drop(&mut self) {
+        tracing::info!(
+            event = "hosted_code_mode_shutdown_requested",
+            thread_id = %self.identity.thread_id,
+            lease_id = %self.identity.lease_id,
+            environment_id = %self.identity.environment_id,
+            connection_generation = self.identity.connection_generation,
+            process_identity = %self.process_identity,
+        );
+    }
+}
+
+impl CodeModeSessionProvider for HostedEnvironmentCodeModeSessionProvider {
+    fn create_session<'a>(
+        &'a self,
+        delegate: Arc<dyn CodeModeSessionDelegate>,
+    ) -> CodeModeSessionProviderFuture<'a> {
+        Box::pin(async move {
+            if self.session_created.swap(true, Ordering::AcqRel) {
+                return Err(
+                    "hosted code-mode provider permits one logical agent session".to_string(),
+                );
+            }
+            let session = ProcessOwnedCodeModeSession::with_process_host(
+                delegate,
+                Arc::clone(&self.process_host),
+            );
+            session.connection().await?;
+            Ok(Arc::new(session) as Arc<dyn CodeModeSession>)
+        })
+    }
+}
+
+fn hosted_process_identity(identity: &HostedCodeModeRuntimeIdentity) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"hosted-code-mode-v1\0");
+    hash.update(identity.lease_id.as_bytes());
+    hash.update(b"\0");
+    hash.update(identity.environment_id.as_bytes());
+    hash.update(b"\0");
+    hash.update(identity.connection_generation.to_le_bytes());
+    format!("{:x}", hash.finalize())[..32].to_string()
 }
 
 enum ProviderState {
@@ -105,7 +260,7 @@ impl CodeModeSessionProvider for ProcessOwnedCodeModeSessionProvider {
 }
 
 struct OwnedProcessHost {
-    host_program: PathBuf,
+    host_program: Option<PathBuf>,
     connection: StdMutex<Option<Arc<Connection>>>,
     spawn_permit: Semaphore,
     next_session_id: AtomicU64,
@@ -114,8 +269,17 @@ struct OwnedProcessHost {
 impl OwnedProcessHost {
     fn new(host_program: PathBuf) -> Self {
         Self {
-            host_program,
+            host_program: Some(host_program),
             connection: StdMutex::new(None),
+            spawn_permit: Semaphore::new(/*permits*/ 1),
+            next_session_id: AtomicU64::new(1),
+        }
+    }
+
+    fn with_connection(connection: Arc<Connection>) -> Self {
+        Self {
+            host_program: None,
+            connection: StdMutex::new(Some(connection)),
             spawn_permit: Semaphore::new(/*permits*/ 1),
             next_session_id: AtomicU64::new(1),
         }
@@ -132,7 +296,10 @@ impl OwnedProcessHost {
         if let Some(connection) = self.live_connection() {
             return Ok(connection);
         }
-        let new_connection = Arc::new(Connection::spawn(&self.host_program).await?);
+        let host_program = self.host_program.as_deref().ok_or_else(|| {
+            ConnectionError::Other("hosted code-mode connection cannot be replaced".into())
+        })?;
+        let new_connection = Arc::new(Connection::spawn(host_program).await?);
         *self
             .connection
             .lock()

@@ -2553,6 +2553,11 @@ impl ThreadManagerState {
         let hosted_tool_authorization = pending_hosted_runtime
             .as_ref()
             .map(PendingHostedAgentRuntime::tool_authorization);
+        let code_mode_session_provider: Arc<dyn CodeModeSessionProvider> = pending_hosted_runtime
+            .as_ref()
+            .and_then(PendingHostedAgentRuntime::code_mode_provider)
+            .map(|provider| provider as Arc<dyn CodeModeSessionProvider>)
+            .unwrap_or_else(|| Arc::clone(&self.code_mode_session_provider));
         let session_result = Box::pin(Session::spawn(SessionSpawnArgs {
             thread_id,
             config,
@@ -2565,7 +2570,7 @@ impl ThreadManagerState {
             skills_service: Arc::clone(&self.skills_service),
             plugins_manager: Arc::clone(&self.plugins_manager),
             mcp_manager: Arc::clone(&self.mcp_manager),
-            code_mode_session_provider: Arc::clone(&self.code_mode_session_provider),
+            code_mode_session_provider,
             extensions: Arc::clone(&self.extensions),
             conversation_history: initial_history,
             requested_history_mode: history_mode,

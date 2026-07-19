@@ -223,7 +223,7 @@ function catalogEntries(value: unknown, result: Array<Record<string, unknown>>):
   for (const item of Object.values(entry)) catalogEntries(item, result)
 }
 
-export async function assertDirectToolModel(
+export async function assertHostedModelCompatibility(
   process: PocAppServerProcess, codexHome: string, configuredModel?: string,
 ): Promise<string> {
   const models: Array<Record<string, unknown>> = []
@@ -261,8 +261,8 @@ export async function assertDirectToolModel(
   catalogEntries(cached, entries)
   const capability = entries.find(entry => entry.slug === model)
   if (!capability) throw new Error('selected model capability is unavailable')
-  if (capability.tool_mode === 'code_mode_only') {
-    throw new Error('selected model is code-mode-only; set POC_CODEX_MODEL to a direct-tool model')
+  if (capability.tool_mode !== null && capability.tool_mode !== 'code_mode_only') {
+    throw new Error('selected model has an unknown hosted tool mode')
   }
   return model
 }
@@ -395,7 +395,7 @@ export async function runAutomatedTurn(input: {
   onEvidence?(evidence: PocAppServerEvidence): void
 }): Promise<PocAppServerEvidence> {
   await initializeAndReadAccount(input.process)
-  await assertDirectToolModel(input.process, input.codexHome, input.model)
+  await assertHostedModelCompatibility(input.process, input.codexHome, input.model)
   const threadResult = record(await input.process.client.request('thread/start', {
     // Omit cwd and roots: the immutable source snapshot is the trusted authority for
     // hosted paths. Passing the host fixture path would leak a client-only path into

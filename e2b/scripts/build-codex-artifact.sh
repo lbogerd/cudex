@@ -34,7 +34,7 @@ if [[ "${target}" == *-musl ]] && ! command -v musl-gcc >/dev/null; then
   exit 1
 fi
 
-echo "Building codex (${profile}, ${target}) from ${revision}"
+echo "Building codex and codex-code-mode-host (${profile}, ${target}) from ${revision}"
 v8_env_file=$(mktemp /tmp/cudex-v8-env.XXXXXX)
 trap 'rm -f "${v8_env_file}"' EXIT
 PYTHONPATH="${codex_dir}/scripts" python3 -c '
@@ -55,17 +55,20 @@ done <"${v8_env_file}"
     --locked \
     --package codex-cli \
     --bin codex \
+    --package codex-code-mode-host \
+    --bin codex-code-mode-host \
     --profile "${profile}" \
     --target "${target}"
 )
 
-source_binary="${codex_rs_dir}/target/${target}/${profile}/codex"
-if [[ ! -x "${source_binary}" ]]; then
-  echo "Expected Codex binary was not produced at ${source_binary}" >&2
-  exit 1
-fi
-
-install -m 0755 "${source_binary}" "${artifact_dir}/codex"
+for binary in codex codex-code-mode-host; do
+  source_binary="${codex_rs_dir}/target/${target}/${profile}/${binary}"
+  if [[ ! -x "${source_binary}" ]]; then
+    echo "Expected binary was not produced at ${source_binary}" >&2
+    exit 1
+  fi
+  install -m 0755 "${source_binary}" "${artifact_dir}/${binary}"
+done
 if [[ "${strip_artifact}" == true ]]; then
   strip_tool=${STRIP:-strip}
   if ! command -v "${strip_tool}" >/dev/null; then
@@ -73,8 +76,10 @@ if [[ "${strip_artifact}" == true ]]; then
     exit 1
   fi
   "${strip_tool}" --strip-unneeded "${artifact_dir}/codex"
+  "${strip_tool}" --strip-unneeded "${artifact_dir}/codex-code-mode-host"
 fi
-binary_sha256=$(sha256sum "${artifact_dir}/codex" | awk '{print $1}')
+codex_sha256=$(sha256sum "${artifact_dir}/codex" | awk '{print $1}')
+code_mode_host_sha256=$(sha256sum "${artifact_dir}/codex-code-mode-host" | awk '{print $1}')
 version=$("${artifact_dir}/codex" --version)
 build_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
@@ -85,10 +90,12 @@ jq -n \
   --arg target "${target}" \
   --arg profile "${profile}" \
   --argjson stripped "${strip_artifact}" \
-  --arg sha256 "${binary_sha256}" \
+  --arg codexSha256 "${codex_sha256}" \
+  --arg codeModeHostSha256 "${code_mode_host_sha256}" \
   --arg version "${version}" \
   --arg builtAt "${build_time}" \
-  '{buildId: $buildId, revision: $revision, dirty: $dirty, target: $target, profile: $profile, stripped: $stripped, sha256: $sha256, version: $version, builtAt: $builtAt}' \
+  '{buildId: $buildId, revision: $revision, dirty: $dirty, target: $target, profile: $profile, stripped: $stripped, binaries: {codex: {sha256: $codexSha256, version: $version}, "codex-code-mode-host": {sha256: $codeModeHostSha256}}, builtAt: $builtAt}' \
   >"${artifact_dir}/build.json"
 
-printf 'artifact_dir=%s\nbuild_id=%s\nsha256=%s\n' "${artifact_dir}" "${build_id}" "${binary_sha256}"
+printf 'artifact_dir=%s\nbuild_id=%s\ncodex_sha256=%s\ncode_mode_host_sha256=%s\n' \
+  "${artifact_dir}" "${build_id}" "${codex_sha256}" "${code_mode_host_sha256}"

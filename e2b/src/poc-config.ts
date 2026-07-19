@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto'
-import { chmod, mkdir, readFile, stat, writeFile } from 'node:fs/promises'
+import { chmod, lstat, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { spawn } from 'node:child_process'
 import { setTimeout as scheduleTimeout } from 'node:timers'
@@ -34,8 +34,10 @@ export interface PocProvenance {
   buildId: string
   revision: string
   codexSha256: string
+  codeModeHostSha256: string
   templateId: string
   binaryPath: string
+  codeModeHostPath: string
   metadataPath: string
 }
 
@@ -126,20 +128,32 @@ export async function validatePocProvenance(repositoryRoot: string, metadataPath
   const buildId = metadataString(record.buildId, 'build ID', /^[A-Za-z0-9._-]{1,128}$/u)
   const revision = metadataString(record.revision, 'Codex revision', /^[0-9a-f]{40}$/u)
   const codexSha256 = metadataString(record.codexSha256, 'Codex checksum', /^[0-9a-f]{64}$/u)
+  const codeModeHostSha256 = metadataString(record.codeModeHostSha256, 'code-mode host checksum', /^[0-9a-f]{64}$/u)
   const templateId = metadataString(record.templateId, 'template ID', /^[A-Za-z0-9._-]{1,512}$/u)
   const binaryPath = resolve(repositoryRoot, 'e2b', '.artifacts', 'codex', buildId, 'codex')
-  let binary: Buffer
-  let metadata
-  try { [binary, metadata] = await Promise.all([readFile(binaryPath), stat(binaryPath)]) }
-  catch { throw new Error('matching local Codex artifact is unavailable') }
-  if (!metadata.isFile() || (metadata.mode & 0o111) === 0) throw new Error('matching local Codex artifact is not executable')
-  if (binary.byteLength < 20 || binary[0] !== 0x7f || binary.subarray(1, 4).toString('ascii') !== 'ELF'
-    || binary[4] !== 2 || binary[5] !== 1 || binary.readUInt16LE(18) !== 0x3e) {
-    throw new Error('matching local Codex artifact is not an x86_64 Linux binary')
+  const codeModeHostPath = resolve(repositoryRoot, 'e2b', '.artifacts', 'codex', buildId, 'codex-code-mode-host')
+  const validateBinary = async (path: string, expected: string, label: string): Promise<void> => {
+    let metadata
+    try { metadata = await lstat(path) }
+    catch { throw new Error(`matching local ${label} artifact is unavailable`) }
+    if (!metadata.isFile() || metadata.isSymbolicLink() || (metadata.mode & 0o111) === 0
+      || metadata.size < 20 || metadata.size > 512 * 1024 * 1024) {
+      throw new Error(`matching local ${label} artifact is not a bounded executable file`)
+    }
+    let binary: Buffer
+    try { binary = await readFile(path) }
+    catch { throw new Error(`matching local ${label} artifact is unavailable`) }
+    if (binary.byteLength < 20 || binary[0] !== 0x7f || binary.subarray(1, 4).toString('ascii') !== 'ELF'
+      || binary[4] !== 2 || binary[5] !== 1 || binary.readUInt16LE(18) !== 0x3e) {
+      throw new Error(`matching local ${label} artifact is not an x86_64 Linux binary`)
+    }
+    if (createHash('sha256').update(binary).digest('hex') !== expected) {
+      throw new Error(`local ${label} artifact checksum does not match template metadata`)
+    }
   }
-  const actual = createHash('sha256').update(binary).digest('hex')
-  if (actual !== codexSha256) throw new Error('local Codex artifact checksum does not match template metadata')
-  return { buildId, revision, codexSha256, templateId, binaryPath, metadataPath }
+  await validateBinary(binaryPath, codexSha256, 'Codex')
+  await validateBinary(codeModeHostPath, codeModeHostSha256, 'code-mode host')
+  return { buildId, revision, codexSha256, codeModeHostSha256, templateId, binaryPath, codeModeHostPath, metadataPath }
 }
 
 export function createTrustedRoles(templateId: string): Record<string, unknown> {
@@ -149,11 +163,11 @@ export function createTrustedRoles(templateId: string): Record<string, unknown> 
     names.map(name => ({ name, namespace: 'collaboration' }))
   return {
     root: { sandboxTemplate: 'poc-root-v1', providerTemplateId: templateId, policyVersion: 1,
-      toolPolicy: { allowedDomains: ['agentEnvironment', 'controlPlane'],
-        allowedTools: [...plainTools(['exec_command', 'write_stdin']),
+      toolPolicy: { allowedDomains: ['agentEnvironment', 'controlPlane', 'environmentBoundCodeMode'],
+        allowedTools: [...plainTools(['exec', 'wait', 'exec_command', 'write_stdin']),
           ...collaborationTools(['spawn_agent', 'wait_agent']), ...plainTools(['apply_agent_patch'])] } },
     child: { sandboxTemplate: 'poc-child-v1', providerTemplateId: templateId, policyVersion: 1,
-      toolPolicy: { allowedDomains: ['agentEnvironment'], allowedTools: plainTools(['exec_command', 'write_stdin']) } },
+      toolPolicy: { allowedDomains: ['agentEnvironment', 'environmentBoundCodeMode'], allowedTools: plainTools(['exec', 'wait', 'exec_command', 'write_stdin']) } },
   }
 }
 

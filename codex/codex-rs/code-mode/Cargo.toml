@@ -17,10 +17,13 @@ workspace = true
 
 [dependencies]
 codex-code-mode-protocol = { workspace = true }
+codex-exec-server = { workspace = true }
 codex-protocol = { workspace = true }
+codex-utils-path-uri = { workspace = true }
 deno_core_icudata = { workspace = true }
 futures = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "macros", "process", "rt", "sync", "time"] }
 tokio-util = { workspace = true, features = ["rt"] }
 tracing = { workspace = true }

@@ -208,6 +208,7 @@ fn tool_domain_tag(domain: &ToolExecutionDomain) -> &'static str {
         ToolExecutionDomain::ControlPlane => "control_plane",
         ToolExecutionDomain::ProviderHosted => "provider_hosted",
         ToolExecutionDomain::EnvironmentBoundMcp { .. } => "environment_bound_mcp",
+        ToolExecutionDomain::EnvironmentBoundCodeMode { .. } => "environment_bound_code_mode",
         ToolExecutionDomain::AmbientMcp { .. } => "ambient_mcp",
         ToolExecutionDomain::ClientCallback => "client_callback",
         ToolExecutionDomain::Extension => "extension",

@@ -105,7 +105,8 @@ readline.on('line', line => {
   await Promise.all([mkdir(paths.codexHome, { recursive: true }), mkdir(paths.logsDirectory, { recursive: true })])
   const stderrLogPath = join(paths.logsDirectory, 'app-server.log')
   const app = startPocAppServer({ provenance: { buildId: 'build', revision: 'a'.repeat(40),
-    codexSha256: 'b'.repeat(64), templateId: 'template', binaryPath: binary, metadataPath: 'metadata' },
+    codexSha256: 'b'.repeat(64), codeModeHostSha256: 'c'.repeat(64), templateId: 'template',
+    binaryPath: binary, codeModeHostPath: binary, metadataPath: 'metadata' },
   paths, caBundlePath: '/tmp/ca.pem', hostedBearer: 'hosted', accessToken: 'access', stderrLogPath })
   try { await initializeAndReadAccount(app) } finally { await app.stop() }
   assert.equal(await readFile(stderrLogPath, 'utf8'), '')

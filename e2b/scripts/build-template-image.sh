@@ -14,15 +14,17 @@ fi
 
 artifact_dir=${CODEX_ARTIFACT_DIR:-"${e2b_dir}/.artifacts/codex/${build_id}"}
 metadata="${artifact_dir}/build.json"
-if [[ ! -x "${artifact_dir}/codex" || ! -f "${metadata}" ]]; then
+if [[ ! -x "${artifact_dir}/codex" || ! -x "${artifact_dir}/codex-code-mode-host" || ! -f "${metadata}" ]]; then
   echo "Missing artifact ${artifact_dir}; run scripts/build-codex-artifact.sh first" >&2
   exit 1
 fi
 
 revision=$(jq -er '.revision' "${metadata}")
-binary_sha256=$(jq -er '.sha256' "${metadata}")
+binary_sha256=$(jq -er '.binaries.codex.sha256' "${metadata}")
+code_mode_host_sha256=$(jq -er '.binaries["codex-code-mode-host"].sha256' "${metadata}")
 actual_sha256=$(sha256sum "${artifact_dir}/codex" | awk '{print $1}')
-if [[ "${binary_sha256}" != "${actual_sha256}" ]]; then
+actual_code_mode_host_sha256=$(sha256sum "${artifact_dir}/codex-code-mode-host" | awk '{print $1}')
+if [[ "${binary_sha256}" != "${actual_sha256}" || "${code_mode_host_sha256}" != "${actual_code_mode_host_sha256}" ]]; then
   echo "Artifact checksum does not match build.json" >&2
   exit 1
 fi
@@ -33,6 +35,7 @@ build_dir="${e2b_dir}/template/.build"
 image_metadata_dir="${e2b_dir}/.artifacts/images"
 mkdir -p "${build_dir}" "${image_metadata_dir}"
 install -m 0755 "${artifact_dir}/codex" "${build_dir}/codex"
+install -m 0755 "${artifact_dir}/codex-code-mode-host" "${build_dir}/codex-code-mode-host"
 install -m 0644 "${metadata}" "${build_dir}/build.json"
 
 sudo docker build \
@@ -40,6 +43,7 @@ sudo docker build \
   --build-arg "BASE_IMAGE=${base_image}" \
   --build-arg "CODEX_REVISION=${revision}" \
   --build-arg "CODEX_BINARY_SHA256=${binary_sha256}" \
+  --build-arg "CODEX_CODE_MODE_HOST_SHA256=${code_mode_host_sha256}" \
   --tag "${image_ref}" \
   "${e2b_dir}/template"
 
@@ -55,7 +59,8 @@ jq -n \
   --arg baseImage "${base_image}" \
   --arg revision "${revision}" \
   --arg sha256 "${binary_sha256}" \
-  '{buildId: $buildId, image: $image, imageDigest: $imageDigest, baseImage: $baseImage, revision: $revision, codexSha256: $sha256}' \
+  --arg codeModeHostSha256 "${code_mode_host_sha256}" \
+  '{buildId: $buildId, image: $image, imageDigest: $imageDigest, baseImage: $baseImage, revision: $revision, codexSha256: $sha256, codeModeHostSha256: $codeModeHostSha256}' \
   >"${image_metadata_dir}/${build_id}.json"
 
 printf 'image=%s\nimage_digest=%s\nmetadata=%s\n' \

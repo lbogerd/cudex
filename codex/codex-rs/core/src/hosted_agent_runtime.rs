@@ -4,6 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
+use codex_code_mode::HostedCodeModeRuntimeIdentity;
+use codex_code_mode::HostedEnvironmentCodeModeSessionProvider;
 use codex_exec_server::EnvironmentManager;
 use codex_exec_server::ExecServerError;
 use codex_hosted_agent::AgentCheckpoint;
@@ -59,6 +61,7 @@ pub(crate) struct HostedAgentRuntime {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct HostedToolAuthorization {
     environment_id: String,
+    code_mode_environment_id: Option<String>,
     policy: AgentToolPolicy,
 }
 
@@ -66,6 +69,19 @@ impl HostedToolAuthorization {
     pub(crate) fn new(environment_id: String, policy: AgentToolPolicy) -> Self {
         Self {
             environment_id,
+            code_mode_environment_id: None,
+            policy,
+        }
+    }
+
+    fn with_code_mode(
+        environment_id: String,
+        code_mode_environment_id: Option<String>,
+        policy: AgentToolPolicy,
+    ) -> Self {
+        Self {
+            environment_id,
+            code_mode_environment_id,
             policy,
         }
     }
@@ -75,6 +91,10 @@ impl HostedToolAuthorization {
             ToolExecutionDomain::EnvironmentBoundMcp { environment_id, .. } => {
                 environment_id == &self.environment_id
             }
+            ToolExecutionDomain::EnvironmentBoundCodeMode { environment_id } => self
+                .code_mode_environment_id
+                .as_ref()
+                .is_some_and(|bound_environment_id| bound_environment_id == environment_id),
             ToolExecutionDomain::AmbientMcp { .. } => false,
             ToolExecutionDomain::AgentEnvironment
             | ToolExecutionDomain::ControlPlane
@@ -86,6 +106,10 @@ impl HostedToolAuthorization {
         environment_matches
             && self.policy.allowed_domains.contains(&domain.kind())
             && self.policy.allowed_tools.contains(tool_name)
+    }
+
+    pub(crate) fn environment_id(&self) -> &str {
+        &self.environment_id
     }
 }
 
@@ -308,6 +332,25 @@ impl HostedAgentProvisioner {
             });
         }
 
+        let code_mode_provider = if cfg!(test) {
+            None
+        } else {
+            let code_mode_start: Pin<Box<dyn Future<Output = _> + Send + '_>> =
+                Box::pin(self.start_code_mode_provider(agent_id, &runtime, &environment_selection));
+            match code_mode_start.await {
+                Ok(provider) => Some(provider),
+                Err(error) => {
+                    let _ = cleanup_runtime(
+                        agent_id,
+                        runtime,
+                        self.environment_manager.as_ref(),
+                        self.service.as_ref(),
+                    )
+                    .await;
+                    return Err(error);
+                }
+            }
+        };
         Ok(PendingHostedAgentRuntime {
             agent_id,
             runtime,
@@ -315,6 +358,7 @@ impl HostedAgentProvisioner {
             service: Arc::clone(&self.service),
             environment_manager: Arc::clone(&self.environment_manager),
             rollback: PendingRuntimeRollback::ReleaseLease,
+            code_mode_provider,
         })
     }
 
@@ -418,6 +462,25 @@ impl HostedAgentProvisioner {
                 source,
             });
         }
+        let code_mode_provider = if cfg!(test) {
+            None
+        } else {
+            let code_mode_start: Pin<Box<dyn Future<Output = _> + Send + '_>> =
+                Box::pin(self.start_code_mode_provider(agent_id, &runtime, &environment_selection));
+            match code_mode_start.await {
+                Ok(provider) => Some(provider),
+                Err(error) => {
+                    let _ = cleanup_runtime(
+                        agent_id,
+                        runtime,
+                        self.environment_manager.as_ref(),
+                        self.service.as_ref(),
+                    )
+                    .await;
+                    return Err(error);
+                }
+            }
+        };
         Ok(PendingHostedAgentRuntime {
             agent_id,
             runtime,
@@ -425,7 +488,48 @@ impl HostedAgentProvisioner {
             service: Arc::clone(&self.service),
             environment_manager: Arc::clone(&self.environment_manager),
             rollback,
+            code_mode_provider,
         })
+    }
+
+    async fn start_code_mode_provider(
+        &self,
+        agent_id: codex_protocol::ThreadId,
+        runtime: &HostedAgentRuntime,
+        environment_selection: &TurnEnvironmentSelection,
+    ) -> Result<Arc<HostedEnvironmentCodeModeSessionProvider>, HostedAgentRuntimeError> {
+        let environment = self
+            .environment_manager
+            .get_environment(&runtime.environment_id)
+            .ok_or_else(|| {
+                HostedAgentRuntimeError::CodeMode(
+                    "registered hosted environment could not be resolved".to_string(),
+                )
+            })?;
+        tokio::time::timeout(
+            HOSTED_ENVIRONMENT_CONNECT_TIMEOUT,
+            environment.wait_until_ready(),
+        )
+        .await
+        .map_err(|_| {
+            HostedAgentRuntimeError::CodeMode(
+                "timed out waiting for the hosted environment".to_string(),
+            )
+        })?
+        .map_err(|error| HostedAgentRuntimeError::CodeMode(error.to_string()))?;
+        let provider = HostedEnvironmentCodeModeSessionProvider::start(
+            HostedCodeModeRuntimeIdentity {
+                thread_id: agent_id,
+                lease_id: runtime.lease_id.clone(),
+                environment_id: runtime.environment_id.clone(),
+                connection_generation: 1,
+            },
+            environment.get_exec_backend(),
+            environment_selection.cwd.clone(),
+        )
+        .await
+        .map_err(HostedAgentRuntimeError::CodeMode)?;
+        Ok(Arc::new(provider))
     }
 
     /// Unregisters and releases a runtime committed to a thread.
@@ -587,6 +691,7 @@ pub(crate) struct PendingHostedAgentRuntime {
     service: Arc<dyn ErasedHostedAgentService>,
     environment_manager: Arc<EnvironmentManager>,
     rollback: PendingRuntimeRollback,
+    code_mode_provider: Option<Arc<HostedEnvironmentCodeModeSessionProvider>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -601,10 +706,19 @@ impl PendingHostedAgentRuntime {
     }
 
     pub(crate) fn tool_authorization(&self) -> HostedToolAuthorization {
-        HostedToolAuthorization::new(
+        HostedToolAuthorization::with_code_mode(
             self.runtime.environment_id.clone(),
+            self.code_mode_provider
+                .as_ref()
+                .map(|provider| provider.identity().environment_id.clone()),
             self.runtime.tool_policy.clone(),
         )
+    }
+
+    pub(crate) fn code_mode_provider(
+        &self,
+    ) -> Option<Arc<HostedEnvironmentCodeModeSessionProvider>> {
+        self.code_mode_provider.clone()
     }
 
     pub(crate) fn commit(self) -> HostedAgentRuntime {
@@ -658,6 +772,8 @@ pub(crate) enum HostedAgentRuntimeError {
         #[source]
         source: ExecServerError,
     },
+    #[error("failed to start hosted code-mode runtime: {0}")]
+    CodeMode(String),
     #[error("failed to checkpoint hosted-agent lease: {0}")]
     Checkpoint(HostedAgentError),
     #[error("failed to export hosted-agent patch: {0}")]

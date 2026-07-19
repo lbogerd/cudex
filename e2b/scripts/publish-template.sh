@@ -20,6 +20,7 @@ fi
 image_ref=$(jq -er '.image' "${image_metadata}")
 revision=$(jq -er '.revision' "${image_metadata}")
 codex_sha256=$(jq -er '.codexSha256' "${image_metadata}")
+code_mode_host_sha256=$(jq -er '.codeModeHostSha256' "${image_metadata}")
 
 writable_layer_size=${CUBE_WRITABLE_LAYER_SIZE:-20Gi}
 template_dir="${e2b_dir}/.artifacts/templates"
@@ -54,8 +55,9 @@ jq -n \
   --arg image "${image_ref}" \
   --arg revision "${revision}" \
   --arg codexSha256 "${codex_sha256}" \
+  --arg codeModeHostSha256 "${code_mode_host_sha256}" \
   --arg publishedAt "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  '{buildId: $buildId, templateId: $templateId, jobId: $jobId, artifactId: $artifactId, image: $image, revision: $revision, codexSha256: $codexSha256, publishedAt: $publishedAt}' \
+  '{buildId: $buildId, templateId: $templateId, jobId: $jobId, artifactId: $artifactId, image: $image, revision: $revision, codexSha256: $codexSha256, codeModeHostSha256: $codeModeHostSha256, publishedAt: $publishedAt}' \
   >"${template_dir}/${build_id}.json"
 
 printf 'template_id=%s\nmetadata=%s\n' "${template_id}" "${template_dir}/${build_id}.json"

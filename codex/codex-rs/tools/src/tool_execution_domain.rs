@@ -19,6 +19,9 @@ pub enum ToolExecutionDomain {
         server: String,
         environment_id: String,
     },
+    EnvironmentBoundCodeMode {
+        environment_id: String,
+    },
     AmbientMcp {
         server: String,
     },
@@ -35,6 +38,9 @@ impl ToolExecutionDomain {
             Self::ControlPlane => ToolExecutionDomainKind::ControlPlane,
             Self::ProviderHosted => ToolExecutionDomainKind::ProviderHosted,
             Self::EnvironmentBoundMcp { .. } => ToolExecutionDomainKind::EnvironmentBoundMcp,
+            Self::EnvironmentBoundCodeMode { .. } => {
+                ToolExecutionDomainKind::EnvironmentBoundCodeMode
+            }
             Self::AmbientMcp { .. } => ToolExecutionDomainKind::AmbientMcp,
             Self::ClientCallback => ToolExecutionDomainKind::ClientCallback,
             Self::Extension => ToolExecutionDomainKind::Extension,
@@ -51,6 +57,7 @@ pub enum ToolExecutionDomainKind {
     ControlPlane,
     ProviderHosted,
     EnvironmentBoundMcp,
+    EnvironmentBoundCodeMode,
     AmbientMcp,
     ClientCallback,
     Extension,

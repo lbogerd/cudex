@@ -8,6 +8,8 @@ mod v8_init;
 pub(crate) type TaskFailureHandler = std::sync::Arc<dyn Fn(String) + Send + Sync>;
 
 pub use codex_code_mode_protocol::*;
+pub use remote_session::HostedCodeModeRuntimeIdentity;
+pub use remote_session::HostedEnvironmentCodeModeSessionProvider;
 pub use remote_session::ProcessOwnedCodeModeSession;
 pub use remote_session::ProcessOwnedCodeModeSessionProvider;
 pub use service::InProcessCodeModeSession;

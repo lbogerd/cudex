@@ -5,6 +5,59 @@ architecture decisions, and spike results for the hosted-agent E2B backend. It
 is reference material, not a work queue. Remaining implementation work is in
 [`TODO.md`](TODO.md).
 
+## Dedicated CubeSandbox code-mode runtime foundation (2026-07-19)
+
+The Linux hosted path now packages two provenance-bound binaries from the same
+revision, target, profile, V8 configuration, dirty-state calculation, and strip
+policy: `codex` and `codex-code-mode-host`. Artifact metadata has one explicit
+`binaries` map and no legacy top-level checksum. Image and published-template
+metadata carry both SHA-256 values; the image installs both at mode `0755`,
+checks both digests, exercises their non-protocol CLI checks, and labels both
+digests. Local provenance validation rejects missing, malformed, symlinked,
+oversized, non-executable, non-ELF64-x86_64, and checksum-mismatched files.
+
+Hosted code mode reuses the selected environment's existing exec-server process
+stream rather than adding a CubeSandbox port. Protocol input uses
+`ExecProcess::write`; only ordered stdout bytes enter the framed decoder;
+stderr is bounded diagnostic text. Interrupt, forced termination, and a bounded
+quiescence poll use the same recoverable process handle. The process receives a
+minimal environment containing only the hosted marker, lease ID, environment
+ID, and connection generation, and is not wrapped in the ordinary command
+filesystem sandbox because CubeSandbox is the containment boundary.
+
+`HostedCodeModeRuntimeIdentity` binds the thread, lease, environment, and
+connection generation. A domain-separated SHA-256 over the lease, environment,
+and generation produces the bounded exec-server process identity; thread ID
+alone is deliberately insufficient. `HostedEnvironmentCodeModeSessionProvider`
+starts exactly one remote process, completes protocol V1 negotiation within ten
+seconds, permits one logical agent session, and has no missing-binary or
+in-process fallback. Hosted provisioning waits for the registered environment,
+starts and verifies this provider before exposing the thread, and passes a
+separate provider returned by child provisioning rather than inheriting the
+parent provider. Ordinary local threads continue to use the existing shared
+process-owned provider and its existing fallback.
+
+The host supports `--hosted-singleton --identity <hashed-id>`, takes a
+non-blocking kernel lock in `/run/cudex`, records a bounded PID/runtime identity,
+refuses a live collision without killing it, and removes the identity record on
+clean exit. The image prepares `/run/cudex` for the unprivileged sandbox user.
+Hosted mode also reduces concurrent JavaScript cells to one per sandbox.
+
+Authorization gained the precise `environmentBoundCodeMode` execution domain.
+The outer `exec` and `wait` tools are exposed only when the hosted authorization
+contains that domain for the exact provider environment; the remote runtime
+does not require `orchestratorProcess`. Root and child POC policies independently
+grant their pre-existing nested tools, so authorizing outer JavaScript execution
+does not authorize a nested operation. The POC model compatibility check now
+recognizes `code_mode_only`, while the default remains `gpt-5.5` until the full
+root/child placement and cleanup proof passes.
+
+This is a foundation checkpoint, not final acceptance. Same-generation process
+recovery, replacement semantics using the service's authoritative generation,
+identity validation at nested dispatch, explicitly awaited provider shutdown,
+complete runtime telemetry, trusted placement evidence, and the real
+code-mode-only CubeSandbox acceptance matrix remain tracked in `TODO.md`.
+
 ## Live local hosted-Codex POC acceptance (2026-07-19)
 
 Automated run `20260719181643-56f841ab0440` passed with real ChatGPT

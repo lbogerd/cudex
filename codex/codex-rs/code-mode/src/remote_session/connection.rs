@@ -24,7 +24,15 @@ use codex_code_mode_protocol::host::HostToClient;
 use codex_code_mode_protocol::host::ProtocolVersion;
 use codex_code_mode_protocol::host::RequestId;
 use codex_code_mode_protocol::host::SupportedProtocolVersions;
+use codex_exec_server::ExecOutputStream;
+use codex_exec_server::ExecProcess;
+use codex_exec_server::ExecProcessEvent;
+use codex_exec_server::ProcessSignal;
 use tokio::io::AsyncBufReadExt;
+use tokio::io::AsyncRead;
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWrite;
+use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 use tokio::process::Child;
 use tokio::process::Command;
@@ -96,7 +104,7 @@ struct CallerCancellation {
 }
 
 struct ConnectionSupervisor {
-    child: Child,
+    process: ConnectionProcess,
     event_tx: mpsc::Sender<DriverEvent>,
     cancellation: CancellationToken,
     alive: Arc<AtomicBool>,
@@ -104,6 +112,11 @@ struct ConnectionSupervisor {
     driver_task: JoinHandle<()>,
     reader_task: JoinHandle<Result<(), String>>,
     writer_task: JoinHandle<Result<(), String>>,
+}
+
+enum ConnectionProcess {
+    Local(Child),
+    Remote(Arc<dyn ExecProcess>),
 }
 
 impl CallerCancellation {
@@ -171,8 +184,68 @@ impl Connection {
             .stdout
             .take()
             .ok_or_else(|| ConnectionError::Other("spawned code-mode host has no stdout".into()))?;
-        let mut reader = FramedReader::new(stdout);
-        let mut writer = FramedWriter::new(stdin);
+        Self::connect(ConnectionProcess::Local(child), stdout, stdin).await
+    }
+
+    pub(super) async fn from_exec_process(
+        process: Arc<dyn ExecProcess>,
+    ) -> Result<Self, ConnectionError> {
+        let (client_reader, mut stdout_writer) = tokio::io::duplex(64 * 1024);
+        let (mut stdin_reader, client_writer) = tokio::io::duplex(64 * 1024);
+        let output_process = Arc::clone(&process);
+        tokio::spawn(async move {
+            let mut events = output_process.subscribe_events();
+            while let Ok(event) = events.recv().await {
+                match event {
+                    ExecProcessEvent::Output(chunk) => match chunk.stream {
+                        ExecOutputStream::Stdout => {
+                            if stdout_writer.write_all(&chunk.chunk.0).await.is_err() {
+                                break;
+                            }
+                        }
+                        ExecOutputStream::Stderr => {
+                            let diagnostic = String::from_utf8_lossy(&chunk.chunk.0);
+                            let diagnostic = diagnostic.chars().take(4096).collect::<String>();
+                            debug!("remote code-mode host stderr: {diagnostic}");
+                        }
+                        ExecOutputStream::Pty => {
+                            warn!("remote code-mode host unexpectedly emitted PTY output");
+                        }
+                    },
+                    ExecProcessEvent::Exited { .. }
+                    | ExecProcessEvent::Closed { .. }
+                    | ExecProcessEvent::Failed(_) => break,
+                }
+            }
+        });
+        let input_process = Arc::clone(&process);
+        tokio::spawn(async move {
+            let mut chunk = vec![0_u8; 64 * 1024];
+            while let Ok(read) = stdin_reader.read(&mut chunk).await {
+                if read == 0 || input_process.write(chunk[..read].to_vec()).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Self::connect(
+            ConnectionProcess::Remote(process),
+            client_reader,
+            client_writer,
+        )
+        .await
+    }
+
+    async fn connect<R, W>(
+        process: ConnectionProcess,
+        reader: R,
+        writer: W,
+    ) -> Result<Self, ConnectionError>
+    where
+        R: AsyncRead + Send + Unpin + 'static,
+        W: AsyncWrite + Send + Unpin + 'static,
+    {
+        let mut reader = FramedReader::new(reader);
+        let mut writer = FramedWriter::new(writer);
         let handshake = async {
             let hello = ClientHello::new(
                 SupportedProtocolVersions::try_new([ProtocolVersion::V1])
@@ -207,14 +280,14 @@ impl Connection {
         let handshake_result = match tokio::time::timeout(HOST_HANDSHAKE_TIMEOUT, handshake).await {
             Ok(result) => result,
             Err(_) => {
-                kill_and_reap(&mut child).await;
+                terminate_process(&process).await;
                 return Err(ConnectionError::Other(
                     "timed out negotiating with the code-mode host".into(),
                 ));
             }
         };
         if let Err(err) = handshake_result {
-            kill_and_reap(&mut child).await;
+            terminate_process(&process).await;
             return Err(ConnectionError::Other(err));
         }
 
@@ -263,7 +336,7 @@ impl Connection {
         let driver_task = tokio::spawn(driver.run());
         tokio::spawn(
             ConnectionSupervisor {
-                child,
+                process,
                 event_tx,
                 cancellation: cancellation.clone(),
                 alive: Arc::clone(&alive),
@@ -428,7 +501,7 @@ impl Drop for Connection {
 
 impl ConnectionSupervisor {
     async fn run(mut self) {
-        let mut child_exited = false;
+        let mut process_exited = false;
         let reason = tokio::select! {
             biased;
             _ = self.cancellation.cancelled() => failure_message(&self.failure),
@@ -438,19 +511,16 @@ impl ConnectionSupervisor {
             },
             result = &mut self.reader_task => task_failure("reader", result),
             result = &mut self.writer_task => task_failure("writer", result),
-            result = self.child.wait() => {
-                child_exited = true;
-                match result {
-                    Ok(status) => format!("code-mode host exited with status {status}"),
-                    Err(err) => format!("failed waiting for code-mode host: {err}"),
-                }
+            reason = wait_for_process(&mut self.process) => {
+                process_exited = true;
+                reason
             }
         };
         mark_connection_dead(&self.alive, &self.failure, reason.clone());
         let _ = self.event_tx.try_send(DriverEvent::Failed(reason));
         self.cancellation.cancel();
-        if !child_exited {
-            kill_and_reap(&mut self.child).await;
+        if !process_exited {
+            terminate_process(&self.process).await;
         }
     }
 }
@@ -488,7 +558,51 @@ fn failure_message(failure: &std::sync::Mutex<Option<String>>) -> String {
         .unwrap_or_else(|| "code-mode host connection closed".to_string())
 }
 
-async fn kill_and_reap(child: &mut Child) {
-    let _ = child.start_kill();
-    let _ = child.wait().await;
+async fn wait_for_process(process: &mut ConnectionProcess) -> String {
+    match process {
+        ConnectionProcess::Local(child) => match child.wait().await {
+            Ok(status) => format!("code-mode host exited with status {status}"),
+            Err(err) => format!("failed waiting for code-mode host: {err}"),
+        },
+        ConnectionProcess::Remote(process) => {
+            let mut events = process.subscribe_events();
+            loop {
+                match events.recv().await {
+                    Ok(ExecProcessEvent::Exited { exit_code, .. }) => {
+                        return format!("code-mode host exited with status {exit_code}");
+                    }
+                    Ok(ExecProcessEvent::Failed(error)) => {
+                        return format!("remote code-mode host transport failed: {error}");
+                    }
+                    Ok(ExecProcessEvent::Closed { .. }) => {
+                        return "remote code-mode host output closed".to_string();
+                    }
+                    Ok(ExecProcessEvent::Output(_)) => {}
+                    Err(error) => {
+                        return format!("remote code-mode host event stream failed: {error}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn terminate_process(process: &ConnectionProcess) {
+    match process {
+        ConnectionProcess::Local(_) => {}
+        ConnectionProcess::Remote(process) => {
+            let _ = process.signal(ProcessSignal::Interrupt).await;
+            let _ = process.terminate().await;
+            let _ = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match process.read(None, Some(1), Some(100)).await {
+                        Ok(status) if status.quiesced => break,
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+            })
+            .await;
+        }
+    }
 }

@@ -2475,11 +2475,14 @@ name = "codex-code-mode"
 version = "0.0.0"
 dependencies = [
  "codex-code-mode-protocol",
+ "codex-exec-server",
  "codex-protocol",
+ "codex-utils-path-uri",
  "deno_core_icudata",
  "futures",
  "pretty_assertions",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "tokio-util",
  "tracing",
@@ -2495,6 +2498,7 @@ dependencies = [
  "codex-code-mode-protocol",
  "codex-protocol",
  "codex-utils-cargo-bin",
+ "libc",
  "pretty_assertions",
  "serde_json",
  "tempfile",

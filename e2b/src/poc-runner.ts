@@ -106,6 +106,7 @@ async function preflight(configured?: PocEnvironment): Promise<void> {
     ports: { control: env.controlPort, postgres: env.postgresPort, garage: env.garagePort },
     authentication: env.accessToken ? 'access_token' : 'auth_json', provenance: {
       buildId: provenance.buildId, revision: provenance.revision, codexSha256: provenance.codexSha256,
+      codeModeHostSha256: provenance.codeModeHostSha256,
       templateId: provenance.templateId } }))
 }
 
@@ -125,7 +126,7 @@ interface HostedCodexPocReport {
   startedAt: string
   finishedAt: string
   status: 'passed' | 'failed' | 'configuration_error' | 'cleanup_intervention'
-  provenance: { buildId: string; revision: string; codexSha256: string; templateId: string }
+  provenance: { buildId: string; revision: string; codexSha256: string; codeModeHostSha256: string; templateId: string }
   identities: { rootThreadId?: string; childThreadId?: string; rootLeaseId?: string; childLeaseId?: string; artifactId?: string }
   assertions: Record<string, boolean>
   cleanup: { serviceCleanupComplete: boolean; forcedProviderCleanup: boolean; dockerVolumesRemoved: boolean }
@@ -388,7 +389,8 @@ async function writeReport(run: CompleteRun, mode: 'automated' | 'interactive', 
   const report: HostedCodexPocReport = { version: 1, runId: run.paths.runId, mode, startedAt,
     finishedAt: new Date().toISOString(), status,
     provenance: { buildId: run.provenance.buildId, revision: run.provenance.revision,
-      codexSha256: run.provenance.codexSha256, templateId: run.provenance.templateId },
+      codexSha256: run.provenance.codexSha256, codeModeHostSha256: run.provenance.codeModeHostSha256,
+      templateId: run.provenance.templateId },
     identities: { ...(evidence ? { rootThreadId: evidence.rootThreadId } : {}),
       ...(evidence?.childThreadId ? { childThreadId: evidence.childThreadId } : {}),
       ...(!evidence && functional?.rootLease ? { rootThreadId: functional.rootLease.agentId } : {}),
