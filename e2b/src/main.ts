@@ -1,7 +1,7 @@
 import process from 'node:process'
 import { resolve } from 'node:path'
 import { JsonStore } from './store.js'
-import { TicketIssuer } from './tickets.js'
+import { TicketIssuer, type TicketAuthority } from './tickets.js'
 import { E2BProvider } from './e2b-provider.js'
 import { ControlPlane } from './service.js'
 import { ExecGateway } from './gateway.js'
@@ -22,6 +22,18 @@ import { PostgresPatchApplyCoordinator } from './postgres-patch-apply.js'
 import { PostgresPatchApplyReconciler } from './postgres-patch-apply-reconciler.js'
 import { PostgresWorkspacePreparations } from './postgres-workspace-preparations.js'
 import { WorkspaceSnapshotPublisher } from './workspace-snapshots.js'
+import { PostgresTicketIssuer } from './postgres-tickets.js'
+import { PostgresProvisionCoordinator } from './postgres-provision.js'
+import { PostgresRestoreCoordinator } from './postgres-restore.js'
+import { PostgresRestoreSourceResolver } from './postgres-restore-source.js'
+import { PostgresCheckpointCoordinator } from './postgres-checkpoint.js'
+import { PostgresReconnectCoordinator } from './postgres-reconnect.js'
+import { PostgresReleaseCoordinator } from './postgres-release.js'
+import { PostgresLifecycleService, type AgentLifecycleService } from './lifecycle-service.js'
+import { PostgresReconciler } from './postgres-reconciler.js'
+import { PostgresChildReconciler } from './postgres-child-reconciler.js'
+import { parseTrustedRoles } from './trusted-roles.js'
+import type { ActiveLeaseDirectory } from './gateway.js'
 
 function required(name: string): string { const value = process.env[name]; if (!value) throw new Error(`${name} is required`); return value }
 function positiveInteger(name: string, fallback: number): number {
@@ -31,7 +43,10 @@ function positiveInteger(name: string, fallback: number): number {
 }
 const development = process.env.HOSTED_AGENT_DEVELOPMENT === 'true'
 const host = process.env.HOSTED_AGENT_HOST ?? '127.0.0.1'; const port = positiveInteger('HOSTED_AGENT_PORT', 8443)
-const store = new JsonStore(resolve(process.env.HOSTED_AGENT_STATE_PATH ?? 'e2b/.state/control-plane.json')); await store.open()
+const store = development
+  ? new JsonStore(resolve(process.env.HOSTED_AGENT_STATE_PATH ?? 'e2b/.state/control-plane.json'))
+  : undefined
+await store?.open()
 const objectBucket = process.env.HOSTED_AGENT_OBJECT_BUCKET
 if (!development && !objectBucket) throw new Error('HOSTED_AGENT_OBJECT_BUCKET is required outside development')
 const blobs = objectBucket
@@ -92,12 +107,19 @@ const durablePreparations = sourceRuntime
   ? new PostgresWorkspacePreparations(sourceRuntime.pool)
   : undefined
 const durableWorkerId = sourceRuntime ? required('HOSTED_AGENT_WORKER_ID') : undefined
+const durableManagedBy = sourceRuntime ? (process.env.HOSTED_AGENT_MANAGED_BY ?? 'cudex') : undefined
+const durableRoles = sourceRuntime && !development
+  ? parseTrustedRoles(required('HOSTED_AGENT_ROLES'))
+  : undefined
+const durableArtifacts = sourceRuntime
+  ? new PostgresPatchArtifactRepository(sourceRuntime.pool)
+  : undefined
 const patchExport = sourceRuntime
   ? new PostgresPatchExportCoordinator(
       durableJournal!,
       durableState!,
       new PostgresPatchExportSourceResolver(sourceRuntime.pool, blobs),
-      new PostgresPatchArtifactRepository(sourceRuntime.pool),
+      durableArtifacts!,
       blobs,
       durableReclaimer!,
       {
@@ -115,7 +137,7 @@ const provider = new E2BProvider(connection, 120_000, {
   maxRoots: ingress.maxRoots,
   observe: observeWorkspaceTransfer,
 })
-const patchApplyPublisher = sourceRuntime
+const durablePublisher = sourceRuntime
   ? new WorkspaceSnapshotPublisher(durableState!, blobs, {
       archiveLimits,
       reclaimer: {
@@ -136,7 +158,7 @@ const patchApply = sourceRuntime
       durableState!,
       new PostgresPatchApplySourceResolver(sourceRuntime.pool, blobs),
       new PostgresPatchApplicationRepository(sourceRuntime.pool),
-      patchApplyPublisher!,
+      durablePublisher!,
       provider,
       { tenantId: sourceRuntime.principal.tenantId, workerId: durableWorkerId! },
     )
@@ -160,10 +182,16 @@ if (gatewayUrl.protocol !== 'wss:' && !(development && gatewayUrl.protocol === '
 if (gatewayUrl.username || gatewayUrl.password || gatewayUrl.search || gatewayUrl.hash) throw new Error('HOSTED_AGENT_GATEWAY_URL must not contain credentials, query, or fragment')
 const ticketTtlMs = positiveInteger('HOSTED_AGENT_TICKET_TTL_MS', 60_000)
 if (!development && (ticketTtlMs < 5_000 || ticketTtlMs > 300_000)) throw new Error('HOSTED_AGENT_TICKET_TTL_MS must be between 5000 and 300000')
-const tickets = new TicketIssuer(store, gatewayUrl.href, ticketTtlMs)
-const templates = JSON.parse(required('HOSTED_AGENT_TEMPLATES')) as Record<string, string>
+const tickets: TicketAuthority = development
+  ? new TicketIssuer(store!, gatewayUrl.href, ticketTtlMs)
+  : new PostgresTicketIssuer(
+      durableState!, sourceRuntime!.principal.tenantId, gatewayUrl.href, ticketTtlMs)
+const leases: ActiveLeaseDirectory = development ? store! : durableState!
+const templates = development
+  ? JSON.parse(required('HOSTED_AGENT_TEMPLATES')) as Record<string, string>
+  : {}
 const allowedRoots = development ? required('HOSTED_AGENT_ALLOWED_ROOTS').split(':').map(root => resolve(root)) : []
-const gateway = new ExecGateway(tickets, store, provider, {
+const gateway = new ExecGateway(tickets, leases, provider, {
   maxPayloadBytes: positiveInteger('HOSTED_AGENT_GATEWAY_MAX_PAYLOAD_BYTES', 1024 * 1024),
   maxConnections: positiveInteger('HOSTED_AGENT_GATEWAY_MAX_CONNECTIONS', 1024),
   maxConnectionsPerLease: positiveInteger('HOSTED_AGENT_GATEWAY_MAX_CONNECTIONS_PER_LEASE', 8),
@@ -172,14 +200,79 @@ const gateway = new ExecGateway(tickets, store, provider, {
   maxBufferedBytes: positiveInteger('HOSTED_AGENT_GATEWAY_MAX_BUFFERED_BYTES', 1024 * 1024),
   leaseRevalidationMs: positiveInteger('HOSTED_AGENT_GATEWAY_LEASE_REVALIDATION_MS', 5_000),
 })
-const service = new ControlPlane(store, provider, tickets, blobs, { templates, allowedRoots,
-  ingress,
-  ...(sourceRuntime ? { sourceSnapshots: {
-    principal: sourceRuntime.principal,
-    resolver: sourceRuntime.lifecycle,
-  } } : {}),
-  allowLocalIngress: development }, gateway)
-await service.reconcile()
+const developmentService = development
+  ? new ControlPlane(store!, provider, tickets, blobs, {
+      templates, allowedRoots, ingress,
+      ...(sourceRuntime ? { sourceSnapshots: {
+        principal: sourceRuntime.principal,
+        resolver: sourceRuntime.lifecycle,
+      } } : {}),
+      allowLocalIngress: true,
+    }, gateway)
+  : undefined
+const productionService = !development
+  ? new PostgresLifecycleService({
+      immutableSource: new PostgresProvisionCoordinator(
+        durableJournal!, durableState!, durablePublisher!, provider, tickets, {
+          principal: sourceRuntime!.principal, managedBy: durableManagedBy!,
+          workerId: durableWorkerId!, roles: durableRoles!,
+          sourceResolver: sourceRuntime!.lifecycle,
+        }),
+      durableRestore: new PostgresRestoreCoordinator(
+        durableJournal!, durableState!, durablePublisher!, provider, tickets,
+        new PostgresRestoreSourceResolver(durableState!, blobs), {
+          principal: sourceRuntime!.principal, managedBy: durableManagedBy!,
+          workerId: durableWorkerId!, roles: durableRoles!,
+        }),
+      // Child capture remains fail-closed until command traffic participates in the lease gate.
+      reconnect: new PostgresReconnectCoordinator(
+        durableJournal!, durableState!, provider, tickets, {
+          tenantId: sourceRuntime!.principal.tenantId,
+          workerId: durableWorkerId!, connections: gateway,
+        }),
+      checkpoint: new PostgresCheckpointCoordinator(
+        durableJournal!, durableState!, durablePublisher!, provider, {
+          tenantId: sourceRuntime!.principal.tenantId, workerId: durableWorkerId!,
+        }),
+      release: new PostgresReleaseCoordinator(
+        durableJournal!, durableState!, provider, {
+          tenantId: sourceRuntime!.principal.tenantId,
+          workerId: durableWorkerId!, connections: gateway,
+        }),
+    })
+  : undefined
+const service: AgentLifecycleService = developmentService ?? productionService!
+const generalReconciler = sourceRuntime
+  ? new PostgresReconciler(durableJournal!, durableState!, provider, {
+      managedBy: durableManagedBy!, tenantId: sourceRuntime.principal.tenantId,
+      workerId: `${durableWorkerId}:general-reconciler`,
+      staleAfterMs: positiveInteger('HOSTED_AGENT_STALE_MS', 5 * 60_000),
+      pollIntervalMs: positiveInteger('HOSTED_AGENT_RECONCILE_MS', 30_000),
+      workspaceRecovery: { preparations: durablePreparations!, reclaimer: durableReclaimer! },
+      patchExportRecovery: { artifacts: durableArtifacts!, reclaimer: durableReclaimer! },
+      connections: gateway,
+      onError: () => console.error(JSON.stringify({ event: 'reconciliation_failed' })),
+    })
+  : undefined
+const childReconciler = sourceRuntime
+  ? new PostgresChildReconciler(
+      durableJournal!, durableState!, provider,
+      { preparations: durablePreparations!, reclaimer: durableReclaimer! },
+      {
+        tenantId: sourceRuntime.principal.tenantId, managedBy: durableManagedBy!,
+        workerId: `${durableWorkerId}:child-reconciler`,
+        staleAfterMs: positiveInteger('HOSTED_AGENT_CHILD_STALE_MS', 5 * 60_000),
+        pollIntervalMs: positiveInteger('HOSTED_AGENT_CHILD_RECONCILE_MS', 30_000),
+        onError: () => console.error(JSON.stringify({ event: 'child_reconciliation_failed' })),
+      },
+    )
+  : undefined
+await developmentService?.reconcile()
+await generalReconciler?.runOnce()
+await childReconciler?.runOnce()
+await patchApplyReconciler?.runOnce()
+generalReconciler?.start()
+childReconciler?.start()
 patchApplyReconciler?.start()
 await startServer(service, gateway, { host, port, bearerToken: required('CODEX_HOSTED_AGENT_TOKEN'),
   ...(process.env.HOSTED_AGENT_TLS_CERT ? { tlsCertPath: process.env.HOSTED_AGENT_TLS_CERT } : {}),

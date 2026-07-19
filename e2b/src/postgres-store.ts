@@ -444,7 +444,8 @@ export class PostgresJournal {
 
   async claimStaleOperations(staleBefore: Date, limit: number, workerId: string,
     tenantId?: string, operationFilter?: string,
-    operationSubtypeFilter?: 'child' | 'none'): Promise<StaleOperation[]> {
+    operationSubtypeFilter?: 'child' | 'none',
+    excludedOperations?: string[]): Promise<StaleOperation[]> {
     if (!Number.isInteger(limit) || limit < 1 || limit > 1000) throw new Error('invalid stale-operation limit')
     validateWorkerId(workerId)
     if (tenantId !== undefined) {
@@ -459,6 +460,12 @@ export class PostgresJournal {
       && operationSubtypeFilter !== 'child' && operationSubtypeFilter !== 'none') {
       throw new Error('invalid operation subtype filter')
     }
+    if (excludedOperations !== undefined && (excludedOperations.length > 32
+      || new Set(excludedOperations).size !== excludedOperations.length
+      || excludedOperations.some(operation => !operation.trim()
+        || Buffer.byteLength(operation) > 128))) {
+      throw new Error('invalid excluded operations')
+    }
     return this.transaction(async client => {
       const result = await client.query<StaleRow>(`
         WITH candidates AS (
@@ -470,6 +477,7 @@ export class PostgresJournal {
             AND ($5::text IS NULL OR operation = $5)
             AND ($6::text IS NULL OR ($6 = 'none' AND operation_subtype IS NULL)
               OR operation_subtype = $6)
+            AND ($7::text[] IS NULL OR NOT (operation = ANY($7)))
           ORDER BY COALESCE(heartbeat_at, started_at), operation, idempotency_key
           FOR UPDATE SKIP LOCKED
           LIMIT $2
@@ -486,7 +494,7 @@ export class PostgresJournal {
                   candidates.worker_id AS previous_worker_id, operation.worker_id,
                   operation.primary_lease_id, operation.result_lease_id
       `, [staleBefore, limit, workerId, tenantId ?? null, operationFilter ?? null,
-        operationSubtypeFilter ?? null])
+        operationSubtypeFilter ?? null, excludedOperations ?? null])
       return result.rows.map(row => ({
         operation: row.operation,
         operationSubtype: row.operation_subtype,

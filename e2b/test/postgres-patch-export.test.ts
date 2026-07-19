@@ -192,6 +192,7 @@ async function fixture(): Promise<Fixture> {
     journal, states[index]!, new PostgresPatchExportSourceResolver(pools[index]!, objects), artifacts[index]!,
     objects, new PostgresObjectReclaimer(pools[index]!, objects), {
       tenantId, workerId: `patch-export-worker-${index}`, waitTimeoutMs: 5_000,
+      heartbeatIntervalMs: 10,
     })) as [PostgresPatchExportCoordinator, PostgresPatchExportCoordinator]
   const request: PatchExportRequest = {
     leaseId: 'lease-child', agentId: 'agent-child', baseSnapshotId: baseManifest.identity,
@@ -225,6 +226,10 @@ live('two replicas export one exact artifact and replay without another put', as
   const second = context.coordinators[1].exportPatch(context.request)
   await context.journals[1].inProgressObserved
   assert.equal(context.objects.puts, baselinePuts + 1)
+  await new Promise(resolve => setTimeout(resolve, 35))
+  assert.deepEqual(await context.journals[1].claimStaleOperations(
+    new Date(Date.now() - 20), 10, 'premature-patch-export-reconciler',
+    tenantId, 'patch_export', 'none'), [])
   gate.release()
   const [left, right] = await Promise.all([first, second])
   assert.deepEqual(left, right)

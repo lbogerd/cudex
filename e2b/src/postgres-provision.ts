@@ -37,6 +37,7 @@ export interface PostgresProvisionOptions {
       expectedChecksum: string): Promise<ResolvedSourceSnapshot>
   }
   waitTimeoutMs?: number
+  heartbeatIntervalMs?: number
 }
 
 interface LogicalProvisionResponse {
@@ -93,6 +94,7 @@ export class PostgresProvisionCoordinator {
   private readonly managedBy: string
   private readonly workerId: string
   private readonly waitTimeoutMs: number
+  private readonly heartbeatIntervalMs: number
 
   constructor(
     private readonly journal: PostgresJournal,
@@ -109,11 +111,15 @@ export class PostgresProvisionCoordinator {
     if (!Number.isSafeInteger(this.waitTimeoutMs) || this.waitTimeoutMs <= 0 || this.waitTimeoutMs > 5 * 60_000) {
       throw new Error('invalid operation wait timeout')
     }
+    this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? 15_000
+    if (!Number.isSafeInteger(this.heartbeatIntervalMs) || this.heartbeatIntervalMs <= 0
+      || this.heartbeatIntervalMs > 60_000) throw new Error('invalid operation heartbeat interval')
   }
 
   async provision(untrustedRequest: ProvisionRequest): Promise<ProvisionedAgent> {
     const request = validateProvisionRequest(untrustedRequest)
     if (request.source.type !== 'sourceSnapshot') throw new ServiceError(400, 'durable provision requires an immutable source snapshot')
+    const sourceRequest = request.source
     const role = this.options.roles[request.agentType]
     if (!role || role.sandboxTemplate !== request.sandboxTemplate) throw new ServiceError(422, 'invalid trusted agent role')
     bounded('provider template ID', role.providerTemplateId)
@@ -148,22 +154,22 @@ export class PostgresProvisionCoordinator {
     let preparationStarted = false
     let finalCommitStarted = false
     try {
-      const source = await this.options.sourceResolver.resolve(
-        this.options.principal, request.source.sourceSnapshotId, request.source.checksum)
-      if (source.sourceSnapshotId !== request.source.sourceSnapshotId
-        || source.checksum !== request.source.checksum || !(source.archive instanceof Uint8Array)) {
+      const source = await this.withHeartbeat(fence, () => this.options.sourceResolver.resolve(
+        this.options.principal, sourceRequest.sourceSnapshotId, sourceRequest.checksum))
+      if (source.sourceSnapshotId !== sourceRequest.sourceSnapshotId
+        || source.checksum !== sourceRequest.checksum || !(source.archive instanceof Uint8Array)) {
         throw new ServiceError(503, 'immutable source snapshot resolution mismatch')
       }
       const leaseId = generatedId('lease')
       const environmentId = generatedId('env')
       const snapshotId = generatedId('snapshot')
-      const created = await this.provider.create(role.providerTemplateId, {
+      const created = await this.withHeartbeat(fence, () => this.provider.create(role.providerTemplateId, {
         managedBy: this.managedBy,
         tenantId: this.tenantId,
         leaseId,
         agentId: request.agentId,
         sandboxTemplate: request.sandboxTemplate,
-      })
+      }))
       const sandboxResource = { kind: 'sandbox' as const, resourceId: created.sandboxId,
         allocation: undefined as OperationAllocation | undefined }
       providerAllocations.push(sandboxResource)
@@ -171,11 +177,14 @@ export class PostgresProvisionCoordinator {
         fence, 'sandbox', created.sandboxId)
       sandboxResource.allocation = sandboxAllocation
       await this.heartbeat(fence)
-      await this.provider.uploadArchive(created.sandboxId, source.archive)
-      await this.provider.startExecServer(created.sandboxId)
-      await this.provider.probeExecServer(created.sandboxId)
-      const archive = await this.provider.exportWorkspace(created.sandboxId)
-      const providerSnapshotId = await this.provider.snapshot(created.sandboxId)
+      await this.withHeartbeat(fence, () =>
+        this.provider.uploadArchive(created.sandboxId, source.archive))
+      await this.withHeartbeat(fence, () => this.provider.startExecServer(created.sandboxId))
+      await this.withHeartbeat(fence, () => this.provider.probeExecServer(created.sandboxId))
+      const archive = await this.withHeartbeat(
+        fence, () => this.provider.exportWorkspace(created.sandboxId))
+      const providerSnapshotId = await this.withHeartbeat(
+        fence, () => this.provider.snapshot(created.sandboxId))
       const snapshotResource = { kind: 'provider_snapshot' as const, resourceId: providerSnapshotId,
         allocation: undefined as OperationAllocation | undefined }
       providerAllocations.push(snapshotResource)
@@ -184,16 +193,16 @@ export class PostgresProvisionCoordinator {
       snapshotResource.allocation = snapshotAllocation
       await this.heartbeat(fence)
       preparationStarted = true
-      prepared = await this.publisher.prepareDurableBase({
+      prepared = await this.withHeartbeat(fence, () => this.publisher.prepareDurableBase({
         fence,
-        expectedSourceChecksum: request.source.checksum,
+        expectedSourceChecksum: sourceRequest.checksum,
         leaseId,
         environmentId,
         tenantId: this.tenantId,
         agentId: request.agentId,
         ownerAgentId: request.ownerAgentId,
         ownerLeaseId: null,
-        sourceSnapshotId: request.source.sourceSnapshotId,
+        sourceSnapshotId: sourceRequest.sourceSnapshotId,
         providerSandboxId: created.sandboxId,
         sandboxTemplate: request.sandboxTemplate,
         cwdUri: source.cwdUri,
@@ -201,7 +210,7 @@ export class PostgresProvisionCoordinator {
         toolPolicy: structuredClone(role.toolPolicy) as unknown as Record<string, unknown>,
         policyVersion: role.policyVersion,
         snapshot: { snapshotId, providerSnapshotId, archive, expiresAt: null },
-      })
+      }))
       finalCommitStarted = true
       committed = await this.journal.withProviderResourceLocks([
         { kind: 'sandbox', resourceId: created.sandboxId },
@@ -284,6 +293,21 @@ export class PostgresProvisionCoordinator {
     }
   }
 
+  private async withHeartbeat<T>(
+    fence: OperationIdentity & { generation: number; workerId: string },
+    call: () => Promise<T>): Promise<T> {
+    const timer = setInterval(() => {
+      void this.journal.heartbeatOperation(fence, fence.generation, fence.workerId)
+        .catch(() => undefined)
+    }, this.heartbeatIntervalMs)
+    timer.unref()
+    try {
+      const result = await call()
+      await this.heartbeat(fence)
+      return result
+    } finally { clearInterval(timer) }
+  }
+
   private async cleanupFailedProvision(
     fence: OperationIdentity & { generation: number; workerId: string },
     prepared: PreparedDurableBaseWorkspaceSnapshot | undefined,
@@ -292,14 +316,15 @@ export class PostgresProvisionCoordinator {
   ): Promise<boolean> {
     let failed = false
     if (prepared) {
-      try { await this.publisher.abortDurableBase(fence, prepared) }
+      try { await this.withHeartbeat(fence, () => this.publisher.abortDurableBase(fence, prepared)) }
       catch { failed = true }
     }
     for (const item of [...allocations].reverse()) {
       try {
         await this.journal.withProviderResourceLock(item.kind, item.resourceId, async client => {
-          if (item.kind === 'provider_snapshot') await this.provider.deleteSnapshot(item.resourceId)
-          else await this.provider.kill(item.resourceId)
+          if (item.kind === 'provider_snapshot') {
+            await this.withHeartbeat(fence, () => this.provider.deleteSnapshot(item.resourceId))
+          } else await this.withHeartbeat(fence, () => this.provider.kill(item.resourceId))
           if (item.allocation) {
             await this.journal.updateAllocationState(fence, fence.generation, fence.workerId,
               item.allocation.allocationId, 'reclaimed', client)

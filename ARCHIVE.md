@@ -522,6 +522,46 @@ PostgreSQL-backed 254-test suite pass with no skips. This coverage does not
 replace production PostgreSQL lifecycle dispatch or the final live E2B run with
 an unmodified Codex client.
 
+### Production PostgreSQL lifecycle dispatch
+
+Production startup now separates the lifecycle interface from the development
+`ControlPlane`. Explicit development mode retains the JSON store, local ticket
+issuer, and local lease directory. Outside development, no JSON control-plane
+state is opened: immutable-source provision, durable restore, checkpoint,
+reconnect, and release dispatch to their PostgreSQL coordinators. The gateway
+and every coordinator share one `PostgresTicketIssuer` and
+`PostgresDurableState`, so ticket hashes, connection generations, active sandbox
+lookup, replay, rotation, and revocation use one authority across replicas.
+Reconnect and release also revoke this replica's active gateway sockets after
+their durable transition.
+
+Trusted production roles now come from exact `HOSTED_AGENT_ROLES` JSON keyed by
+agent type. Each role contains only `sandboxTemplate`, `providerTemplateId`,
+`toolPolicy`, and positive `policyVersion`; names, policy domains/tools, counts,
+and UTF-8 byte lengths are bounded. Duplicate sandbox templates are rejected so
+restore cannot ambiguously select a policy. Local `rootWorkspace` ingress stays
+disabled in production. Child provision is deliberately not supplied to the
+production dispatcher yet: it returns a stable 503 until command traffic shares
+the lease gate, preventing a durable but command-inconsistent capture from being
+exposed.
+
+Startup runs the generic, child, and patch-apply reconcilers once before
+listening and then starts their non-overlapping bounded pollers. Generic stale
+claims explicitly exclude `patch_apply`, whose richer phase ledger belongs only
+to its dedicated reconciler; child subtype rows remain isolated as before.
+Immutable provision now continuously heartbeats source resolution, provider
+create/upload/start/probe/export/snapshot calls, workspace preparation, and
+cleanup. Patch export does the same around source resolution, artifact storage,
+and object reclamation. Live gated tests prove neither operation can be taken
+stale during a slow external call.
+
+Router, role configuration, exclusion-filter, heartbeat, and existing lifecycle
+coverage bring the complete Docker-backed PostgreSQL suite to 272 passing tests
+with no skips. The remaining production-dispatch gap is the durable command
+interaction gate required before child exposure (and for a fully
+command-consistent patch/checkpoint instant), plus the final live E2B client
+acceptance run.
+
 ### Canonical workspace comparison foundation
 
 Patch lifecycle code now has a provider-independent canonical workspace model

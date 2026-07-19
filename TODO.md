@@ -56,7 +56,7 @@ production backend. Stable decisions, evidence, and wire schemas are in
   commit across service replicas.
 - [x] Apply transactional lease/provider locking to durable release across
   service replicas and stale-operation takeover.
-- [ ] Apply transactional per-lease locks and deterministic multi-lease lock
+- [x] Apply transactional per-lease locks and deterministic multi-lease lock
   order to every remaining lifecycle mutation.
 - [x] Add composable same-transaction journal/state executors and sorted compound
   provider-resource locks so allocation recording, lease/snapshot commit,
@@ -86,6 +86,10 @@ production backend. Stable decisions, evidence, and wire schemas are in
   provision/checkpoint logical recovery, guarded provider inventory, and
   retained ticket cleanup. Keep it unwired until lifecycle writers share its
   provider-resource lock protocol.
+- [x] Select PostgreSQL lifecycle coordinators, ticket hashes, active-sandbox
+  directory, trusted roles, and bounded reconcilers in production startup for
+  immutable provision, restore, checkpoint, reconnect, release, and patch;
+  retain the JSON control plane only in explicit development mode.
 - [x] Reconcile stale durable release intent by preserving revoked access,
   retrying exact sandbox cleanup, and atomically terminalizing lease/allocation/
   operation state without deleting referenced snapshots or objects.
@@ -178,7 +182,7 @@ tickets always fail, and secrets never enter durable or observable state.
   corruption, and quota excess.
 - [x] Strictly validate exact provision, reconnect, checkpoint, and release
   request shapes plus bounded provision/reconnect/checkpoint responses at HTTP.
-- [ ] Extend strict validation and authorization to patch requests, trusted
+- [x] Extend strict validation and authorization to patch requests, trusted
   template/role mappings, and persisted tenant/owner relationships.
 - [x] Strictly validate the exact patch export/apply request and tagged response
   wire shapes, including bounded checksums, counts, sizes, canonical conflicts,

@@ -158,8 +158,8 @@ export class PostgresReconciler {
     }
     const staleBefore = new Date(Date.now() - this.options.staleAfterMs)
     const operations = await this.journal.claimStaleOperations(
-      staleBefore, this.options.maxOperationsPerRun, this.options.workerId, this.options.tenantId,
-      undefined, 'none',
+      staleBefore, this.options.maxOperationsPerRun, this.options.workerId,
+      this.options.tenantId, undefined, 'none', ['patch_apply'],
     )
     result.operationsClaimed = operations.length
     for (const operation of operations) await this.reconcileOperation(operation, result)

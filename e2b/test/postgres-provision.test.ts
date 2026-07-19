@@ -237,7 +237,7 @@ async function fixture(provider: FakeProvider = new FakeProvider(), failFirstTic
     const tickets = index === 0 && failFirstTicket ? new FailOnceTickets(issuer) : issuer
     return new PostgresProvisionCoordinator(journal, states[index]!, publishers[index]!, provider, tickets, {
         principal, managedBy: 'cudex', workerId: `provision-worker-${index}`,
-        roles: { default: role }, sourceResolver: lifecycle,
+        roles: { default: role }, sourceResolver: lifecycle, heartbeatIntervalMs: 10,
       })
   }) as [PostgresProvisionCoordinator, PostgresProvisionCoordinator]
   const checkpointCoordinators = journals.map((journal, index) =>
@@ -281,6 +281,10 @@ test('durable provision serializes two replicas and replays one adopted allocati
           WHERE allocation_kind = 'sandbox' AND state = 'allocated') AS sandboxes
     `)
     assert.deepEqual(blocked.rows[0], { operations: '1', sandboxes: '1' })
+    await new Promise(resolve => setTimeout(resolve, 35))
+    assert.deepEqual(await context.journals[1].claimStaleOperations(
+      new Date(Date.now() - 20), 10, 'premature-provision-reconciler',
+      tenantId, 'provision', 'none'), [])
     provider.releaseUpload()
     const [left, right] = await Promise.all([first, second])
     assert.deepEqual({ ...left, connection: undefined }, { ...right, connection: undefined })

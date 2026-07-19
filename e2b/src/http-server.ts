@@ -2,7 +2,7 @@ import { createServer as createHttpServer, type IncomingMessage, type ServerResp
 import { createServer as createHttpsServer } from 'node:https'
 import { readFile } from 'node:fs/promises'
 import { timingSafeEqual } from 'node:crypto'
-import type { ControlPlane } from './service.js'
+import type { AgentLifecycleService } from './lifecycle-service.js'
 import { ServiceError } from './types.js'
 import type { ExecGateway } from './gateway.js'
 import type { AuthenticatedSourceSnapshotApi } from './source-snapshot-api.js'
@@ -112,7 +112,7 @@ function sourceEnvelope(bytes: Buffer): { metadata: unknown; archive: Uint8Array
   try { metadata = JSON.parse(metadataText) } catch { throw new ServiceError(400, 'invalid source snapshot metadata') }
   return { metadata, archive: Uint8Array.from(bytes.subarray(4 + metadataLength)) }
 }
-export async function startServer(service: ControlPlane, gateway: ExecGateway, options: ServerOptions) {
+export async function startServer(service: AgentLifecycleService, gateway: ExecGateway, options: ServerOptions) {
   if (Boolean(options.tlsCertPath) !== Boolean(options.tlsKeyPath)) throw new Error('TLS certificate and key must be configured together')
   if (!options.tlsCertPath && !options.allowInsecureHttp) throw new Error('TLS is required unless development HTTP is explicitly enabled')
   if (options.sourceSnapshots && (!Number.isSafeInteger(options.sourceSnapshots.maxArchiveBytes)

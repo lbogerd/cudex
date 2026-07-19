@@ -286,7 +286,7 @@ function validateConnection(value: unknown, leaseId: string): { execServerUrl: s
   return { execServerUrl: endpoint }
 }
 
-function validateToolPolicy(value: unknown): ToolPolicy {
+export function validateToolPolicy(value: unknown): ToolPolicy {
   const record = object(value, ['allowedDomains', 'allowedTools'], responseFailure, 'tool policy')
   const domains = array(record.allowedDomains, contractLimits.maxAllowedDomains, responseFailure, 'allowed domains', true)
   const allowedDomains = domains.map(domain => {

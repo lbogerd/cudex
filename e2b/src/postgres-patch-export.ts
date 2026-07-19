@@ -36,6 +36,7 @@ export interface PostgresPatchExportOptions {
   artifactTtlMs?: number
   waitTimeoutMs?: number
   cleanupBatchSize?: number
+  heartbeatIntervalMs?: number
 }
 
 const operation = 'patch_export'
@@ -109,6 +110,7 @@ export class PostgresPatchExportCoordinator {
   private readonly artifactTtlMs: number
   private readonly waitTimeoutMs: number
   private readonly cleanupBatchSize: number
+  private readonly heartbeatIntervalMs: number
 
   constructor(
     private readonly journal: PostgresJournal,
@@ -124,12 +126,15 @@ export class PostgresPatchExportCoordinator {
     this.artifactTtlMs = options.artifactTtlMs ?? 7 * 24 * 60 * 60_000
     this.waitTimeoutMs = options.waitTimeoutMs ?? 30_000
     this.cleanupBatchSize = options.cleanupBatchSize ?? 100
+    this.heartbeatIntervalMs = options.heartbeatIntervalMs ?? 15_000
     if (!Number.isSafeInteger(this.artifactTtlMs) || this.artifactTtlMs < 1000
       || this.artifactTtlMs > 30 * 24 * 60 * 60_000) throw new Error('invalid artifact TTL')
     if (!Number.isSafeInteger(this.waitTimeoutMs) || this.waitTimeoutMs <= 0
       || this.waitTimeoutMs > 5 * 60_000) throw new Error('invalid operation wait timeout')
     if (!Number.isSafeInteger(this.cleanupBatchSize) || this.cleanupBatchSize < 1
       || this.cleanupBatchSize > 1000) throw new Error('invalid cleanup batch size')
+    if (!Number.isSafeInteger(this.heartbeatIntervalMs) || this.heartbeatIntervalMs <= 0
+      || this.heartbeatIntervalMs > 60_000) throw new Error('invalid operation heartbeat interval')
   }
 
   async exportPatch(untrustedRequest: PatchExportRequest): Promise<AgentPatchArtifact> {
@@ -160,14 +165,14 @@ export class PostgresPatchExportCoordinator {
     let finalCommitStarted = false
     try {
       await this.heartbeat(fence)
-      const initial = await this.sourceResolver.resolve({
+      const initial = await this.withHeartbeat(fence, () => this.sourceResolver.resolve({
         tenantId: this.tenantId, leaseId: request.leaseId,
         agentId: request.agentId, baseSnapshotId: request.baseSnapshotId,
-      })
+      }))
       const serialized = serializedSource(initial)
       const artifactId = deterministicPatchExportId('artifact', identity)
       const objectId = deterministicPatchExportId('object', identity, serialized.checksum)
-      const physicalId = await this.objects.put(serialized.bytes)
+      const physicalId = await this.withHeartbeat(fence, () => this.objects.put(serialized.bytes))
       if (serialized.checksum !== `sha256:${physicalId}`) {
         throw new ServiceError(503, 'patch artifact storage mismatch')
       }
@@ -266,6 +271,21 @@ export class PostgresPatchExportCoordinator {
     }
   }
 
+  private async withHeartbeat<T>(
+    fence: OperationIdentity & { generation: number; workerId: string },
+    call: () => Promise<T>): Promise<T> {
+    const timer = setInterval(() => {
+      void this.journal.heartbeatOperation(fence, fence.generation, fence.workerId)
+        .catch(() => undefined)
+    }, this.heartbeatIntervalMs)
+    timer.unref()
+    try {
+      const result = await call()
+      await this.heartbeat(fence)
+      return result
+    } finally { clearInterval(timer) }
+  }
+
   private async recoverCommitOutcome(identity: OperationIdentity, requestHash: string, leaseId: string,
     fence: OperationIdentity & { generation: number; workerId: string }): Promise<
       Extract<OperationClaim, { kind: 'succeeded' }> | null> {
@@ -283,8 +303,8 @@ export class PostgresPatchExportCoordinator {
 
   private async cleanup(fence: OperationIdentity & { generation: number; workerId: string }): Promise<boolean> {
     try {
-      await this.reclaimer.reclaimOperationObjects(
-        fence, fence.generation, fence.workerId, this.cleanupBatchSize)
+      await this.withHeartbeat(fence, () => this.reclaimer.reclaimOperationObjects(
+        fence, fence.generation, fence.workerId, this.cleanupBatchSize))
       const allocations = await this.journal.listAllocations(fence, this.cleanupBatchSize + 1)
       return allocations.length <= this.cleanupBatchSize
         && allocations.every(item => item.state === 'reclaimed')

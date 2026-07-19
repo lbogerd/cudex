@@ -131,6 +131,27 @@ live('child operation subtype is immutable, replay-exact, and stale-claim filter
   assert.equal(remaining[0]!.operationSubtype, null)
 })
 
+live('stale claims can exclude operations owned by a dedicated reconciler', async context => {
+  for (const operation of ['provision', 'patch_apply']) {
+    await context.first.claimOperation({
+      operation, idempotencyKey: `exclude-${operation}`, tenantId: 'tenant-1',
+      requestHash: canonicalRequestHash({ operation }), workerId: `worker-${operation}`,
+    })
+  }
+  await context.firstPool.query(`
+    UPDATE hosted_agent_operations SET heartbeat_at = now() - interval '1 hour'
+  `)
+  const general = await context.second.claimStaleOperations(
+    new Date(), 10, 'general-reconciler', 'tenant-1', undefined, 'none', ['patch_apply'])
+  assert.deepEqual(general.map(value => value.operation), ['provision'])
+  const dedicated = await context.first.claimStaleOperations(
+    new Date(), 10, 'patch-reconciler', 'tenant-1', 'patch_apply', 'none')
+  assert.deepEqual(dedicated.map(value => value.operation), ['patch_apply'])
+  await assert.rejects(context.first.claimStaleOperations(
+    new Date(), 10, 'invalid-reconciler', 'tenant-1', undefined, 'none',
+    ['patch_apply', 'patch_apply']), /invalid excluded operations/)
+})
+
 live('journal validation, heartbeat, terminal failure, and database identities are enforced', async context => {
   await assert.rejects(context.first.claimOperation({
     operation: 'release', idempotencyKey: 'bad-hash', tenantId: 'tenant-1',
