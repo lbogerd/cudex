@@ -47,6 +47,7 @@ interface ArtifactRow {
 interface SnapshotRow {
   snapshot_id: string
   lease_id: string
+  workspace_archive_object_id: string
   manifest_object_id: string
   manifest_checksum: string
   state: string
@@ -87,6 +88,14 @@ export interface ResolvedPatchApplySource {
     expiresAt: Date
   }
   plan: PatchApplicationPlan
+}
+
+export interface ResolvedPatchApplyRecoveryTarget {
+  leaseId: string
+  agentId: string
+  providerSandboxId: string
+  latestSnapshotId: string
+  archive: Uint8Array
 }
 
 /** A stable, non-disclosing apply rejection rather than an infrastructure failure. */
@@ -134,6 +143,72 @@ export class PostgresPatchApplySourceResolver {
     } finally {
       client.release()
     }
+  }
+
+  /** Resolves only the exact pre-apply target, independent of later artifact expiry. */
+  async resolveRecoveryTarget(input: {
+    tenantId: string
+    targetLeaseId: string
+    sourceTargetSnapshotId: string
+    targetProviderSandboxId: string
+  }, executor?: PoolClient): Promise<ResolvedPatchApplyRecoveryTarget> {
+    if (![input.tenantId, input.targetLeaseId, input.sourceTargetSnapshotId,
+      input.targetProviderSandboxId].every(validId)) {
+      throw new ServiceError(400, 'invalid patch apply recovery request')
+    }
+    const resolve = async (client: PoolClient): Promise<ResolvedPatchApplyRecoveryTarget> => {
+      await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
+        [`hosted-agent:lease:${input.tenantId}:${input.targetLeaseId}`])
+      const targetResult = await client.query<TargetLeaseRow>(`
+        SELECT lease_id, agent_id, provider_sandbox_id, latest_snapshot_id, state
+        FROM hosted_agent_leases
+        WHERE tenant_id = $1 AND lease_id = $2
+        FOR UPDATE
+      `, [input.tenantId, input.targetLeaseId])
+      const target = targetResult.rows[0]
+      if (!target || !['active', 'paused'].includes(target.state)
+        || target.provider_sandbox_id !== input.targetProviderSandboxId
+        || target.latest_snapshot_id !== input.sourceTargetSnapshotId) {
+        throw new ServiceError(409, 'patch apply recovery target changed')
+      }
+      const now = new Date()
+      const snapshot = await this.targetSnapshot(client, input.tenantId,
+        input.targetLeaseId, input.sourceTargetSnapshotId, now)
+      const rows = await this.objectReferences(
+        client, input.tenantId, 'snapshot', input.sourceTargetSnapshotId)
+      const archives = rows.filter(row => row.purpose === 'workspace_archive'
+        && row.object_id === snapshot.workspace_archive_object_id)
+      if (archives.length !== 1 || rows.some(row => row.purpose === 'workspace_archive'
+        && row.object_id !== snapshot.workspace_archive_object_id)
+        || archives[0]!.kind !== 'workspace_archive') {
+        throw new ServiceError(503, 'patch apply recovery archive unavailable')
+      }
+      const archive = await this.verifiedBytes(archives[0]!, now)
+      return {
+        leaseId: target.lease_id, agentId: target.agent_id,
+        providerSandboxId: target.provider_sandbox_id,
+        latestSnapshotId: target.latest_snapshot_id,
+        archive,
+      }
+    }
+    if (executor) {
+      try { return await resolve(executor) }
+      catch (error) {
+        if (error instanceof ServiceError) throw error
+        throw new ServiceError(503, 'patch apply recovery source unavailable')
+      }
+    }
+    const client = await this.pool.connect()
+    try {
+      await client.query('BEGIN')
+      const target = await resolve(client)
+      await client.query('COMMIT')
+      return target
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined)
+      if (error instanceof ServiceError) throw error
+      throw new ServiceError(503, 'patch apply recovery source unavailable')
+    } finally { client.release() }
   }
 
   private async resolveSafely(input: {
@@ -250,7 +325,8 @@ export class PostgresPatchApplySourceResolver {
   private async artifactSnapshots(executor: Queryable, tenantId: string, artifact: ArtifactRow,
     now: Date): Promise<Map<string, SnapshotRow>> {
     const result = await executor.query<SnapshotRow>(`
-      SELECT snapshot_id, lease_id, manifest_object_id, manifest_checksum, state, expires_at
+      SELECT snapshot_id, lease_id, workspace_archive_object_id,
+             manifest_object_id, manifest_checksum, state, expires_at
       FROM hosted_agent_snapshots
       WHERE tenant_id = $1 AND snapshot_id = ANY($2::text[])
       FOR SHARE
@@ -291,7 +367,8 @@ export class PostgresPatchApplySourceResolver {
   private async targetSnapshot(executor: Queryable, tenantId: string, leaseId: string,
     snapshotId: string, now: Date): Promise<SnapshotRow> {
     const result = await executor.query<SnapshotRow>(`
-      SELECT snapshot_id, lease_id, manifest_object_id, manifest_checksum, state, expires_at
+      SELECT snapshot_id, lease_id, workspace_archive_object_id,
+             manifest_object_id, manifest_checksum, state, expires_at
       FROM hosted_agent_snapshots
       WHERE tenant_id = $1 AND snapshot_id = $2
       FOR SHARE

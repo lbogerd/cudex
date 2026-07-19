@@ -294,10 +294,30 @@ export class PostgresPatchApplicationRepository {
     validateFence(fence); validateId('application ID', applicationId)
     return this.inTransaction(executor, async client => {
       const application = await this.locked(client, fence, applicationId)
-      if (application.phase === 'checkpointed') return application
-      if (application.phase !== 'swapped') {
+      if (application.phase !== 'swapped' && application.phase !== 'checkpointed') {
         throw new PatchApplicationConflictError('patch application is not ready to checkpoint')
       }
+      await this.requireCheckpoint(client, application)
+      if (application.phase === 'checkpointed') return application
+      return this.updated(client, applicationId,
+        `phase = 'checkpointed', checkpointed_at = now()`, [])
+    })
+  }
+
+  async verifyCheckpointed(fence: PatchApplicationFence, applicationId: string,
+    executor?: PoolClient): Promise<PatchApplication> {
+    validateFence(fence); validateId('application ID', applicationId)
+    return this.inTransaction(executor, async client => {
+      const application = await this.locked(client, fence, applicationId)
+      if (application.phase !== 'checkpointed') {
+        throw new PatchApplicationConflictError('patch application is not checkpointed')
+      }
+      await this.requireCheckpoint(client, application)
+      return application
+    })
+  }
+
+  private async requireCheckpoint(client: Queryable, application: PatchApplication): Promise<void> {
       const snapshot = await client.query(`
         SELECT 1
         FROM hosted_agent_snapshots AS snapshot
@@ -319,9 +339,6 @@ export class PostgresPatchApplicationRepository {
       if (snapshot.rowCount !== 1) {
         throw new PatchApplicationConflictError('patch application checkpoint is unavailable')
       }
-      return this.updated(client, applicationId,
-        `phase = 'checkpointed', checkpointed_at = now()`, [])
-    })
   }
 
   async beginRollback(fence: PatchApplicationFence, applicationId: string,

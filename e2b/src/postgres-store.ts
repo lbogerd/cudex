@@ -430,20 +430,27 @@ export class PostgresJournal {
     return executor ? bind(executor) : this.transaction(bind)
   }
 
-  async claimStaleOperations(staleBefore: Date, limit: number, workerId: string, tenantId?: string): Promise<StaleOperation[]> {
+  async claimStaleOperations(staleBefore: Date, limit: number, workerId: string,
+    tenantId?: string, operationFilter?: string): Promise<StaleOperation[]> {
     if (!Number.isInteger(limit) || limit < 1 || limit > 1000) throw new Error('invalid stale-operation limit')
     validateWorkerId(workerId)
     if (tenantId !== undefined) {
       if (!tenantId.trim() || Buffer.byteLength(tenantId) > 512) throw new Error('invalid tenant ID')
     }
+    if (operationFilter !== undefined) {
+      if (!operationFilter.trim() || Buffer.byteLength(operationFilter) > 128) {
+        throw new Error('invalid operation filter')
+      }
+    }
     return this.transaction(async client => {
       const result = await client.query<StaleRow>(`
         WITH candidates AS (
-          SELECT operation, idempotency_key, worker_id
+          SELECT operation, idempotency_key, tenant_id, worker_id
           FROM hosted_agent_operations
           WHERE state = 'in_progress'
             AND COALESCE(heartbeat_at, started_at) < $1
             AND ($4::text IS NULL OR tenant_id = $4)
+            AND ($5::text IS NULL OR operation = $5)
           ORDER BY COALESCE(heartbeat_at, started_at), operation, idempotency_key
           FOR UPDATE SKIP LOCKED
           LIMIT $2
@@ -454,11 +461,12 @@ export class PostgresJournal {
         FROM candidates
         WHERE operation.operation = candidates.operation
           AND operation.idempotency_key = candidates.idempotency_key
+          AND operation.tenant_id = candidates.tenant_id
         RETURNING operation.operation, operation.idempotency_key, operation.tenant_id,
                   operation.request_hash, operation.generation::text,
                   candidates.worker_id AS previous_worker_id, operation.worker_id,
                   operation.primary_lease_id, operation.result_lease_id
-      `, [staleBefore, limit, workerId, tenantId ?? null])
+      `, [staleBefore, limit, workerId, tenantId ?? null, operationFilter ?? null])
       return result.rows.map(row => ({
         operation: row.operation,
         idempotencyKey: row.idempotency_key,

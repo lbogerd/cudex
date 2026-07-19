@@ -196,6 +196,7 @@ export class PostgresPatchApplyCoordinator {
     let resultSnapshot: { resourceId: string; allocation?: OperationAllocation } | undefined
     let prepared: PreparedDurableBaseWorkspaceSnapshot | undefined
     let finalCommitStarted = false
+    let providerSnapshotOutcomeAmbiguous = false
     try {
       const initial = await this.transaction(client, async () => {
         await this.heartbeat(fence, client)
@@ -253,9 +254,11 @@ export class PostgresPatchApplyCoordinator {
       if (!('application' in initial)) return initial
       mutation = initial
 
+      providerSnapshotOutcomeAmbiguous = true
       const rollbackId = await this.withHeartbeat(fence, () => this.provider.snapshot(
         mutation!.source.target.providerSandboxId,
         { name: patchApplyProviderSnapshotName('rollback', fence) }))
+      providerSnapshotOutcomeAmbiguous = false
       rollback = { resourceId: rollbackId }
       await this.transaction(client, async () => {
         await this.journal.lockProviderResources(
@@ -294,9 +297,11 @@ export class PostgresPatchApplyCoordinator {
         ? mutation.source.plan.manifest : null)) {
         throw new ServiceError(503, 'provider patch application did not match its plan')
       }
+      providerSnapshotOutcomeAmbiguous = true
       const resultProviderId = await this.withHeartbeat(fence, () => this.provider.snapshot(
         mutation!.source.target.providerSandboxId,
         { name: patchApplyProviderSnapshotName('result', fence) }))
+      providerSnapshotOutcomeAmbiguous = false
       resultSnapshot = { resourceId: resultProviderId }
       await this.transaction(client, async () => {
         await this.journal.lockProviderResources(
@@ -381,6 +386,9 @@ export class PostgresPatchApplyCoordinator {
       const rolledBack = await this.rollbackFailure(
         fence, mutation, rollback, resultSnapshot, prepared, client)
       if (!rolledBack) throw new ServiceError(503, 'durable patch apply cleanup pending')
+      if (providerSnapshotOutcomeAmbiguous) {
+        throw new ServiceError(503, 'durable patch apply cleanup pending')
+      }
       const failure = error instanceof ServiceError && error.status < 500
         ? error : new ServiceError(503, 'durable patch apply failed')
       await this.transaction(client, () => this.journal.failOperation(
@@ -398,6 +406,15 @@ export class PostgresPatchApplyCoordinator {
     client: PoolClient): Promise<boolean> {
     let failed = false
     let rollbackRestored = rollback?.allocation === undefined
+    if (mutation && !rollback?.allocation && mutation.application.phase === 'planned') {
+      try {
+        await this.transaction(client, async () => {
+          mutation!.application = await this.applications.markFailed(
+            fence, mutation!.application.applicationId,
+            'patch application failed before provider mutation', client)
+        })
+      } catch { failed = true }
+    }
     if (mutation && rollback?.allocation) {
       try {
         await this.transaction(client, async () => {
@@ -422,7 +439,31 @@ export class PostgresPatchApplyCoordinator {
       try { await this.cleanupProviderSnapshot(fence, snapshot, client) }
       catch { failed = true }
     }
+    for (const kind of ['rollback', 'result'] as const) {
+      try { await this.cleanupUnledgeredProviderSnapshot(fence, kind) }
+      catch { failed = true }
+    }
     return !failed
+  }
+
+  private async cleanupUnledgeredProviderSnapshot(fence: PatchApplicationFence,
+    kind: 'rollback' | 'result'): Promise<void> {
+    const name = patchApplyProviderSnapshotName(kind, fence)
+    const snapshots = await this.provider.listSnapshots({ name })
+    if (snapshots.length > 1 || snapshots.some(value => !value.names.includes(name))) {
+      throw new Error(`ambiguous deterministic patch apply ${kind} snapshot inventory`)
+    }
+    const snapshot = snapshots[0]
+    if (!snapshot || await this.state.findSnapshotByProviderIdForReconciliation(snapshot.snapshotId)
+      || await this.journal.hasUnreclaimedAllocation('provider_snapshot', snapshot.snapshotId)) return
+    await this.journal.withProviderResourceLock('provider_snapshot', snapshot.snapshotId,
+      async client => {
+        await this.heartbeat(fence, client)
+        if (await this.state.findSnapshotByProviderIdForReconciliation(snapshot.snapshotId, client)
+          || await this.journal.hasUnreclaimedAllocation(
+            'provider_snapshot', snapshot.snapshotId, client)) return
+        await this.provider.deleteSnapshot(snapshot.snapshotId)
+      })
   }
 
   private async cleanupProviderSnapshot(fence: PatchApplicationFence,

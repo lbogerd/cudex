@@ -622,7 +622,40 @@ fails closed when the PostgreSQL runtime is absent rather than calling the JSON
 control plane. Focused HTTP tests cover every result tag, extra tenant-field
 rejection before dispatch, malformed coordinator output, and unavailable durable
 service behavior. The full PostgreSQL-backed suite passed 244 tests with no
-skips. Stale apply-phase reconciliation remains outstanding.
+skips.
+
+A production-wired, patch-apply-only reconciler now claims stale operations with
+an explicit tenant and `patch_apply` filter, without enabling the general
+inventory reconciler against lifecycle sandboxes still owned by the JSON control
+plane. It holds the same session lease lock as a live apply, validates the
+immutable application and exact allocation metadata, and resolves the original
+workspace archive directly from the checksummed durable source snapshot without
+depending on an artifact that may have expired. Before checkpoint it
+conservatively restores every ambiguous `swap_started`, `swapped`, or
+`rollback_started` outcome, aborts and reclaims staged workspace objects, removes
+ledgered and deterministic-name unledgered provider snapshots, and only then
+fails the operation terminally. A verified `checkpointed` attempt instead
+preserves every adopted result resource, reclaims only rollback state, and
+reconstructs the exact `applied` response.
+
+Provider deletion failure remains retryable, resource deletion rechecks durable
+snapshot and unfinished-allocation guards under the provider-resource lock, and
+the checkpoint repository now revalidates the complete latest-snapshot/object
+graph even on phase replay. Recovery rechecks the original canonical request
+hash and the exact committed preparation, numeric object-allocation set, result
+provider allocation, provider snapshot, archive, and manifest identities before
+completing. Snapshot RPC failures whose server-side outcome is ambiguous remain
+in progress for a later deterministic inventory pass even when immediate cleanup
+finds nothing. The stale-claim update also carries tenant identity through its
+candidate/update join as defense in depth.
+
+Seven additional live tests cover lost rollback/result snapshot responses,
+expired-artifact rollback-ready recovery with a missing redundant content blob
+and without claiming an unrelated checkpoint, an unledgered rollback snapshot,
+ambiguous swap-started rollback plus cleanup retry, swapped prepared-object and
+unledgered-result cleanup, and checkpoint-commit-before-response completion.
+The checkpoint case deliberately crosses single- to double-digit allocation IDs.
+The full PostgreSQL-backed suite passed 251 tests with no skips.
 
 ### Durable patch-artifact repository
 

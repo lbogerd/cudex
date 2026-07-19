@@ -6,21 +6,38 @@ import type { ObjectStore } from '../src/blob-store.js'
 import { runMigrations } from '../src/migrate.js'
 import { buildPatchApplyArchive } from '../src/patch-apply-archive.js'
 import { PostgresPatchApplySourceResolver } from '../src/postgres-patch-apply-source.js'
-import { PostgresPatchApplyCoordinator } from '../src/postgres-patch-apply.js'
+import {
+  deterministicPatchApplyId,
+  patchApplyProviderSnapshotName,
+  PostgresPatchApplyCoordinator,
+} from '../src/postgres-patch-apply.js'
+import {
+  type PatchApplyReconcileResult,
+  PostgresPatchApplyReconciler,
+} from '../src/postgres-patch-apply-reconciler.js'
 import { serializePatchArtifact } from '../src/patch-artifact.js'
 import { PostgresPatchArtifactRepository } from '../src/postgres-artifacts.js'
-import { PostgresPatchApplicationRepository } from '../src/postgres-patch-applications.js'
+import {
+  type PatchApplication,
+  type PatchApplicationFence,
+  PostgresPatchApplicationRepository,
+} from '../src/postgres-patch-applications.js'
 import { PostgresObjectReclaimer } from '../src/postgres-object-reclaimer.js'
 import { PostgresDurableState, type StoredObject } from '../src/postgres-state.js'
-import { PostgresJournal } from '../src/postgres-store.js'
+import { canonicalRequestHash, PostgresJournal } from '../src/postgres-store.js'
 import { PostgresWorkspacePreparations } from '../src/postgres-workspace-preparations.js'
 import { ServiceError } from '../src/types.js'
 import {
   createWorkspaceManifest,
+  workspaceManifestChecksum,
   type WorkspaceEntry,
   type WorkspaceManifest,
 } from '../src/workspace-manifest.js'
-import { WorkspaceSnapshotPublisher, type PublishedWorkspaceSnapshot } from '../src/workspace-snapshots.js'
+import {
+  type PreparedDurableBaseWorkspaceSnapshot,
+  type PublishedWorkspaceSnapshot,
+  WorkspaceSnapshotPublisher,
+} from '../src/workspace-snapshots.js'
 import { FakeProvider } from './fake-provider.js'
 
 const databaseUrl = process.env.HOSTED_AGENT_TEST_DATABASE_URL
@@ -54,6 +71,7 @@ class TrackingObjects implements ObjectStore {
 
 class FailOnceExportProvider extends FakeProvider {
   failNextExport = false
+  ambiguousSnapshotName: string | undefined
   override async exportWorkspace(sandboxId: string): Promise<Uint8Array> {
     if (this.failNextExport) {
       this.failNextExport = false
@@ -61,12 +79,24 @@ class FailOnceExportProvider extends FakeProvider {
     }
     return super.exportWorkspace(sandboxId)
   }
+  override async snapshot(sandboxId: string, options: { name?: string } = {}): Promise<string> {
+    const snapshotId = await super.snapshot(sandboxId, options)
+    if (options.name && options.name === this.ambiguousSnapshotName) {
+      this.ambiguousSnapshotName = undefined
+      throw new Error('injected lost snapshot response')
+    }
+    return snapshotId
+  }
 }
 
 interface Fixture {
   admin: Pool
   pools: [Pool, Pool]
   states: [PostgresDurableState, PostgresDurableState]
+  journals: [PostgresJournal, PostgresJournal]
+  reclaimers: [PostgresObjectReclaimer, PostgresObjectReclaimer]
+  preparations: [PostgresWorkspacePreparations, PostgresWorkspacePreparations]
+  publishers: [WorkspaceSnapshotPublisher, WorkspaceSnapshotPublisher]
   provider: FailOnceExportProvider
   objects: TrackingObjects
   coordinators: [PostgresPatchApplyCoordinator, PostgresPatchApplyCoordinator]
@@ -86,7 +116,7 @@ async function archive(manifest: WorkspaceManifest,
   })))
 }
 
-async function fixture(conflictingTarget = false): Promise<Fixture> {
+async function fixture(conflictingTarget = false, artifactTtlMs = 60_000): Promise<Fixture> {
   const schema = `hosted_agent_patch_apply_${randomUUID().replaceAll('-', '')}`
   const admin = new Pool({ connectionString: databaseUrl })
   await admin.query(`CREATE SCHEMA ${schema}`)
@@ -98,14 +128,17 @@ async function fixture(conflictingTarget = false): Promise<Fixture> {
   const journals = pools.map(pool => new PostgresJournal(pool)) as [PostgresJournal, PostgresJournal]
   const objects = new TrackingObjects()
   const provider = new FailOnceExportProvider()
-  const reclaimers = pools.map(pool => new PostgresObjectReclaimer(pool, objects))
+  const reclaimers = pools.map(pool => new PostgresObjectReclaimer(pool, objects)) as
+    [PostgresObjectReclaimer, PostgresObjectReclaimer]
+  const preparations = pools.map(pool => new PostgresWorkspacePreparations(pool)) as
+    [PostgresWorkspacePreparations, PostgresWorkspacePreparations]
   const publishers = pools.map((pool, index) => new WorkspaceSnapshotPublisher(
     states[index]!, objects, {
       reclaimer: { async reclaimUnreferencedWorkspaceObject() {
         assert.fail('test fixture publication must not require legacy cleanup')
       } },
       durablePreparation: {
-        journal: journals[index]!, preparations: new PostgresWorkspacePreparations(pool),
+        journal: journals[index]!, preparations: preparations[index]!,
         reclaimer: reclaimers[index]!,
       },
     })) as [WorkspaceSnapshotPublisher, WorkspaceSnapshotPublisher]
@@ -206,7 +239,7 @@ async function fixture(conflictingTarget = false): Promise<Fixture> {
     contentObjects: [{ path: changedContent.path, objectId: changedContent.objectId }],
     checksum: serialized.checksum, changedFiles: serialized.changedFiles,
     sizeBytes: serialized.sizeBytes, state: 'available',
-    expiresAt: new Date(Date.now() + 60_000),
+    expiresAt: new Date(Date.now() + artifactTtlMs),
     baseManifest: childBaseManifest, currentManifest: childCurrentManifest,
   })
 
@@ -219,7 +252,8 @@ async function fixture(conflictingTarget = false): Promise<Fixture> {
     ...childCurrentManifest.entries, file('roots/0/owner', ownerBytes),
   ])
   return {
-    admin, pools, states, provider, objects, coordinators, targetArchive, targetManifest,
+    admin, pools, states, journals, reclaimers, preparations, publishers,
+    provider, objects, coordinators, targetArchive, targetManifest,
     expectedManifest, targetLeaseId: 'lease-target', targetSandboxId: targetSandbox.sandboxId,
     artifactId: 'artifact-1', schema,
   }
@@ -232,12 +266,148 @@ async function cleanup(context: Fixture): Promise<void> {
 }
 
 const live = (name: string, conflict: boolean,
-  fn: (context: Fixture) => Promise<void>) => test(name, {
+  fn: (context: Fixture) => Promise<void>, artifactTtlMs = 60_000) => test(name, {
   skip: databaseUrl ? false : 'HOSTED_AGENT_TEST_DATABASE_URL is not set',
 }, async () => {
-  const context = await fixture(conflict)
+  const context = await fixture(conflict, artifactTtlMs)
   try { await fn(context) } finally { await cleanup(context) }
 })
+
+interface SeededApplication {
+  fence: PatchApplicationFence
+  application: PatchApplication
+  resultArchive: Uint8Array
+  resultProviderSnapshotId?: string
+  prepared?: PreparedDurableBaseWorkspaceSnapshot
+}
+
+async function seedInterruptedApplication(context: Fixture, idempotencyKey: string,
+  phase: 'planned' | 'rollback_ready' | 'swap_started' | 'swapped' | 'checkpointed',
+  options: { mutateAfterSwapStarted?: boolean; resultSnapshot?: 'none' | 'unledgered' | 'ledgered';
+    prepareWorkspace?: boolean } = {}): Promise<SeededApplication> {
+  const identity = { operation: 'patch_apply', idempotencyKey, tenantId }
+  const request = { targetLeaseId: context.targetLeaseId, artifactId: context.artifactId,
+    idempotencyKey }
+  const claim = await context.journals[0].claimOperation({
+    ...identity, requestHash: canonicalRequestHash(request), workerId: 'crashed-apply-worker',
+    primaryLeaseId: context.targetLeaseId,
+  })
+  assert.equal(claim.kind, 'claimed')
+  if (claim.kind !== 'claimed') throw new Error('test operation was not claimed')
+  const fence = { ...identity, generation: claim.generation,
+    workerId: 'crashed-apply-worker' } satisfies PatchApplicationFence
+  const resultSnapshotId = deterministicPatchApplyId('snapshot', identity)
+  const source = await new PostgresPatchApplySourceResolver(
+    context.pools[0], context.objects).resolve({
+      tenantId, targetLeaseId: context.targetLeaseId,
+      artifactId: context.artifactId, resultSnapshotId,
+    })
+  assert.equal(source.plan.type, 'ready')
+  if (source.plan.type !== 'ready') throw new Error('test patch plan was not ready')
+  const content = new Map([...source.target.contentObjects, ...source.artifact.contentObjects]
+    .map(value => [value.objectId, value]))
+  const resultArchive = await archive(source.plan.manifest,
+    source.plan.contentObjects.map(value => {
+      const body = content.get(value.objectId)!
+      return { path: value.path, objectId: value.objectId, bytes: body.bytes }
+    }))
+  const applications = new PostgresPatchApplicationRepository(context.pools[0])
+  let application = await applications.create({
+    ...identity, applicationId: deterministicPatchApplyId('application', identity),
+    createdGeneration: claim.generation, targetLeaseId: context.targetLeaseId,
+    artifactId: context.artifactId, sourceTargetSnapshotId: source.target.latestSnapshotId,
+    targetProviderSandboxId: source.target.providerSandboxId, resultSnapshotId,
+    resultManifestChecksum: workspaceManifestChecksum(source.plan.manifest),
+    resultArchiveChecksum: checksum(resultArchive),
+    resultArchiveSizeBytes: resultArchive.byteLength,
+  }, fence)
+  if (phase === 'planned') return { fence, application, resultArchive }
+
+  const rollbackId = await context.provider.snapshot(context.targetSandboxId,
+    { name: patchApplyProviderSnapshotName('rollback', identity) })
+  const rollbackAllocation = await context.journals[0].recordAllocation(
+    identity, fence.generation, fence.workerId, {
+      kind: 'provider_snapshot', resourceId: rollbackId, leaseId: context.targetLeaseId,
+      metadata: { purpose: 'patch_apply_rollback', applicationId: application.applicationId,
+        name: patchApplyProviderSnapshotName('rollback', identity) },
+    })
+  application = await applications.recordRollback(fence, application.applicationId, {
+    allocationId: rollbackAllocation.allocationId, providerSnapshotId: rollbackId,
+  })
+  if (phase === 'rollback_ready') return { fence, application, resultArchive }
+
+  application = await applications.markSwapStarted(fence, application.applicationId)
+  if (options.mutateAfterSwapStarted || phase !== 'swap_started') {
+    await context.provider.uploadArchive(context.targetSandboxId, resultArchive)
+  }
+  if (phase === 'swap_started') return { fence, application, resultArchive }
+  application = await applications.markSwapped(fence, application.applicationId)
+
+  let resultProviderSnapshotId: string | undefined
+  let resultAllocationId: string | undefined
+  if ((options.resultSnapshot ?? (phase === 'checkpointed' ? 'ledgered' : 'none')) !== 'none') {
+    resultProviderSnapshotId = await context.provider.snapshot(context.targetSandboxId,
+      { name: patchApplyProviderSnapshotName('result', identity) })
+    if ((options.resultSnapshot ?? 'ledgered') === 'ledgered' || phase === 'checkpointed') {
+      const allocation = await context.journals[0].recordAllocation(
+        identity, fence.generation, fence.workerId, {
+          kind: 'provider_snapshot', resourceId: resultProviderSnapshotId,
+          leaseId: context.targetLeaseId,
+          metadata: { purpose: 'patch_apply_checkpoint', applicationId: application.applicationId,
+            name: patchApplyProviderSnapshotName('result', identity) },
+        })
+      resultAllocationId = allocation.allocationId
+    }
+  }
+
+  let prepared: PreparedDurableBaseWorkspaceSnapshot | undefined
+  if (options.prepareWorkspace || phase === 'checkpointed') {
+    const lease = (await context.states[0].getLease(tenantId, context.targetLeaseId))!
+    assert.ok(resultProviderSnapshotId)
+    prepared = await context.publishers[0].prepareDurableBase({
+      fence, expectedSourceChecksum: null,
+      expectedLatestSnapshotId: source.target.latestSnapshotId,
+      leaseId: lease.leaseId, environmentId: lease.environmentId, tenantId: lease.tenantId,
+      agentId: lease.agentId, ownerAgentId: lease.ownerAgentId,
+      ownerLeaseId: lease.ownerLeaseId, sourceSnapshotId: null,
+      providerSandboxId: lease.providerSandboxId!, sandboxTemplate: lease.sandboxTemplate,
+      cwdUri: lease.cwdUri, workspaceRootUris: [...lease.workspaceRootUris],
+      toolPolicy: structuredClone(lease.toolPolicy), policyVersion: lease.policyVersion,
+      snapshot: { snapshotId: resultSnapshotId,
+        providerSnapshotId: resultProviderSnapshotId!, archive: resultArchive, expiresAt: null },
+    })
+  }
+  if (phase === 'checkpointed') {
+    assert.ok(prepared); assert.ok(resultProviderSnapshotId); assert.ok(resultAllocationId)
+    await context.journals[0].withProviderResourceLocks([
+      { kind: 'provider_snapshot', resourceId: rollbackId },
+      { kind: 'provider_snapshot', resourceId: resultProviderSnapshotId! },
+    ], async client => {
+      const durable = await context.publishers[0].commitDurableCheckpoint(fence, prepared!, client)
+      await context.journals[0].bindLeaseAndAdoptAllocations(
+        fence, fence.generation, fence.workerId, context.targetLeaseId,
+        [resultAllocationId!, ...durable.objectAllocationIds], client)
+      application = await applications.markCheckpointed(fence, application.applicationId, client)
+    })
+  }
+  return { fence, application, resultArchive,
+    ...(resultProviderSnapshotId ? { resultProviderSnapshotId } : {}),
+    ...(prepared ? { prepared } : {}) }
+}
+
+async function reconcileInterrupted(context: Fixture): Promise<PatchApplyReconcileResult> {
+  await context.pools[0].query(`UPDATE hosted_agent_operations
+    SET heartbeat_at = now() - interval '1 hour'
+    WHERE operation = 'patch_apply' AND state = 'in_progress'`)
+  return new PostgresPatchApplyReconciler(
+    context.journals[1], context.states[1],
+    new PostgresPatchApplySourceResolver(context.pools[1], context.objects),
+    new PostgresPatchApplicationRepository(context.pools[1]), context.provider,
+    { preparations: context.preparations[1], reclaimer: context.reclaimers[1] },
+    { tenantId, workerId: 'patch-apply-reconciler', staleAfterMs: 1_000,
+      heartbeatIntervalMs: 100, pollIntervalMs: 1_000 },
+  ).runOnce()
+}
 
 live('atomically applies, checkpoints, cleans rollback, and replays without mutation', false,
   async context => {
@@ -342,4 +512,200 @@ live('restores the exact pre-apply archive and terminalizes after a post-swap fa
     })
     await assert.rejects(context.coordinators[1].applyPatch(request),
       (error: unknown) => error instanceof ServiceError && error.status === 503)
+  })
+
+for (const kind of ['rollback', 'result'] as const) {
+  live(`reclaims a ${kind} snapshot whose provider response was lost`, false,
+    async context => {
+      const idempotencyKey = `apply-ambiguous-${kind}`
+      const identity = { operation: 'patch_apply', idempotencyKey, tenantId }
+      context.provider.ambiguousSnapshotName = patchApplyProviderSnapshotName(kind, identity)
+      await assert.rejects(context.coordinators[0].applyPatch({
+        targetLeaseId: context.targetLeaseId, artifactId: context.artifactId, idempotencyKey,
+      }), (error: unknown) => error instanceof ServiceError && error.status === 503)
+      assert.equal((await context.provider.listSnapshots({
+        name: patchApplyProviderSnapshotName(kind, identity),
+      })).length, 0)
+      assert.deepEqual(context.provider.sandboxes.get(context.targetSandboxId)!.bytes,
+        context.targetArchive)
+      const graph = await context.pools[0].query<{ phase: string; state: string }>(`
+        SELECT application.phase, operation.state
+        FROM hosted_agent_patch_applications AS application
+        JOIN hosted_agent_operations AS operation USING (operation, idempotency_key, tenant_id)
+        WHERE application.idempotency_key = $1
+      `, [idempotencyKey])
+      assert.deepEqual(graph.rows[0], {
+        phase: kind === 'rollback' ? 'failed' : 'rolled_back', state: 'in_progress',
+      })
+      const recovered = await reconcileInterrupted(context)
+      assert.deepEqual({ failed: recovered.operationsFailed,
+        pending: recovered.allocationsPending }, { failed: 1, pending: 0 })
+      assert.equal((await context.pools[0].query<{ state: string }>(`
+        SELECT state FROM hosted_agent_operations
+        WHERE operation = 'patch_apply' AND idempotency_key = $1
+      `, [idempotencyKey])).rows[0]!.state, 'failed_terminal')
+    })
+}
+
+live('reconciles rollback-ready interruption after artifact expiry without claiming other operations', false,
+  async context => {
+    const seeded = await seedInterruptedApplication(
+      context, 'apply-stale-rollback-ready', 'rollback_ready')
+    const checkpointIdentity = {
+      operation: 'checkpoint', idempotencyKey: 'unrelated-stale-checkpoint', tenantId,
+    }
+    const checkpointClaim = await context.journals[0].claimOperation({
+      ...checkpointIdentity, requestHash: canonicalRequestHash(checkpointIdentity),
+      workerId: 'unrelated-worker', primaryLeaseId: context.targetLeaseId,
+    })
+    assert.equal(checkpointClaim.kind, 'claimed')
+    const targetContent = await context.pools[0].query<{ checksum: string }>(`
+      SELECT object_row.checksum
+      FROM hosted_agent_object_references AS reference
+      JOIN hosted_agent_objects AS object_row ON object_row.object_id = reference.object_id
+      WHERE reference.reference_kind = 'snapshot' AND reference.reference_id = $1
+        AND reference.purpose = 'content_blob'
+      ORDER BY object_row.object_id LIMIT 1
+    `, [context.targetManifest.identity])
+    assert.equal(context.objects.values.delete(
+      targetContent.rows[0]!.checksum.slice('sha256:'.length)), true)
+    await new Promise(resolve => setTimeout(resolve, 550))
+    const result = await reconcileInterrupted(context)
+    assert.deepEqual({ claimed: result.operationsClaimed, failed: result.operationsFailed,
+      pending: result.allocationsPending }, { claimed: 1, failed: 1, pending: 0 })
+    assert.deepEqual(context.provider.sandboxes.get(context.targetSandboxId)!.bytes,
+      context.targetArchive)
+    const graph = await context.pools[0].query<{
+      phase: string; operation_state: string; allocation_state: string
+    }>(`
+      SELECT application.phase, operation.state AS operation_state,
+             allocation.state AS allocation_state
+      FROM hosted_agent_patch_applications AS application
+      JOIN hosted_agent_operations AS operation USING (operation, idempotency_key, tenant_id)
+      JOIN hosted_agent_operation_allocations AS allocation
+        ON allocation.allocation_id = application.rollback_allocation_id
+      WHERE application.application_id = $1
+    `, [seeded.application.applicationId])
+    assert.deepEqual(graph.rows[0], {
+      phase: 'rolled_back', operation_state: 'failed_terminal', allocation_state: 'reclaimed',
+    })
+    assert.equal((await context.provider.listSnapshots({
+      name: patchApplyProviderSnapshotName('rollback', seeded.fence),
+    })).length, 0)
+    const unrelated = await context.pools[0].query<{ generation: string; worker_id: string }>(`
+      SELECT generation::text, worker_id FROM hosted_agent_operations
+      WHERE operation = 'checkpoint' AND idempotency_key = $1
+    `, [checkpointIdentity.idempotencyKey])
+    assert.deepEqual(unrelated.rows[0], { generation: '0', worker_id: 'unrelated-worker' })
+  }, 500)
+
+live('reclaims a rollback snapshot created before its allocation was journaled', false,
+  async context => {
+    const seeded = await seedInterruptedApplication(
+      context, 'apply-stale-unledgered-rollback', 'planned')
+    const orphan = await context.provider.snapshot(context.targetSandboxId,
+      { name: patchApplyProviderSnapshotName('rollback', seeded.fence) })
+    assert.equal(context.provider.snapshots.has(orphan), true)
+    const result = await reconcileInterrupted(context)
+    assert.deepEqual({ failed: result.operationsFailed, pending: result.allocationsPending },
+      { failed: 1, pending: 0 })
+    assert.equal(context.provider.snapshots.has(orphan), false)
+    const graph = await context.pools[0].query<{ phase: string; state: string }>(`
+      SELECT application.phase, operation.state
+      FROM hosted_agent_patch_applications AS application
+      JOIN hosted_agent_operations AS operation USING (operation, idempotency_key, tenant_id)
+      WHERE application.application_id = $1
+    `, [seeded.application.applicationId])
+    assert.deepEqual(graph.rows[0], { phase: 'failed', state: 'failed_terminal' })
+  })
+
+live('retries cleanup after restoring an ambiguous swap-started provider outcome', false,
+  async context => {
+    const seeded = await seedInterruptedApplication(
+      context, 'apply-stale-swap-started', 'swap_started', { mutateAfterSwapStarted: true })
+    assert.notDeepEqual(context.provider.sandboxes.get(context.targetSandboxId)!.bytes,
+      context.targetArchive)
+    context.provider.failAt = 'deleteSnapshot'
+    const first = await reconcileInterrupted(context)
+    assert.deepEqual({ failed: first.operationsFailed, pending: first.allocationsPending },
+      { failed: 0, pending: 1 })
+    assert.deepEqual(context.provider.sandboxes.get(context.targetSandboxId)!.bytes,
+      context.targetArchive)
+    assert.equal((await new PostgresPatchApplicationRepository(
+      context.pools[0]).getForOperation(seeded.fence))?.phase, 'rolled_back')
+    context.provider.failAt = undefined
+    const second = await reconcileInterrupted(context)
+    assert.deepEqual({ failed: second.operationsFailed, pending: second.allocationsPending },
+      { failed: 1, pending: 0 })
+    const allocations = await context.journals[1].listAllocations(seeded.fence)
+    assert.equal(allocations.every(value => value.state === 'reclaimed'), true)
+  })
+
+live('reconciles an ambiguous completed swap, staged objects, and unledgered result snapshot', false,
+  async context => {
+    const seeded = await seedInterruptedApplication(context, 'apply-stale-swapped', 'swapped', {
+      resultSnapshot: 'unledgered', prepareWorkspace: true,
+    })
+    assert.notDeepEqual(context.provider.sandboxes.get(context.targetSandboxId)!.bytes,
+      context.targetArchive)
+    const beforePreparation = await context.preparations[0].getForOperation(seeded.fence)
+    assert.equal(beforePreparation?.state, 'prepared')
+    const result = await reconcileInterrupted(context)
+    assert.equal(result.operationsFailed, 1)
+    assert.equal(result.allocationsPending, 0)
+    assert.ok(result.allocationsReclaimed >= 4)
+    assert.deepEqual(context.provider.sandboxes.get(context.targetSandboxId)!.bytes,
+      context.targetArchive)
+    assert.equal((await context.preparations[1].getForOperation(seeded.fence))?.state,
+      'reclaimed')
+    assert.equal((await context.provider.listSnapshots({
+      name: patchApplyProviderSnapshotName('result', seeded.fence),
+    })).length, 0)
+    const final = await context.journals[1].listAllocations(seeded.fence)
+    assert.ok(final.length > 1)
+    assert.equal(final.every(value => value.state === 'reclaimed'), true)
+  })
+
+live('reconciles checkpoint commit before response without rolling back the durable result', false,
+  async context => {
+    const prefixIdentity = {
+      operation: 'patch_export', idempotencyKey: 'allocation-sequence-prefix', tenantId,
+    }
+    const prefix = await context.journals[0].claimOperation({
+      ...prefixIdentity, requestHash: canonicalRequestHash(prefixIdentity), workerId: 'prefix-worker',
+    })
+    assert.equal(prefix.kind, 'claimed')
+    if (prefix.kind !== 'claimed') return
+    for (let index = 0; index < 5; index++) {
+      const allocation = await context.journals[0].recordAllocation(
+        prefixIdentity, prefix.generation, 'prefix-worker', {
+          kind: 'object', resourceId: `prefix-object-${index}`,
+        })
+      await context.journals[0].updateAllocationState(
+        prefixIdentity, prefix.generation, 'prefix-worker', allocation.allocationId, 'reclaimed')
+    }
+    await context.journals[0].failOperation(
+      prefixIdentity, prefix.generation, 'prefix-worker', 'test_complete', 'test prefix complete')
+    const seeded = await seedInterruptedApplication(
+      context, 'apply-stale-checkpointed', 'checkpointed')
+    assert.ok(seeded.resultProviderSnapshotId)
+    const result = await reconcileInterrupted(context)
+    assert.deepEqual({ claimed: result.operationsClaimed, completed: result.operationsCompleted,
+      failed: result.operationsFailed, pending: result.allocationsPending },
+    { claimed: 1, completed: 1, failed: 0, pending: 0 })
+    assert.deepEqual(context.provider.sandboxes.get(context.targetSandboxId)!.bytes,
+      seeded.resultArchive)
+    const lease = await context.states[1].getLease(tenantId, context.targetLeaseId)
+    assert.equal(lease?.latestSnapshotId, seeded.application.resultSnapshotId)
+    assert.equal(context.provider.snapshots.has(seeded.resultProviderSnapshotId!), true)
+    assert.equal((await context.provider.listSnapshots({
+      name: patchApplyProviderSnapshotName('rollback', seeded.fence),
+    })).length, 0)
+    const replay = await context.coordinators[0].applyPatch({
+      targetLeaseId: context.targetLeaseId, artifactId: context.artifactId,
+      idempotencyKey: 'apply-stale-checkpointed',
+    })
+    assert.deepEqual(replay, { type: 'applied', checkpoint: {
+      snapshotId: seeded.application.resultSnapshotId,
+    } })
   })

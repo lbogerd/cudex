@@ -291,7 +291,7 @@ Exit criterion: a durable checksummed artifact remains usable after child releas
 - [x] Create a rollback snapshot, stage and validate the complete result away
   from the live workspace, then atomically swap it into place.
 - [x] Persist the post-apply durable checkpoint before responding.
-- [ ] Reconcile crashes between rollback, staging, swap, checkpoint, and response.
+- [x] Reconcile crashes between rollback, staging, swap, checkpoint, and response.
 
 Exit criterion: clean changes apply atomically; conflicts do not mutate; binary,
 mode, symlink, addition, and deletion behavior matches the Codex fake.

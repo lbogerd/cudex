@@ -19,6 +19,7 @@ import { PostgresPatchExportCoordinator } from './postgres-patch-export.js'
 import { PostgresPatchApplySourceResolver } from './postgres-patch-apply-source.js'
 import { PostgresPatchApplicationRepository } from './postgres-patch-applications.js'
 import { PostgresPatchApplyCoordinator } from './postgres-patch-apply.js'
+import { PostgresPatchApplyReconciler } from './postgres-patch-apply-reconciler.js'
 import { PostgresWorkspacePreparations } from './postgres-workspace-preparations.js'
 import { WorkspaceSnapshotPublisher } from './workspace-snapshots.js'
 
@@ -87,6 +88,9 @@ const sourceRuntime = await createSourceSnapshotRuntime({
 const durableJournal = sourceRuntime ? new PostgresJournal(sourceRuntime.pool) : undefined
 const durableState = sourceRuntime ? new PostgresDurableState(sourceRuntime.pool) : undefined
 const durableReclaimer = sourceRuntime ? new PostgresObjectReclaimer(sourceRuntime.pool, blobs) : undefined
+const durablePreparations = sourceRuntime
+  ? new PostgresWorkspacePreparations(sourceRuntime.pool)
+  : undefined
 const durableWorkerId = sourceRuntime ? required('HOSTED_AGENT_WORKER_ID') : undefined
 const patchExport = sourceRuntime
   ? new PostgresPatchExportCoordinator(
@@ -121,7 +125,7 @@ const patchApplyPublisher = sourceRuntime
       },
       durablePreparation: {
         journal: durableJournal!,
-        preparations: new PostgresWorkspacePreparations(sourceRuntime.pool),
+        preparations: durablePreparations!,
         reclaimer: durableReclaimer!,
       },
     })
@@ -135,6 +139,20 @@ const patchApply = sourceRuntime
       patchApplyPublisher!,
       provider,
       { tenantId: sourceRuntime.principal.tenantId, workerId: durableWorkerId! },
+    )
+  : undefined
+const patchApplyReconciler = sourceRuntime
+  ? new PostgresPatchApplyReconciler(
+      durableJournal!, durableState!,
+      new PostgresPatchApplySourceResolver(sourceRuntime.pool, blobs),
+      new PostgresPatchApplicationRepository(sourceRuntime.pool), provider,
+      { preparations: durablePreparations!, reclaimer: durableReclaimer! },
+      {
+        tenantId: sourceRuntime.principal.tenantId, workerId: durableWorkerId!,
+        staleAfterMs: positiveInteger('HOSTED_AGENT_PATCH_APPLY_STALE_MS', 5 * 60_000),
+        pollIntervalMs: positiveInteger('HOSTED_AGENT_PATCH_APPLY_RECONCILE_MS', 30_000),
+        onError: () => console.error(JSON.stringify({ event: 'patch_apply_reconciliation_failed' })),
+      },
     )
   : undefined
 const gatewayUrl = new URL(required('HOSTED_AGENT_GATEWAY_URL'))
@@ -162,6 +180,7 @@ const service = new ControlPlane(store, provider, tickets, blobs, { templates, a
   } } : {}),
   allowLocalIngress: development }, gateway)
 await service.reconcile()
+patchApplyReconciler?.start()
 await startServer(service, gateway, { host, port, bearerToken: required('CODEX_HOSTED_AGENT_TOKEN'),
   ...(process.env.HOSTED_AGENT_TLS_CERT ? { tlsCertPath: process.env.HOSTED_AGENT_TLS_CERT } : {}),
   ...(process.env.HOSTED_AGENT_TLS_KEY ? { tlsKeyPath: process.env.HOSTED_AGENT_TLS_KEY } : {}),

@@ -588,6 +588,25 @@ export class PostgresWorkspacePreparations {
     return result.rows[0] ? preparationFromRow(result.rows[0]) : null
   }
 
+  /** Read-only recovery identity for every object allocation associated with one preparation. */
+  async listObjectAllocationIdsForReconciliation(identity: OperationIdentity,
+    executor: Pick<PoolClient, 'query'> = this.pool): Promise<string[]> {
+    id('operation', identity.operation, 128)
+    id('idempotency key', identity.idempotencyKey)
+    id('tenant ID', identity.tenantId)
+    const result = await executor.query<{ allocation_id: string }>(`
+      SELECT prepared_object.allocation_id::text
+      FROM hosted_agent_workspace_preparation_objects AS prepared_object
+      JOIN hosted_agent_workspace_preparations AS preparation
+        ON preparation.preparation_id = prepared_object.preparation_id
+       AND preparation.tenant_id = prepared_object.tenant_id
+      WHERE preparation.operation = $1 AND preparation.idempotency_key = $2
+        AND preparation.tenant_id = $3
+      ORDER BY prepared_object.allocation_id
+    `, [identity.operation, identity.idempotencyKey, identity.tenantId])
+    return result.rows.map(row => allocationId(row.allocation_id))
+  }
+
   private assertExact(preparation: WorkspacePreparation | null, fence: PreparationFence,
     intentHash: string, encodedIntent: string, expectedState: WorkspacePreparationState): void {
     if (!preparation || preparation.state !== expectedState) {

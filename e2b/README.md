@@ -112,7 +112,9 @@ Patch export and application are served from the same durable runtime at
 back to the JSON control plane. Apply returns the exact tagged `applied`,
 `conflict`, or `rejected` result, and a normal conflict is HTTP 200.
 `HOSTED_AGENT_ARTIFACT_TTL_MS` controls artifact retention and defaults to seven
-days.
+days. The apply-only reconciler claims no other operation types;
+`HOSTED_AGENT_PATCH_APPLY_STALE_MS` and
+`HOSTED_AGENT_PATCH_APPLY_RECONCILE_MS` default to five minutes and 30 seconds.
 
 Production mode requires a TLS certificate/key pair and a `wss:`
 `HOSTED_AGENT_GATEWAY_URL`. Plain HTTP and `ws:` are accepted only when
