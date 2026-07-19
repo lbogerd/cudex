@@ -30,16 +30,16 @@ complete until a real ChatGPT-authenticated automated run passes.
 
 ## 4. Acceptance and cleanup
 
-- [ ] Inspect exact run-owned PostgreSQL lifecycle state and E2B metadata.
-- [ ] Verify the active root workspace through its exact provider sandbox ID.
-- [ ] Assert child isolation, patch application, release, thread-tree deletion, and marker.
-- [ ] Add graceful cleanup, scoped forced cleanup, idempotency, and exit-code behavior.
-- [ ] Scan retained logs/reports for credential and ticket taint.
+- [x] Inspect exact run-owned PostgreSQL lifecycle state and E2B metadata.
+- [x] Verify the active root workspace through its exact provider sandbox ID.
+- [x] Assert child isolation, patch application, release, thread-tree deletion, and marker.
+- [x] Add graceful cleanup, scoped forced cleanup, idempotency, and exit-code behavior.
+- [x] Scan retained logs/reports for credential and ticket taint.
 
 ## 5. Documentation and verified evidence
 
-- [ ] Document every public command, prerequisite, cost, warning, and recovery path.
-- [ ] Run the full relevant E2B suite and confirm `codex/codex-rs` is unchanged.
+- [x] Document every public command, prerequisite, cost, warning, and recovery path.
+- [x] Run the full relevant E2B suite and confirm `codex/codex-rs` is unchanged.
 - [ ] Run a real ChatGPT-authenticated automated proof and record redacted evidence.
 - [ ] Run interactive mode when needed for diagnosis and record its acceptance result.
 - [ ] Commit and push each sizeable implementation chunk.

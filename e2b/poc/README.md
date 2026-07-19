@@ -55,6 +55,12 @@ Each live proof creates at least a root and child E2B sandbox and may create
 provider snapshots, so normal E2B compute/storage costs apply. On interruption,
 run `status` and then `down`. Cleanup is strictly scoped to the run's tenant and
 `managedBy` marker; the POC never inventories or deletes unaffiliated resources.
+Retained reports contain only lifecycle IDs and assertion booleans. Exit 0 means
+functional and service-owned cleanup acceptance passed, exit 1 means a
+functional/lifecycle failure, exit 2 means preflight/configuration failure, and
+exit 3 means the functional flow passed but exact provider cleanup needed forced
+intervention. Set `POC_KEEP_ON_FAILURE=true` only for diagnosis, then use
+`status` and `down` promptly to avoid continued E2B and Docker resource costs.
 
 The current secured E2B public-port route to exec-server port 22101 is accepted
 only for this proof. Private/reverse executor transport and removal of this

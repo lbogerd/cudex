@@ -102,6 +102,49 @@ deletion order, isolated app-server startup, initialize, and ChatGPT account
 preflight. App-server stderr is capped and exact auth/bearer values are redacted
 before the retained mode-`0600` log is written. No raw protocol stream is logged.
 
+## POC lifecycle inspection and exact cleanup (2026-07-19)
+
+Acceptance now joins app-server evidence to durable PostgreSQL records using the
+exact `poc-<run-id>` tenant. The inspector covers leases, operations, snapshots,
+artifacts, patch applications, operation allocations (including capture
+sandboxes), live tickets, and unfinished lease interactions. It requires distinct
+root/child leases, environments, and provider sandbox IDs; exact child ownership;
+released child state; an available child artifact; a checkpointed application;
+and a root latest snapshot advanced to the application result.
+
+Before thread deletion, the runner connects only to the root lease's persisted
+E2B sandbox ID and runs `./verify.sh` plus the owner-only `/tmp` marker assertion
+inside `/workspace/roots/0/fixture`. It retains only the boolean result. Provider
+inventory is filtered by the exact `managedBy=cudex-poc-<run-id>` and tenant
+metadata pair. Snapshot inspection starts only from provider IDs recorded in the
+same tenant's leases and allocations; no provider-wide snapshot inventory is
+performed.
+
+Cleanup attempts root-tree deletion, gracefully stops Codex, waits up to 60
+seconds for direct release and configured reconcilers, and then requires released
+leases, terminal operations, no pending allocations, no live tickets or
+interactions, and no exact-scope E2B sandboxes or known snapshots. When necessary,
+forced cleanup kills only the filtered sandboxes and deletes only provider
+snapshot IDs read from the run's durable records. A functionally successful run
+that needs that intervention exits 3; functional/lifecycle failure exits 1 and
+configuration failure exits 2. `down` uses this same exact cleanup path.
+
+The report serializer rejects secret-shaped fields, connection/ticket URLs, and
+exact generated credential taint. Retained control/app logs are bounded and
+scanned for E2B/Codex/Garage/database credentials, bearer material, WSS ticket
+URLs, and auth JSON markers. Unit evidence covers every SQL tenant predicate,
+the exact provider metadata filter, known-ID-only deletion, cleanup idempotency,
+functional/cleanup state evaluation, and log/report taint rejection. The live
+ChatGPT/E2B acceptance remains pending on a current matching Codex artifact,
+template metadata, and user-owned ignored `.env` credentials.
+
+Chunk 4 verification ran all 315 TypeScript tests: 190 passed and 125
+PostgreSQL/live-provider cases were correctly skipped without their opt-in
+environment. The opt-in Docker POC integration separately passed repeatable
+migrations, Garage readiness and S3 round-trip/delete, production HTTPS source
+upload/resolve, TLS validation, and volume teardown. `codex/codex-rs` remained
+unchanged.
+
 The Codex-side sources of truth are:
 
 - `codex/codex-rs/hosted-agent/src/types.rs` for wire and lifecycle types;

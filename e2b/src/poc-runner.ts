@@ -5,6 +5,7 @@ import process from 'node:process'
 import { spawn } from 'node:child_process'
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
+import { parseEnv } from 'node:util'
 import { copyAuthJsonToRuntime, createCodexProcessEnvironment, removeRuntimeAuth, validateAuthJsonFile } from './poc-auth.js'
 import { createRunId, generateCodexConfiguration, generateRuntimeSecrets, pocRunPaths, prepareRunFiles,
   resolveRepositoryPath, validateGeneratedCodexConfiguration, validatePocProvenance,
@@ -21,12 +22,21 @@ import { archiveWorkspace } from './ingress.js'
 import { uploadSourceSnapshot } from './source-snapshot-client.js'
 import { deleteThreadTree, initializeAndReadAccount, runAutomatedTurn, startPocAppServer,
   type PocAppServerEvidence, type PocAppServerProcess } from './poc-app-server-client.js'
+import { evaluatePocCleanupInspection, evaluatePocFunctionalInspection, openPocDatabaseInspector,
+  PocProviderInspector, retainedFilesAreRedacted, serializePocReport,
+  type PocDatabaseInspection, type PocFunctionalInspection } from './poc-inspector.js'
 
 const e2bRoot = resolve(dirname(new URL(import.meta.url).pathname), '..', '..')
 const repositoryRoot = resolve(e2bRoot, '..')
 const envPath = `${e2bRoot}/poc/.env`
 const pointerPath = `${e2bRoot}/.state/poc/current`
 const exec = promisify(execFile)
+
+function existingTlsMaterial(paths: PocRunPaths): PocTlsMaterial {
+  return { caCertificatePath: `${paths.tlsDirectory}/ca.crt`, caKeyPath: `${paths.tlsDirectory}/ca.key`,
+    serverCertificatePath: `${paths.tlsDirectory}/server.crt`, serverKeyPath: `${paths.tlsDirectory}/server.key`,
+    combinedCaBundlePath: `${paths.tlsDirectory}/combined-ca.pem` }
+}
 
 function usage(): never {
   console.error('usage: poc-runner <auth|preflight|up|automated|interactive|status|down>')
@@ -145,20 +155,94 @@ async function removeCurrentPointer(paths: PocRunPaths): Promise<void> {
   if (current.trim() === paths.runId) await rm(pointerPath, { force: true })
 }
 
-async function basicCleanup(run: CompleteRun, appServer: PocAppServerProcess | undefined,
-  evidence: PocAppServerEvidence | undefined, preserve: boolean): Promise<{ serviceCleanupComplete: boolean; dockerVolumesRemoved: boolean }> {
-  let serviceCleanupComplete = true
+type CleanupRun = Pick<CompleteRun, 'env' | 'paths' | 'docker' | 'tls' | 'runtime'>
+
+function providerInspector(run: CleanupRun): PocProviderInspector {
+  return new PocProviderInspector({ apiKey: run.env.e2bApiKey, apiUrl: run.env.e2bApiUrl,
+    domain: run.env.e2bDomain, validateApiKey: process.env.E2B_VALIDATE_API_KEY !== 'false' },
+  `cudex-poc-${run.paths.runId}`, `poc-${run.paths.runId}`)
+}
+
+interface FunctionalRunInspection {
+  database?: PocDatabaseInspection
+  functional?: PocFunctionalInspection
+  workspaceVerified: boolean
+}
+
+async function inspectFunctionalRun(run: CompleteRun, evidence: PocAppServerEvidence | undefined): Promise<FunctionalRunInspection> {
+  const opened = await openPocDatabaseInspector(run.runtime.POC_DATABASE_URL!, `poc-${run.paths.runId}`)
+  try {
+    const database = await opened.inspector.inspect()
+    const functional = evaluatePocFunctionalInspection(database, evidence)
+    const workspaceVerified = functional.rootLease
+      ? await providerInspector(run).verifyRootWorkspace(functional.rootLease).catch(() => false) : false
+    return { database, functional, workspaceVerified }
+  } finally { await opened.close() }
+}
+
+interface CleanupOutcome {
+  serviceCleanupComplete: boolean
+  forcedProviderCleanup: boolean
+  dockerVolumesRemoved: boolean
+  assertions: Record<string, boolean>
+  database?: PocDatabaseInspection
+}
+
+async function exactCleanup(run: CleanupRun, appServer: PocAppServerProcess | undefined,
+  evidence: PocAppServerEvidence | undefined, preserve: boolean): Promise<CleanupOutcome> {
+  let deletionComplete = !evidence
   if (appServer && evidence && !evidence.deletedThreadIds.includes(evidence.rootThreadId)) {
-    try { await deleteThreadTree(appServer, evidence) } catch { serviceCleanupComplete = false }
+    try { await deleteThreadTree(appServer, evidence); deletionComplete = true } catch { deletionComplete = false }
   }
-  if (appServer) await appServer.stop().catch(() => { serviceCleanupComplete = false })
-  if (preserve) return { serviceCleanupComplete, dockerVolumesRemoved: false }
-  await stopControlService(run.paths).catch(() => { serviceCleanupComplete = false })
+  if (appServer) await appServer.stop().catch(() => { deletionComplete = false })
+
+  let database: PocDatabaseInspection | undefined
+  let provider = { managedSandboxIds: [] as string[], knownProviderSnapshotIds: [] as string[] }
+  let cleanupAssertions: Record<string, boolean> = { threadDeletionCompleted: deletionComplete,
+    databaseInspectionCompleted: false, providerInspectionCompleted: false }
+  let forcedProviderCleanup = false
+  let opened: Awaited<ReturnType<typeof openPocDatabaseInspector>> | undefined
+  try {
+    opened = await openPocDatabaseInspector(run.runtime.POC_DATABASE_URL!, `poc-${run.paths.runId}`)
+    const deadline = Date.now() + 60_000
+    do {
+      database = await opened.inspector.inspect()
+      const databaseSettled = database.leases.every(lease => lease.state === 'released')
+        && database.operations.every(operation => operation.state !== 'in_progress')
+        && database.allocations.every(allocation => allocation.state !== 'allocated'
+          && allocation.state !== 'reclaim_pending')
+        && database.liveTicketCount === 0 && database.unfinishedInteractionCount === 0
+      if (databaseSettled || Date.now() >= deadline) break
+      await new Promise(resolveWait => setTimeout(resolveWait, 500))
+    } while (true)
+    cleanupAssertions.databaseInspectionCompleted = true
+    try {
+      provider = await providerInspector(run).inspect(database)
+      cleanupAssertions.providerInspectionCompleted = true
+    } catch { cleanupAssertions.providerInspectionCompleted = false }
+    cleanupAssertions = { threadDeletionCompleted: deletionComplete,
+      databaseInspectionCompleted: true, providerInspectionCompleted: cleanupAssertions.providerInspectionCompleted!,
+      ...evaluatePocCleanupInspection(database, provider) }
+    const serviceCleanupComplete = Object.values(cleanupAssertions).every(Boolean)
+    if (!preserve && (!serviceCleanupComplete || provider.managedSandboxIds.length > 0
+      || provider.knownProviderSnapshotIds.length > 0)) {
+      forcedProviderCleanup = await providerInspector(run).forceCleanup(database).catch(() => false)
+    }
+  } catch { /* Teardown below remains mandatory after an inspection failure. */ }
+  finally { await opened?.close().catch(() => undefined) }
+
+  const serviceCleanupComplete = Object.values(cleanupAssertions).every(Boolean)
+  if (preserve) return { serviceCleanupComplete, forcedProviderCleanup: false,
+    dockerVolumesRemoved: false, assertions: cleanupAssertions, ...(database ? { database } : {}) }
+
+  let serviceStopped = true
+  await stopControlService(run.paths).catch(() => { serviceStopped = false })
   let dockerVolumesRemoved = true
   await stopCompose(run.docker, run.paths).catch(() => { dockerVolumesRemoved = false })
   await Promise.all([removeRuntimeAuth(run.paths.codexHome), rm(run.tls.caKeyPath, { force: true }),
     rm(run.tls.serverKeyPath, { force: true }), removeCurrentPointer(run.paths)])
-  return { serviceCleanupComplete, dockerVolumesRemoved }
+  return { serviceCleanupComplete: serviceCleanupComplete && serviceStopped, forcedProviderCleanup,
+    dockerVolumesRemoved, assertions: cleanupAssertions, ...(database ? { database } : {}) }
 }
 
 function appAssertions(evidence: PocAppServerEvidence | undefined): Record<string, boolean> {
@@ -172,25 +256,44 @@ function appAssertions(evidence: PocAppServerEvidence | undefined): Record<strin
     childPatchAvailable: evidence?.childPatchAvailable === true,
     rootTurnCompleted: evidence?.rootTurnCompleted === true,
     finalMarkerObserved: evidence?.finalMarker === true,
-    rootThreadDeleted: Boolean(evidence && evidence.deletedThreadIds.includes(evidence.rootThreadId)),
-    childThreadDeleted: Boolean(evidence?.childThreadId && evidence.deletedThreadIds.includes(evidence.childThreadId)),
   }
+}
+
+function deletionAssertions(evidence: PocAppServerEvidence | undefined): Record<string, boolean> {
+  return { rootThreadDeleted: Boolean(evidence && evidence.deletedThreadIds.includes(evidence.rootThreadId)),
+    childThreadDeleted: Boolean(evidence?.childThreadId && evidence.deletedThreadIds.includes(evidence.childThreadId)) }
+}
+
+async function reportSecretValues(run: CompleteRun): Promise<string[]> {
+  const compose = parseEnv(await readFile(run.paths.composeEnv, 'utf8'))
+  const values = [run.env.e2bApiKey, run.env.accessToken ?? '', run.runtime.POC_DATABASE_URL ?? '',
+    run.runtime.POC_GARAGE_ACCESS_KEY ?? '', run.runtime.POC_GARAGE_SECRET_KEY ?? '', run.runtime.POC_SERVICE_BEARER ?? '']
+  for (const [key, value] of Object.entries(compose)) {
+    if (value && /(?:PASSWORD|SECRET|TOKEN|KEY)/u.test(key)) values.push(value)
+  }
+  return [...new Set(values.filter(value => value.length >= 8))]
 }
 
 async function writeReport(run: CompleteRun, mode: 'automated' | 'interactive', startedAt: string,
   status: HostedCodexPocReport['status'], evidence: PocAppServerEvidence | undefined,
-  assertions: Record<string, boolean>, cleanup: { serviceCleanupComplete: boolean; dockerVolumesRemoved: boolean }): Promise<void> {
+  functional: PocFunctionalInspection | undefined, assertions: Record<string, boolean>, cleanup: CleanupOutcome): Promise<void> {
   const report: HostedCodexPocReport = { version: 1, runId: run.paths.runId, mode, startedAt,
     finishedAt: new Date().toISOString(), status,
     provenance: { buildId: run.provenance.buildId, revision: run.provenance.revision,
       codexSha256: run.provenance.codexSha256, templateId: run.provenance.templateId },
     identities: { ...(evidence ? { rootThreadId: evidence.rootThreadId } : {}),
       ...(evidence?.childThreadId ? { childThreadId: evidence.childThreadId } : {}),
-      ...(evidence?.artifactId ? { artifactId: evidence.artifactId } : {}) },
-    assertions, cleanup: { ...cleanup, forcedProviderCleanup: false },
+      ...(!evidence && functional?.rootLease ? { rootThreadId: functional.rootLease.agentId } : {}),
+      ...(!evidence && functional?.childLease ? { childThreadId: functional.childLease.agentId } : {}),
+      ...(functional?.rootLease ? { rootLeaseId: functional.rootLease.leaseId } : {}),
+      ...(functional?.childLease ? { childLeaseId: functional.childLease.leaseId } : {}),
+      ...(functional?.artifactId ? { artifactId: functional.artifactId }
+        : evidence?.artifactId ? { artifactId: evidence.artifactId } : {}) },
+    assertions, cleanup: { serviceCleanupComplete: cleanup.serviceCleanupComplete,
+      forcedProviderCleanup: cleanup.forcedProviderCleanup, dockerVolumesRemoved: cleanup.dockerVolumesRemoved },
     logFiles: ['control-service.log', ...(mode === 'automated' ? ['app-server.log'] : [])],
   }
-  await writeFile(run.paths.report, `${JSON.stringify(report, null, 2)}\n`, { mode: 0o600 })
+  await writeFile(run.paths.report, serializePocReport(report, await reportSecretValues(run)), { mode: 0o600 })
 }
 
 async function automated(): Promise<void> {
@@ -199,6 +302,7 @@ async function automated(): Promise<void> {
   const run = await prepareCompleteRun(env)
   let appServer: PocAppServerProcess | undefined
   let evidence: PocAppServerEvidence | undefined
+  let inspection: FunctionalRunInspection = { workspaceVerified: false }
   let functional = false
   let failure: unknown
   let rejectSignal: ((error: Error) => void) | undefined
@@ -215,18 +319,28 @@ async function automated(): Promise<void> {
       prompt: await readFile(`${e2bRoot}/poc/prompts/automated.md`, 'utf8'), fixturePath: `${e2bRoot}/poc/fixture`,
       ...(env.codexModel ? { model: env.codexModel } : {}), deadlineMs: 20 * 60_000,
       onEvidence: value => { evidence = value } }), interrupted])
-    await deleteThreadTree(appServer, evidence)
-    functional = Object.values(appAssertions(evidence)).every(Boolean)
+    inspection = await inspectFunctionalRun(run, evidence)
+    functional = Object.values({ ...appAssertions(evidence), ...(inspection.functional?.assertions ?? {}),
+      rootWorkspaceVerified: inspection.workspaceVerified }).every(Boolean)
     if (!functional) failure = new Error('automated app-server evidence is incomplete')
   } catch (error) { failure = error }
   finally { process.off('SIGINT', onSigint); process.off('SIGTERM', onSigterm) }
   const preserve = !functional && env.keepOnFailure
-  const cleanup = await basicCleanup(run, appServer, evidence, preserve)
-  const assertions = appAssertions(evidence)
-  const passed = functional && cleanup.serviceCleanupComplete && cleanup.dockerVolumesRemoved
-  await writeReport(run, 'automated', startedAt, passed ? 'passed' : 'failed', evidence, assertions, cleanup)
-  console.log(JSON.stringify({ runId: run.paths.runId, status: passed ? 'passed' : 'failed', report: run.paths.report }))
-  if (!passed) { console.error(failure instanceof Error ? failure.message : 'automated POC failed'); process.exitCode = 1 }
+  const cleanup = await exactCleanup(run, appServer, evidence, preserve)
+  const logPaths = [`${run.paths.logsDirectory}/control-service.log`, `${run.paths.logsDirectory}/app-server.log`]
+  const logsRedacted = await retainedFilesAreRedacted(logPaths, await reportSecretValues(run)).catch(() => false)
+  const assertions = { ...appAssertions(evidence), ...(inspection.functional?.assertions ?? {}),
+    rootWorkspaceVerified: inspection.workspaceVerified, ...deletionAssertions(evidence), ...cleanup.assertions,
+    retainedLogsRedacted: logsRedacted }
+  functional = functional && logsRedacted
+  const passed = functional && cleanup.serviceCleanupComplete && cleanup.dockerVolumesRemoved && !cleanup.forcedProviderCleanup
+  const status = passed ? 'passed' : functional && cleanup.forcedProviderCleanup ? 'cleanup_intervention' : 'failed'
+  await writeReport(run, 'automated', startedAt, status, evidence, inspection.functional, assertions, cleanup)
+  console.log(JSON.stringify({ runId: run.paths.runId, status, report: run.paths.report }))
+  if (!passed) {
+    console.error(failure instanceof Error ? failure.message : 'automated POC failed')
+    process.exitCode = status === 'cleanup_intervention' ? 3 : 1
+  }
 }
 
 async function clipboardCommand(promptPath: string): Promise<string | undefined> {
@@ -261,12 +375,23 @@ async function interactive(): Promise<void> {
     })
   } catch (error) { childFailure = error }
   finally { process.off('SIGINT', onSigint); process.off('SIGTERM', onSigterm) }
-  const cleanup = await basicCleanup(run, undefined, undefined, exitCode !== 0 && env.keepOnFailure)
-  const assertions = { cliExitedSuccessfully: exitCode === 0 }
-  await writeReport(run, 'interactive', startedAt, 'failed', undefined, assertions, cleanup)
-  console.log(JSON.stringify({ runId: run.paths.runId, mode: 'interactive', cliExitCode: exitCode, report: run.paths.report }))
+  const inspection = await inspectFunctionalRun(run, undefined).catch(() => ({ workspaceVerified: false } as FunctionalRunInspection))
+  const functional = exitCode === 0 && inspection.functional !== undefined && inspection.workspaceVerified
+    && Object.values(inspection.functional.assertions).every(Boolean)
+  const cleanup = await exactCleanup(run, undefined, undefined, !functional && env.keepOnFailure)
+  const logsRedacted = await retainedFilesAreRedacted([`${run.paths.logsDirectory}/control-service.log`],
+    await reportSecretValues(run)).catch(() => false)
+  const assertions = { cliExitedSuccessfully: exitCode === 0, ...(inspection.functional?.assertions ?? {}),
+    rootWorkspaceVerified: inspection.workspaceVerified, ...cleanup.assertions, retainedLogsRedacted: logsRedacted }
+  const passed = functional && logsRedacted && cleanup.serviceCleanupComplete && cleanup.dockerVolumesRemoved
+    && !cleanup.forcedProviderCleanup
+  const status = passed ? 'passed' : functional && logsRedacted && cleanup.forcedProviderCleanup
+    ? 'cleanup_intervention' : 'failed'
+  await writeReport(run, 'interactive', startedAt, status, undefined, inspection.functional, assertions, cleanup)
+  console.log(JSON.stringify({ runId: run.paths.runId, mode: 'interactive', status,
+    cliExitCode: exitCode, report: run.paths.report }))
   if (childFailure instanceof Error) console.error(childFailure.message)
-  process.exitCode = 1
+  if (!passed) process.exitCode = status === 'cleanup_intervention' ? 3 : 1
 }
 
 async function auth(): Promise<void> {
@@ -337,8 +462,18 @@ async function status(): Promise<void> {
   const env = await configuration()
   const docker = await detectDocker()
   const compose = await runCompose(docker, paths, ['ps', '--format', 'json']).catch(() => '')
+  const opened = await openPocDatabaseInspector(runtime.POC_DATABASE_URL!, `poc-${paths.runId}`)
+  let database: PocDatabaseInspection
+  try { database = await opened.inspector.inspect() } finally { await opened.close() }
+  const run: CleanupRun = { env, paths, docker, tls: existingTlsMaterial(paths), runtime }
+  const provider = await providerInspector(run).inspect(database).catch(() => undefined)
   console.log(JSON.stringify({ runId: paths.runId, serviceReachable: await tcpConnects(env.controlPort),
-    servicePid: Number(runtime.POC_SERVICE_PID ?? 0), compose: compose.split('\n').filter(Boolean).map(line => {
+    servicePid: Number(runtime.POC_SERVICE_PID ?? 0), lifecycle: {
+      leases: database.leases.map(lease => ({ leaseId: lease.leaseId, state: lease.state })),
+      liveTickets: database.liveTicketCount, unfinishedInteractions: database.unfinishedInteractionCount,
+      managedProviderSandboxes: provider?.managedSandboxIds.length,
+      knownProviderSnapshots: provider?.knownProviderSnapshotIds.length,
+    }, compose: compose.split('\n').filter(Boolean).map(line => {
       try { const value = JSON.parse(line) as Record<string, unknown>; return { service: value.Service, state: value.State, health: value.Health } }
       catch { return { state: 'unknown' } }
     }) }, null, 2))
@@ -346,14 +481,16 @@ async function status(): Promise<void> {
 
 async function down(): Promise<void> {
   const paths = await currentRun()
+  const env = await configuration()
+  const runtime = await readRuntimeEnvironment(paths)
   const docker = await detectDocker()
-  const graceful = await stopControlService(paths)
-  await stopCompose(docker, paths)
-  await Promise.all([
-    rm(`${paths.codexHome}/auth.json`, { force: true }), rm(`${paths.tlsDirectory}/ca.key`, { force: true }),
-    rm(`${paths.tlsDirectory}/server.key`, { force: true }), rm(pointerPath, { force: true }),
-  ])
-  console.log(JSON.stringify({ runId: paths.runId, stopped: true, graceful, dockerVolumesRemoved: true }))
+  const cleanup = await exactCleanup({ env, paths, docker, tls: existingTlsMaterial(paths), runtime },
+    undefined, undefined, false)
+  console.log(JSON.stringify({ runId: paths.runId, stopped: true,
+    serviceCleanupComplete: cleanup.serviceCleanupComplete,
+    forcedProviderCleanup: cleanup.forcedProviderCleanup, dockerVolumesRemoved: cleanup.dockerVolumesRemoved }))
+  if (!cleanup.dockerVolumesRemoved) process.exitCode = 1
+  else if (cleanup.forcedProviderCleanup) process.exitCode = 3
 }
 
 async function main(): Promise<void> {
