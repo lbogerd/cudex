@@ -160,6 +160,12 @@ Maintainers can still run the fixed POC commands documented in
 [`e2b/poc/README.md`](e2b/poc/README.md): `auth`, `preflight`, `up`, `automated`,
 `interactive`, `status`, and `down`.
 
+Before inviting a coworker, follow the maintainer-only
+[`pre-coworker verification walkthrough`](docs/pre-coworker-verification.md).
+It covers the automated gates, published release and template, disposable
+checkout success/conflict/interrupt behavior, exact cleanup, and the root/child
+live proof without putting credentials in the test project or prompts.
+
 ## Pilot shortcuts and internal-release blockers
 
 Every active shortcut has a stable ID here, a remediation and validation record

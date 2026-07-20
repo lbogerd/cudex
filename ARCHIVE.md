@@ -117,6 +117,16 @@ infrastructure test passed 2/2, including repeatable migrations, Garage object
 round-trip, TLS source upload, and cleanup; a final inventory found no matching
 containers or volumes.
 
+A maintainer-only pre-coworker walkthrough now provides one ordered gate for
+candidate provenance, automated and database-backed tests, release/template
+verification, disposable-checkout projection, successful return, conflict and
+interrupt safety, exact cleanup, the root/child proof, redaction review, and
+the remaining privileged fault-injection evidence. It explicitly keeps H3 open
+when exact sandbox-loss injection is unavailable rather than delegating that
+risk to a coworker. Documentation verification passed the build, shortcut
+registry test, and all 358 default tests (230 passed, 128 environment-gated
+skips, no failures) on 2026-07-20.
+
 ## Dedicated CubeSandbox code-mode runtime foundation (2026-07-19)
 
 The Linux hosted path now packages two provenance-bound binaries from the same
