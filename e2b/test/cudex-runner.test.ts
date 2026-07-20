@@ -6,7 +6,8 @@ import { join } from 'node:path'
 import test from 'node:test'
 import { promisify } from 'node:util'
 import { resolveCudexPaths } from '../src/cudex-config.js'
-import { dispatchCudexCommand, launchTui, RunSignals, type PreparedCudexRun } from '../src/cudex-runner.js'
+import { cudexSessionExitCode, dispatchCudexCommand, launchTui, RunSignals,
+  type PreparedCudexRun } from '../src/cudex-runner.js'
 
 const exec = promisify(execFile)
 
@@ -85,4 +86,20 @@ test('TUI signals are forwarded and an ignoring child is killed after the grace 
     await ready(join(run.paths.codexHome, 'ready')); ignored.request('SIGTERM')
     assert.deepEqual(await hanging, { exitCode: null, signal: 'SIGTERM' })
   } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test('session exit precedence keeps manual recovery and conflicts distinct from ordinary failures', () => {
+  const base = { cleanupComplete: true, ownershipCleared: true, resultCode: 0,
+    operationalFailure: false, reportFailure: false, tuiExitCode: 0 }
+  assert.equal(cudexSessionExitCode(base), 0)
+  assert.equal(cudexSessionExitCode({ ...base, resultCode: 1 }), 1)
+  assert.equal(cudexSessionExitCode({ ...base, resultCode: 4 }), 4)
+  assert.equal(cudexSessionExitCode({ ...base, signal: 'SIGINT' }), 130)
+  assert.equal(cudexSessionExitCode({ ...base, signal: 'SIGTERM' }), 143)
+  assert.equal(cudexSessionExitCode({ ...base, signal: 'SIGINT', resultCode: 3 }), 3)
+  assert.equal(cudexSessionExitCode({ ...base, cleanupComplete: false, signal: 'SIGTERM' }), 3)
+  assert.equal(cudexSessionExitCode({ ...base, ownershipCleared: false }), 3)
+  assert.equal(cudexSessionExitCode({ ...base, operationalFailure: true }), 1)
+  assert.equal(cudexSessionExitCode({ ...base, reportFailure: true }), 1)
+  assert.equal(cudexSessionExitCode({ ...base, tuiExitCode: 7 }), 1)
 })

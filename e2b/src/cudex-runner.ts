@@ -358,6 +358,17 @@ function applyReport(result: LocalPatchApplyResult): { status: CudexResultStatus
   }
 }
 
+export function cudexSessionExitCode(input: { cleanupComplete: boolean; ownershipCleared: boolean;
+  resultCode: number; signal?: 'SIGINT' | 'SIGTERM'; operationalFailure: boolean;
+  reportFailure: boolean; tuiExitCode: number | null }): number {
+  if (!input.cleanupComplete || !input.ownershipCleared || input.resultCode === 3) return 3
+  if (input.signal === 'SIGINT') return 130
+  if (input.signal === 'SIGTERM') return 143
+  if (input.resultCode === 4) return 4
+  if (input.operationalFailure || input.reportFailure || input.tuiExitCode !== 0) return 1
+  return input.resultCode
+}
+
 async function runSession(parsed: Extract<CudexArguments, { command: 'session' }>, paths: CudexPaths): Promise<number> {
   const signals = new RunSignals(); signals.install()
   const lock = await acquireLock(paths).catch(error => { signals.dispose(); throw error })
@@ -440,12 +451,9 @@ async function runSession(parsed: Extract<CudexArguments, { command: 'session' }
   console.log(JSON.stringify({ runId: run.paths.runId, tuiExitCode: tui.exitCode,
     applyResult: result,
     cleanupComplete, reports: run.paths.runDirectory }))
-  if (!cleanupComplete || !ownershipCleared || resultCode === 3) return 3
-  if (signals.signal === 'SIGINT') return 130
-  if (signals.signal === 'SIGTERM') return 143
-  if (resultCode === 4) return 4
-  if (operationalFailure || reportFailure || tui.exitCode !== 0) return 1
-  return resultCode
+  return cudexSessionExitCode({ cleanupComplete, ownershipCleared, resultCode,
+    ...(signals.signal ? { signal: signals.signal } : {}), operationalFailure: Boolean(operationalFailure),
+    reportFailure, tuiExitCode: tui.exitCode })
 }
 
 async function cleanupCurrent(paths: CudexPaths): Promise<number> {

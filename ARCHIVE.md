@@ -108,6 +108,15 @@ fake-provider/fake-TUI acceptance exercised durable ownerless-root export,
 exact byte resolution, automatic local apply visible in `git diff`, and lease
 release. The temporary database container was removed after verification.
 
+Post-feature verification added a complete exit-precedence table, TUI signal
+forwarding/escalation coverage, and control-service teardown tests that require
+the exact run tenant, command, and working directory before signaling a PID.
+The shortcut consistency test now requires a one-to-one match between every
+open registry row and every active code comment. The opt-in Docker/Compose
+infrastructure test passed 2/2, including repeatable migrations, Garage object
+round-trip, TLS source upload, and cleanup; a final inventory found no matching
+containers or volumes.
+
 ## Dedicated CubeSandbox code-mode runtime foundation (2026-07-19)
 
 The Linux hosted path now packages two provenance-bound binaries from the same

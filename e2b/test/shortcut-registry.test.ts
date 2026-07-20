@@ -52,6 +52,9 @@ test('pilot shortcut registries and active code comments stay consistent', async
   }
   const todoSet = new Set(todoIds)
   for (const id of activeIds) assert.ok(todoSet.has(id), `${id} code comment is missing from TODO.md`)
+  unique(activeIds, 'active pilot code comments')
+  assert.deepEqual([...activeIds].sort(), [...openIds].sort(),
+    'every open shortcut must have one exact active code comment')
 
   const completedIds = todo.split('\n')
     .filter(line => line.startsWith('| PILOT-') && line.endsWith('| completed |'))
