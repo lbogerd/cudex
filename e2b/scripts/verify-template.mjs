@@ -95,6 +95,8 @@ try {
   if (hostCheck.exitCode !== 0) {
     throw new Error('sandbox code-mode host self-check failed')
   }
+  const gitCheck = await dataPlane.commands.run('git --version >/dev/null', { timeoutMs: 10_000 })
+  if (gitCheck.exitCode !== 0) throw new Error('sandbox Git self-check failed')
 
   const stderr = []
   const started = await dataPlane.commands.run(

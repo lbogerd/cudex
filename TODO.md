@@ -8,7 +8,7 @@ decisions and completed evidence are preserved in [`ARCHIVE.md`](ARCHIVE.md).
 - [x] A1: documentation baseline, registry enforcement, and delivery checklist.
 - [ ] A2: finish reusable runner, patch, report, and lifecycle module extraction.
 - [x] A3: release setup, XDG config, auth discovery/login, installer, and doctor.
-- [ ] A4/A5: deterministic Git projection, synthetic baseline, and hosted export.
+- [x] A4/A5: deterministic Git projection, synthetic baseline, and hosted export.
 - [ ] A6: generalized TUI runner with exact lifecycle cleanup.
 - [ ] A7/A8: exact root patch resolution and recoverable three-way local apply.
 - [ ] A9/A10: signals, cleanup/status, redaction, database tests, and fake acceptance.

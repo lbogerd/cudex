@@ -146,6 +146,7 @@ test('conflicts are sorted, URI encoded, and capped only after all are counted',
 
 test('canonical paths and safe relative symlinks reject traversal and ambiguity', () => {
   assert.equal(validateWorkspacePath('roots/0/project/file'), 'roots/0/project/file')
+  assert.equal(validateWorkspacePath('roots/0/project/line\nbreak'), 'roots/0/project/line\nbreak')
   assert.equal(validateSymlinkTarget('roots/0/project/dir/link', '../file'), '../file')
   for (const path of ['', '/absolute', 'roots//file', 'roots/./file', 'roots/../file', 'roots\\file', 'roots/file/']) {
     assert.throws(() => validateWorkspacePath(path), WorkspaceManifestError)

@@ -103,7 +103,9 @@ export function validateWorkspacePath(path: string, limits: WorkspaceManifestLim
   if (path !== path.normalize('NFC')) invalid('workspace path must use NFC Unicode normalization')
   const segments = path.split('/')
   if (segments.some(segment => segment.length === 0 || segment === '.' || segment === '..')) invalid('workspace path is not canonical')
-  if (segments.some(segment => /[\u0000-\u001f\u007f]/u.test(segment))) invalid('workspace path contains a control character')
+  // LF is valid in POSIX/Git filenames and remains unambiguous because all workspace
+  // transports are NUL-delimited, JSON-escaped, URI-encoded, or tar-header based.
+  if (segments.some(segment => /[\u0000-\u0009\u000b-\u001f\u007f]/u.test(segment))) invalid('workspace path contains a control character')
   if (bytes(path) > limits.maxPathBytes) quota('workspace path byte limit exceeded')
   if (segments.length > limits.maxPathDepth) quota('workspace path depth limit exceeded')
   return path
@@ -120,7 +122,7 @@ export function validateSymlinkTarget(path: string, target: string, limits: Work
   if (bytes(target) > limits.maxLinkTargetBytes) quota('symlink target byte limit exceeded')
   const targetSegments = target.split('/')
   if (targetSegments.some(segment => segment.length === 0 || segment === '.')) invalid('symlink target is not canonical')
-  if (targetSegments.some(segment => /[\u0000-\u001f\u007f]/u.test(segment))) invalid('symlink target contains a control character')
+  if (targetSegments.some(segment => /[\u0000-\u0009\u000b-\u001f\u007f]/u.test(segment))) invalid('symlink target contains a control character')
 
   const resolved = path.split('/').slice(0, -1)
   for (const segment of targetSegments) {

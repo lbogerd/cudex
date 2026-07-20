@@ -35,10 +35,10 @@ root result. On a successful TUI exit it compares the uploaded base, hosted
 proposal, and current local files. Conflict-free changes are applied locally
 without staging or committing them. A conflict leaves the checkout unchanged.
 
-Release setup, authentication discovery/login, installation, `doctor`, and
-`version` are implemented. Workspace projection and the end-to-end session
-runner are delivered in later commits on this branch; until then `cudex files`
-and sessions fail before allocation.
+Release setup, authentication discovery/login, installation, `doctor`,
+`version`, and `cudex files` are implemented. The end-to-end session runner is
+delivered in later commits on this branch; until then sessions fail before
+allocation.
 
 ## Command reference
 
@@ -74,10 +74,20 @@ Exit statuses are stable:
 
 The selected directory must be inside a Git worktree. Cudex uploads the
 NUL-safe result of `git ls-files --cached --others --exclude-standard`, in
-deterministic order. Regular files and safe relative symlinks are preserved;
+deterministic order. That includes every tracked file (even if a current ignore
+rule matches its name) and excludes ignored untracked files. Regular files and
+safe relative symlinks are preserved;
 special files, submodules, nested repositories, unsafe symlinks, and archive
 limit violations are rejected before allocation. Ignored files and `.git` are
 never uploaded or returned.
+
+For pilot uploads the service receives
+`HOSTED_AGENT_WORKSPACE_MODE=git-working-set`. It initializes Git metadata at
+`/workspace/.cudex-git`, writes the project `.git` pointer, and creates one
+fixed-identity synthetic baseline commit. Hosted exports use the same Git
+working-set selection, so deletions and executable-mode changes are preserved
+while ignored generated output and Git metadata stay out of the returned
+archive. Other provider modes retain their previous full-archive behavior.
 
 The shared release manifest is the pilot trust root. Setup validates platform,
 Node version, file sizes, SHA-256 checksums, executable modes, matching template

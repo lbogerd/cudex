@@ -95,6 +95,10 @@ const archiveLimits: ArchiveManifestLimits = {
   maxExtractionRatio: ingress.maxExtractionRatio,
 }
 const sourceDatabaseUrl = process.env.HOSTED_AGENT_DATABASE_URL ?? process.env.DATABASE_URL
+const workspaceMode = process.env.HOSTED_AGENT_WORKSPACE_MODE ?? 'default'
+if (workspaceMode !== 'default' && workspaceMode !== 'git-working-set') {
+  throw new Error('HOSTED_AGENT_WORKSPACE_MODE must be default or git-working-set')
+}
 const sourceRuntime = await createSourceSnapshotRuntime({
   ...(sourceDatabaseUrl ? { databaseUrl: sourceDatabaseUrl } : {}),
   ...(process.env.HOSTED_AGENT_TENANT_ID ? { tenantId: process.env.HOSTED_AGENT_TENANT_ID } : {}),
@@ -153,6 +157,7 @@ function observeWorkspaceTransfer(metric: WorkspaceTransferMetric): void {
 const provider = new E2BProvider(connection, 120_000, {
   archiveLimits,
   maxRoots: ingress.maxRoots,
+  workspaceMode,
   observe: observeWorkspaceTransfer,
 })
 const durablePublisher = sourceRuntime

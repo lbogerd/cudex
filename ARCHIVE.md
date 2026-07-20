@@ -40,6 +40,21 @@ Focused config/release/CLI/installer/registry checks passed, including a complet
 installation under temporary HOME/XDG roots. The full default suite passed with
 337 tests discovered: 211 passed and 126 PostgreSQL-gated cases skipped.
 
+Git working-set projection now uses one NUL-delimited selector for `cudex files`
+and uploads, preserves bytes/modes/safe relative symlinks and the selected `-C`
+root, produces deterministic canonical archives, and rejects submodules, nested
+repositories, special files, `.git` traversal, unsafe links, and quota excess.
+Coverage includes binary data, ignored and tracked files, deletions, spaces,
+Unicode, LF, and leading-dash names.
+
+The provider has an opt-in `git-working-set` transfer mode; its default is
+unchanged. Pilot materialization creates one fixed synthetic commit in a
+separate `/workspace/.cudex-git` directory. Projected exports retain additions,
+deletions, and mode changes while excluding ignored generated output and Git
+metadata. Template build and live verification now require Git. Focused transfer
+tests and the full default suite passed: 341 discovered, 215 passed, and 126
+PostgreSQL-gated cases skipped.
+
 ## Dedicated CubeSandbox code-mode runtime foundation (2026-07-19)
 
 The Linux hosted path now packages two provenance-bound binaries from the same
