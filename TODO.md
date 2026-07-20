@@ -65,6 +65,8 @@ its existing process-owned/in-process behavior; hosted Codex must fail closed.
   workspace quiescence, while retaining gates for commands and
   filesystem activity; cover the root-spawns-child deadlock regression in
   PostgreSQL.
+- [x] Shut down the child provider on the dedicated patch-finalization path
+  before lease release, not only during ordinary thread removal.
 
 ## 1. Local POC infrastructure
 

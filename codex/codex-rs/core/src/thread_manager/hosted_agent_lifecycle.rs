@@ -146,6 +146,14 @@ impl ThreadManagerState {
             artifact: artifact.clone(),
         });
 
+        if let Some(provider) = &runtime.code_mode_provider
+            && let Err(error) = provider.shutdown().await
+        {
+            // Lease release remains the final containment boundary. Continue to the
+            // idempotent forced cleanup path, but never silently leave the dedicated
+            // process running merely because child finalization bypasses remove_thread.
+            warn!(%error, %agent_id, "hosted child code-mode runtime did not quiesce before forced lease cleanup");
+        }
         match provisioner.release(agent_id, value.clone()).await {
             Ok(retained) => {
                 value.reference_revision = Some(retained.revision);

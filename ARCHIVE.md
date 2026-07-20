@@ -2206,6 +2206,14 @@ snapshot transaction is permanently rejected by the root runtime that issued
 the spawn call. Exec-server's unique process ID also prevents an ordinary
 command from adopting that exempt identity while the singleton host is live.
 
+Hosted child completion has its own finalization path: checkpoint, export the
+patch, publish the artifact, then release the lease. It does not necessarily
+pass through ordinary thread removal. That path must explicitly shut down the
+child's code-mode provider before release; otherwise the sandbox is destroyed
+but the trusted interaction ledger correctly retains an unfinished runtime and
+the acceptance report cannot claim quiescence. Lease release remains the forced
+containment fallback if graceful shutdown cannot be confirmed.
+
 The Linux/musl release build uses linker-plugin LTO across the full CLI graph.
 With the pinned Rust toolchain, the hosted additions push the CLI layout query
 past rustc's default recursion depth; `cli/src/main.rs` therefore declares the
