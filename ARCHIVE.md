@@ -5,6 +5,28 @@ architecture decisions, and spike results for the hosted-agent E2B backend. It
 is reference material, not a work queue. Remaining implementation work is in
 [`TODO.md`](TODO.md).
 
+## Trusted coworker pilot decision (2026-07-20)
+
+The accepted pilot interface is `cudex` from one selected Git working tree on a
+trusted Linux/x86_64 coworker machine. It projects tracked and non-ignored
+untracked files without `.git` or ignored files, creates one synthetic hosted
+baseline, launches the standard Codex TUI with approval fixed to `never`, and
+automatically applies a conflict-free hosted root result without staging or
+committing. Local PostgreSQL and Garage remain disposable per run, release
+artifacts come from a trusted shared filesystem, existing Codex authentication
+is copied only into the isolated runtime, and one run per user is permitted.
+
+The fixed POC commands remain maintainer diagnostics. Pilot shortcuts are
+tracked by stable PILOT-001 through PILOT-017 IDs in README/TODO/code, and the
+delivery branch is `cudex/coworker-pilot` with reviewable non-force-pushed
+commits. Release publication, privileged live acceptance, the fresh-coworker
+trial, and final approval remain human-in-the-loop work.
+
+The documentation baseline includes the intentionally reviewed top-level
+README, a root ignore policy, a per-commit contributor checklist, and an
+automated registry consistency test. The focused build and registry test passed
+on 2026-07-20 before the baseline commit.
+
 ## Dedicated CubeSandbox code-mode runtime foundation (2026-07-19)
 
 The Linux hosted path now packages two provenance-bound binaries from the same

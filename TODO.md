@@ -1,4 +1,57 @@
-# Local Hosted-Codex Owner/Child POC Queue
+# Cudex pilot queue
+
+This file is the active implementation and internal-release queue. Stable
+decisions and completed evidence are preserved in [`ARCHIVE.md`](ARCHIVE.md).
+
+## Autonomous coworker-pilot delivery
+
+- [x] A1: documentation baseline, registry enforcement, and delivery checklist.
+- [ ] A2/A3: reusable runner modules, release setup, auth, installer, and doctor.
+- [ ] A4/A5: deterministic Git projection, synthetic baseline, and hosted export.
+- [ ] A6: generalized TUI runner with exact lifecycle cleanup.
+- [ ] A7/A8: exact root patch resolution and recoverable three-way local apply.
+- [ ] A9/A10: signals, cleanup/status, redaction, database tests, and fake acceptance.
+
+## Pilot shortcuts and internal-release blockers
+
+`State` is `open` until remediation and validation are complete. A completed ID
+must be removed from active code comments and recorded in `ARCHIVE.md`.
+
+| ID | Affected modules | Concrete remediation | Validation required before closing | State |
+| --- | --- | --- | --- | --- |
+| PILOT-001 | CLI, release selection, installer | Define supported OS/architecture combinations and select platform-specific artifacts. | Install, doctor, projection, run, apply, and cleanup pass on every supported platform. | open |
+| PILOT-002 | release, setup, installer | Sign manifests, authenticate distribution, and implement update plus rollback policy. | Tamper, downgrade, key-rotation, update, and rollback tests pass. | open |
+| PILOT-003 | runner, infrastructure | Select and operate the supported internal PostgreSQL/object-store topology. | Multi-user lifecycle, outage, upgrade, and isolation acceptance passes. | open |
+| PILOT-004 | CLI, lock, runner, workspace | Add isolated concurrent run identities and bounded multi-root selection. | Concurrent runs and multi-root conflict/cleanup tests pass. | open |
+| PILOT-005 | CLI, git-workspace | Specify safe non-Git discovery, ignore, identity, and apply rules. | Equivalent selection and three-way apply suites pass outside Git. | open |
+| PILOT-006 | synthetic-git, hosted projection | Transport or reconstruct explicitly bounded Git history outside workspace capture. | History-dependent Codex tasks pass without leaking excluded objects. | open |
+| PILOT-007 | git-workspace, apply | Define recursive repository boundaries, credentials, and patch semantics. | Submodule and nested-repository security/lifecycle tests pass. | open |
+| PILOT-008 | git-workspace, hosted export, apply | Add an explicit reviewable allowlist for required ignored files. | Selection, secrecy, round-trip, deletion, and conflict tests pass. | open |
+| PILOT-009 | CLI, TUI launcher | Define a safe upstream option-forwarding compatibility policy. | Versioned compatibility suite covers every supported flag. | open |
+| PILOT-010 | runner, generated Codex config | Define configurable approval and hosted policy behavior. | Policy/approval matrix and denial tests pass. | open |
+| PILOT-011 | local-patch-source | Expose a stable authenticated patch-return interface or formalize the direct store contract. | Wrong-run, child, corrupt, expired, replay, and availability tests pass across upgrades. | open |
+| PILOT-012 | local-patch-apply | Select atomic worktree/directory mechanics and specify crash recovery. | Power-loss and filesystem-fault testing proves atomicity or complete recovery. | open |
+| PILOT-013 | gateway, provider, runner | Move exec-server traffic to approved internal private transport. | Network-policy and credential-leak acceptance passes. | open |
+| PILOT-014 | service, inspector, cleanup | Replace POC-only operations with supported authenticated operational APIs. | Authorization, audit, pagination, and exact-scope deletion tests pass. | open |
+| PILOT-015 | config, infrastructure | Allocate collision-free ports and persist durable discovery. | Parallel-user and stale-state port tests pass. | open |
+| PILOT-016 | auth, runner | Complete credential review and implement supported isolated credential storage. | Permission, lifecycle, crash, redaction, and threat-model review pass. | open |
+| PILOT-017 | reconciler, quotas, operations | Complete the production-hardening queue required for the approved rollout size. | Human release review accepts outage, quota, monitoring, backup, and recovery evidence. | open |
+
+## Human-in-the-loop delivery
+
+- [ ] H1: confirm LAN endpoint, DNS, API-key issuance, private CA, shared release path, template Git, and coworker Docker access.
+- [ ] H2: publish a reviewed matching release bundle and CubeSandbox template; record release ID and checksums.
+- [ ] H3: run live success, conflict, signal, sandbox-loss, timeout, cleanup, and redaction acceptance.
+- [ ] H4: complete the fresh-coworker UX trial and convert reproducible issues into TODOs.
+- [ ] H5: approve the named pilot users and all remaining shortcuts.
+
+## Existing POC and production-hardening queue
+
+The remaining sections preserve the prior POC queue. Completed items are useful
+implementation evidence; unchecked fault injection and production items remain
+open and are covered by PILOT-017 where applicable.
+
+# Local Hosted-Codex Owner/Child POC Queue (preserved)
 
 This queue tracks the Linux-only development proof. Stable production decisions
 and redacted evidence remain in [`ARCHIVE.md`](ARCHIVE.md). The proof is not
