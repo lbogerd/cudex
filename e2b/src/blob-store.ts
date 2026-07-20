@@ -47,6 +47,7 @@ export interface S3BlobStoreOptions {
   endpoint?: string
   forcePathStyle?: boolean
   maxObjectBytes?: number
+  credentials?: { accessKeyId: string; secretAccessKey: string; sessionToken?: string }
 }
 
 /** Authenticated, content-addressed storage for archives, manifests, and artifacts. */
@@ -63,6 +64,7 @@ export class S3BlobStore implements ObjectStore {
       region: options.region ?? 'us-east-1',
       ...(options.endpoint ? { endpoint: options.endpoint } : {}),
       ...(options.forcePathStyle === undefined ? {} : { forcePathStyle: options.forcePathStyle }),
+      ...(options.credentials ? { credentials: options.credentials } : {}),
     })
   }
 

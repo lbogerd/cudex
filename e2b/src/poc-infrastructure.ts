@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process'
 import { createConnection, createServer } from 'node:net'
-import { readFile, open, writeFile } from 'node:fs/promises'
+import { readFile, open, readlink, writeFile } from 'node:fs/promises'
+import { resolve } from 'node:path'
 import { spawn } from 'node:child_process'
 import { HeadBucketCommand, S3Client } from '@aws-sdk/client-s3'
 import WebSocket from 'ws'
@@ -201,8 +202,15 @@ export async function stopControlService(paths: PocRunPaths): Promise<boolean> {
   const pid = Number(runtime.POC_SERVICE_PID ?? '0')
   if (!Number.isSafeInteger(pid) || pid <= 1) return true
   try {
-    const command = (await readFile(`/proc/${pid}/cmdline`)).toString('utf8')
-    if (!command.includes('dist/src/main.js')) throw new Error('refusing to stop a process that is not the POC control service')
+    const [command, environment, cwd] = await Promise.all([
+      readFile(`/proc/${pid}/cmdline`), readFile(`/proc/${pid}/environ`), readlink(`/proc/${pid}/cwd`),
+    ])
+    const tenant = `HOSTED_AGENT_TENANT_ID=poc-${paths.runId}`
+    if (!command.toString('utf8').includes('dist/src/main.js')
+      || !environment.toString('utf8').split('\0').includes(tenant)
+      || resolve(cwd) !== resolve(paths.repositoryRoot)) {
+      throw new Error('refusing to stop a control service without the exact run identity')
+    }
     process.kill(pid, 'SIGTERM')
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT' || (error as NodeJS.ErrnoException).code === 'ESRCH') return true

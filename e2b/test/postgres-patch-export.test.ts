@@ -268,6 +268,34 @@ live('two replicas export one exact artifact and replay without another put', as
   })
 })
 
+live('internal root export requires exact source lineage and retains the artifact for its thread', async context => {
+  const sourceArchive = await register(context.states[0], context.objects,
+    'source-archive-root', 'source_archive', encoded('root source archive'))
+  await context.states[0].registerSourceSnapshot({ sourceSnapshotId: 'source-root', tenantId,
+    archiveObjectId: sourceArchive.objectId, checksum: sourceArchive.checksum,
+    cwdUri: 'file:///workspace/roots', workspaceRootUris: ['file:///workspace/roots'],
+    state: 'available', expiresAt: new Date(Date.now() + 60_000) })
+  await context.pools[0].query(`UPDATE hosted_agent_leases
+    SET owner_agent_id = NULL, owner_lease_id = NULL, source_snapshot_id = $2
+    WHERE tenant_id = $1 AND lease_id = 'lease-child'`, [tenantId, 'source-root'])
+  const publicRequest = { ...context.request, idempotencyKey: 'root-public-rejected' }
+  await assert.rejects(context.coordinators[0].exportPatch(publicRequest),
+    serviceFailure(409, 'lease cannot export a patch'))
+  await assert.rejects(context.coordinators[0].exportRootPatch(
+    { ...context.request, idempotencyKey: 'root-wrong-source' }, 'wrong-source'),
+    serviceFailure(409, 'lease cannot export a patch'))
+  const rootRequest = { ...context.request, idempotencyKey: 'root-internal-export' }
+  const exported = await context.coordinators[0].exportRootPatch(rootRequest, 'source-root')
+  assert.equal(exported.agentId, rootRequest.agentId)
+  const references = await context.pools[0].query<{ reference_kind: string; reference_id: string }>(`
+    SELECT reference_kind, reference_id FROM hosted_agent_artifact_references
+    WHERE artifact_id = $1 ORDER BY reference_kind, reference_id
+  `, [exported.artifactId])
+  assert.deepEqual(references.rows, [{ reference_kind: 'codex_thread', reference_id: rootRequest.agentId }])
+  assert.equal((await context.artifacts[1].getAuthorized(
+    tenantId, exported.artifactId, rootRequest.agentId))?.ownerAgentId, null)
+})
+
 live('stale reconciliation reconstructs an adopted patch artifact logical response exactly', async context => {
   const expected = await context.coordinators[0].exportPatch(context.request)
   const deletes = context.objects.deletes

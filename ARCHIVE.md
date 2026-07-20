@@ -73,6 +73,41 @@ commands remain unchanged. Focused runner/report/POC regression tests passed.
 The complete default suite then passed with 345 tests discovered: 219 passed
 and 126 PostgreSQL-gated cases skipped.
 
+The coworker return path now creates an explicitly internal root artifact only
+for an ownerless lease with the exact uploaded source snapshot. Artifact
+ownership is nullable without a schema change: child artifacts retain their
+`owner_agent` reference and unchanged owner authorization, while root artifacts
+retain themselves through the exact Codex thread. The local resolver verifies
+the exact run tenant and provider marker, sole root, source/base/latest lineage,
+logical response, retention graph, snapshot graph, object locations, sizes,
+checksums, canonical manifests, and content bytes directly against disposable
+PostgreSQL and Garage. No patch download endpoint was added.
+
+Local application reparses the artifact, proves its base equals the immutable
+uploaded projection, plans the complete three-way result before mutation,
+rejects Git metadata and ignored additions, and cannot remove ignored
+descendants during directory changes. It stages exact content in an owner-only
+same-filesystem sibling journal, revalidates the checkout, applies only changed
+paths, and rolls every completed operation back in reverse on failure. A
+concurrent post-image or unprovable rollback retains the journal and requires
+manual recovery; ordinary conflicts and proven failures leave no partial Cudex
+mutation. Git staging and commits are never performed.
+
+Lifecycle signals are installed before allocation, forwarded to the TUI with a
+bounded SIGKILL escalation, and retained through cleanup. Finalization and
+report failures cannot bypass cleanup. An incomplete cleanup preserves the
+exact per-run configuration, credentials, service, and Docker state required by
+`cudex cleanup`; proven cleanup scrubs runtime credentials, Codex auth, TLS,
+source/base material, recovery state, and volumes. Focused tests cover TUI flag
+forwarding and signal escalation, local success/no-change/conflict/concurrency,
+ignored descendants, rollback, retained recovery journals, and report bounds.
+
+A disposable PostgreSQL 17 run passed the final complete 356-test suite with 355
+passes, no failures, and one environment-gated skip. The new
+fake-provider/fake-TUI acceptance exercised durable ownerless-root export,
+exact byte resolution, automatic local apply visible in `git diff`, and lease
+release. The temporary database container was removed after verification.
+
 ## Dedicated CubeSandbox code-mode runtime foundation (2026-07-19)
 
 The Linux hosted path now packages two provenance-bound binaries from the same

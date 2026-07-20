@@ -6,12 +6,12 @@ decisions and completed evidence are preserved in [`ARCHIVE.md`](ARCHIVE.md).
 ## Autonomous coworker-pilot delivery
 
 - [x] A1: documentation baseline, registry enforcement, and delivery checklist.
-- [ ] A2: finish reusable runner, patch, report, and lifecycle module extraction.
+- [x] A2: reusable runner, patch source/apply, report, and lifecycle modules.
 - [x] A3: release setup, XDG config, auth discovery/login, installer, and doctor.
 - [x] A4/A5: deterministic Git projection, synthetic baseline, and hosted export.
 - [x] A6: generalized TUI runner with exact lifecycle cleanup.
-- [ ] A7/A8: exact root patch resolution and recoverable three-way local apply.
-- [ ] A9/A10: signals, cleanup/status, redaction, database tests, and fake acceptance.
+- [x] A7/A8: exact root patch resolution and recoverable three-way local apply.
+- [x] A9/A10: signals, cleanup/status, redaction, database tests, and fake acceptance.
 
 ## Pilot shortcuts and internal-release blockers
 

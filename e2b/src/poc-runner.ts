@@ -271,7 +271,8 @@ export interface CleanupOutcome {
 }
 
 export async function exactCleanup(run: CleanupRun, appServer: PocAppServerProcess | undefined,
-  evidence: PocAppServerEvidence | undefined, preserve: boolean): Promise<CleanupOutcome> {
+  evidence: PocAppServerEvidence | undefined, preserve: boolean,
+  retainOnIncomplete = false): Promise<CleanupOutcome> {
   let deletionComplete = !evidence
   if (appServer && evidence && !evidence.deletedThreadIds.includes(evidence.rootThreadId)) {
     try { await deleteThreadTree(appServer, evidence); deletionComplete = true } catch { deletionComplete = false }
@@ -320,6 +321,9 @@ export async function exactCleanup(run: CleanupRun, appServer: PocAppServerProce
   const serviceCleanupComplete = Object.values(cleanupAssertions).every(Boolean)
   if (preserve) return { serviceCleanupComplete, forcedProviderCleanup: false,
     dockerVolumesRemoved: false, assertions: cleanupAssertions, ...(database ? { database } : {}) }
+  if (retainOnIncomplete && !serviceCleanupComplete) return { serviceCleanupComplete: false,
+    forcedProviderCleanup, dockerVolumesRemoved: false, assertions: cleanupAssertions,
+    ...(database ? { database } : {}) }
 
   let serviceStopped = true
   await stopControlService(run.paths).catch(() => { serviceStopped = false })

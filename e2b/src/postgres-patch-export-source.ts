@@ -33,7 +33,7 @@ export interface ResolvedPatchExportSource {
   lease: {
     leaseId: string
     agentId: string
-    ownerAgentId: string
+    ownerAgentId: string | null
     baseSnapshotId: string
     latestSnapshotId: string
   }
@@ -48,19 +48,25 @@ export class PostgresPatchExportSourceResolver {
   constructor(private readonly pool: Pool, private readonly objects: ObjectStore) {}
 
   async resolve(input: { tenantId: string; leaseId: string; agentId: string;
-    baseSnapshotId: string }, executor: Queryable = this.pool): Promise<ResolvedPatchExportSource> {
+    baseSnapshotId: string; rootSourceSnapshotId?: string }, executor: Queryable = this.pool): Promise<ResolvedPatchExportSource> {
     try {
       const leaseResult = await executor.query<{
-        lease_id: string; agent_id: string; owner_agent_id: string | null
+        lease_id: string; agent_id: string; owner_agent_id: string | null; owner_lease_id: string | null
+        source_snapshot_id: string | null
         base_snapshot_id: string | null; latest_snapshot_id: string | null; state: string
       }>(`
-        SELECT lease_id, agent_id, owner_agent_id, base_snapshot_id, latest_snapshot_id, state
+        SELECT lease_id, agent_id, owner_agent_id, owner_lease_id, source_snapshot_id,
+               base_snapshot_id, latest_snapshot_id, state
         FROM hosted_agent_leases WHERE tenant_id = $1 AND lease_id = $2
       `, [input.tenantId, input.leaseId])
       const lease = leaseResult.rows[0]
       if (!lease) throw new ServiceError(404, 'lease missing')
+      const allowedOwner = input.rootSourceSnapshotId === undefined
+        ? lease.owner_agent_id !== null
+        : lease.owner_agent_id === null && lease.owner_lease_id === null
+          && lease.source_snapshot_id === input.rootSourceSnapshotId
       if (!['active', 'paused'].includes(lease.state) || lease.agent_id !== input.agentId
-        || lease.owner_agent_id === null || lease.base_snapshot_id !== input.baseSnapshotId
+        || !allowedOwner || lease.base_snapshot_id !== input.baseSnapshotId
         || lease.latest_snapshot_id === null) throw new ServiceError(409, 'lease cannot export a patch')
       const snapshots = await Promise.all([
         this.snapshot(executor, input.tenantId, lease.lease_id, input.baseSnapshotId),

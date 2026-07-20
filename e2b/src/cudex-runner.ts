@@ -4,9 +4,12 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { CudexArguments } from './cudex-cli.js'
 import { copyDiscoveredCodexAuth, discoverCodexAuth } from './cudex-cli.js'
-import { loadCudexConfig, loadCudexCredentials, type CudexConfig, type CudexPaths } from './cudex-config.js'
+import { loadCudexConfig, loadCudexCredentials, validateCudexConfig, validateCudexCredentials,
+  type CudexConfig, type CudexCredentials, type CudexPaths } from './cudex-config.js'
 import { validateCachedRelease, type CudexReleaseManifest } from './cudex-release.js'
 import { projectGitWorkspace, type GitWorkspaceProjection } from './git-workspace.js'
+import { applyLocalRootPatch, type LocalPatchApplyResult } from './local-patch-apply.js'
+import { resolveRootPatch } from './local-patch-source.js'
 import { createCodexProcessEnvironment } from './poc-auth.js'
 import { initializeAndReadAccount, startPocAppServer } from './poc-app-server-client.js'
 import { createRunId, generateCodexConfiguration, generateRuntimeSecrets, prepareRunFiles,
@@ -45,6 +48,27 @@ export interface PreparedCudexRun {
   projection: GitWorkspaceProjection
   source: UploadedSourceSnapshot
   startedAt: string
+}
+
+class PreparationFailure extends Error {
+  constructor(message: string, readonly recoveryRequired: boolean, readonly allocated: boolean) {
+    super(message); this.name = 'PreparationFailure'
+  }
+}
+
+export class RunSignals {
+  signal: 'SIGINT' | 'SIGTERM' | undefined
+  private forward: ((signal: 'SIGINT' | 'SIGTERM') => void) | undefined
+  private readonly sigint = () => this.receive('SIGINT')
+  private readonly sigterm = () => this.receive('SIGTERM')
+  install(): void { process.on('SIGINT', this.sigint); process.on('SIGTERM', this.sigterm) }
+  dispose(): void { process.off('SIGINT', this.sigint); process.off('SIGTERM', this.sigterm) }
+  request(signal: 'SIGINT' | 'SIGTERM'): void { this.receive(signal) }
+  setForward(value: ((signal: 'SIGINT' | 'SIGTERM') => void) | undefined): void { this.forward = value }
+  private receive(signal: 'SIGINT' | 'SIGTERM'): void {
+    this.signal ??= signal
+    this.forward?.(signal)
+  }
 }
 
 function pilotRunPaths(paths: CudexPaths, runId: string): PocRunPaths {
@@ -142,6 +166,25 @@ async function saveBase(runPaths: PocRunPaths, projection: GitWorkspaceProjectio
   ])
 }
 
+async function saveRecovery(runPaths: PocRunPaths, config: CudexConfig,
+  credentials: CudexCredentials): Promise<void> {
+  await ownerJson(join(runPaths.runDirectory, 'recovery-config.json'),
+    { version: 1, config, credentials })
+}
+
+async function loadRecovery(runPaths: PocRunPaths): Promise<{ config: CudexConfig;
+  credentials: CudexCredentials }> {
+  const path = join(runPaths.runDirectory, 'recovery-config.json')
+  const metadata = await lstat(path)
+  if (!metadata.isFile() || metadata.isSymbolicLink() || (metadata.mode & 0o077) !== 0
+    || metadata.size > 64 * 1024) throw new Error('Cudex recovery configuration is unsafe')
+  const value = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>
+  if (!value || value.version !== 1 || Reflect.ownKeys(value).length !== 3) {
+    throw new Error('Cudex recovery configuration is invalid')
+  }
+  return { config: validateCudexConfig(value.config), credentials: validateCudexCredentials(value.credentials) }
+}
+
 async function prepareSession(parsed: Extract<CudexArguments, { command: 'session' }>, paths: CudexPaths,
   state: CurrentRunState): Promise<PreparedCudexRun> {
   const startedAt = state.startedAt
@@ -154,11 +197,13 @@ async function prepareSession(parsed: Extract<CudexArguments, { command: 'sessio
   await assertPocPortsAvailable(env)
   const runPaths = pilotRunPaths(paths, state.runId)
   await prepareRunFiles(runPaths, env, generateRuntimeSecrets())
+  await saveRecovery(runPaths, config, credentials)
   await saveBase(runPaths, projection)
   const tls = await generatePocTls(runPaths.tlsDirectory, config.providerCaCertificate)
-  let composeStarted = false
+  let allocationAttempted = false
   try {
-    await startCompose(docker, runPaths); composeStarted = true
+    allocationAttempted = true
+    await startCompose(docker, runPaths)
     const runtime = await readRuntimeEnvironment(runPaths)
     await verifyGarage(env, runtime); await runMigrations(runPaths, runtime.POC_DATABASE_URL!)
     await startControlService(runPaths, env, runtime, tls); await verifyControlService(env, runtime, tls)
@@ -174,16 +219,26 @@ async function prepareSession(parsed: Extract<CudexArguments, { command: 'sessio
     return { config, env, release, provenance: releaseProvenance, paths: runPaths, docker, tls, runtime,
       projection, source, startedAt }
   } catch (error) {
-    await stopControlService(runPaths).catch(() => undefined)
-    if (composeStarted) await stopCompose(docker, runPaths).catch(() => undefined)
-    await Promise.all([rm(tls.caKeyPath, { force: true }), rm(tls.serverKeyPath, { force: true }),
-      rm(runPaths.codexHome, { recursive: true, force: true })])
-    throw error
+    if (!allocationAttempted) throw error
+    let cleanupProven = true
+    const serviceStopped = await stopControlService(runPaths).catch(() => { cleanupProven = false; return false })
+    if (!serviceStopped) cleanupProven = false
+    await stopCompose(docker, runPaths).catch(() => { cleanupProven = false })
+    if (cleanupProven) {
+      await rm(runPaths.runDirectory, { recursive: true, force: true })
+    }
+    throw new PreparationFailure(error instanceof Error ? error.message : 'Cudex preparation failed',
+      !cleanupProven, true)
   }
 }
 
-async function launchTui(run: PreparedCudexRun, parsed: Extract<CudexArguments, { command: 'session' }>): Promise<{
+export async function launchTui(run: PreparedCudexRun,
+  parsed: Extract<CudexArguments, { command: 'session' }>, signals: RunSignals,
+  killGraceMs = 10_000): Promise<{
   exitCode: number | null; signal?: 'SIGINT' | 'SIGTERM' }> {
+  if (!Number.isSafeInteger(killGraceMs) || killGraceMs < 1 || killGraceMs > 60_000) {
+    throw new Error('invalid TUI signal grace period')
+  }
   // TODO(internal-release, PILOT-010): The isolated pilot fixes approval to never because CubeSandbox
   // is the approval boundary. Replace this with the reviewed internal approval and policy model.
   const args = ['--strict-config', '-C', run.projection.localDirectory, '-a', 'never',
@@ -191,16 +246,19 @@ async function launchTui(run: PreparedCudexRun, parsed: Extract<CudexArguments, 
   const child = spawn(run.provenance.binaryPath, args, { cwd: run.projection.localDirectory,
     env: createCodexProcessEnvironment({ codexHome: run.paths.codexHome,
       caBundlePath: run.tls.combinedCaBundlePath, hostedBearer: run.runtime.POC_SERVICE_BEARER! }), stdio: 'inherit' })
-  let received: 'SIGINT' | 'SIGTERM' | undefined
-  const sigint = () => { received = 'SIGINT'; child.kill('SIGINT') }
-  const sigterm = () => { received = 'SIGTERM'; child.kill('SIGTERM') }
-  process.once('SIGINT', sigint); process.once('SIGTERM', sigterm)
+  let killTimer: NodeJS.Timeout | undefined
+  signals.setForward(signal => {
+    child.kill(signal)
+    killTimer ??= setTimeout(() => child.kill('SIGKILL'), killGraceMs)
+    killTimer.unref()
+  })
+  if (signals.signal) child.kill(signals.signal)
   try {
     const exitCode = await new Promise<number | null>((resolveExit, reject) => {
       child.once('error', reject); child.once('exit', resolveExit)
     })
-    return { exitCode, ...(received ? { signal: received } : {}) }
-  } finally { process.off('SIGINT', sigint); process.off('SIGTERM', sigterm) }
+    return { exitCode, ...(signals.signal ? { signal: signals.signal } : {}) }
+  } finally { signals.setForward(undefined); if (killTimer) clearTimeout(killTimer) }
 }
 
 async function rootLease(run: Pick<PreparedCudexRun, 'runtime' | 'paths'>): Promise<PocLeaseInspection | undefined> {
@@ -232,8 +290,21 @@ async function deleteRootThread(run: Pick<PreparedCudexRun, 'provenance' | 'path
 }
 
 async function cleanupPrepared(run: PreparedCudexRun, root: PocLeaseInspection | undefined) {
-  const deleted = await deleteRootThread(run, root)
-  const outcome = await exactCleanup(run, undefined, undefined, false)
+  const cleanupRoot = root ?? await rootLease(run).catch(() => undefined)
+  const deleted = await deleteRootThread(run, cleanupRoot)
+  if (!deleted) return { serviceCleanupComplete: false, forcedProviderCleanup: false,
+    dockerVolumesRemoved: false, deleted }
+  const outcome = await exactCleanup(run, undefined, undefined, false, true)
+  if (deleted && outcome.serviceCleanupComplete && outcome.dockerVolumesRemoved) {
+    await Promise.all([
+      rm(run.paths.runtimeEnv, { force: true }), rm(run.paths.composeEnv, { force: true }),
+      rm(run.paths.garageConfig, { force: true }), rm(run.paths.codexHome, { recursive: true, force: true }),
+      rm(run.paths.tlsDirectory, { recursive: true, force: true }),
+      rm(join(run.paths.runDirectory, 'base.tar'), { force: true }),
+      rm(join(run.paths.runDirectory, 'base-manifest.json'), { force: true }),
+      rm(join(run.paths.runDirectory, 'recovery-config.json'), { force: true }),
+    ])
+  }
   return { ...outcome, deleted }
 }
 
@@ -247,72 +318,175 @@ async function record(run: PreparedCudexRun, phase: 'session' | 'apply' | 'clean
     startedAt, finishedAt: new Date().toISOString(), details })
 }
 
+async function resolveAndApply(run: PreparedCudexRun,
+  root: PocLeaseInspection, signals: RunSignals): Promise<LocalPatchApplyResult> {
+  if (!root.baseSnapshotId || !root.latestSnapshotId || !root.providerSandboxId) {
+    throw new Error('hosted root did not finalize an exact workspace lineage')
+  }
+  const required = (name: string): string => {
+    const value = run.runtime[name]
+    if (!value) throw new Error('Cudex patch storage configuration is incomplete')
+    return value
+  }
+  // TODO(internal-release, PILOT-011): The pilot resolves root artifact bytes directly from its
+  // disposable PostgreSQL and Garage because no stable return boundary exists. Replace this with
+  // a supported authenticated patch-return API or formalize this exact internal boundary.
+  const patch = await resolveRootPatch({ runId: run.paths.runId,
+    databaseUrl: required('POC_DATABASE_URL'), sourceSnapshotId: run.source.sourceSnapshotId, root,
+    provider: { apiKey: run.env.e2bApiKey, apiUrl: run.env.e2bApiUrl, domain: run.env.e2bDomain,
+      validateApiKey: run.env.e2bValidateApiKey },
+    objectStore: { bucket: required('POC_GARAGE_BUCKET'), endpoint: `http://127.0.0.1:${run.env.garagePort}`,
+      accessKeyId: required('POC_GARAGE_ACCESS_KEY'), secretAccessKey: required('POC_GARAGE_SECRET_KEY') } })
+  if (signals.signal) return { type: 'failed', reason: 'interrupted before local application' }
+  return applyLocalRootPatch({ runId: run.paths.runId, selectedDirectory: run.projection.localDirectory,
+    immutableBaseManifest: run.projection.captured.manifest, patch })
+}
+
+function applyReport(result: LocalPatchApplyResult): { status: CudexResultStatus;
+  details: Record<string, string | number | boolean | null>; code: number } {
+  switch (result.type) {
+    case 'applied': return { status: 'succeeded', details: { applied: true,
+      conflict: false, changedFiles: result.changedFiles }, code: 0 }
+    case 'no-change': return { status: 'succeeded', details: { applied: false,
+      conflict: false, changedFiles: 0 }, code: 0 }
+    case 'conflict': return { status: 'conflict', details: { applied: false,
+      conflict: true, conflictCount: result.total, conflictPathsTruncated: result.truncated }, code: 4 }
+    case 'manual-recovery': return { status: 'manual-recovery', details: { applied: false,
+      conflict: false, recoveryJournalRetained: true, reason: result.reason }, code: 3 }
+    case 'failed': return { status: 'failed', details: { applied: false,
+      conflict: false, reason: result.reason }, code: 1 }
+  }
+}
+
 async function runSession(parsed: Extract<CudexArguments, { command: 'session' }>, paths: CudexPaths): Promise<number> {
-  const lock = await acquireLock(paths)
+  const signals = new RunSignals(); signals.install()
+  const lock = await acquireLock(paths).catch(error => { signals.dispose(); throw error })
   const state: CurrentRunState = { version: 1, runId: createRunId(), pid: process.pid,
     startedAt: new Date().toISOString(), selectedDirectory: parsed.directory, phase: 'preparing' }
-  await ownerJson(paths.currentRunFile, state)
+  try { await ownerJson(paths.currentRunFile, state) }
+  catch (error) { await clearOwnership(paths, lock); signals.dispose(); throw error }
   let run: PreparedCudexRun | undefined
   try {
     run = await prepareSession(parsed, paths, state)
   } catch (error) {
+    if (error instanceof PreparationFailure && error.recoveryRequired) {
+      state.phase = 'recovery'; await ownerJson(paths.currentRunFile, state).catch(() => undefined)
+      await lock.close().catch(() => undefined); signals.dispose()
+      console.error(error.message); return 3
+    }
     await clearOwnership(paths, lock)
     await rm(pilotRunPaths(paths, state.runId).runDirectory, { recursive: true, force: true })
+    const interrupted = signals.signal; signals.dispose()
+    if (interrupted) return interrupted === 'SIGINT' ? 130 : 143
+    if (error instanceof PreparationFailure && error.allocated) { console.error(error.message); return 1 }
     throw error
   }
-  state.phase = 'tui'; await ownerJson(paths.currentRunFile, state)
   let tui: Awaited<ReturnType<typeof launchTui>> = { exitCode: null }
-  let sessionFailure: unknown
-  try { tui = await launchTui(run, parsed) } catch (error) { sessionFailure = error }
-  await record(run, 'session', tui.signal ? 'interrupted' : tui.exitCode === 0 ? 'succeeded' : 'failed',
-    { tuiExitCode: tui.exitCode, interrupted: Boolean(tui.signal), projectedFiles: run.projection.files.length })
-
-  state.phase = 'finalizing'; await ownerJson(paths.currentRunFile, state)
-  const root = await rootLease(run).catch(error => { sessionFailure ??= error; return undefined })
-  // Root result resolution and local application are added in the next delivery chunk. Until then a
-  // successful hosted TUI is still reported separately and never mutates the local checkout.
-  const applySucceeded = false
-  await record(run, 'apply', 'failed', { applied: false, conflict: false, reason: 'patch-return-pending' })
-
-  state.phase = 'cleanup'; await ownerJson(paths.currentRunFile, state)
+  let root: PocLeaseInspection | undefined
+  let result: LocalPatchApplyResult = { type: 'failed', reason: 'hosted session did not complete' }
+  let resultCode = 1
+  let operationalFailure: unknown
+  let reportFailure = false
+  let cleanup = { serviceCleanupComplete: false, forcedProviderCleanup: false,
+    dockerVolumesRemoved: false, deleted: false }
   const cleanupStarted = new Date().toISOString()
-  const cleanup = await cleanupPrepared(run, root).catch(error => {
-    sessionFailure ??= error
-    return { serviceCleanupComplete: false, forcedProviderCleanup: false, dockerVolumesRemoved: false, deleted: false }
-  })
+  try {
+    state.phase = 'tui'; await ownerJson(paths.currentRunFile, state)
+    if (signals.signal) tui = { exitCode: null, signal: signals.signal }
+    else tui = await launchTui(run, parsed, signals)
+    await record(run, 'session', signals.signal ? 'interrupted' : tui.exitCode === 0 ? 'succeeded' : 'failed',
+      { tuiExitCode: tui.exitCode, interrupted: Boolean(signals.signal),
+        projectedFiles: run.projection.files.length }).catch(error => { reportFailure = true; operationalFailure ??= error })
+
+    state.phase = 'finalizing'; await ownerJson(paths.currentRunFile, state)
+    if (!signals.signal && tui.exitCode === 0) {
+      root = await rootLease(run)
+      if (!root) throw new Error('hosted root lease was not durably visible')
+      if (!signals.signal) result = await resolveAndApply(run, root, signals)
+      else result = { type: 'failed', reason: 'interrupted before local application' }
+    } else {
+      result = { type: 'failed', reason: signals.signal ? 'interrupted before local application' : 'hosted TUI failed' }
+    }
+    const reported = applyReport(result); resultCode = reported.code
+    await record(run, 'apply', signals.signal ? 'interrupted' : reported.status,
+      reported.details).catch(error => { reportFailure = true; operationalFailure ??= error })
+  } catch (error) {
+    operationalFailure ??= error; resultCode = 1
+    await record(run, 'apply', signals.signal ? 'interrupted' : 'failed', { applied: false,
+      conflict: false, reason: error instanceof Error ? error.message : 'root patch resolution failed' })
+      .catch(() => { reportFailure = true })
+  } finally {
+    state.phase = 'cleanup'; await ownerJson(paths.currentRunFile, state).catch(error => { operationalFailure ??= error })
+    cleanup = await cleanupPrepared(run, root).catch(error => {
+      operationalFailure ??= error
+      return { serviceCleanupComplete: false, forcedProviderCleanup: false,
+        dockerVolumesRemoved: false, deleted: false }
+    })
+  }
   const cleanupComplete = cleanup.deleted && cleanup.serviceCleanupComplete && cleanup.dockerVolumesRemoved
   await record(run, 'cleanup', cleanupComplete ? 'succeeded' : 'manual-recovery', {
     threadDeleted: cleanup.deleted, serviceCleanupComplete: cleanup.serviceCleanupComplete,
     forcedProviderCleanup: cleanup.forcedProviderCleanup, dockerVolumesRemoved: cleanup.dockerVolumesRemoved,
-  }, cleanupStarted)
-  if (cleanupComplete) await clearOwnership(paths, lock)
-  else { state.phase = 'recovery'; await ownerJson(paths.currentRunFile, state); await lock.close().catch(() => undefined) }
-  console.log(JSON.stringify({ runId: run.paths.runId, tuiExitCode: tui.exitCode, applySucceeded,
+  }, cleanupStarted).catch(() => { reportFailure = true })
+  let ownershipCleared = false
+  if (cleanupComplete) {
+    try { await clearOwnership(paths, lock); ownershipCleared = true } catch { /* Retain recovery state below. */ }
+  }
+  if (!ownershipCleared) {
+    state.phase = 'recovery'; await ownerJson(paths.currentRunFile, state).catch(() => undefined)
+    await lock.close().catch(() => undefined)
+  }
+  signals.dispose()
+  console.log(JSON.stringify({ runId: run.paths.runId, tuiExitCode: tui.exitCode,
+    applyResult: result,
     cleanupComplete, reports: run.paths.runDirectory }))
-  if (!cleanupComplete) return 3
-  if (tui.signal === 'SIGINT') return 130
-  if (tui.signal === 'SIGTERM') return 143
-  if (sessionFailure || tui.exitCode !== 0 || !applySucceeded) return 1
-  return 0
+  if (!cleanupComplete || !ownershipCleared || resultCode === 3) return 3
+  if (signals.signal === 'SIGINT') return 130
+  if (signals.signal === 'SIGTERM') return 143
+  if (resultCode === 4) return 4
+  if (operationalFailure || reportFailure || tui.exitCode !== 0) return 1
+  return resultCode
 }
 
 async function cleanupCurrent(paths: CudexPaths): Promise<number> {
   const state = await currentState(paths)
   if (!state) { console.log(JSON.stringify({ active: false, cleaned: true })); await rm(paths.lockFile, { force: true }); return 0 }
   if (state.pid !== process.pid && pidAlive(state.pid)) throw new Error('the active Cudex process must finish its own cleanup')
-  const [config, credentials, docker] = await Promise.all([loadCudexConfig(paths), loadCudexCredentials(paths), detectDocker()])
-  const runPaths = pilotRunPaths(paths, state.runId); const runtime = await readRuntimeEnvironment(runPaths)
-  const release = await validateCachedRelease(config.releaseDirectory); const env = environment(config, credentials)
-  const partial = { config, env, release, provenance: provenance(config, release), paths: runPaths, docker,
-    tls: existingTlsMaterial(runPaths), runtime, projection: undefined, source: undefined, startedAt: state.startedAt }
-  const root = await rootLease(partial).catch(() => undefined)
-  const deleted = await deleteRootThread(partial, root)
-  const outcome = await exactCleanup(partial, undefined, undefined, false)
-  const complete = deleted && outcome.serviceCleanupComplete && outcome.dockerVolumesRemoved
-  if (complete) await clearOwnership(paths)
-  console.log(JSON.stringify({ runId: state.runId, cleaned: complete, threadDeleted: deleted,
-    forcedProviderCleanup: outcome.forcedProviderCleanup, dockerVolumesRemoved: outcome.dockerVolumesRemoved }))
-  return complete ? (outcome.forcedProviderCleanup ? 3 : 0) : 3
+  const cleanupLockPath = `${paths.lockFile}.cleanup`
+  const cleanupLock = await open(cleanupLockPath, 'wx', 0o600).catch(() => undefined)
+  if (!cleanupLock) { console.error('another Cudex cleanup is active'); return 3 }
+  try {
+    const runPaths = pilotRunPaths(paths, state.runId)
+    const [{ config, credentials }, docker, runtime] = await Promise.all([
+      loadRecovery(runPaths), detectDocker(), readRuntimeEnvironment(runPaths),
+    ])
+    const release = await validateCachedRelease(config.releaseDirectory); const env = environment(config, credentials)
+    const partial = { config, env, release, provenance: provenance(config, release), paths: runPaths, docker,
+      tls: existingTlsMaterial(runPaths), runtime, projection: undefined, source: undefined, startedAt: state.startedAt }
+    const root = await rootLease(partial).catch(() => undefined)
+    const deleted = await deleteRootThread(partial, root)
+    const outcome = deleted
+      ? await exactCleanup(partial, undefined, undefined, false, true)
+      : { serviceCleanupComplete: false, forcedProviderCleanup: false, dockerVolumesRemoved: false }
+    const complete = deleted && outcome.serviceCleanupComplete && outcome.dockerVolumesRemoved
+    if (complete) {
+      await Promise.all([rm(runPaths.runtimeEnv, { force: true }), rm(runPaths.composeEnv, { force: true }),
+        rm(runPaths.garageConfig, { force: true }), rm(runPaths.codexHome, { recursive: true, force: true }),
+        rm(runPaths.tlsDirectory, { recursive: true, force: true }),
+        rm(join(runPaths.runDirectory, 'base.tar'), { force: true }),
+        rm(join(runPaths.runDirectory, 'base-manifest.json'), { force: true }),
+        rm(join(runPaths.runDirectory, 'recovery-config.json'), { force: true })])
+      await clearOwnership(paths)
+    }
+    console.log(JSON.stringify({ runId: state.runId, cleaned: complete, threadDeleted: deleted,
+      forcedProviderCleanup: outcome.forcedProviderCleanup, dockerVolumesRemoved: outcome.dockerVolumesRemoved }))
+    return complete ? 0 : 3
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : 'Cudex cleanup failed')
+    return 3
+  } finally {
+    await cleanupLock.close().catch(() => undefined); await rm(cleanupLockPath, { force: true })
+  }
 }
 
 async function showStatus(paths: CudexPaths): Promise<number> {

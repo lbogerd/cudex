@@ -139,10 +139,24 @@ export class PostgresPatchExportCoordinator {
 
   async exportPatch(untrustedRequest: PatchExportRequest): Promise<AgentPatchArtifact> {
     const request = validatePatchExportRequest(untrustedRequest)
+    return this.exportAuthorized(request)
+  }
+
+  /** Internal-only root export used by the trusted coworker return path. */
+  async exportRootPatch(untrustedRequest: PatchExportRequest,
+    rootSourceSnapshotId: string): Promise<AgentPatchArtifact> {
+    const request = validatePatchExportRequest(untrustedRequest)
+    bounded('root source snapshot ID', rootSourceSnapshotId)
+    return this.exportAuthorized(request, rootSourceSnapshotId)
+  }
+
+  private async exportAuthorized(request: PatchExportRequest,
+    rootSourceSnapshotId?: string): Promise<AgentPatchArtifact> {
     const identity: OperationIdentity = {
       operation, idempotencyKey: request.idempotencyKey, tenantId: this.tenantId,
     }
-    const requestHash = canonicalRequestHash(request)
+    const requestHash = canonicalRequestHash(rootSourceSnapshotId === undefined
+      ? request : { ...request, rootSourceSnapshotId })
     let claim: OperationClaim
     try {
       claim = await this.journal.claimOperation({
@@ -168,6 +182,7 @@ export class PostgresPatchExportCoordinator {
       const initial = await this.withHeartbeat(fence, () => this.sourceResolver.resolve({
         tenantId: this.tenantId, leaseId: request.leaseId,
         agentId: request.agentId, baseSnapshotId: request.baseSnapshotId,
+        ...(rootSourceSnapshotId === undefined ? {} : { rootSourceSnapshotId }),
       }))
       const serialized = serializedSource(initial)
       const artifactId = deterministicPatchExportId('artifact', identity)
@@ -200,6 +215,7 @@ export class PostgresPatchExportCoordinator {
         const finalSource = await this.sourceResolver.resolve({
           tenantId: this.tenantId, leaseId: request.leaseId,
           agentId: request.agentId, baseSnapshotId: request.baseSnapshotId,
+          ...(rootSourceSnapshotId === undefined ? {} : { rootSourceSnapshotId }),
         }, client)
         const finalSerialized = serializedSource(finalSource)
         if (!sameSerialization(serialized, finalSerialized)) {

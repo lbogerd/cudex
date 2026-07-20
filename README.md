@@ -37,9 +37,8 @@ without staging or committing them. A conflict leaves the checkout unchanged.
 
 Release setup, authentication discovery/login, installation, `doctor`,
 `version`, `cudex files`, and the arbitrary-checkout TUI lifecycle are
-implemented. Root-result resolution and local application arrive in the next
-delivery chunk; in the current intermediate revision a successful TUI is
-reported, cleanup runs, and the command returns `1` without local mutation.
+implemented together with exact root-result resolution, automatic local apply,
+signal handling, recovery state, and exact cleanup.
 
 ## Command reference
 
@@ -111,8 +110,20 @@ atomically caches exactly `release.json`, `codex`, `codex-code-mode-host`, and
 
 Cudex never stages or commits project changes. It applies only paths proven
 safe by the immutable base/proposed/target comparison and uses a same-filesystem
-backup journal. If rollback cannot be proven complete, it retains the journal,
+backup journal. Proposed `.git` paths and ignored additions are rejected;
+destructive directory changes cannot consume ignored descendants. All touched
+paths are staged and revalidated before mutation, concurrent touched-path edits
+abort the apply, and unrelated local changes remain in place. If rollback
+cannot be proven complete, Cudex retains the owner-only sibling journal,
 returns status `3`, and prints its exact recovery path.
+
+The root result is exported only for the one ownerless lease derived from the
+uploaded source snapshot. Cudex resolves it in-process from the disposable
+PostgreSQL and Garage instances and verifies the exact run tenant, provider
+ownership marker, root/source/base/latest lineage, artifact retention, complete
+object-reference graph, locations, sizes, checksums, manifests, and content
+bytes. Child artifacts cannot substitute for the root result; an exact
+zero-change artifact succeeds without local mutation.
 
 Never put API keys, auth files, credentials, release secrets, connection URLs,
 or private keys in a project or prompt. Repository-local `.env`, auth files,
@@ -125,11 +136,21 @@ inspect its redacted state with `cudex status`; use `cudex cleanup` to retry the
 exact run-scoped cleanup. Do not manually remove the lock or current pointer
 until the command reports that no live run owns them.
 
+SIGINT and SIGTERM are handled from allocation through cleanup. During the TUI
+they are forwarded to Codex, followed by a bounded forced stop if it does not
+exit. Cudex skips new finalization work after an interruption and returns
+`130`/`143` only after cleanup is proven complete; otherwise status `3` and the
+recovery pointer take precedence.
+
 Each run keeps separate mode-`0600` `session-report.json`, `apply-report.json`,
 and `cleanup-report.json` files below the XDG state directory. Reports contain
 only bounded non-secret outcomes. `cudex status` reads the non-secret current
 pointer and exact tenant lifecycle counts; `cudex cleanup` retries deletion and
-teardown for only that run.
+teardown for only that run. If cleanup is incomplete, Cudex retains an
+owner-only per-run recovery configuration and the still-running disposable
+control plane so a retry remains possible. Successful cleanup removes runtime
+credentials, isolated Codex auth, TLS material, local base archives, recovery
+configuration, and Docker volumes while retaining only redacted reports/logs.
 
 When local application returns status `3`, leave the retained journal in place
 and follow the printed recovery instructions. When it returns status `4`, no

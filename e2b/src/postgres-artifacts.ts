@@ -18,7 +18,7 @@ export interface PatchArtifact {
   artifactId: string
   tenantId: string
   agentId: string
-  ownerAgentId: string
+  ownerAgentId: string | null
   sourceLeaseId: string
   baseSnapshotId: string
   currentSnapshotId: string
@@ -37,7 +37,7 @@ export interface CreatePatchArtifactInput {
   artifactId: string
   tenantId: string
   agentId: string
-  ownerAgentId: string
+  ownerAgentId: string | null
   sourceLeaseId: string
   baseSnapshotId: string
   currentSnapshotId: string
@@ -58,7 +58,7 @@ interface ArtifactRow {
   artifact_id: string
   tenant_id: string
   agent_id: string
-  owner_agent_id: string
+  owner_agent_id: string | null
   source_lease_id: string
   base_snapshot_id: string
   current_snapshot_id: string
@@ -101,7 +101,7 @@ interface ObjectRow {
 }
 
 const artifactColumns = `a.artifact_id, a.tenant_id, a.agent_id,
-  COALESCE(l.owner_agent_id, '') AS owner_agent_id, a.source_lease_id,
+  l.owner_agent_id, a.source_lease_id,
   a.base_snapshot_id, a.current_snapshot_id, a.base_manifest_object_id,
   a.current_manifest_object_id, a.artifact_object_id, a.checksum,
   a.changed_files, a.size_bytes::text, a.state, a.expires_at, a.created_at`
@@ -129,11 +129,12 @@ function validatedInput(input: CreatePatchArtifactInput): {
 } {
   for (const [label, value] of [
     ['artifact ID', input.artifactId], ['tenant ID', input.tenantId], ['agent ID', input.agentId],
-    ['owner agent ID', input.ownerAgentId], ['source lease ID', input.sourceLeaseId],
+    ['source lease ID', input.sourceLeaseId],
     ['base snapshot ID', input.baseSnapshotId], ['current snapshot ID', input.currentSnapshotId],
     ['base manifest object ID', input.baseManifestObjectId],
     ['current manifest object ID', input.currentManifestObjectId], ['artifact object ID', input.artifactObjectId],
   ] as const) validateId(label, value)
+  if (input.ownerAgentId !== null) validateId('owner agent ID', input.ownerAgentId)
   if (!checksumPattern.test(input.checksum)) throw new Error('invalid artifact checksum')
   if (input.state !== 'available') throw new Error('new patch artifact must be available')
   validateDate('artifact expiry', input.expiresAt)
@@ -455,15 +456,17 @@ export class PostgresPatchArtifactRepository {
         ELSE GREATEST(hosted_agent_snapshot_references.retain_until, EXCLUDED.retain_until)
       END
     `, [input.baseSnapshotId, input.currentSnapshotId, input.artifactId, input.expiresAt])
+    const retentionKind = input.ownerAgentId === null ? 'codex_thread' : 'owner_agent'
+    const retentionId = input.ownerAgentId ?? input.agentId
     await client.query(`
       INSERT INTO hosted_agent_artifact_references
         (artifact_id, reference_kind, reference_id, retain_until)
-      VALUES ($1, 'owner_agent', $2, $3)
+      VALUES ($1, $2, $3, $4)
       ON CONFLICT (artifact_id, reference_kind, reference_id)
       DO UPDATE SET retain_until = CASE
         WHEN hosted_agent_artifact_references.retain_until IS NULL OR EXCLUDED.retain_until IS NULL THEN NULL
         ELSE GREATEST(hosted_agent_artifact_references.retain_until, EXCLUDED.retain_until)
       END
-    `, [input.artifactId, input.ownerAgentId, input.expiresAt])
+    `, [input.artifactId, retentionKind, retentionId, input.expiresAt])
   }
 }
