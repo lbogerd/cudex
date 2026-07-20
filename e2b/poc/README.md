@@ -50,9 +50,9 @@ application remains a plain hosted-only tool by design.
 `POC_CODEX_MODEL` may select either a direct-tool model or a listed
 `code_mode_only` model. Preflight checks the authenticated catalog, the exact
 artifact's bounded capability cache, both binary checksums, and the root/child
-`environmentBoundCodeMode` grants before any CubeSandbox allocation. Keep the
-checked-in example at `gpt-5.5` until a full code-mode-only acceptance report
-passes; only then should the default move to the selected `gpt-5.6-*` model.
+`environmentBoundCodeMode` grants before any CubeSandbox allocation. The
+checked-in default is `gpt-5.6-luna` following the successful full remote
+root/child acceptance run recorded in `ARCHIVE.md`.
 
 Template publication explicitly defaults each sandbox to 2000 CPU millicores
 and 2000 MB memory. Override these provider-enforced limits with

@@ -56,10 +56,12 @@ its existing process-owned/in-process behavior; hosted Codex must fail closed.
   shutdown tests without bypassing remote startup.
 - [x] Add trusted runtime-placement evidence and the six code-mode booleans to
   retained POC reports.
-- [ ] Run the real root/child CubeSandbox scenarios, including CPU placement,
-  stored-value isolation, nested command routing, independent failure/shutdown,
-  and exact final cleanup.
-- [ ] Switch the POC default from `gpt-5.5` only after the full code-mode-only
+- [x] Run the real root/child CubeSandbox happy-path acceptance with pure
+  JavaScript work, stored-value isolation, nested command routing, distinct
+  placement, durable patch application, and exact final cleanup.
+- [ ] Add destructive live fault cases for an infinite child cell, independent
+  root/child sandbox failure, and measured local-versus-sandbox CPU accounting.
+- [x] Switch the POC default from `gpt-5.5` only after the full code-mode-only
   acceptance run passes.
 - [x] Exempt only the exact identity-derived lease-long code-mode host from
   workspace quiescence, while retaining gates for commands and

@@ -48,15 +48,29 @@ The outer `exec` and `wait` tools are exposed only when the hosted authorization
 contains that domain for the exact provider environment; the remote runtime
 does not require `orchestratorProcess`. Root and child POC policies independently
 grant their pre-existing nested tools, so authorizing outer JavaScript execution
-does not authorize a nested operation. The POC model compatibility check now
-recognizes `code_mode_only`, while the default remains `gpt-5.5` until the full
-root/child placement and cleanup proof passes.
+does not authorize a nested operation. The POC model compatibility check
+recognizes `code_mode_only`; after the full placement and cleanup proof passed,
+the checked-in default moved to `gpt-5.6-luna`.
 
-This is a foundation checkpoint, not final acceptance. Same-generation process
-recovery, replacement semantics using the service's authoritative generation,
-identity validation at nested dispatch, explicitly awaited provider shutdown,
-complete runtime telemetry, trusted placement evidence, and the real
-code-mode-only CubeSandbox acceptance matrix remain tracked in `TODO.md`.
+The remaining reconnect and fault-injection work is tracked in `TODO.md`.
+
+## Live remote code-mode acceptance (2026-07-20)
+
+Automated run `20260720001911-93e0fd917b64` passed with `gpt-5.6-luna`, build
+`adc83e5f1bc6`, template `tpl-ed31bdd9f1534d76bb723e1f`, Codex checksum
+`42e0916804ff956bb3b576c90eddfe1c39574961f10646184c5a2653210dcc4d`, and
+code-mode-host checksum
+`b0c5995ae08e1f19828e5dcadb326faa0e51e807263ef7cc4f4cb524cc5c8df6`.
+Trusted database and provider evidence confirmed distinct root/child threads,
+leases, environments, provider sandboxes, and code-mode environments. Both
+runtime hosts became ready and quiesced; the child artifact was durable,
+applied, and verified in the root workspace. Final cleanup reported no local
+hosted code-mode process, live tickets, unfinished interactions, pending
+allocations, managed sandboxes, or known snapshots, and required no forced
+provider cleanup. A first template instance from the same image failed before
+guest startup with CubeMaster's bounded `reset guest time` timeout; republishing
+the identical digest produced a directly probed healthy template before the
+successful run.
 
 ## Live local hosted-Codex POC acceptance (2026-07-19)
 
