@@ -1,5 +1,7 @@
 import { createHash } from 'node:crypto'
 import { Pool, type PoolClient } from 'pg'
+import type { IDatabaseConnection } from '@pgtyped/runtime'
+import { beginRepeatableRead, commit, rollbackQuietly } from './db/primitives.js'
 import { S3BlobStore, type ObjectStore } from './blob-store.js'
 import { parsePatchArtifact, type SerializedPatchArtifact } from './patch-artifact.js'
 import { PostgresPatchArtifactRepository } from './postgres-artifacts.js'
@@ -10,6 +12,11 @@ import { PostgresDurableState } from './postgres-state.js'
 import { PostgresJournal } from './postgres-store.js'
 import { PocDatabaseInspector, PocProviderInspector, type PocLeaseInspection } from './poc-inspector.js'
 import { canonicalJson, parseWorkspaceManifest, workspaceManifestChecksum } from './workspace-manifest.js'
+import { resolveLocalRootPatchArtifact, shareLocalPatchArtifactRetention,
+  sharePatchApplyObjectReferences, sharePatchApplySnapshots,
+  sharePatchArtifactSnapshotReferences } from './db/queries/patches.queries.js'
+
+function connection(client: PoolClient): IDatabaseConnection { return client as IDatabaseConnection }
 
 interface RootArtifactRow {
   artifact_id: string
@@ -94,19 +101,8 @@ function sameLease(left: PocLeaseInspection, right: PocLeaseInspection): boolean
 
 async function rowsForArtifact(client: PoolClient, tenantId: string,
   artifactId: string): Promise<ObjectRow[]> {
-  const result = await client.query<ObjectRow>(`
-    SELECT reference.purpose, reference.retain_until, object_row.object_id,
-           object_row.kind, object_row.storage_bucket, object_row.storage_key,
-           object_row.checksum, object_row.size_bytes::text, object_row.state,
-           object_row.expires_at
-    FROM hosted_agent_object_references AS reference
-    JOIN hosted_agent_objects AS object_row ON object_row.object_id = reference.object_id
-    WHERE object_row.tenant_id = $1 AND reference.reference_kind = 'artifact'
-      AND reference.reference_id = $2
-    ORDER BY reference.purpose, object_row.object_id
-    FOR SHARE OF reference, object_row
-  `, [tenantId, artifactId])
-  return result.rows
+  return await sharePatchApplyObjectReferences.run({ tenantId, referenceKind: 'artifact',
+    referenceId: artifactId }, connection(client)) as ObjectRow[]
 }
 
 async function verifiedBytes(store: ObjectStore, row: ObjectRow, at: Date): Promise<Uint8Array> {
@@ -128,22 +124,9 @@ async function verifiedBytes(store: ObjectStore, row: ObjectRow, at: Date): Prom
 async function resolveMaterial(client: PoolClient, store: ObjectStore, tenantId: string,
   input: ResolveRootPatchInput, response: { artifactId: string; agentId: string; baseSnapshotId: string;
     checksum: string; changedFiles: number; sizeBytes: number }): Promise<ResolvedRootPatch> {
-  const result = await client.query<RootArtifactRow>(`
-    SELECT artifact.artifact_id, artifact.agent_id, artifact.source_lease_id,
-           artifact.base_snapshot_id, artifact.current_snapshot_id,
-           artifact.base_manifest_object_id, artifact.current_manifest_object_id,
-           artifact.artifact_object_id, artifact.checksum, artifact.changed_files,
-           artifact.size_bytes::text, artifact.state, artifact.expires_at,
-           lease.agent_id AS lease_agent_id, lease.owner_agent_id, lease.owner_lease_id,
-           lease.source_snapshot_id, lease.base_snapshot_id AS lease_base_snapshot_id,
-           lease.latest_snapshot_id AS lease_latest_snapshot_id, lease.state AS lease_state
-    FROM hosted_agent_artifacts AS artifact
-    JOIN hosted_agent_leases AS lease
-      ON lease.lease_id = artifact.source_lease_id AND lease.tenant_id = artifact.tenant_id
-    WHERE artifact.tenant_id = $1 AND artifact.artifact_id = $2
-    FOR SHARE OF artifact, lease
-  `, [tenantId, response.artifactId])
-  const artifact = result.rows[0]
+  const [artifactRow] = await resolveLocalRootPatchArtifact.run({ tenantId,
+    artifactId: response.artifactId }, connection(client))
+  const artifact = artifactRow as RootArtifactRow | undefined
   const now = new Date()
   if (!artifact || artifact.artifact_id !== response.artifactId
     || artifact.agent_id !== response.agentId || artifact.agent_id !== input.root.agentId
@@ -160,24 +143,16 @@ async function resolveMaterial(client: PoolClient, store: ObjectStore, tenantId:
     || artifact.checksum !== response.checksum || artifact.changed_files !== response.changedFiles
     || size(artifact.size_bytes) !== response.sizeBytes) throw new Error('root patch artifact identity is invalid')
 
-  const retention = await client.query<{ reference_kind: string; reference_id: string;
-    retain_until: Date | null }>(`
-    SELECT reference_kind, reference_id, retain_until
-    FROM hosted_agent_artifact_references WHERE artifact_id = $1 FOR SHARE
-  `, [artifact.artifact_id])
-  if (retention.rows.length !== 1 || retention.rows[0]!.reference_kind !== 'codex_thread'
-    || retention.rows[0]!.reference_id !== input.root.agentId
-    || (retention.rows[0]!.retain_until !== null
-      && retention.rows[0]!.retain_until! < artifact.expires_at)) {
+  const retention = await shareLocalPatchArtifactRetention.run({ artifactId: artifact.artifact_id }, connection(client))
+  if (retention.length !== 1 || retention[0]!.reference_kind !== 'codex_thread'
+    || retention[0]!.reference_id !== input.root.agentId
+    || (retention[0]!.retain_until !== null && retention[0]!.retain_until! < artifact.expires_at)) {
     throw new Error('root patch artifact retention is invalid')
   }
 
-  const snapshots = await client.query<SnapshotRow>(`
-    SELECT snapshot_id, lease_id, manifest_object_id, manifest_checksum, state, expires_at
-    FROM hosted_agent_snapshots
-    WHERE tenant_id = $1 AND snapshot_id = ANY($2::text[]) FOR SHARE
-  `, [tenantId, [artifact.base_snapshot_id, artifact.current_snapshot_id]])
-  const snapshotById = new Map(snapshots.rows.map(row => [row.snapshot_id, row]))
+  const snapshots = await sharePatchApplySnapshots.run({ tenantId,
+    snapshotIds: [artifact.base_snapshot_id, artifact.current_snapshot_id] }, connection(client))
+  const snapshotById = new Map(snapshots.map(row => [row.snapshot_id, row as SnapshotRow]))
   for (const [snapshotId, manifestObjectId] of [
     [artifact.base_snapshot_id, artifact.base_manifest_object_id],
     [artifact.current_snapshot_id, artifact.current_manifest_object_id],
@@ -189,16 +164,13 @@ async function resolveMaterial(client: PoolClient, store: ObjectStore, tenantId:
       throw new Error('root patch snapshot lineage is invalid')
     }
   }
-  const snapshotReferences = await client.query<{ snapshot_id: string; reference_kind: string;
-    retain_until: Date | null }>(`
-    SELECT snapshot_id, reference_kind, retain_until FROM hosted_agent_snapshot_references
-    WHERE reference_id = $1 AND reference_kind IN ('artifact_base', 'artifact_current') FOR SHARE
-  `, [artifact.artifact_id])
+  const snapshotReferences = await sharePatchArtifactSnapshotReferences.run(
+    { artifactId: artifact.artifact_id }, connection(client))
   const expectedSnapshotReferences = new Set([
     `${artifact.base_snapshot_id}\u0000artifact_base`, `${artifact.current_snapshot_id}\u0000artifact_current`,
   ])
-  if (snapshotReferences.rows.length !== expectedSnapshotReferences.size
-    || snapshotReferences.rows.some(row => !expectedSnapshotReferences.has(`${row.snapshot_id}\u0000${row.reference_kind}`)
+  if (snapshotReferences.length !== expectedSnapshotReferences.size
+    || snapshotReferences.some(row => !expectedSnapshotReferences.has(`${row.snapshot_id}\u0000${row.reference_kind}`)
       || (row.retain_until !== null && row.retain_until < artifact.expires_at))) {
     throw new Error('root patch snapshot retention is invalid')
   }
@@ -299,12 +271,12 @@ export async function resolveRootPatchFromStores(input: ResolveRootPatchInput, p
     idempotencyKey: `cudex-root-return-${input.runId}` }, input.sourceSnapshotId)
   const client = await pool.connect()
   try {
-    await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ')
+    await beginRepeatableRead(client)
     const material = await resolveMaterial(client, store, tenantId, input, response)
-    await client.query('COMMIT')
+    await commit(client)
     return material
   } catch (error) {
-    await client.query('ROLLBACK').catch(() => undefined)
+    await rollbackQuietly(client)
     throw error
   } finally { client.release() }
 }

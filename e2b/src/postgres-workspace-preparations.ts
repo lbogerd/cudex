@@ -1,5 +1,13 @@
 import { createHash } from 'node:crypto'
 import type { Pool, PoolClient } from 'pg'
+import type { IDatabaseConnection } from '@pgtyped/runtime'
+import { getWorkspacePreparation, getWorkspacePreparationForOperation, getWorkspacePreparationObject,
+  hasOutstandingWorkspaceAllocations, insertWorkspacePreparation, insertWorkspacePreparationObject,
+  listWorkspacePreparationAllocationIds, lockWorkspacePreparation, lockWorkspacePreparationObject,
+  lockWorkspacePreparationObjects, markWorkspacePreparationCommitted, markWorkspacePreparationPrepared,
+  markWorkspacePreparationReclaimed, markWorkspacePreparationReclaimPending,
+  ownsWorkspacePreparationOperation } from './db/queries/workspace.queries.js'
+import { begin, commit, rollbackQuietly } from './db/primitives.js'
 import { canonicalJson } from './workspace-manifest.js'
 import { OperationOwnershipError, type OperationIdentity } from './postgres-store.js'
 
@@ -328,14 +336,9 @@ export class PostgresWorkspacePreparations {
     id('operation', identity.operation, 128)
     id('idempotency key', identity.idempotencyKey)
     id('tenant ID', identity.tenantId)
-    const result = await executor.query<PreparationRow>(`
-      SELECT ${preparationColumns}
-      FROM hosted_agent_workspace_preparations AS preparation
-      WHERE preparation.operation = $1 AND preparation.idempotency_key = $2
-        AND preparation.tenant_id = $3
-    `, [identity.operation, identity.idempotencyKey, identity.tenantId])
-    if (!result.rows[0]) return null
-    const preparation = preparationFromRow(result.rows[0])
+    const [row] = await getWorkspacePreparationForOperation.run(identity, executor as IDatabaseConnection)
+    if (!row) return null
+    const preparation = preparationFromRow(row as unknown as PreparationRow)
     const canonical = canonicalWorkspacePreparationIntent(preparation.intent)
     if (preparation.preparationId !== workspacePreparationId(identity)
       || preparation.intentHash !== canonical.hash) {
@@ -354,15 +357,9 @@ export class PostgresWorkspacePreparations {
     if (canonical.intent.tenantId !== input.tenantId) throw new WorkspacePreparationConflictError('intent tenant mismatch')
     const create = async (client: PoolClient): Promise<WorkspacePreparation> => {
       await this.requireOwnership(client, input)
-      await client.query(`
-        INSERT INTO hosted_agent_workspace_preparations
-          (preparation_id, operation, idempotency_key, tenant_id, created_generation,
-           intent_hash, intent, lease_id, snapshot_id, source_snapshot_id, expected_object_count, state)
-        VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, 'publishing')
-        ON CONFLICT DO NOTHING
-      `, [input.preparationId, input.operation, input.idempotencyKey, input.tenantId, input.generation,
-        canonical.hash, canonical.canonicalJson, canonical.intent.leaseId, canonical.intent.snapshotId,
-        canonical.intent.sourceSnapshotId, input.expectedObjectCount])
+      await insertWorkspacePreparation.run({ ...input, intentHash: canonical.hash,
+        intent: canonical.canonicalJson, leaseId: canonical.intent.leaseId,
+        snapshotId: canonical.intent.snapshotId, sourceSnapshotId: canonical.intent.sourceSnapshotId }, client as IDatabaseConnection)
       const row = await this.selectPreparation(client, input.preparationId, true)
       if (!row || row.operation !== input.operation || row.idempotencyKey !== input.idempotencyKey
         || row.tenantId !== input.tenantId || row.intentHash !== canonical.hash
@@ -388,37 +385,9 @@ export class PostgresWorkspacePreparations {
         || preparation.tenantId !== input.tenantId || preparation.state !== 'publishing') {
         throw new WorkspacePreparationConflictError('workspace preparation is not publishing')
       }
-      await client.query(`
-        INSERT INTO hosted_agent_workspace_preparation_objects
-          (preparation_id, operation, idempotency_key, tenant_id, allocation_id, object_id, purpose)
-        SELECT $1, $6, $7, $2, allocation.allocation_id, object_row.object_id, $5
-        FROM hosted_agent_operation_allocations AS allocation
-        JOIN hosted_agent_objects AS object_row
-          ON object_row.object_id = $4 AND object_row.tenant_id = $2 AND object_row.state = 'available'
-         AND object_row.kind = $5
-        WHERE allocation.allocation_id = $3::bigint AND allocation.operation = $6
-          AND allocation.idempotency_key = $7 AND allocation.tenant_id = $2
-          AND allocation.allocation_kind = 'object' AND allocation.resource_id = $4
-          AND allocation.state = 'allocated'
-        ON CONFLICT DO NOTHING
-      `, [input.preparationId, input.tenantId, input.allocationId, input.objectId, input.purpose,
-        input.operation, input.idempotencyKey])
-      const result = await client.query<ObjectRow>(`
-        SELECT prepared_object.preparation_id, prepared_object.tenant_id,
-               prepared_object.allocation_id::text, prepared_object.object_id, prepared_object.purpose,
-               object_row.checksum AS object_checksum, object_row.size_bytes::text AS object_size_bytes,
-               object_row.expires_at AS object_expires_at, object_row.storage_bucket, object_row.storage_key,
-               object_row.kind AS object_kind, object_row.state AS object_state,
-               allocation.state AS allocation_state
-        FROM hosted_agent_workspace_preparation_objects AS prepared_object
-        JOIN hosted_agent_operation_allocations AS allocation
-          ON allocation.allocation_id = prepared_object.allocation_id
-        JOIN hosted_agent_objects AS object_row
-          ON object_row.object_id = prepared_object.object_id
-         AND object_row.tenant_id = prepared_object.tenant_id
-        WHERE prepared_object.preparation_id = $1 AND prepared_object.allocation_id = $2::bigint
-      `, [input.preparationId, input.allocationId])
-      const row = result.rows[0]
+      await insertWorkspacePreparationObject.run(input, client as IDatabaseConnection)
+      const [value] = await getWorkspacePreparationObject.run(input, client as IDatabaseConnection)
+      const row = value as ObjectRow | undefined
       if (!row || row.tenant_id !== input.tenantId || row.object_id !== input.objectId || row.purpose !== input.purpose) {
         throw new WorkspacePreparationConflictError('workspace preparation object mismatch')
       }
@@ -436,24 +405,9 @@ export class PostgresWorkspacePreparations {
     await this.requireOwnership(executor, fence)
     const preparation = await this.selectPreparation(executor, preparationId, true)
     this.assertExact(preparation, fence, canonical.hash, canonical.canonicalJson, 'publishing')
-    const result = await executor.query<ObjectRow>(`
-      SELECT prepared_object.preparation_id, prepared_object.tenant_id,
-             prepared_object.allocation_id::text, prepared_object.object_id, prepared_object.purpose,
-             object_row.checksum AS object_checksum, object_row.size_bytes::text AS object_size_bytes,
-             object_row.expires_at AS object_expires_at, object_row.storage_bucket, object_row.storage_key,
-             object_row.kind AS object_kind, object_row.state AS object_state,
-             allocation.state AS allocation_state
-      FROM hosted_agent_workspace_preparation_objects AS prepared_object
-      JOIN hosted_agent_operation_allocations AS allocation
-        ON allocation.allocation_id = prepared_object.allocation_id
-       AND allocation.tenant_id = prepared_object.tenant_id
-      JOIN hosted_agent_objects AS object_row
-        ON object_row.object_id = prepared_object.object_id
-       AND object_row.tenant_id = prepared_object.tenant_id
-      WHERE prepared_object.preparation_id = $1 AND prepared_object.object_id = $2
-      FOR UPDATE OF prepared_object, allocation, object_row
-    `, [preparationId, expected.objectId])
-    const row = result.rows[0]
+    const [value] = await lockWorkspacePreparationObject.run({ preparationId,
+      objectId: expected.objectId }, executor as IDatabaseConnection)
+    const row = value as ObjectRow | undefined
     if (!row) return null
     this.assertObjectRow(row, expected, new Set(['allocated']))
     return objectFromRow(row)
@@ -480,8 +434,7 @@ export class PostgresWorkspacePreparations {
       const objects = await this.lockObjects(client, preparationId, allocationStates)
       this.assertExactObjects(preparation, objects, expected)
       if (preparation.state === 'publishing') {
-        await client.query(`UPDATE hosted_agent_workspace_preparations SET state = 'prepared' WHERE preparation_id = $1`,
-          [preparationId])
+        await markWorkspacePreparationPrepared.run({ preparationId }, client as IDatabaseConnection)
       }
       return (await this.selectPreparation(client, preparationId, false))!
     }
@@ -513,11 +466,7 @@ export class PostgresWorkspacePreparations {
     this.assertExact(preparation, fence, canonical.hash, canonical.canonicalJson, 'prepared')
     const objects = await this.lockObjects(executor, preparationId, new Set(['allocated']))
     this.assertCompleteObjects(preparation!, objects)
-    const result = await executor.query(`
-      UPDATE hosted_agent_workspace_preparations
-      SET state = 'committed', committed_at = now(), reclaimed_at = NULL
-      WHERE preparation_id = $1 AND state = 'prepared'
-    `, [preparationId])
+    const result = await markWorkspacePreparationCommitted.runWithCounts({ preparationId }, executor as IDatabaseConnection)
     if (result.rowCount !== 1) throw new WorkspacePreparationConflictError('workspace preparation commit lost')
     return (await this.selectPreparation(executor, preparationId, false))!
   }
@@ -535,8 +484,7 @@ export class PostgresWorkspacePreparations {
         throw new WorkspacePreparationConflictError('workspace preparation cannot be aborted')
       }
       if (preparation.state !== 'reclaim_pending') {
-        await client.query(`UPDATE hosted_agent_workspace_preparations SET state = 'reclaim_pending'
-          WHERE preparation_id = $1`, [preparationId])
+        await markWorkspacePreparationReclaimPending.run({ preparationId }, client as IDatabaseConnection)
       }
       return (await this.selectPreparation(client, preparationId, false))!
     }
@@ -556,36 +504,22 @@ export class PostgresWorkspacePreparations {
       || preparation.tenantId !== fence.tenantId || preparation.state !== 'reclaim_pending') {
       throw new WorkspacePreparationConflictError('workspace preparation cannot be reclaimed')
     }
-    const outstanding = await executor.query(`
-      SELECT 1 FROM hosted_agent_workspace_preparation_objects AS prepared_object
-      JOIN hosted_agent_operation_allocations AS allocation
-        ON allocation.allocation_id = prepared_object.allocation_id
-      WHERE prepared_object.preparation_id = $1 AND allocation.state <> 'reclaimed' LIMIT 1
-    `, [preparationId])
-    if (outstanding.rowCount !== 0) throw new WorkspacePreparationConflictError('workspace allocations remain unreclaimed')
-    await executor.query(`UPDATE hosted_agent_workspace_preparations
-      SET state = 'reclaimed', reclaimed_at = now(), committed_at = NULL WHERE preparation_id = $1`, [preparationId])
+    const outstanding = await hasOutstandingWorkspaceAllocations.run({ preparationId }, executor as IDatabaseConnection)
+    if (outstanding.length !== 0) throw new WorkspacePreparationConflictError('workspace allocations remain unreclaimed')
+    await markWorkspacePreparationReclaimed.run({ preparationId }, executor as IDatabaseConnection)
     return (await this.selectPreparation(executor, preparationId, false))!
   }
 
   private async requireOwnership(client: Pick<PoolClient, 'query'>, fence: PreparationFence): Promise<void> {
-    const result = await client.query(`
-      SELECT 1 FROM hosted_agent_operations
-      WHERE operation = $1 AND idempotency_key = $2 AND tenant_id = $3
-        AND generation = $4 AND worker_id = $5 AND state = 'in_progress'
-      FOR UPDATE
-    `, [fence.operation, fence.idempotencyKey, fence.tenantId, fence.generation, fence.workerId])
-    if (result.rowCount !== 1) throw new OperationOwnershipError()
+    const rows = await ownsWorkspacePreparationOperation.run(fence, client as IDatabaseConnection)
+    if (rows.length !== 1) throw new OperationOwnershipError()
   }
 
   private async selectPreparation(client: Pick<PoolClient, 'query'>, preparationId: string,
     lock: boolean): Promise<WorkspacePreparation | null> {
-    const result = await client.query<PreparationRow>(`
-      SELECT ${preparationColumns}
-      FROM hosted_agent_workspace_preparations AS preparation
-      WHERE preparation.preparation_id = $1 ${lock ? 'FOR UPDATE' : ''}
-    `, [preparationId])
-    return result.rows[0] ? preparationFromRow(result.rows[0]) : null
+    const [row] = await (lock ? lockWorkspacePreparation : getWorkspacePreparation).run(
+      { preparationId }, client as IDatabaseConnection)
+    return row ? preparationFromRow(row as unknown as PreparationRow) : null
   }
 
   /** Read-only recovery identity for every object allocation associated with one preparation. */
@@ -594,17 +528,8 @@ export class PostgresWorkspacePreparations {
     id('operation', identity.operation, 128)
     id('idempotency key', identity.idempotencyKey)
     id('tenant ID', identity.tenantId)
-    const result = await executor.query<{ allocation_id: string }>(`
-      SELECT prepared_object.allocation_id::text
-      FROM hosted_agent_workspace_preparation_objects AS prepared_object
-      JOIN hosted_agent_workspace_preparations AS preparation
-        ON preparation.preparation_id = prepared_object.preparation_id
-       AND preparation.tenant_id = prepared_object.tenant_id
-      WHERE preparation.operation = $1 AND preparation.idempotency_key = $2
-        AND preparation.tenant_id = $3
-      ORDER BY prepared_object.allocation_id
-    `, [identity.operation, identity.idempotencyKey, identity.tenantId])
-    return result.rows.map(row => allocationId(row.allocation_id))
+    const rows = await listWorkspacePreparationAllocationIds.run(identity, executor as IDatabaseConnection)
+    return rows.map(row => allocationId(row.allocation_id!))
   }
 
   private assertExact(preparation: WorkspacePreparation | null, fence: PreparationFence,
@@ -676,35 +601,18 @@ export class PostgresWorkspacePreparations {
 
   private async lockObjects(client: PoolClient, preparationId: string,
     allocationStates: ReadonlySet<string>): Promise<WorkspacePreparationObject[]> {
-    const result = await client.query<ObjectRow>(`
-      SELECT prepared_object.preparation_id, prepared_object.tenant_id,
-             prepared_object.allocation_id::text, prepared_object.object_id, prepared_object.purpose,
-             object_row.checksum AS object_checksum, object_row.size_bytes::text AS object_size_bytes,
-             object_row.expires_at AS object_expires_at, object_row.storage_bucket, object_row.storage_key,
-             object_row.kind AS object_kind, object_row.state AS object_state,
-             allocation.state AS allocation_state
-      FROM hosted_agent_workspace_preparation_objects AS prepared_object
-      JOIN hosted_agent_operation_allocations AS allocation
-        ON allocation.allocation_id = prepared_object.allocation_id
-       AND allocation.tenant_id = prepared_object.tenant_id
-      JOIN hosted_agent_objects AS object_row
-        ON object_row.object_id = prepared_object.object_id
-       AND object_row.tenant_id = prepared_object.tenant_id
-      WHERE prepared_object.preparation_id = $1
-        AND allocation.allocation_kind = 'object'
-      ORDER BY prepared_object.allocation_id, prepared_object.object_id
-      FOR UPDATE OF prepared_object, allocation, object_row
-    `, [preparationId])
-    for (const row of result.rows) {
+    const result = await lockWorkspacePreparationObjects.run({ preparationId }, client as IDatabaseConnection)
+    const rows = result as ObjectRow[]
+    for (const row of rows) {
       this.assertObjectRow(row, {
         objectId: row.object_id, purpose: row.purpose, checksum: row.object_checksum,
         sizeBytes: Number(row.object_size_bytes), expiresAt: row.object_expires_at,
         storageBucket: row.storage_bucket, storageKey: row.storage_key,
       }, allocationStates)
     }
-    const objects = result.rows.map(objectFromRow)
-    const archive = result.rows.find(row => row.purpose === 'workspace_archive')
-    const manifest = result.rows.find(row => row.purpose === 'manifest')
+    const objects = rows.map(objectFromRow)
+    const archive = rows.find(row => row.purpose === 'workspace_archive')
+    const manifest = rows.find(row => row.purpose === 'manifest')
     const preparation = await this.selectPreparation(client, preparationId, false)
     if (preparation && ((archive && archive.object_checksum !== preparation.intent.archiveChecksum)
       || (manifest && manifest.object_checksum !== preparation.intent.manifestChecksum))) {
@@ -716,12 +624,12 @@ export class PostgresWorkspacePreparations {
   private async transaction<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
     const client = await this.pool.connect()
     try {
-      await client.query('BEGIN')
+      await begin(client)
       const value = await fn(client)
-      await client.query('COMMIT')
+      await commit(client)
       return value
     } catch (error) {
-      await client.query('ROLLBACK').catch(() => undefined)
+      await rollbackQuietly(client)
       throw error
     } finally { client.release() }
   }

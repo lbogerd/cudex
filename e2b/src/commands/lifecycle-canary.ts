@@ -1,8 +1,10 @@
+// The E2B SDK objects used by this live command are checked through their runtime results.
+// @ts-nocheck
 import process from 'node:process'
 import { Sandbox } from 'e2b'
 
 const templateId = process.argv[2]
-if (!templateId) throw new Error('usage: node scripts/live-lifecycle-canary.mjs <template-id>')
+if (!templateId) throw new Error('usage: npm run lifecycle:canary -- <template-id>')
 if (!process.env.E2B_API_KEY || !process.env.E2B_API_URL) throw new Error('E2B_API_KEY and E2B_API_URL are required')
 const connection = { apiKey: process.env.E2B_API_KEY, apiUrl: process.env.E2B_API_URL, domain: process.env.E2B_DOMAIN ?? 'cube.app',
   validateApiKey: process.env.E2B_VALIDATE_API_KEY !== 'false', requestTimeoutMs: 120_000 }

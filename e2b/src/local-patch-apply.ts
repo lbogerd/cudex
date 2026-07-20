@@ -1,16 +1,15 @@
 import { createHash } from 'node:crypto'
-import { execFile } from 'node:child_process'
+import { execa } from 'execa'
 import { chmod, lstat, mkdir, open, readFile, readlink, rename, rm, rmdir, stat, symlink,
   writeFile } from 'node:fs/promises'
 import { basename, dirname, join, relative, resolve, sep } from 'node:path'
-import { promisify } from 'node:util'
 import { projectGitWorkspace } from './git-workspace.js'
 import type { LocalPatchContentObject, ResolvedRootPatch } from './local-patch-source.js'
 import { planPatchApplication, type PatchContentMaterial } from './patch-apply.js'
 import { canonicalJson, diffWorkspaceManifests, type WorkspaceEntry,
   type WorkspaceManifest } from './workspace-manifest.js'
 
-const exec = promisify(execFile)
+const exec = execa
 
 export type LocalPatchApplyResult =
   | { type: 'applied'; changedFiles: number }

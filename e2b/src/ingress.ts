@@ -1,12 +1,11 @@
-import { execFile } from 'node:child_process'
+import { execa } from 'execa'
 import { lstat, mkdtemp, mkdir, readFile, readdir, readlink, realpath, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, normalize, relative, resolve, sep } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-import { promisify } from 'node:util'
 import { ServiceError } from './types.js'
 
-const run = promisify(execFile)
+const run = execa
 export interface WorkspaceArchive { bytes: Uint8Array; cwd: string; roots: string[]; sizeBytes: number; transferStartedAt: number }
 export interface IngressLimits {
   maxBytes: number

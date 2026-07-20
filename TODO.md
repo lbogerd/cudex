@@ -3,6 +3,15 @@
 This file is the active implementation and internal-release queue. Stable
 decisions and completed evidence are preserved in [`ARCHIVE.md`](ARCHIVE.md).
 
+## Deferred dependency evaluations
+
+- Evaluate OpenAPI schema-to-document tooling, route metadata, generated-document
+  validation, and client generation after the Hono/Zod boundary is stable. Do
+  not select a package before that evaluation.
+- Evaluate whether an ORM, including Drizzle, would materially improve repository
+  implementations and transaction ownership. Do not add ORM schema definitions
+  or a parallel migration system; PostgreSQL migrations remain authoritative.
+
 ## Autonomous coworker-pilot delivery
 
 - [x] A1: documentation baseline, registry enforcement, and delivery checklist.

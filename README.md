@@ -194,6 +194,19 @@ enforced. These are explicit pilot limits, not production defaults.
 
 ## Contributing and delivery
 
+The E2B TypeScript package builds and tests without a database. PostgreSQL query
+changes additionally require the reproducibility check:
+
+```bash
+npm run build --prefix e2b
+npm test --prefix e2b
+HOSTED_AGENT_TEST_DATABASE_URL=postgresql://... npm run sql:check --prefix e2b
+```
+
+Template, release, and lifecycle-canary utilities are compiled TypeScript npm
+commands documented in [`e2b/README.md`](e2b/README.md); the former direct `.mjs`
+entry points no longer exist.
+
 Follow [`CONTRIBUTING.md`](CONTRIBUTING.md) before every implementation commit.
 Stable decisions and redacted evidence belong in [`ARCHIVE.md`](ARCHIVE.md).
 Open work and shortcut remediation belong in [`TODO.md`](TODO.md). The delivery

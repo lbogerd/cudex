@@ -9,6 +9,7 @@ import {
   ExecInteractionTracker,
   type ExecInteractionContext,
 } from './exec-interaction-tracker.js'
+import { createSilentLogger, type ServiceLogger } from './observability/logger.js'
 
 export interface ActiveLeaseDirectory {
   activeLeaseTarget(leaseId: string): Promise<ActiveLeaseTarget | undefined>
@@ -58,6 +59,7 @@ export class ExecGateway {
     limits: Partial<GatewayLimits> = {},
     private readonly allowInsecureUpstream = false,
     private readonly interactions?: ExecInteractionContext,
+    private readonly logger: ServiceLogger = createSilentLogger(),
   ) {
     this.limits = { ...defaultLimits, ...limits }
     for (const [name, value] of Object.entries(this.limits)) {
@@ -200,7 +202,7 @@ export class ExecGateway {
     let upstreamConnection
     try { upstreamConnection = validateExecUpstream(await this.provider.execUpstream(target.sandboxId), this.allowInsecureUpstream) }
     catch {
-      console.error(JSON.stringify({ event: 'gateway_upstream_failed', phase: 'provider_connection' }))
+      this.logger.error({ event: 'gateway_upstream_failed', phase: 'provider_connection' })
       cleanup(1013, 'gateway upstream unavailable'); return
     }
     if (closed) return
@@ -217,7 +219,7 @@ export class ExecGateway {
       })
     }
     catch {
-      console.error(JSON.stringify({ event: 'gateway_upstream_failed', phase: 'socket_construction' }))
+      this.logger.error({ event: 'gateway_upstream_failed', phase: 'socket_construction' })
       cleanup(1013, 'gateway upstream unavailable'); return
     }
 
@@ -253,7 +255,7 @@ export class ExecGateway {
     })
     upstream.on('close', () => cleanup())
     upstream.on('error', () => {
-      console.error(JSON.stringify({ event: 'gateway_upstream_failed', phase: upstreamReady ? 'active_socket' : 'handshake' }))
+      this.logger.error({ event: 'gateway_upstream_failed', phase: upstreamReady ? 'active_socket' : 'handshake' })
       cleanup(1013, 'gateway upstream unavailable')
     })
   }

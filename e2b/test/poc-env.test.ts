@@ -21,6 +21,8 @@ test('POC environment rejects unknown scoped keys and invalid ports', () => {
   assert.throws(() => validatePocEnvironment({ ...base, POC_CONTROL_PORT: '15432' }), /distinct/)
   assert.throws(() => validatePocEnvironment({ ...base, E2B_VALIDATE_API_KEY: 'no' }), /true or false/)
   assert.throws(() => validatePocEnvironment({ ...base, CODEX_ACCESS_TOKEN: ' token ' }), /whitespace/)
+  assert.throws(() => validatePocEnvironment({ ...base, POC_CONTROL_PORT: '1.5' }), /TCP port/)
+  assert.throws(() => validatePocEnvironment({ ...base, POC_CONTROL_PORT: '' }), /TCP port/)
 })
 
 test('POC environment accepts explicit provider trust configuration', () => {

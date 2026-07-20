@@ -10,6 +10,9 @@ Before each implementation commit:
 - run the shortcut registry test and focused tests;
 - inspect the complete staged diff and stage intended paths explicitly;
 - verify no credential, `.env`, auth file, artifact, state, log, report, or generated output is staged.
+  Reviewed PgTyped `src/db/queries/*.queries.ts` files are the sole generated-output exception.
+- run `HOSTED_AGENT_TEST_DATABASE_URL=... npm run sql:check --prefix e2b` after changing typed SQL
+  or migrations, and review generated query changes alongside their named SQL sources.
 
 After the focused checks, run:
 

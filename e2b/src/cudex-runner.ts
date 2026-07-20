@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process'
+import { execa } from 'execa'
 import { chmod, lstat, mkdir, open, readFile, rename, rm, writeFile, type FileHandle } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -243,9 +243,9 @@ export async function launchTui(run: PreparedCudexRun,
   // is the approval boundary. Replace this with the reviewed internal approval and policy model.
   const args = ['--strict-config', '-C', run.projection.localDirectory, '-a', 'never',
     ...(parsed.model ? ['--model', parsed.model] : []), ...(parsed.prompt ? [parsed.prompt] : [])]
-  const child = spawn(run.provenance.binaryPath, args, { cwd: run.projection.localDirectory,
+  const child = execa(run.provenance.binaryPath, args, { cwd: run.projection.localDirectory, extendEnv: false,
     env: createCodexProcessEnvironment({ codexHome: run.paths.codexHome,
-      caBundlePath: run.tls.combinedCaBundlePath, hostedBearer: run.runtime.POC_SERVICE_BEARER! }), stdio: 'inherit' })
+      caBundlePath: run.tls.combinedCaBundlePath, hostedBearer: run.runtime.POC_SERVICE_BEARER! }), stdio: 'inherit', reject: false })
   let killTimer: NodeJS.Timeout | undefined
   signals.setForward(signal => {
     child.kill(signal)
@@ -254,10 +254,8 @@ export async function launchTui(run: PreparedCudexRun,
   })
   if (signals.signal) child.kill(signals.signal)
   try {
-    const exitCode = await new Promise<number | null>((resolveExit, reject) => {
-      child.once('error', reject); child.once('exit', resolveExit)
-    })
-    return { exitCode, ...(signals.signal ? { signal: signals.signal } : {}) }
+    const result = await child
+    return { exitCode: result.exitCode ?? null, ...(signals.signal ? { signal: signals.signal } : {}) }
   } finally { signals.setForward(undefined); if (killTimer) clearTimeout(killTimer) }
 }
 

@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
 import type { PoolClient } from 'pg'
+import { begin, commit, rollbackQuietly } from './db/primitives.js'
 import type { ProviderAdapter } from './provider.js'
 import { ProviderSandboxMissingError } from './provider.js'
 import type { Lease, PostgresDurableState } from './postgres-state.js'
@@ -525,13 +526,13 @@ export class PostgresChildCoordinator {
   }
 
   private async transaction<T>(client: PoolClient, fn: () => Promise<T>): Promise<T> {
-    await client.query('BEGIN')
+    await begin(client)
     try {
       const result = await fn()
-      await client.query('COMMIT')
+      await commit(client)
       return result
     } catch (error) {
-      await client.query('ROLLBACK').catch(() => undefined)
+      await rollbackQuietly(client)
       throw error
     }
   }

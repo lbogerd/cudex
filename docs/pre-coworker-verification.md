@@ -97,7 +97,7 @@ Set this to the exact read-only manifest that the coworker will receive:
 ```bash
 read -r -p "Shared release.json path: " CUDEX_RELEASE
 CUDEX_RELEASE="$(realpath "$CUDEX_RELEASE")"
-node e2b/scripts/verify-cudex-release.mjs \
+npm run verify:release --prefix e2b -- \
   "$CUDEX_RELEASE" "$(git rev-parse HEAD)"
 ./e2b/scripts/install-cudex.sh --release "$CUDEX_RELEASE"
 export PATH="$HOME/.local/bin:$PATH"

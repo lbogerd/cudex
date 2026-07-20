@@ -1,15 +1,15 @@
-import { execFile } from 'node:child_process'
+import { execa } from 'execa'
 import type { Stats } from 'node:fs'
 import { chmod, lstat, mkdir, mkdtemp, readFile, readlink, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, dirname, isAbsolute, join, normalize, relative, resolve, sep } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { promisify } from 'node:util'
 import { captureArchiveManifest, defaultArchiveManifestLimits, type ArchiveManifestLimits,
   type CapturedArchiveManifest } from './archive-manifest.js'
 import type { WorkspaceArchive } from './ingress.js'
+import { loadCommandOsEnv } from './config/command-env.js'
 
-const exec = promisify(execFile)
+const exec = execa
 const decoder = new TextDecoder('utf-8', { fatal: true })
 
 export interface GitWorkspaceProjection extends WorkspaceArchive {
@@ -39,7 +39,7 @@ function nulPaths(bytes: Buffer, label: string): string[] {
 async function gitBytes(directory: string, args: string[]): Promise<Buffer> {
   try {
     const result = await exec('git', ['-C', directory, ...args], { encoding: 'buffer', maxBuffer: 64 * 1024 * 1024 })
-    return result.stdout
+    return Buffer.from(result.stdout)
   } catch { throw new Error('Git workspace inspection failed') }
 }
 
@@ -60,9 +60,9 @@ async function validateRepository(directory: string): Promise<void> {
     const nestedGit = join(directory, candidate, '.git')
     if (await lstat(nestedGit).catch(() => undefined)) throw new Error('Cudex does not support nested repositories')
   }
-  const special = nulPaths((await exec('find', [directory, '-path', join(directory, '.git'), '-prune', '-o',
+  const special = nulPaths(Buffer.from((await exec('find', [directory, '-path', join(directory, '.git'), '-prune', '-o',
     '!', '-type', 'd', '!', '-type', 'f', '!', '-type', 'l', '-print0'],
-  { encoding: 'buffer', maxBuffer: 16 * 1024 * 1024 })).stdout, 'special-file inspection')
+  { encoding: 'buffer', maxBuffer: 16 * 1024 * 1024 })).stdout), 'special-file inspection')
   for (const absolute of special) {
     const candidate = relative(directory, absolute)
     try { await exec('git', ['-C', directory, 'check-ignore', '-q', '--', candidate]) }
@@ -147,7 +147,7 @@ export async function projectGitWorkspace(selectedDirectory: string,
     const archivePath = join(temporary, 'workspace.tar')
     await exec('tar', ['--sort=name', '--mtime=@0', '--owner=0', '--group=0', '--numeric-owner',
       '--format=pax', '--pax-option=delete=atime,delete=ctime', '-cf', archivePath, '-C', stage, 'roots'],
-    { env: { PATH: process.env.PATH, LC_ALL: 'C' } })
+    { extendEnv: false, env: { PATH: loadCommandOsEnv().path, LC_ALL: 'C' } })
     const archiveMetadata = await stat(archivePath)
     if (archiveMetadata.size > limits.maxArchiveBytes) throw new Error('workspace archive quota exceeded')
     const bytes = new Uint8Array(await readFile(archivePath))

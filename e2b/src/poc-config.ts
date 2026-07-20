@@ -1,10 +1,11 @@
 import { createHash, randomBytes } from 'node:crypto'
 import { chmod, lstat, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
-import { spawn } from 'node:child_process'
+import { execa } from 'execa'
 import { setTimeout as scheduleTimeout } from 'node:timers'
 import type { PocEnvironment } from './poc-env.js'
 import type { UploadedSourceSnapshot } from './source-snapshot-client.js'
+import { loadCommandOsEnv } from './config/command-env.js'
 
 export interface PocRunPaths {
   repositoryRoot: string
@@ -227,18 +228,18 @@ export async function validateGeneratedCodexConfiguration(
   provenance: PocProvenance, paths: PocRunPaths, caBundlePath: string, hostedBearer: string,
 ): Promise<void> {
   const environment: NodeJS.ProcessEnv = {
-    PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin', CODEX_HOME: paths.codexHome,
+    PATH: loadCommandOsEnv().path, CODEX_HOME: paths.codexHome,
     CODEX_CA_CERTIFICATE: caBundlePath, SSL_CERT_FILE: caBundlePath,
     CODEX_HOSTED_AGENT_TOKEN: hostedBearer,
   }
-  const child = spawn(provenance.binaryPath, ['app-server', '--listen', 'stdio://', '--strict-config'], {
-    cwd: paths.repositoryRoot, env: environment, stdio: ['pipe', 'pipe', 'pipe'],
+  const child = execa(provenance.binaryPath, ['app-server', '--listen', 'stdio://', '--strict-config'], {
+    cwd: paths.repositoryRoot, env: environment, extendEnv: false, stdio: ['pipe', 'pipe', 'pipe'], reject: false,
   })
   const errors: Buffer[] = []
   child.stderr.on('data', chunk => {
     if (Buffer.concat(errors).byteLength < 64 * 1024) errors.push(Buffer.from(chunk))
   })
-  const exited = new Promise<number | null>(resolveExit => child.once('exit', resolveExit))
+  const exited = new Promise<number | null>(resolveExit => child.nodeChildProcess.once('exit', resolveExit))
   const result = await Promise.race([exited.then(code => ({ exited: true as const, code })),
     new Promise<{ exited: false }>(resolveWait => { const timer = scheduleTimeout(() => resolveWait({ exited: false }), 500); timer.unref() })])
   if (result.exited) {

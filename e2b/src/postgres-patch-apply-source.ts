@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
 import type { Pool, PoolClient } from 'pg'
+import type { IDatabaseConnection } from '@pgtyped/runtime'
 import type { ObjectStore } from './blob-store.js'
 import {
   planPatchApplication,
@@ -14,8 +15,14 @@ import {
   workspaceManifestChecksum,
   type WorkspaceManifest,
 } from './workspace-manifest.js'
+import { begin, commit, lockTransaction, rollbackQuietly } from './db/primitives.js'
+import { hasLatestSnapshotReference, hasRetainedPatchArtifact, lockPatchApplyTarget,
+  sharePatchApplyArtifact, sharePatchApplyObjectReferences, sharePatchApplySnapshot,
+  sharePatchApplySnapshots, sharePatchArtifactOwnership, sharePatchArtifactSnapshotReferences,
+} from './db/queries/patches.queries.js'
 
 type Queryable = Pick<PoolClient, 'query'>
+function connection(value: Queryable): IDatabaseConnection { return value as IDatabaseConnection }
 
 interface TargetLeaseRow {
   lease_id: string
@@ -133,12 +140,12 @@ export class PostgresPatchApplySourceResolver {
     if (executor) return this.resolveSafely(input, executor)
     const client = await this.pool.connect()
     try {
-      await client.query('BEGIN')
+      await begin(client)
       const source = await this.resolveSafely(input, client)
-      await client.query('COMMIT')
+      await commit(client)
       return source
     } catch (error) {
-      await client.query('ROLLBACK').catch(() => undefined)
+      await rollbackQuietly(client)
       throw error
     } finally {
       client.release()
@@ -157,15 +164,9 @@ export class PostgresPatchApplySourceResolver {
       throw new ServiceError(400, 'invalid patch apply recovery request')
     }
     const resolve = async (client: PoolClient): Promise<ResolvedPatchApplyRecoveryTarget> => {
-      await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
-        [`hosted-agent:lease:${input.tenantId}:${input.targetLeaseId}`])
-      const targetResult = await client.query<TargetLeaseRow>(`
-        SELECT lease_id, agent_id, provider_sandbox_id, latest_snapshot_id, state
-        FROM hosted_agent_leases
-        WHERE tenant_id = $1 AND lease_id = $2
-        FOR UPDATE
-      `, [input.tenantId, input.targetLeaseId])
-      const target = targetResult.rows[0]
+      await lockTransaction(client, `hosted-agent:lease:${input.tenantId}:${input.targetLeaseId}`)
+      const [target] = await lockPatchApplyTarget.run({ tenantId: input.tenantId,
+        leaseId: input.targetLeaseId }, connection(client))
       if (!target || !['active', 'paused'].includes(target.state)
         || target.provider_sandbox_id !== input.targetProviderSandboxId
         || target.latest_snapshot_id !== input.sourceTargetSnapshotId) {
@@ -200,12 +201,12 @@ export class PostgresPatchApplySourceResolver {
     }
     const client = await this.pool.connect()
     try {
-      await client.query('BEGIN')
+      await begin(client)
       const target = await resolve(client)
-      await client.query('COMMIT')
+      await commit(client)
       return target
     } catch (error) {
-      await client.query('ROLLBACK').catch(() => undefined)
+      await rollbackQuietly(client)
       if (error instanceof ServiceError) throw error
       throw new ServiceError(503, 'patch apply recovery source unavailable')
     } finally { client.release() }
@@ -231,42 +232,21 @@ export class PostgresPatchApplySourceResolver {
     artifactId: string
     resultSnapshotId: string
   }, executor: Queryable): Promise<ResolvedPatchApplySource> {
-    await executor.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
-      [`hosted-agent:lease:${input.tenantId}:${input.targetLeaseId}`])
-    const targetResult = await executor.query<TargetLeaseRow>(`
-      SELECT lease_id, agent_id, provider_sandbox_id, latest_snapshot_id, state
-      FROM hosted_agent_leases
-      WHERE tenant_id = $1 AND lease_id = $2
-      FOR UPDATE
-    `, [input.tenantId, input.targetLeaseId])
-    const target = targetResult.rows[0]
+    await lockTransaction(executor, `hosted-agent:lease:${input.tenantId}:${input.targetLeaseId}`)
+    const [target] = await lockPatchApplyTarget.run({ tenantId: input.tenantId,
+      leaseId: input.targetLeaseId }, connection(executor))
     if (!target) throw new ServiceError(404, 'target lease missing')
     if (!['active', 'paused'].includes(target.state) || target.provider_sandbox_id === null
       || target.latest_snapshot_id === null) {
       throw new ServiceError(409, 'target lease cannot accept a patch')
     }
 
-    const artifactResult = await executor.query<ArtifactRow>(`
-      SELECT artifact.artifact_id, artifact.agent_id, artifact.source_lease_id,
-             artifact.base_snapshot_id, artifact.current_snapshot_id,
-             artifact.base_manifest_object_id, artifact.current_manifest_object_id,
-             artifact.artifact_object_id, artifact.checksum, artifact.changed_files,
-             artifact.size_bytes::text, artifact.state, artifact.expires_at,
-             source.agent_id AS source_agent_id,
-             source.owner_agent_id AS source_owner_agent_id,
-             source.owner_lease_id AS source_owner_lease_id
-      FROM hosted_agent_artifacts AS artifact
-      JOIN hosted_agent_leases AS source
-        ON source.lease_id = artifact.source_lease_id AND source.tenant_id = artifact.tenant_id
-      WHERE artifact.tenant_id = $1 AND artifact.artifact_id = $2
-      FOR SHARE OF artifact, source
-    `, [input.tenantId, input.artifactId])
-    const artifact = artifactResult.rows[0]
+    const [artifactRow] = await sharePatchApplyArtifact.run({ tenantId: input.tenantId,
+      artifactId: input.artifactId }, connection(executor))
+    const artifact = artifactRow as ArtifactRow | undefined
     const now = new Date()
-    const retainedArtifact = artifact && (await executor.query(`
-      SELECT 1 FROM hosted_agent_artifact_references
-      WHERE artifact_id = $1 AND reference_kind = 'codex_thread' LIMIT 1
-    `, [input.artifactId])).rowCount === 1
+    const retainedArtifact = artifact && (await hasRetainedPatchArtifact.run(
+      { artifactId: input.artifactId }, connection(executor))).length === 1
     if (!artifact || artifact.state !== 'available' || (artifact.expires_at <= now && !retainedArtifact)
       || artifact.agent_id !== artifact.source_agent_id
       || artifact.source_owner_agent_id !== target.agent_id
@@ -315,30 +295,18 @@ export class PostgresPatchApplySourceResolver {
 
   private async verifyArtifactOwnership(executor: Queryable, artifact: ArtifactRow,
     ownerAgentId: string): Promise<void> {
-    const result = await executor.query<{ reference_kind: string; reference_id: string;
-      retain_until: Date | null }>(`
-      SELECT reference_kind, reference_id, retain_until
-      FROM hosted_agent_artifact_references
-      WHERE artifact_id = $1 AND reference_kind = 'owner_agent'
-      FOR SHARE
-    `, [artifact.artifact_id])
-    if (result.rows.length !== 1 || result.rows[0]!.reference_id !== ownerAgentId
-      || (result.rows[0]!.retain_until !== null
-        && result.rows[0]!.retain_until < artifact.expires_at)) {
+    const rows = await sharePatchArtifactOwnership.run({ artifactId: artifact.artifact_id }, connection(executor))
+    if (rows.length !== 1 || rows[0]!.reference_id !== ownerAgentId
+      || (rows[0]!.retain_until !== null && rows[0]!.retain_until < artifact.expires_at)) {
       throw new ServiceError(503, 'patch apply artifact ownership unavailable')
     }
   }
 
   private async artifactSnapshots(executor: Queryable, tenantId: string, artifact: ArtifactRow,
     now: Date): Promise<Map<string, SnapshotRow>> {
-    const result = await executor.query<SnapshotRow>(`
-      SELECT snapshot_id, lease_id, workspace_archive_object_id,
-             manifest_object_id, manifest_checksum, state, expires_at
-      FROM hosted_agent_snapshots
-      WHERE tenant_id = $1 AND snapshot_id = ANY($2::text[])
-      FOR SHARE
-    `, [tenantId, [artifact.base_snapshot_id, artifact.current_snapshot_id]])
-    const snapshots = new Map(result.rows.map(row => [row.snapshot_id, row]))
+    const rows = await sharePatchApplySnapshots.run({ tenantId,
+      snapshotIds: [artifact.base_snapshot_id, artifact.current_snapshot_id] }, connection(executor))
+    const snapshots = new Map(rows.map(row => [row.snapshot_id, row as SnapshotRow]))
     for (const [snapshotId, manifestObjectId] of [
       [artifact.base_snapshot_id, artifact.base_manifest_object_id],
       [artifact.current_snapshot_id, artifact.current_manifest_object_id],
@@ -350,21 +318,16 @@ export class PostgresPatchApplySourceResolver {
         throw new ServiceError(503, 'patch apply artifact lineage unavailable')
       }
     }
-    const references = await executor.query<{ snapshot_id: string; reference_kind: string;
-      retain_until: Date | null }>(`
-      SELECT snapshot_id, reference_kind, retain_until
-      FROM hosted_agent_snapshot_references
-      WHERE reference_id = $1 AND reference_kind IN ('artifact_base', 'artifact_current')
-      FOR SHARE
-    `, [artifact.artifact_id])
+    const references = await sharePatchArtifactSnapshotReferences.run(
+      { artifactId: artifact.artifact_id }, connection(executor))
     const expected = new Set([
       `${artifact.base_snapshot_id}\u0000artifact_base`,
       `${artifact.current_snapshot_id}\u0000artifact_current`,
     ])
-    const actual = new Set(references.rows.map(row => `${row.snapshot_id}\u0000${row.reference_kind}`))
-    if (references.rows.length !== expected.size || actual.size !== expected.size
+    const actual = new Set(references.map(row => `${row.snapshot_id}\u0000${row.reference_kind}`))
+    if (references.length !== expected.size || actual.size !== expected.size
       || [...expected].some(value => !actual.has(value))
-      || references.rows.some(row => row.retain_until !== null
+      || references.some(row => row.retain_until !== null
         && row.retain_until < artifact.expires_at)) {
       throw new ServiceError(503, 'patch apply artifact lineage unavailable')
     }
@@ -373,24 +336,14 @@ export class PostgresPatchApplySourceResolver {
 
   private async targetSnapshot(executor: Queryable, tenantId: string, leaseId: string,
     snapshotId: string, now: Date): Promise<SnapshotRow> {
-    const result = await executor.query<SnapshotRow>(`
-      SELECT snapshot_id, lease_id, workspace_archive_object_id,
-             manifest_object_id, manifest_checksum, state, expires_at
-      FROM hosted_agent_snapshots
-      WHERE tenant_id = $1 AND snapshot_id = $2
-      FOR SHARE
-    `, [tenantId, snapshotId])
-    const snapshot = result.rows[0]
+    const [snapshotRow] = await sharePatchApplySnapshot.run({ tenantId, snapshotId }, connection(executor))
+    const snapshot = snapshotRow as SnapshotRow | undefined
     if (!snapshot || snapshot.lease_id !== leaseId || snapshot.state !== 'available'
       || (snapshot.expires_at !== null && snapshot.expires_at <= now)) {
       throw new ServiceError(409, 'target snapshot cannot accept a patch')
     }
-    const latestReference = await executor.query(`
-      SELECT 1 FROM hosted_agent_snapshot_references
-      WHERE snapshot_id = $1 AND reference_kind = 'lease_latest' AND reference_id = $2
-      FOR SHARE
-    `, [snapshotId, leaseId])
-    if (latestReference.rowCount !== 1) {
+    const latestReference = await hasLatestSnapshotReference.run({ snapshotId, leaseId }, connection(executor))
+    if (latestReference.length !== 1) {
       throw new ServiceError(503, 'patch apply target snapshot unavailable')
     }
     return snapshot
@@ -398,19 +351,8 @@ export class PostgresPatchApplySourceResolver {
 
   private async objectReferences(executor: Queryable, tenantId: string,
     referenceKind: 'artifact' | 'snapshot', referenceId: string): Promise<ObjectReferenceRow[]> {
-    const result = await executor.query<ObjectReferenceRow>(`
-      SELECT reference.purpose, reference.retain_until, object_row.object_id,
-             object_row.kind, object_row.storage_bucket, object_row.storage_key,
-             object_row.checksum, object_row.size_bytes::text, object_row.state,
-             object_row.expires_at
-      FROM hosted_agent_object_references AS reference
-      JOIN hosted_agent_objects AS object_row ON object_row.object_id = reference.object_id
-      WHERE object_row.tenant_id = $1 AND reference.reference_kind = $2
-        AND reference.reference_id = $3
-      ORDER BY reference.purpose, object_row.object_id
-      FOR SHARE OF object_row, reference
-    `, [tenantId, referenceKind, referenceId])
-    return result.rows
+    return await sharePatchApplyObjectReferences.run({ tenantId, referenceKind, referenceId },
+      connection(executor)) as ObjectReferenceRow[]
   }
 
   private async artifactMaterial(artifact: ArtifactRow, snapshots: Map<string, SnapshotRow>,

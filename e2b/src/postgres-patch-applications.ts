@@ -1,10 +1,18 @@
 import type { Pool, PoolClient } from 'pg'
+import type { IDatabaseConnection, PreparedQuery } from '@pgtyped/runtime'
+import { createPatchApplication, getPatchApplicationForOperation, lockPatchApplication,
+  lockPatchApplicationForOperation, markPatchCheckpointed, markPatchFailed, markPatchRollbackReady,
+  markPatchRollbackStarted, markPatchRolledBack, markPatchSwapStarted, markPatchSwapped,
+  ownsPatchApplicationOperation, validatePatchApplicationCheckpoint, validatePatchRollbackAllocation,
+} from './db/queries/patches.queries.js'
+import { begin, commit, rollbackQuietly } from './db/primitives.js'
 import {
   OperationOwnershipError,
   type OperationIdentity,
 } from './postgres-store.js'
 
 const checksumPattern = /^sha256:[0-9a-f]{64}$/u
+function connection(value: Queryable): IDatabaseConnection { return value as IDatabaseConnection }
 
 export type PatchApplicationPhase =
   | 'planned'
@@ -192,34 +200,12 @@ export class PostgresPatchApplicationRepository {
       throw new Error('patch application fence does not match its identity')
     }
     return this.inTransaction(executor, async client => {
-      await client.query(`
-        INSERT INTO hosted_agent_patch_applications
-          (application_id, operation, idempotency_key, tenant_id, created_generation,
-           target_lease_id, artifact_id, source_target_snapshot_id,
-           target_provider_sandbox_id, result_snapshot_id, result_manifest_checksum,
-           result_archive_checksum, result_archive_size_bytes, phase)
-        SELECT $6, operation, idempotency_key, tenant_id, $4, $7, $8, $9,
-               $10, $11, $12, $13, $14, 'planned'
-        FROM hosted_agent_operations
-        WHERE operation = $1 AND idempotency_key = $2 AND tenant_id = $3
-          AND generation = $4 AND worker_id = $5 AND state = 'in_progress'
-          AND primary_lease_id = $7
-        ON CONFLICT DO NOTHING
-      `, [fence.operation, fence.idempotencyKey, fence.tenantId, fence.generation,
-        fence.workerId, input.applicationId, input.targetLeaseId, input.artifactId,
-        input.sourceTargetSnapshotId, input.targetProviderSandboxId,
-        input.resultSnapshotId, input.resultManifestChecksum,
-        input.resultArchiveChecksum, input.resultArchiveSizeBytes])
+      await createPatchApplication.run({ ...input, generation: fence.generation,
+        workerId: fence.workerId }, connection(client))
       const application = await this.lockedForOperation(client, fence)
       if (!application) {
-        const owned = await client.query(`
-          SELECT 1 FROM hosted_agent_operations
-          WHERE operation = $1 AND idempotency_key = $2 AND tenant_id = $3
-            AND generation = $4 AND worker_id = $5 AND state = 'in_progress'
-          FOR UPDATE
-        `, [fence.operation, fence.idempotencyKey, fence.tenantId,
-          fence.generation, fence.workerId])
-        if (owned.rowCount === 1) {
+        const owned = await ownsPatchApplicationOperation.run(fence, connection(client))
+        if (owned.length === 1) {
           throw new PatchApplicationConflictError(
             'patch application identity conflicts with its durable record')
         }
@@ -235,13 +221,8 @@ export class PostgresPatchApplicationRepository {
   async getForOperation(identity: OperationIdentity,
     executor: Pick<PoolClient, 'query'> = this.pool): Promise<PatchApplication | null> {
     validateIdentity(identity)
-    const result = await executor.query<ApplicationRow>(`
-      SELECT ${columns}
-      FROM hosted_agent_patch_applications AS application
-      WHERE application.operation = $1 AND application.idempotency_key = $2
-        AND application.tenant_id = $3
-    `, [identity.operation, identity.idempotencyKey, identity.tenantId])
-    return result.rows[0] ? fromRow(result.rows[0]) : null
+    const [row] = await getPatchApplicationForOperation.run(identity, connection(executor))
+    return row ? fromRow(row as ApplicationRow) : null
   }
 
   async recordRollback(fence: PatchApplicationFence, applicationId: string, rollback: {
@@ -258,16 +239,10 @@ export class PostgresPatchApplicationRepository {
           && application.rollbackProviderSnapshotId === rollback.providerSnapshotId) return application
         throw new PatchApplicationConflictError('patch application rollback identity conflicts')
       }
-      const allocation = await client.query(`
-        SELECT 1 FROM hosted_agent_operation_allocations
-        WHERE allocation_id = $1::bigint AND operation = $2 AND idempotency_key = $3
-          AND tenant_id = $4 AND allocation_kind = 'provider_snapshot'
-          AND resource_id = $5 AND lease_id = $6 AND state = 'allocated'
-          AND metadata ->> 'purpose' = 'patch_apply_rollback'
-        FOR UPDATE
-      `, [rollback.allocationId, fence.operation, fence.idempotencyKey, fence.tenantId,
-        rollback.providerSnapshotId, application.targetLeaseId])
-      if (allocation.rowCount !== 1) {
+      const allocation = await validatePatchRollbackAllocation.run({ ...fence,
+        allocationId: rollback.allocationId, providerSnapshotId: rollback.providerSnapshotId,
+        leaseId: application.targetLeaseId }, connection(client))
+      if (allocation.length !== 1) {
         throw new PatchApplicationConflictError('patch application rollback allocation is invalid')
       }
       return this.updated(client, applicationId, `
@@ -318,25 +293,11 @@ export class PostgresPatchApplicationRepository {
   }
 
   private async requireCheckpoint(client: Queryable, application: PatchApplication): Promise<void> {
-      const snapshot = await client.query(`
-        SELECT 1
-        FROM hosted_agent_snapshots AS snapshot
-        JOIN hosted_agent_leases AS lease
-          ON lease.lease_id = snapshot.lease_id AND lease.tenant_id = snapshot.tenant_id
-        JOIN hosted_agent_objects AS archive
-          ON archive.object_id = snapshot.workspace_archive_object_id
-         AND archive.tenant_id = snapshot.tenant_id
-        WHERE snapshot.snapshot_id = $1 AND snapshot.lease_id = $2
-          AND snapshot.tenant_id = $3 AND snapshot.state = 'available'
-          AND snapshot.manifest_checksum = $4 AND lease.latest_snapshot_id = snapshot.snapshot_id
-          AND lease.state IN ('active', 'paused')
-          AND archive.kind = 'workspace_archive' AND archive.state = 'available'
-          AND archive.checksum = $5 AND archive.size_bytes = $6
-        FOR SHARE OF snapshot, lease, archive
-      `, [application.resultSnapshotId, application.targetLeaseId,
-        application.tenantId, application.resultManifestChecksum,
-        application.resultArchiveChecksum, application.resultArchiveSizeBytes])
-      if (snapshot.rowCount !== 1) {
+      const snapshot = await validatePatchApplicationCheckpoint.run({ snapshotId: application.resultSnapshotId,
+        leaseId: application.targetLeaseId, tenantId: application.tenantId,
+        manifestChecksum: application.resultManifestChecksum, archiveChecksum: application.resultArchiveChecksum,
+        archiveSizeBytes: application.resultArchiveSizeBytes }, connection(client))
+      if (snapshot.length !== 1) {
         throw new PatchApplicationConflictError('patch application checkpoint is unavailable')
       }
   }
@@ -389,48 +350,32 @@ export class PostgresPatchApplicationRepository {
 
   private async locked(client: Queryable, fence: PatchApplicationFence,
     applicationId: string): Promise<PatchApplication> {
-    const result = await client.query<ApplicationRow>(`
-      SELECT ${columns}
-      FROM hosted_agent_patch_applications AS application
-      JOIN hosted_agent_operations AS operation
-        USING (operation, idempotency_key, tenant_id)
-      WHERE application.application_id = $1 AND application.tenant_id = $2
-        AND operation.operation = $3 AND operation.idempotency_key = $4
-        AND operation.generation = $5 AND operation.worker_id = $6
-        AND operation.state = 'in_progress'
-      FOR UPDATE OF application, operation
-    `, [applicationId, fence.tenantId, fence.operation, fence.idempotencyKey,
-      fence.generation, fence.workerId])
-    if (!result.rows[0]) throw new OperationOwnershipError()
-    return fromRow(result.rows[0])
+    const [row] = await lockPatchApplication.run({ applicationId, ...fence }, connection(client))
+    if (!row) throw new OperationOwnershipError()
+    return fromRow(row as ApplicationRow)
   }
 
   private async lockedForOperation(client: Queryable,
     fence: PatchApplicationFence): Promise<PatchApplication | null> {
-    const result = await client.query<ApplicationRow>(`
-      SELECT ${columns}
-      FROM hosted_agent_patch_applications AS application
-      JOIN hosted_agent_operations AS operation
-        USING (operation, idempotency_key, tenant_id)
-      WHERE operation.operation = $1 AND operation.idempotency_key = $2
-        AND operation.tenant_id = $3 AND operation.generation = $4
-        AND operation.worker_id = $5 AND operation.state = 'in_progress'
-      FOR UPDATE OF application, operation
-    `, [fence.operation, fence.idempotencyKey, fence.tenantId,
-      fence.generation, fence.workerId])
-    return result.rows[0] ? fromRow(result.rows[0]) : null
+    const [row] = await lockPatchApplicationForOperation.run(fence, connection(client))
+    return row ? fromRow(row as ApplicationRow) : null
   }
 
   private async updated(client: Queryable, applicationId: string, assignment: string,
     parameters: unknown[]): Promise<PatchApplication> {
-    const result = await client.query<ApplicationRow>(`
-      UPDATE hosted_agent_patch_applications AS application
-      SET ${assignment}
-      WHERE application_id = $1
-      RETURNING ${columns}
-    `, [applicationId, ...parameters])
-    if (!result.rows[0]) throw new Error('patch application disappeared while locked')
-    return fromRow(result.rows[0])
+    const query = assignment.includes("'rollback_ready'") ? markPatchRollbackReady
+      : assignment.includes("'swap_started'") ? markPatchSwapStarted
+      : assignment.includes("'swapped'") ? markPatchSwapped
+      : assignment.includes("'checkpointed'") ? markPatchCheckpointed
+      : assignment.includes("'rollback_started'") ? markPatchRollbackStarted
+      : assignment.includes("'rolled_back'") ? markPatchRolledBack : markPatchFailed
+    const values: any = { applicationId, ...(parameters[0] !== undefined
+      ? assignment.includes('rollback_allocation_id')
+        ? { allocationId: parameters[0], providerSnapshotId: parameters[1] }
+        : { errorMessage: parameters[0] } : {}) }
+    const [row] = await (query as PreparedQuery<any, any>).run(values, connection(client))
+    if (!row) throw new Error('patch application disappeared while locked')
+    return fromRow(row as ApplicationRow)
   }
 
   private async inTransaction<T>(executor: PoolClient | undefined,
@@ -438,12 +383,12 @@ export class PostgresPatchApplicationRepository {
     if (executor) return fn(executor)
     const client = await this.pool.connect()
     try {
-      await client.query('BEGIN')
+      await begin(client)
       const result = await fn(client)
-      await client.query('COMMIT')
+      await commit(client)
       return result
     } catch (error) {
-      await client.query('ROLLBACK').catch(() => undefined)
+      await rollbackQuietly(client)
       throw error
     } finally { client.release() }
   }

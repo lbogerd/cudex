@@ -1,5 +1,6 @@
 import type { TrustedProvisionRole } from './postgres-provision.js'
 import { contractLimits, validateToolPolicy } from './validation.js'
+import { z } from 'zod'
 
 export type TrustedRole = TrustedProvisionRole
 
@@ -28,15 +29,18 @@ function record(value: unknown, keys?: string[]): Record<string, unknown> {
   return result
 }
 
-function name(value: unknown, maximum: number): string {
-  if (typeof value !== 'string' || !value || value !== value.trim()
-    || Buffer.byteLength(value, 'utf8') > maximum
-    || Buffer.from(value, 'utf8').toString('utf8') !== value
-    || /[\u0000-\u001f\u007f]/u.test(value)) {
-    throw new Error('invalid trusted role configuration')
-  }
-  return value
-}
+const name = (maximum: number) => z.string().min(1).refine(value => value === value.trim())
+  .refine(value => Buffer.byteLength(value, 'utf8') <= maximum)
+  .refine(value => Buffer.from(value, 'utf8').toString('utf8') === value)
+  .refine(value => !/[\u0000-\u001f\u007f]/u.test(value))
+
+const roleSchema = z.strictObject({
+  sandboxTemplate: name(contractLimits.maxNameBytes), providerTemplateId: name(512),
+  toolPolicy: z.unknown().transform((value, context) => {
+    try { return validateToolPolicy(value) } catch { context.addIssue({ code: 'custom' }); return z.NEVER }
+  }),
+  policyVersion: z.number().int().safe().min(1).max(2_147_483_647),
+})
 
 export function validateTrustedRoles(value: unknown): Record<string, TrustedRole> {
   const input = record(value)
@@ -47,24 +51,15 @@ export function validateTrustedRoles(value: unknown): Record<string, TrustedRole
   const roles: Record<string, TrustedRole> = Object.create(null) as Record<string, TrustedRole>
   const templates = new Set<string>()
   for (const [untrustedAgentType, untrustedRole] of entries) {
-    const agentType = name(untrustedAgentType, contractLimits.maxNameBytes)
-    const role = record(untrustedRole, [
-      'sandboxTemplate', 'providerTemplateId', 'toolPolicy', 'policyVersion',
-    ])
-    const sandboxTemplate = name(role.sandboxTemplate, contractLimits.maxNameBytes)
-    const providerTemplateId = name(role.providerTemplateId, 512)
-    if (templates.has(sandboxTemplate) || !Number.isSafeInteger(role.policyVersion)
-      || Number(role.policyVersion) < 1 || Number(role.policyVersion) > 2_147_483_647) {
-      throw new Error('invalid trusted role configuration')
-    }
+    const agentTypeResult = name(contractLimits.maxNameBytes).safeParse(untrustedAgentType)
+    record(untrustedRole, ['sandboxTemplate', 'providerTemplateId', 'toolPolicy', 'policyVersion'])
+    const roleResult = roleSchema.safeParse(untrustedRole)
+    if (!agentTypeResult.success || !roleResult.success) throw new Error('invalid trusted role configuration')
+    const agentType = agentTypeResult.data
+    const { sandboxTemplate, providerTemplateId, toolPolicy, policyVersion } = roleResult.data
+    if (templates.has(sandboxTemplate)) throw new Error('invalid trusted role configuration')
     templates.add(sandboxTemplate)
-    let toolPolicy
-    try { toolPolicy = validateToolPolicy(role.toolPolicy) }
-    catch { throw new Error('invalid trusted role configuration') }
-    roles[agentType] = {
-      sandboxTemplate, providerTemplateId, toolPolicy,
-      policyVersion: Number(role.policyVersion),
-    }
+    roles[agentType] = { sandboxTemplate, providerTemplateId, toolPolicy, policyVersion }
   }
   return roles
 }

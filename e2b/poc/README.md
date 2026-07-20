@@ -28,7 +28,11 @@ not count. The documented auth file location is
 
 For local CubeSandbox, set `E2B_VALIDATE_API_KEY=false` and set
 `POC_PROVIDER_CA_CERTIFICATE` to its development CA PEM. The runner validates
-that bounded regular certificate file, re-executes Node with it as additional
+the POC `.env` through its own scoped schema. Boolean values must be exactly
+`true` or `false`; ports must be distinct positive integer TCP ports. Unrelated
+operating-system variables are ignored, while misspelled `POC_`, `E2B_`, or
+`CODEX_` keys in the POC file are rejected. The runner validates that bounded
+regular certificate file, re-executes Node with it as additional
 provider trust before loading the E2B SDK, includes it in the generated combined
 CA bundle, and passes the explicit key-validation policy to the control service.
 These settings belong in `.env`; no shell export or system trust-store change is

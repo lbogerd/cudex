@@ -14,7 +14,9 @@ interface Response {
 
 function post(port: number, path: string, body: string | Buffer, headers: Record<string, string> = {}): Promise<Response> {
   return new Promise((resolve, reject) => {
-    const request = httpRequest({ host: '127.0.0.1', port, path, method: 'POST', headers: { authorization: 'Bearer test-token', ...headers } }, response => {
+    const request = httpRequest({ host: '127.0.0.1', port, path, method: 'POST', headers: {
+      authorization: 'Bearer test-token', 'content-type': 'application/json', ...headers,
+    } }, response => {
       const chunks: Buffer[] = []
       response.on('data', chunk => chunks.push(Buffer.from(chunk)))
       response.on('end', () => resolve({ status: response.statusCode ?? 0, headers: response.headers, body: Buffer.concat(chunks).toString('utf8') }))
@@ -26,7 +28,9 @@ function post(port: number, path: string, body: string | Buffer, headers: Record
 
 function postOversizedStream(port: number, path: string): Promise<Response> {
   return new Promise((resolve, reject) => {
-    const request = httpRequest({ host: '127.0.0.1', port, path, method: 'POST', headers: { authorization: 'Bearer test-token' } }, response => {
+    const request = httpRequest({ host: '127.0.0.1', port, path, method: 'POST', headers: {
+      authorization: 'Bearer test-token', 'content-type': 'application/json',
+    } }, response => {
       const chunks: Buffer[] = []
       response.on('data', chunk => chunks.push(Buffer.from(chunk)))
       response.on('end', () => resolve({ status: response.statusCode ?? 0, headers: response.headers, body: Buffer.concat(chunks).toString('utf8') }))
@@ -76,6 +80,16 @@ test('HTTP responses disable caching and redact unexpected service errors', asyn
   assert.equal(failure.headers['cache-control'], 'no-store')
   assert.deepEqual(JSON.parse(failure.body), { error: 'service unavailable' })
   assert.equal(failure.body.includes('secret'), false)
+})
+
+test('JSON routes require an explicit application/json content type', async t => {
+  const { server, port } = await fixture({ async checkpoint() { return { snapshotId: 'snapshot' } } })
+  t.after(() => server.close())
+  const response = await post(port, '/v1/agents/checkpoint', JSON.stringify({
+    leaseId: 'lease', idempotencyKey: 'checkpoint',
+  }), { 'content-type': 'text/plain' })
+  assert.equal(response.status, 415)
+  assert.deepEqual(JSON.parse(response.body), { error: 'unsupported media type' })
 })
 
 test('HTTP retention route strictly dispatches the exact durable set', async t => {

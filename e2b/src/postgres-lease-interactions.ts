@@ -2,6 +2,11 @@ import { createHash } from 'node:crypto'
 import type { PoolClient } from 'pg'
 import type { PostgresDurableState } from './postgres-state.js'
 import type { PostgresJournal } from './postgres-store.js'
+import {
+  hasUnfinishedLeaseInteraction, insertLeaseInteraction, listUnfinishedLeaseInteractions,
+  selectLeaseInteractionForUpdate, updateLeaseInteraction,
+  type IInsertLeaseInteractionResult,
+} from './db/queries/lease-interactions.queries.js'
 
 export type LeaseInteractionKind = 'process' | 'filesystem'
 export type LeaseInteractionState = 'active' | 'detached' | 'finished'
@@ -42,7 +47,7 @@ export interface LeaseInteractionLedger extends LeaseQuiescenceGate {
     sessionId: string): Promise<LeaseInteractionIdentity[]>
 }
 
-interface InteractionRow {
+interface InteractionRow extends Omit<IInsertLeaseInteractionResult, 'interaction_kind' | 'state'> {
   interaction_id: string
   tenant_id: string
   lease_id: string
@@ -145,16 +150,12 @@ export class PostgresLeaseInteractionGate implements LeaseInteractionLedger {
           || lease.connectionGeneration !== identity.connectionGeneration) {
           throw new LeaseInteractionConflictError()
         }
-        const inserted = await client.query<InteractionRow>(`
-          INSERT INTO hosted_agent_lease_interactions
-            (interaction_id, tenant_id, lease_id, connection_generation,
-             session_id, interaction_kind, process_id, state)
-          VALUES ($1, $2, $3, $4, $5, $6, $7, 'active')
-          ON CONFLICT (interaction_id) DO NOTHING
-          RETURNING ${columns}
-        `, [identity.interactionId, identity.tenantId, identity.leaseId,
-          identity.connectionGeneration, identity.sessionId, identity.kind, identity.processId])
-        if (inserted.rows[0]) return interaction(inserted.rows[0])
+        const inserted = await insertLeaseInteraction.run({
+          interactionId: identity.interactionId, tenantId: identity.tenantId, leaseId: identity.leaseId,
+          connectionGeneration: identity.connectionGeneration, sessionId: identity.sessionId,
+          interactionKind: identity.kind, processId: identity.processId,
+        }, client)
+        if (inserted[0]) return interaction(inserted[0] as InteractionRow)
         const existing = await this.select(identity.interactionId, client)
         if (!existing || !exact(existing, identity) || existing.state !== 'active') {
           throw new LeaseInteractionConflictError()
@@ -221,13 +222,8 @@ export class PostgresLeaseInteractionGate implements LeaseInteractionLedger {
     // and filesystem interactions remain subject to the lifecycle gate.
     const codeModeProcessId = hostedCodeModeProcessId(
       lease.leaseId, lease.environmentId, lease.connectionGeneration)
-    const result = await executor.query(`
-      SELECT 1 FROM hosted_agent_lease_interactions
-      WHERE tenant_id = $1 AND lease_id = $2 AND state <> 'finished'
-        AND NOT (interaction_kind = 'process' AND process_id = $3)
-      LIMIT 1
-    `, [tenantId, leaseId, codeModeProcessId])
-    if (result.rowCount !== 0) throw new LeaseNotQuiescentError()
+    const result = await hasUnfinishedLeaseInteraction.run({ tenantId, leaseId, codeModeProcessId }, executor)
+    if (result.length !== 0) throw new LeaseNotQuiescentError()
   }
 
   async listUnfinishedProcesses(tenantId: string, leaseId: string,
@@ -253,16 +249,10 @@ export class PostgresLeaseInteractionGate implements LeaseInteractionLedger {
         || lease.connectionGeneration !== connectionGeneration) {
         throw new LeaseInteractionConflictError()
       }
-      return client.query<InteractionRow>(`
-        SELECT ${columns} FROM hosted_agent_lease_interactions
-        WHERE tenant_id = $1 AND lease_id = $2
-          AND session_id = $3 AND interaction_kind = $4 AND state <> 'finished'
-        ORDER BY interaction_id
-        FOR UPDATE
-      `, [tenantId, leaseId, sessionId, kind])
+      return listUnfinishedLeaseInteractions.run({ tenantId, leaseId, sessionId, interactionKind: kind }, client)
     })
-    return result.rows.map(row => {
-      const value = interaction(row)
+    return result.map(row => {
+      const value = interaction(row as InteractionRow)
       return {
         interactionId: value.interactionId, tenantId: value.tenantId,
         leaseId: value.leaseId, connectionGeneration: value.connectionGeneration,
@@ -287,26 +277,14 @@ export class PostgresLeaseInteractionGate implements LeaseInteractionLedger {
     }
     if (current.state === state) return current
     if (state === 'active' && current.state !== 'detached') throw new LeaseInteractionConflictError()
-    const result = await client.query<InteractionRow>(`
-      UPDATE hosted_agent_lease_interactions
-      SET state = $2,
-          detached_at = CASE WHEN $2 = 'detached' THEN now()
-            WHEN $2 = 'active' THEN NULL ELSE detached_at END,
-          finished_at = CASE WHEN $2 = 'finished' THEN now() ELSE NULL END
-      WHERE interaction_id = $1
-      RETURNING ${columns}
-    `, [identity.interactionId, state])
-    if (!result.rows[0]) throw new LeaseInteractionConflictError()
-    return interaction(result.rows[0])
+    const result = await updateLeaseInteraction.run({ interactionId: identity.interactionId, state }, client)
+    if (!result[0]) throw new LeaseInteractionConflictError()
+    return interaction(result[0] as InteractionRow)
   }
 
   private async select(interactionId: string,
     executor: Pick<PoolClient, 'query'>): Promise<LeaseInteraction | null> {
-    const result = await executor.query<InteractionRow>(`
-      SELECT ${columns} FROM hosted_agent_lease_interactions
-      WHERE interaction_id = $1
-      FOR UPDATE
-    `, [interactionId])
-    return result.rows[0] ? interaction(result.rows[0]) : null
+    const result = await selectLeaseInteractionForUpdate.run({ interactionId }, executor)
+    return result[0] ? interaction(result[0] as InteractionRow) : null
   }
 }

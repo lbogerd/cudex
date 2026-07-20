@@ -1,17 +1,16 @@
 #!/usr/bin/env node
-import { spawn, spawnSync } from 'node:child_process'
+import { execa, execaSync } from 'execa'
 import { chmod, lstat, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import process from 'node:process'
 import { createInterface } from 'node:readline/promises'
 import { fileURLToPath } from 'node:url'
-import { execFile } from 'node:child_process'
-import { promisify } from 'node:util'
 import { createPilotConfig, loadCudexConfig, loadCudexCredentials, resolveCudexPaths,
   saveCudexSetup, validateCudexCredentials, type CudexPaths } from './cudex-config.js'
 import { installSharedRelease, validateCachedRelease } from './cudex-release.js'
+import { loadCudexEnv } from './config/cudex-env.js'
 
-const exec = promisify(execFile)
+const exec = execa
 const e2bRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..')
 
 export type CudexArguments =
@@ -84,12 +83,12 @@ async function promptLine(label: string): Promise<string> {
 async function promptSecret(label: string): Promise<string> {
   if (!process.stdin.isTTY) throw new Error(`${label} is required in the environment for non-interactive setup`)
   process.stderr.write(`${label}: `)
-  const disabled = spawnSync('stty', ['-echo'], { stdio: ['inherit', 'ignore', 'ignore'] }).status === 0
+  const disabled = execaSync('stty', ['-echo'], { stdin: 'inherit', stdout: 'ignore', stderr: 'ignore', reject: false }).exitCode === 0
   const terminal = createInterface({ input: process.stdin, terminal: false })
   try { return (await terminal.question('')).trim() }
   finally {
     terminal.close()
-    if (disabled) spawnSync('stty', ['echo'], { stdio: ['inherit', 'ignore', 'ignore'] })
+    if (disabled) execaSync('stty', ['echo'], { stdin: 'inherit', stdout: 'ignore', stderr: 'ignore', reject: false })
     process.stderr.write('\n')
   }
 }
@@ -105,13 +104,14 @@ async function currentCudexRevision(): Promise<string> {
 }
 
 async function setup(release: string, paths: CudexPaths): Promise<void> {
+  const environment = loadCudexEnv()
   const installed = await installSharedRelease(release, paths)
   const revision = await currentCudexRevision()
   if (revision !== installed.manifest.cudexRevision) throw new Error('installed Cudex revision does not match the selected release')
-  const apiUrl = process.env.CUDEX_API_URL?.trim() || await promptLine('CubeSandbox API URL')
-  const apiKey = process.env.CUDEX_API_KEY || await promptSecret('CubeSandbox API key')
-  const domain = process.env.CUDEX_DOMAIN?.trim() || 'cube.app'
-  const providerCaCertificate = process.env.CUDEX_PROVIDER_CA_CERTIFICATE?.trim()
+  const apiUrl = environment.CUDEX_API_URL?.trim() || await promptLine('CubeSandbox API URL')
+  const apiKey = environment.CUDEX_API_KEY || await promptSecret('CubeSandbox API key')
+  const domain = environment.CUDEX_DOMAIN
+  const providerCaCertificate = environment.CUDEX_PROVIDER_CA_CERTIFICATE?.trim()
   if (providerCaCertificate) {
     const metadata = await lstat(providerCaCertificate).catch(() => undefined)
     if (!metadata?.isFile() || metadata.isSymbolicLink()) throw new Error('provider CA certificate is missing or unsafe')
@@ -124,7 +124,8 @@ async function setup(release: string, paths: CudexPaths): Promise<void> {
 }
 
 export async function discoverCodexAuth(paths: CudexPaths): Promise<string | undefined> {
-  const candidates = [process.env.CODEX_HOME ? join(process.env.CODEX_HOME, 'auth.json') : undefined,
+  const environment = loadCudexEnv()
+  const candidates = [environment.CODEX_HOME ? join(environment.CODEX_HOME, 'auth.json') : undefined,
     join(paths.home, '.codex', 'auth.json'), join(paths.isolatedCodexHome, 'auth.json')].filter(Boolean) as string[]
   for (const candidate of candidates) {
     const metadata = await lstat(candidate).catch(() => undefined)
@@ -151,6 +152,7 @@ export async function copyDiscoveredCodexAuth(paths: CudexPaths, runtimeCodexHom
 }
 
 async function doctor(paths: CudexPaths, verifyTemplate: boolean): Promise<void> {
+  const environment = loadCudexEnv()
   const [config, credentials] = await Promise.all([loadCudexConfig(paths), loadCudexCredentials(paths)])
   const release = await validateCachedRelease(config.releaseDirectory)
   if (release.releaseId !== config.releaseId) throw new Error('configured release identity is inconsistent')
@@ -161,10 +163,10 @@ async function doctor(paths: CudexPaths, verifyTemplate: boolean): Promise<void>
   const auth = await discoverCodexAuth(paths)
   if (!auth) throw new Error('Codex authentication is unavailable; run cudex login')
   if (verifyTemplate) {
-    const verifier = join(e2bRoot, 'scripts', 'verify-template.mjs')
+    const verifier = join(e2bRoot, 'dist', 'src', 'commands', 'verify-template.js')
     await exec(process.execPath, [verifier, join(config.releaseDirectory, 'template.json')], {
       timeout: 300_000, maxBuffer: 2 * 1024 * 1024,
-      env: { PATH: process.env.PATH, E2B_API_KEY: credentials.e2bApiKey, E2B_API_URL: config.apiUrl,
+      extendEnv: false, env: { PATH: environment.PATH, E2B_API_KEY: credentials.e2bApiKey, E2B_API_URL: config.apiUrl,
         E2B_DOMAIN: config.domain, E2B_VALIDATE_API_KEY: String(config.validateApiKey),
         ...(config.providerCaCertificate ? { NODE_EXTRA_CA_CERTS: config.providerCaCertificate } : {}) },
     })
@@ -175,13 +177,14 @@ async function doctor(paths: CudexPaths, verifyTemplate: boolean): Promise<void>
 }
 
 async function login(paths: CudexPaths): Promise<void> {
+  const environment = loadCudexEnv()
   const config = await loadCudexConfig(paths); const release = await validateCachedRelease(config.releaseDirectory)
   await mkdir(paths.isolatedCodexHome, { recursive: true, mode: 0o700 }); await chmod(paths.isolatedCodexHome, 0o700)
   await writeFile(join(paths.isolatedCodexHome, 'config.toml'), 'cli_auth_credentials_store = "file"\n', { mode: 0o600 })
-  const child = spawn(join(config.releaseDirectory, 'codex'), ['login', '--device-auth'], { stdio: 'inherit',
-    env: { PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin', CODEX_HOME: paths.isolatedCodexHome } })
-  const code = await new Promise<number | null>((resolveExit, reject) => { child.once('error', reject); child.once('exit', resolveExit) })
-  if (code !== 0 || !await discoverCodexAuth(paths)) throw new Error('Codex device login did not complete')
+  const child = execa(join(config.releaseDirectory, 'codex'), ['login', '--device-auth'], { stdio: 'inherit', reject: false, extendEnv: false,
+    env: { PATH: environment.PATH, CODEX_HOME: paths.isolatedCodexHome } })
+  const result = await child
+  if (result.exitCode !== 0 || !await discoverCodexAuth(paths)) throw new Error('Codex device login did not complete')
   console.log(JSON.stringify({ loggedIn: true, releaseId: release.releaseId }))
 }
 

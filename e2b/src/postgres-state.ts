@@ -2,6 +2,56 @@ import type { Pool, PoolClient } from 'pg'
 import { isAbsolute, relative, sep } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import type { TicketPurpose } from './types.js'
+import { begin, commit, lockTransaction, rollbackQuietly, setLocalLockTimeout } from './db/primitives.js'
+import {
+  stateAddSnapshotReference,
+  stateFindAuthorizedSource,
+  stateFindAuthorizedSourceByChecksum,
+  stateGetSourceTenant,
+  stateInsertObject,
+  stateInsertSourceSnapshot,
+  stateLockAuthorizedSource,
+  stateLockAvailableObject,
+  stateLockObjectById,
+  stateLockObjectByTenant,
+  stateLockSourceByChecksum,
+  stateLockSourceById,
+  stateUpsertObjectReference,
+  type IStateLockObjectByIdResult,
+  type IStateLockSourceByIdResult,
+} from './db/queries/objects.queries.js'
+import {
+  activeLeaseTarget as activeLeaseTargetQuery,
+  activateLease,
+  beginRelease as beginReleaseQuery,
+  cleanupTickets as cleanupTicketsQuery,
+  completeReconnect as completeReconnectQuery,
+  completeRelease as completeReleaseQuery,
+  consumeTicket as consumeTicketQuery,
+  findLeaseByProviderSandboxForReconciliation as findLeaseByProviderSandboxQuery,
+  findRestoreReplacementForUpdate,
+  findSnapshotByProviderIdForReconciliation as findSnapshotByProviderIdQuery,
+  getLease as getLeaseQuery,
+  getSnapshot as getSnapshotQuery,
+  insertLatestSnapshotReference,
+  insertLease,
+  insertLeaseBaseReferences,
+  insertLeaseRestoreSourceReference,
+  insertSnapshot as insertSnapshotQuery,
+  insertTicket as insertTicketQuery,
+  lockLease as lockLeaseQuery,
+  markLeaseLost as markLeaseLostQuery,
+  lockSnapshot,
+  deleteLatestSnapshotReference,
+  releaseLostRestoreSource,
+  revokeLeaseTickets as revokeLeaseTicketsQuery,
+  revokeTicketsByLeaseId,
+  rotateReconnectReplayAccess as rotateReconnectReplayAccessQuery,
+  setLatestSnapshot,
+  transitionLeaseState as transitionLeaseStateQuery,
+  type IGetLeaseResult,
+  type IGetSnapshotResult,
+} from './db/queries/lifecycle.queries.js'
 
 const checksumPattern = /^sha256:[0-9a-f]{64}$/
 const ticketPurposes = new Set<TicketPurpose>(['exec_gateway_connect', 'exec_gateway_probe'])
@@ -129,28 +179,6 @@ export interface AuthorizedRestoreSource {
 
 type LeaseState = Lease['state']
 
-interface ObjectRow {
-  object_id: string; tenant_id: string; kind: StoredObject['kind']; storage_bucket: string
-  storage_key: string; checksum: string; size_bytes: string; state: StoredObject['state']; expires_at: Date | null
-}
-interface SourceRow {
-  source_snapshot_id: string; tenant_id: string; archive_object_id: string; checksum: string
-  cwd_uri: string; workspace_root_uris: string[]; state: SourceSnapshot['state']; expires_at: Date
-}
-interface LeaseRow {
-  lease_id: string; environment_id: string; tenant_id: string; agent_id: string
-  owner_agent_id: string | null; owner_lease_id: string | null; source_snapshot_id: string | null
-  restore_source_lease_id: string | null; restore_source_snapshot_id: string | null
-  provider_sandbox_id: string | null; sandbox_template: string; cwd_uri: string
-  workspace_root_uris: string[]; base_snapshot_id: string | null; latest_snapshot_id: string | null
-  state: LeaseState; tool_policy: Record<string, unknown>; policy_version: string
-  connection_generation: string; released_at: Date | null
-}
-interface SnapshotRow {
-  snapshot_id: string; tenant_id: string; lease_id: string; provider_snapshot_id: string | null
-  workspace_archive_object_id: string; manifest_object_id: string; manifest_checksum: string
-  state: Snapshot['state']; expires_at: Date | null; created_at: Date
-}
 
 function validateId(label: string, value: string, max = 512): void {
   if (!value.trim() || Buffer.byteLength(value) > max) throw new Error(`invalid ${label}`)
@@ -206,39 +234,31 @@ function postgresError(error: unknown): never {
   throw error
 }
 
-const leaseColumns = `lease_id, environment_id, tenant_id, agent_id, owner_agent_id,
-  owner_lease_id, source_snapshot_id, restore_source_lease_id, restore_source_snapshot_id,
-  provider_sandbox_id, sandbox_template, cwd_uri,
-  workspace_root_uris, base_snapshot_id, latest_snapshot_id, state, tool_policy,
-  policy_version::text, connection_generation::text, released_at`
-const snapshotColumns = `snapshot_id, tenant_id, lease_id, provider_snapshot_id,
-  workspace_archive_object_id, manifest_object_id, manifest_checksum, state, expires_at, created_at`
-
-function objectFromRow(row: ObjectRow): StoredObject {
-  return { objectId: row.object_id, tenantId: row.tenant_id, kind: row.kind,
+function objectFromRow(row: IStateLockObjectByIdResult): StoredObject {
+  return { objectId: row.object_id, tenantId: row.tenant_id, kind: row.kind as StoredObject['kind'],
     storageBucket: row.storage_bucket, storageKey: row.storage_key, checksum: row.checksum,
-    sizeBytes: Number(row.size_bytes), state: row.state, expiresAt: row.expires_at }
+    sizeBytes: Number(row.size_bytes), state: row.state as StoredObject['state'], expiresAt: row.expires_at }
 }
-function sourceFromRow(row: SourceRow): SourceSnapshot {
+function sourceFromRow(row: IStateLockSourceByIdResult): SourceSnapshot {
   return { sourceSnapshotId: row.source_snapshot_id, tenantId: row.tenant_id,
     archiveObjectId: row.archive_object_id, checksum: row.checksum, cwdUri: row.cwd_uri,
-    workspaceRootUris: row.workspace_root_uris, state: row.state, expiresAt: row.expires_at }
+    workspaceRootUris: row.workspace_root_uris as string[], state: row.state as SourceSnapshot['state'], expiresAt: row.expires_at }
 }
-function leaseFromRow(row: LeaseRow): Lease {
+function leaseFromRow(row: IGetLeaseResult): Lease {
   return { leaseId: row.lease_id, environmentId: row.environment_id, tenantId: row.tenant_id,
     agentId: row.agent_id, ownerAgentId: row.owner_agent_id, ownerLeaseId: row.owner_lease_id,
     sourceSnapshotId: row.source_snapshot_id, restoreSourceLeaseId: row.restore_source_lease_id,
     restoreSourceSnapshotId: row.restore_source_snapshot_id, providerSandboxId: row.provider_sandbox_id,
-    sandboxTemplate: row.sandbox_template, cwdUri: row.cwd_uri, workspaceRootUris: row.workspace_root_uris,
-    baseSnapshotId: row.base_snapshot_id, latestSnapshotId: row.latest_snapshot_id, state: row.state,
-    toolPolicy: row.tool_policy, policyVersion: Number(row.policy_version),
+    sandboxTemplate: row.sandbox_template, cwdUri: row.cwd_uri, workspaceRootUris: row.workspace_root_uris as string[],
+    baseSnapshotId: row.base_snapshot_id, latestSnapshotId: row.latest_snapshot_id,
+    state: row.state as LeaseState, toolPolicy: row.tool_policy as Record<string, unknown>, policyVersion: Number(row.policy_version),
     connectionGeneration: Number(row.connection_generation), releasedAt: row.released_at }
 }
-function snapshotFromRow(row: SnapshotRow): Snapshot {
+function snapshotFromRow(row: IGetSnapshotResult): Snapshot {
   return { snapshotId: row.snapshot_id, tenantId: row.tenant_id, leaseId: row.lease_id,
     providerSnapshotId: row.provider_snapshot_id, workspaceArchiveObjectId: row.workspace_archive_object_id,
     manifestObjectId: row.manifest_object_id, manifestChecksum: row.manifest_checksum,
-    state: row.state, expiresAt: row.expires_at, createdAt: row.created_at }
+    state: row.state as Snapshot['state'], expiresAt: row.expires_at, createdAt: row.created_at }
 }
 
 export class PostgresDurableState {
@@ -248,7 +268,7 @@ export class PostgresDurableState {
     fn: (client: PoolClient) => Promise<T>): Promise<T> {
     validateId('storage bucket', storageBucket); validateId('storage key', storageKey, 2048)
     return this.transaction(async client => {
-      await client.query("SET LOCAL lock_timeout = '30s'")
+      await setLocalLockTimeout(client)
       await this.lockObjectLocation(client, storageBucket, storageKey)
       return fn(client)
     })
@@ -262,19 +282,12 @@ export class PostgresDurableState {
     try {
       const register = async (client: PoolClient): Promise<StoredObject> => {
         await this.lockObjectLocation(client, input.storageBucket, input.storageKey)
-        await client.query(`
-          INSERT INTO hosted_agent_objects
-            (object_id, tenant_id, kind, storage_bucket, storage_key, checksum, size_bytes, state, expires_at)
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-          ON CONFLICT (object_id) DO NOTHING
-        `, [input.objectId, input.tenantId, input.kind, input.storageBucket, input.storageKey,
-          input.checksum, input.sizeBytes, input.state, input.expiresAt])
-        const result = await client.query<ObjectRow>(`
-          SELECT object_id, tenant_id, kind, storage_bucket, storage_key, checksum,
-                 size_bytes::text, state, expires_at
-          FROM hosted_agent_objects WHERE object_id = $1 FOR UPDATE
-        `, [input.objectId])
-        const row = result.rows[0]
+        await stateInsertObject.run({ objectId: input.objectId, tenantId: input.tenantId,
+          kind: input.kind, storageBucket: input.storageBucket, storageKey: input.storageKey,
+          checksum: input.checksum, sizeBytes: input.sizeBytes, state: input.state,
+          expiresAt: input.expiresAt }, client)
+        const result = await stateLockObjectById.run({ objectId: input.objectId }, client)
+        const row = result[0]
         if (!row || row.tenant_id !== input.tenantId || row.kind !== input.kind ||
           row.storage_bucket !== input.storageBucket || row.storage_key !== input.storageKey ||
           row.checksum !== input.checksum || Number(row.size_bytes) !== input.sizeBytes) {
@@ -295,18 +308,10 @@ export class PostgresDurableState {
 
   async addSnapshotReference(input: { tenantId: string; snapshotId: string; referenceKind: string; referenceId: string; retainUntil?: Date | null }): Promise<void> {
     validateId('tenant ID', input.tenantId); validateId('snapshot ID', input.snapshotId); validateId('reference ID', input.referenceId)
-    const result = await this.pool.query(`
-      INSERT INTO hosted_agent_snapshot_references
-        (snapshot_id, reference_kind, reference_id, retain_until)
-      SELECT snapshot_id, $3, $4, $5
-      FROM hosted_agent_snapshots WHERE snapshot_id = $2 AND tenant_id = $1
-      ON CONFLICT (snapshot_id, reference_kind, reference_id)
-      DO UPDATE SET retain_until = CASE
-        WHEN hosted_agent_snapshot_references.retain_until IS NULL OR EXCLUDED.retain_until IS NULL THEN NULL
-        ELSE GREATEST(hosted_agent_snapshot_references.retain_until, EXCLUDED.retain_until)
-      END
-    `, [input.tenantId, input.snapshotId, input.referenceKind, input.referenceId, input.retainUntil ?? null])
-    if (result.rowCount !== 1) throw new DurableStateNotFoundError('snapshot was not found')
+    const result = await stateAddSnapshotReference.run({ tenantId: input.tenantId,
+      snapshotId: input.snapshotId, referenceKind: input.referenceKind,
+      referenceId: input.referenceId, retainUntil: input.retainUntil ?? null }, this.pool)
+    if (result.length !== 1) throw new DurableStateNotFoundError('snapshot was not found')
   }
 
   async registerSourceSnapshot(input: SourceSnapshot): Promise<SourceSnapshot> {
@@ -316,35 +321,22 @@ export class PostgresDurableState {
     validateDate('source snapshot expiry', input.expiresAt)
     try {
       return await this.transaction(async client => {
-        const existingIdentity = await client.query<{ tenant_id: string }>(`
-          SELECT tenant_id FROM hosted_agent_source_snapshots WHERE source_snapshot_id = $1
-        `, [input.sourceSnapshotId])
-        if (existingIdentity.rows[0] && existingIdentity.rows[0].tenant_id !== input.tenantId) {
+        const existingIdentity = await stateGetSourceTenant.run({
+          sourceSnapshotId: input.sourceSnapshotId }, client)
+        if (existingIdentity[0] && existingIdentity[0].tenant_id !== input.tenantId) {
           throw new DurableStateConflictError('source snapshot identity does not match its existing registration')
         }
         await this.lockAvailableObject(client, input.tenantId, input.archiveObjectId, 'source_archive')
-        await client.query(`
-          INSERT INTO hosted_agent_source_snapshots
-            (source_snapshot_id, tenant_id, archive_object_id, checksum, cwd_uri,
-             workspace_root_uris, state, expires_at)
-          VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8)
-          ON CONFLICT DO NOTHING
-        `, [input.sourceSnapshotId, input.tenantId, input.archiveObjectId, input.checksum,
-          input.cwdUri, JSON.stringify(input.workspaceRootUris), input.state, input.expiresAt])
-        let result = await client.query<SourceRow>(`
-          SELECT source_snapshot_id, tenant_id, archive_object_id, checksum, cwd_uri,
-                 workspace_root_uris, state, expires_at
-          FROM hosted_agent_source_snapshots WHERE source_snapshot_id = $1 FOR UPDATE
-        `, [input.sourceSnapshotId])
-        if (!result.rows[0]) {
-          result = await client.query<SourceRow>(`
-            SELECT source_snapshot_id, tenant_id, archive_object_id, checksum, cwd_uri,
-                   workspace_root_uris, state, expires_at
-            FROM hosted_agent_source_snapshots
-            WHERE tenant_id = $1 AND checksum = $2 FOR UPDATE
-          `, [input.tenantId, input.checksum])
+        await stateInsertSourceSnapshot.run({ sourceSnapshotId: input.sourceSnapshotId,
+          tenantId: input.tenantId, archiveObjectId: input.archiveObjectId, checksum: input.checksum,
+          cwdUri: input.cwdUri, workspaceRootUris: JSON.stringify(input.workspaceRootUris),
+          state: input.state, expiresAt: input.expiresAt }, client)
+        let result = await stateLockSourceById.run({ sourceSnapshotId: input.sourceSnapshotId }, client)
+        if (!result[0]) {
+          result = await stateLockSourceByChecksum.run({ tenantId: input.tenantId,
+            checksum: input.checksum }, client)
         }
-        const row = result.rows[0]
+        const row = result[0]
         if (!row || row.tenant_id !== input.tenantId || row.archive_object_id !== input.archiveObjectId ||
           row.checksum !== input.checksum || row.cwd_uri !== input.cwdUri ||
           JSON.stringify(row.workspace_root_uris) !== JSON.stringify(input.workspaceRootUris) ||
@@ -360,80 +352,50 @@ export class PostgresDurableState {
 
   async findAuthorizedSourceSnapshot(tenantId: string, sourceSnapshotId: string, at = new Date()): Promise<SourceSnapshot | null> {
     validateId('tenant ID', tenantId); validateId('source snapshot ID', sourceSnapshotId)
-    const result = await this.pool.query<SourceRow>(`
-      SELECT source_snapshot_id, tenant_id, archive_object_id, checksum, cwd_uri,
-             workspace_root_uris, state, expires_at
-      FROM hosted_agent_source_snapshots
-      WHERE source_snapshot_id = $1 AND tenant_id = $2
-        AND state = 'available' AND expires_at > $3
-    `, [sourceSnapshotId, tenantId, at])
-    return result.rows[0] ? sourceFromRow(result.rows[0]) : null
+    const result = await stateFindAuthorizedSource.run({ sourceSnapshotId, tenantId, at }, this.pool)
+    return result[0] ? sourceFromRow(result[0]) : null
   }
 
   async lockAuthorizedSourceSnapshot(tenantId: string, sourceSnapshotId: string, expectedChecksum: string,
     at: Date, executor: Pick<PoolClient, 'query'>): Promise<SourceSnapshot> {
     validateId('tenant ID', tenantId); validateId('source snapshot ID', sourceSnapshotId)
     validateChecksum(expectedChecksum); validateDate('source snapshot authorization time', at)
-    const result = await executor.query<SourceRow>(`
-      SELECT source_snapshot_id, tenant_id, archive_object_id, checksum, cwd_uri,
-             workspace_root_uris, state, expires_at
-      FROM hosted_agent_source_snapshots
-      WHERE source_snapshot_id = $1 AND tenant_id = $2 AND checksum = $3
-        AND state = 'available' AND expires_at > $4
-      FOR UPDATE
-    `, [sourceSnapshotId, tenantId, expectedChecksum, at])
-    if (result.rowCount !== 1) throw new DurableStateNotFoundError('authorized source snapshot was not found')
-    return sourceFromRow(result.rows[0]!)
+    const result = await stateLockAuthorizedSource.run({ sourceSnapshotId, tenantId,
+      checksum: expectedChecksum, at }, executor)
+    if (result.length !== 1) throw new DurableStateNotFoundError('authorized source snapshot was not found')
+    return sourceFromRow(result[0]!)
   }
 
   async findAuthorizedSourceSnapshotByChecksum(tenantId: string, checksum: string, at = new Date()): Promise<SourceSnapshot | null> {
     validateId('tenant ID', tenantId); validateChecksum(checksum); validateDate('source snapshot lookup time', at)
-    const result = await this.pool.query<SourceRow>(`
-      SELECT source_snapshot_id, tenant_id, archive_object_id, checksum, cwd_uri,
-             workspace_root_uris, state, expires_at
-      FROM hosted_agent_source_snapshots
-      WHERE tenant_id = $1 AND checksum = $2 AND state = 'available' AND expires_at > $3
-    `, [tenantId, checksum, at])
-    return result.rows[0] ? sourceFromRow(result.rows[0]) : null
+    const result = await stateFindAuthorizedSourceByChecksum.run({ tenantId, checksum, at }, this.pool)
+    return result[0] ? sourceFromRow(result[0]) : null
   }
 
   async createLeaseWithBaseSnapshot(input: CreateLeaseInput, executor?: PoolClient): Promise<{ lease: Lease; snapshot: Snapshot }> {
     validateLeaseInput(input); validateSnapshotInput(input.baseSnapshot)
     try {
       const create = async (client: PoolClient) => {
-        await client.query(`
-          INSERT INTO hosted_agent_leases
-            (lease_id, environment_id, tenant_id, agent_id, owner_agent_id, owner_lease_id,
-             source_snapshot_id, restore_source_lease_id, restore_source_snapshot_id,
-             provider_sandbox_id, sandbox_template, cwd_uri,
-             workspace_root_uris, state, tool_policy, policy_version)
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                  $13::jsonb, 'provisioning', $14::jsonb, $15)
-        `, [input.leaseId, input.environmentId, input.tenantId, input.agentId,
-          input.ownerAgentId ?? null, input.ownerLeaseId ?? null, input.sourceSnapshotId ?? null,
-          input.restoreSourceLeaseId ?? null, input.restoreSourceSnapshotId ?? null,
-          input.providerSandboxId, input.sandboxTemplate, input.cwdUri,
-          JSON.stringify(input.workspaceRootUris), JSON.stringify(input.toolPolicy), input.policyVersion])
+        await insertLease.run({ leaseId: input.leaseId, environmentId: input.environmentId,
+          tenantId: input.tenantId, agentId: input.agentId, ownerAgentId: input.ownerAgentId ?? null,
+          ownerLeaseId: input.ownerLeaseId ?? null, sourceSnapshotId: input.sourceSnapshotId ?? null,
+          restoreSourceLeaseId: input.restoreSourceLeaseId ?? null,
+          restoreSourceSnapshotId: input.restoreSourceSnapshotId ?? null,
+          providerSandboxId: input.providerSandboxId, sandboxTemplate: input.sandboxTemplate,
+          cwdUri: input.cwdUri, workspaceRootUris: JSON.stringify(input.workspaceRootUris),
+          toolPolicy: JSON.stringify(input.toolPolicy), policyVersion: input.policyVersion }, client)
         await this.referenceSnapshotObjects(client, input.tenantId, input.leaseId, input.baseSnapshot)
         await this.insertSnapshot(client, input.tenantId, input.leaseId, input.baseSnapshot)
-        await client.query(`
-          INSERT INTO hosted_agent_snapshot_references (snapshot_id, reference_kind, reference_id)
-          VALUES ($1, 'lease_base', $2), ($1, 'lease_latest', $2)
-        `, [input.baseSnapshot.snapshotId, input.leaseId])
+        await insertLeaseBaseReferences.run({ snapshotId: input.baseSnapshot.snapshotId,
+          leaseId: input.leaseId }, client)
         if (input.restoreSourceSnapshotId) {
-          await client.query(`
-            INSERT INTO hosted_agent_snapshot_references (snapshot_id, reference_kind, reference_id)
-            VALUES ($1, 'lease_restore_source', $2)
-          `, [input.restoreSourceSnapshotId, input.leaseId])
+          await insertLeaseRestoreSourceReference.run({ snapshotId: input.restoreSourceSnapshotId,
+            leaseId: input.leaseId }, client)
         }
-        const leaseResult = await client.query<LeaseRow>(`
-          UPDATE hosted_agent_leases
-          SET base_snapshot_id = $2, latest_snapshot_id = $2, state = 'active'
-          WHERE lease_id = $1 AND tenant_id = $3
-          RETURNING ${leaseColumns}
-        `, [input.leaseId, input.baseSnapshot.snapshotId, input.tenantId])
+        const leaseResult = await activateLease.run({ leaseId: input.leaseId,
+          snapshotId: input.baseSnapshot.snapshotId, tenantId: input.tenantId }, client)
         const snapshot = await this.snapshotWithClient(client, input.tenantId, input.baseSnapshot.snapshotId)
-        return { lease: leaseFromRow(leaseResult.rows[0]!), snapshot }
+        return { lease: leaseFromRow(leaseResult[0]!), snapshot }
       }
       return executor ? await create(executor) : await this.transaction(create)
     } catch (error) { return postgresError(error) }
@@ -452,13 +414,9 @@ export class PostgresDurableState {
         }, client)
         const source = authorized.lease
         const created = await this.createLeaseWithBaseSnapshot(input, client)
-        await client.query(`UPDATE hosted_agent_tickets
-          SET revoked_at = COALESCE(revoked_at, now()) WHERE lease_id = $1`, [source.leaseId])
+        await revokeTicketsByLeaseId.run({ leaseId: source.leaseId }, client)
         if (source.state === 'lost') {
-          await client.query(`
-            UPDATE hosted_agent_leases SET state = 'released', released_at = now()
-            WHERE lease_id = $1 AND tenant_id = $2 AND state = 'lost'
-          `, [source.leaseId, input.tenantId])
+          await releaseLostRestoreSource.run({ leaseId: source.leaseId, tenantId: input.tenantId }, client)
         }
         return created
       }
@@ -510,29 +468,21 @@ export class PostgresDurableState {
           || lease.sandboxTemplate !== input.sandboxTemplate) {
           throw new DurableStateNotFoundError('authorized restore source was not found')
         }
-        const replacement = await client.query(`
-          SELECT lease_id FROM hosted_agent_leases
-          WHERE restore_source_lease_id = $1 AND tenant_id = $2 FOR UPDATE
-        `, [lease.leaseId, input.tenantId])
-        if (replacement.rowCount !== 0) {
+        const replacement = await findRestoreReplacementForUpdate.run({
+          sourceLeaseId: lease.leaseId, tenantId: input.tenantId }, client)
+        if (replacement.length !== 0) {
           throw new DurableStateConflictError('restore source already has a replacement')
         }
-        const snapshotResult = await client.query<SnapshotRow>(`
-          SELECT ${snapshotColumns} FROM hosted_agent_snapshots
-          WHERE snapshot_id = $1 AND tenant_id = $2 FOR UPDATE
-        `, [input.sourceSnapshotId, input.tenantId])
-        const snapshot = snapshotResult.rows[0] ? snapshotFromRow(snapshotResult.rows[0]) : null
+        const snapshotResult = await lockSnapshot.run({ snapshotId: input.sourceSnapshotId,
+          tenantId: input.tenantId }, client)
+        const snapshot = snapshotResult[0] ? snapshotFromRow(snapshotResult[0]) : null
         if (!snapshot || snapshot.leaseId !== lease.leaseId || snapshot.state !== 'available'
           || (snapshot.expiresAt !== null && snapshot.expiresAt <= new Date())) {
           throw new DurableStateNotFoundError('authorized restore source was not found')
         }
-        const objectResult = await client.query<ObjectRow>(`
-          SELECT object_id, tenant_id, kind, storage_bucket, storage_key, checksum,
-                 size_bytes::text, state, expires_at
-          FROM hosted_agent_objects
-          WHERE object_id = $1 AND tenant_id = $2 FOR UPDATE
-        `, [snapshot.workspaceArchiveObjectId, input.tenantId])
-        const archiveObject = objectResult.rows[0] ? objectFromRow(objectResult.rows[0]) : null
+        const objectResult = await stateLockObjectByTenant.run({
+          objectId: snapshot.workspaceArchiveObjectId, tenantId: input.tenantId }, client)
+        const archiveObject = objectResult[0] ? objectFromRow(objectResult[0]) : null
         if (!archiveObject || archiveObject.kind !== 'workspace_archive' || archiveObject.state !== 'available'
           || (archiveObject.expiresAt !== null && archiveObject.expiresAt <= new Date())) {
           throw new DurableStateNotFoundError('authorized restore source was not found')
@@ -546,54 +496,39 @@ export class PostgresDurableState {
   async getLease(tenantId: string, leaseId: string,
     executor: Pick<PoolClient, 'query'> = this.pool): Promise<Lease | null> {
     validateId('tenant ID', tenantId); validateId('lease ID', leaseId)
-    const result = await executor.query<LeaseRow>(`
-      SELECT ${leaseColumns} FROM hosted_agent_leases WHERE lease_id = $1 AND tenant_id = $2
-    `, [leaseId, tenantId])
-    return result.rows[0] ? leaseFromRow(result.rows[0]) : null
+    const result = await getLeaseQuery.run({ leaseId, tenantId }, executor)
+    return result[0] ? leaseFromRow(result[0]) : null
   }
 
   async activeLeaseTarget(leaseId: string): Promise<{ sandboxId: string; connectionGeneration: number } | undefined> {
     validateId('lease ID', leaseId)
-    const result = await this.pool.query<{ provider_sandbox_id: string; connection_generation: string }>(`
-      SELECT provider_sandbox_id, connection_generation::text FROM hosted_agent_leases
-      WHERE lease_id = $1 AND state = 'active' AND provider_sandbox_id IS NOT NULL
-    `, [leaseId])
-    const row = result.rows[0]
-    return row ? { sandboxId: row.provider_sandbox_id, connectionGeneration: Number(row.connection_generation) } : undefined
+    const result = await activeLeaseTargetQuery.run({ leaseId }, this.pool)
+    const row = result[0]
+    return row?.provider_sandbox_id
+      ? { sandboxId: row.provider_sandbox_id, connectionGeneration: Number(row.connection_generation) } : undefined
   }
 
   /** Internal global safety lookup used only to prevent provider reconciliation from killing a durable lease. */
   async findLeaseByProviderSandboxForReconciliation(providerSandboxId: string,
     executor: Pick<PoolClient, 'query'> = this.pool): Promise<Lease | null> {
     validateId('provider sandbox ID', providerSandboxId)
-    const result = await executor.query<LeaseRow>(`
-      SELECT ${leaseColumns} FROM hosted_agent_leases
-      WHERE provider_sandbox_id = $1
-        AND state IN ('provisioning', 'active', 'paused', 'release_pending')
-      ORDER BY created_at DESC LIMIT 1
-    `, [providerSandboxId])
-    return result.rows[0] ? leaseFromRow(result.rows[0]) : null
+    const result = await findLeaseByProviderSandboxQuery.run({ providerSandboxId }, executor)
+    return result[0] ? leaseFromRow(result[0]) : null
   }
 
   /** Internal global safety lookup used only to protect provider snapshots retained by durable state. */
   async findSnapshotByProviderIdForReconciliation(providerSnapshotId: string,
     executor: Pick<PoolClient, 'query'> = this.pool): Promise<Snapshot | null> {
     validateId('provider snapshot ID', providerSnapshotId)
-    const result = await executor.query<SnapshotRow>(`
-      SELECT ${snapshotColumns} FROM hosted_agent_snapshots
-      WHERE provider_snapshot_id = $1 AND state <> 'deleted'
-      ORDER BY created_at DESC LIMIT 1
-    `, [providerSnapshotId])
-    return result.rows[0] ? snapshotFromRow(result.rows[0]) : null
+    const result = await findSnapshotByProviderIdQuery.run({ providerSnapshotId }, executor)
+    return result[0] ? snapshotFromRow(result[0]) : null
   }
 
   async getSnapshot(tenantId: string, snapshotId: string,
     executor: Pick<PoolClient, 'query'> = this.pool): Promise<Snapshot | null> {
     validateId('tenant ID', tenantId); validateId('snapshot ID', snapshotId)
-    const result = await executor.query<SnapshotRow>(`
-      SELECT ${snapshotColumns} FROM hosted_agent_snapshots WHERE snapshot_id = $1 AND tenant_id = $2
-    `, [snapshotId, tenantId])
-    return result.rows[0] ? snapshotFromRow(result.rows[0]) : null
+    const result = await getSnapshotQuery.run({ snapshotId, tenantId }, executor)
+    return result[0] ? snapshotFromRow(result[0]) : null
   }
 
   async appendCheckpoint(tenantId: string, leaseId: string, snapshot: SnapshotInput, executor?: PoolClient): Promise<Snapshot> {
@@ -604,18 +539,9 @@ export class PostgresDurableState {
         if (!['active', 'paused'].includes(lease.state)) throw new DurableStateConflictError('lease cannot be checkpointed')
         await this.referenceSnapshotObjects(client, tenantId, leaseId, snapshot)
         await this.insertSnapshot(client, tenantId, leaseId, snapshot)
-        await client.query(`
-          DELETE FROM hosted_agent_snapshot_references
-          WHERE reference_kind = 'lease_latest' AND reference_id = $1
-        `, [leaseId])
-        await client.query(`
-          INSERT INTO hosted_agent_snapshot_references (snapshot_id, reference_kind, reference_id)
-          VALUES ($1, 'lease_latest', $2)
-        `, [snapshot.snapshotId, leaseId])
-        await client.query(`
-          UPDATE hosted_agent_leases SET latest_snapshot_id = $3
-          WHERE lease_id = $1 AND tenant_id = $2
-        `, [leaseId, tenantId, snapshot.snapshotId])
+        await deleteLatestSnapshotReference.run({ leaseId }, client)
+        await insertLatestSnapshotReference.run({ snapshotId: snapshot.snapshotId, leaseId }, client)
+        await setLatestSnapshot.run({ snapshotId: snapshot.snapshotId, leaseId, tenantId }, client)
         return this.snapshotWithClient(client, tenantId, snapshot.snapshotId)
       }
       return executor ? await append(executor) : await this.transaction(append)
@@ -627,13 +553,8 @@ export class PostgresDurableState {
     return this.transaction(async client => {
       const lease = await this.lockLease(client, tenantId, leaseId)
       if (!expected.includes(lease.state)) throw new DurableStateConflictError('lease state changed concurrently')
-      const result = await client.query<LeaseRow>(`
-        UPDATE hosted_agent_leases
-        SET state = $3, released_at = CASE WHEN $3 = 'released' THEN now() ELSE NULL END
-        WHERE lease_id = $1 AND tenant_id = $2
-        RETURNING ${leaseColumns}
-      `, [leaseId, tenantId, next])
-      return leaseFromRow(result.rows[0]!)
+      const result = await transitionLeaseStateQuery.run({ leaseId, tenantId, next }, client)
+      return leaseFromRow(result[0]!)
     })
   }
 
@@ -642,16 +563,13 @@ export class PostgresDurableState {
     try {
       const begin = async (client: PoolClient) => {
         const lease = await this.lockLease(client, tenantId, leaseId)
-        await client.query(`UPDATE hosted_agent_tickets SET revoked_at = COALESCE(revoked_at, now()) WHERE lease_id = $1`, [leaseId])
+        await revokeTicketsByLeaseId.run({ leaseId }, client)
         if (lease.state === 'released' || lease.state === 'release_pending') return lease
         if (!['active', 'paused', 'lost', 'failed'].includes(lease.state)) {
           throw new DurableStateConflictError('lease cannot be released')
         }
-        const result = await client.query<LeaseRow>(`
-          UPDATE hosted_agent_leases SET state = 'release_pending', released_at = NULL
-          WHERE lease_id = $1 AND tenant_id = $2 RETURNING ${leaseColumns}
-        `, [leaseId, tenantId])
-        return leaseFromRow(result.rows[0]!)
+        const result = await beginReleaseQuery.run({ leaseId, tenantId }, client)
+        return leaseFromRow(result[0]!)
       }
       return executor ? await begin(executor) : await this.transaction(begin)
     } catch (error) { return postgresError(error) }
@@ -667,14 +585,9 @@ export class PostgresDurableState {
         || lease.providerSandboxId !== expectedSandboxId) {
         throw new DurableStateConflictError('lease cannot be reconnected')
       }
-      await executor.query(`UPDATE hosted_agent_tickets
-        SET revoked_at = COALESCE(revoked_at, now()) WHERE lease_id = $1`, [leaseId])
-      const result = await executor.query<LeaseRow>(`
-        UPDATE hosted_agent_leases
-        SET state = 'active', released_at = NULL, connection_generation = connection_generation + 1
-        WHERE lease_id = $1 AND tenant_id = $2 RETURNING ${leaseColumns}
-      `, [leaseId, tenantId])
-      return leaseFromRow(result.rows[0]!)
+      await revokeTicketsByLeaseId.run({ leaseId }, executor)
+      const result = await completeReconnectQuery.run({ leaseId, tenantId }, executor)
+      return leaseFromRow(result[0]!)
     } catch (error) { return postgresError(error) }
   }
 
@@ -687,14 +600,9 @@ export class PostgresDurableState {
       if (lease.state !== 'active' || lease.providerSandboxId !== expectedSandboxId) {
         throw new DurableStateConflictError('lease reconnect cannot be replayed')
       }
-      await executor.query(`UPDATE hosted_agent_tickets
-        SET revoked_at = COALESCE(revoked_at, now()) WHERE lease_id = $1`, [leaseId])
-      const result = await executor.query<LeaseRow>(`
-        UPDATE hosted_agent_leases
-        SET connection_generation = connection_generation + 1
-        WHERE lease_id = $1 AND tenant_id = $2 RETURNING ${leaseColumns}
-      `, [leaseId, tenantId])
-      return leaseFromRow(result.rows[0]!)
+      await revokeTicketsByLeaseId.run({ leaseId }, executor)
+      const result = await rotateReconnectReplayAccessQuery.run({ leaseId, tenantId }, executor)
+      return leaseFromRow(result[0]!)
     } catch (error) { return postgresError(error) }
   }
 
@@ -708,15 +616,10 @@ export class PostgresDurableState {
         || (!['active', 'paused'].includes(lease.state) && lease.state !== 'lost')) {
         throw new DurableStateConflictError('lease cannot be marked lost')
       }
-      await executor.query(`UPDATE hosted_agent_tickets
-        SET revoked_at = COALESCE(revoked_at, now()) WHERE lease_id = $1`, [leaseId])
+      await revokeTicketsByLeaseId.run({ leaseId }, executor)
       if (lease.state === 'lost') return lease
-      const result = await executor.query<LeaseRow>(`
-        UPDATE hosted_agent_leases
-        SET state = 'lost', released_at = NULL, connection_generation = connection_generation + 1
-        WHERE lease_id = $1 AND tenant_id = $2 RETURNING ${leaseColumns}
-      `, [leaseId, tenantId])
-      return leaseFromRow(result.rows[0]!)
+      const result = await markLeaseLostQuery.run({ leaseId, tenantId }, executor)
+      return leaseFromRow(result[0]!)
     } catch (error) { return postgresError(error) }
   }
 
@@ -725,14 +628,11 @@ export class PostgresDurableState {
     try {
       const release = async (client: PoolClient) => {
         const lease = await this.lockLease(client, tenantId, leaseId)
-        await client.query(`UPDATE hosted_agent_tickets SET revoked_at = COALESCE(revoked_at, now()) WHERE lease_id = $1`, [leaseId])
+        await revokeTicketsByLeaseId.run({ leaseId }, client)
         if (lease.state === 'released') return lease
         if (lease.state !== 'release_pending') throw new DurableStateConflictError('lease release was not prepared')
-        const result = await client.query<LeaseRow>(`
-          UPDATE hosted_agent_leases SET state = 'released', released_at = now()
-          WHERE lease_id = $1 AND tenant_id = $2 RETURNING ${leaseColumns}
-        `, [leaseId, tenantId])
-        return leaseFromRow(result.rows[0]!)
+        const result = await completeReleaseQuery.run({ leaseId, tenantId }, client)
+        return leaseFromRow(result[0]!)
       }
       return executor ? await release(executor) : await this.transaction(release)
     } catch (error) { return postgresError(error) }
@@ -756,16 +656,10 @@ export class PostgresDurableState {
         && lease.connectionGeneration !== input.expectedConnectionGeneration) {
         throw new DurableStateConflictError('lease connection generation changed')
       }
-      await client.query(`
-        UPDATE hosted_agent_tickets SET revoked_at = COALESCE(revoked_at, now())
-        WHERE lease_id = $1 AND revoked_at IS NULL
-      `, [input.leaseId])
+      await revokeTicketsByLeaseId.run({ leaseId: input.leaseId }, client)
       try {
-        await client.query(`
-          INSERT INTO hosted_agent_tickets
-            (ticket_hash, lease_id, purpose, expires_at, connection_generation)
-          VALUES ($1, $2, $3, $4, $5)
-        `, [ticketHash, input.leaseId, input.purpose, input.expiresAt, lease.connectionGeneration])
+        await insertTicketQuery.run({ ticketHash, leaseId: input.leaseId, purpose: input.purpose,
+          expiresAt: input.expiresAt, connectionGeneration: lease.connectionGeneration }, client)
       } catch (error) { postgresError(error) }
     })
   }
@@ -774,72 +668,43 @@ export class PostgresDurableState {
     validateId('tenant ID', input.tenantId); validateId('lease ID', input.leaseId); validateTicketPurpose(input.purpose)
     if (input.at) validateDate('ticket consumption time', input.at)
     const ticketHash = validateHash(input.ticketHash)
-    const result = await this.pool.query(`
-      UPDATE hosted_agent_tickets AS ticket
-      SET consumed_at = $5
-      FROM hosted_agent_leases AS lease
-      WHERE ticket.ticket_hash = $1 AND ticket.lease_id = $2 AND ticket.purpose = $3
-        AND ticket.lease_id = lease.lease_id AND lease.tenant_id = $4 AND lease.state = 'active'
-        AND ticket.connection_generation = lease.connection_generation
-        AND ticket.consumed_at IS NULL AND ticket.revoked_at IS NULL
-        AND ticket.expires_at > $5
-      RETURNING ticket.connection_generation::text
-    `, [ticketHash, input.leaseId, input.purpose, input.tenantId, input.at ?? new Date()])
-    const generation = (result.rows[0] as { connection_generation?: string } | undefined)?.connection_generation
+    const result = await consumeTicketQuery.run({ ticketHash, leaseId: input.leaseId,
+      purpose: input.purpose, tenantId: input.tenantId, at: input.at ?? new Date() }, this.pool)
+    const generation = result[0]?.connection_generation
     return generation === undefined ? null : Number(generation)
   }
 
   async revokeLeaseTickets(tenantId: string, leaseId: string): Promise<number> {
     validateId('tenant ID', tenantId); validateId('lease ID', leaseId)
-    const result = await this.pool.query(`
-      UPDATE hosted_agent_tickets AS ticket SET revoked_at = COALESCE(ticket.revoked_at, now())
-      FROM hosted_agent_leases AS lease
-      WHERE ticket.lease_id = lease.lease_id AND lease.lease_id = $1 AND lease.tenant_id = $2
-        AND ticket.revoked_at IS NULL
-    `, [leaseId, tenantId])
-    return result.rowCount ?? 0
+    const result = await revokeLeaseTicketsQuery.run({ leaseId, tenantId }, this.pool)
+    return result.length
   }
 
   async cleanupTickets(before = new Date(), limit = 1000): Promise<number> {
     validateDate('ticket cleanup time', before)
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 10_000) throw new Error('invalid ticket cleanup limit')
-    const result = await this.pool.query(`
-      DELETE FROM hosted_agent_tickets
-      WHERE ctid IN (
-        SELECT ctid FROM hosted_agent_tickets
-        WHERE expires_at < $1 OR consumed_at < $1 OR revoked_at < $1
-        LIMIT $2
-      )
-    `, [before, limit])
-    return result.rowCount ?? 0
+    const result = await cleanupTicketsQuery.run({ before, limit }, this.pool)
+    return result.length
   }
 
   private async lockLease(client: PoolClient, tenantId: string, leaseId: string): Promise<Lease> {
-    const result = await client.query<LeaseRow>(`
-      SELECT ${leaseColumns} FROM hosted_agent_leases
-      WHERE lease_id = $1 AND tenant_id = $2 FOR UPDATE
-    `, [leaseId, tenantId])
-    if (!result.rows[0]) throw new DurableStateNotFoundError('lease was not found')
-    return leaseFromRow(result.rows[0])
+    const result = await lockLeaseQuery.run({ leaseId, tenantId }, client)
+    if (!result[0]) throw new DurableStateNotFoundError('lease was not found')
+    return leaseFromRow(result[0])
   }
 
   private async insertSnapshot(client: PoolClient, tenantId: string, leaseId: string, snapshot: SnapshotInput): Promise<void> {
-    await client.query(`
-      INSERT INTO hosted_agent_snapshots
-        (snapshot_id, tenant_id, lease_id, provider_snapshot_id, workspace_archive_object_id,
-         manifest_object_id, manifest_checksum, state, expires_at)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, 'available', $8)
-    `, [snapshot.snapshotId, tenantId, leaseId, snapshot.providerSnapshotId,
-      snapshot.workspaceArchiveObjectId, snapshot.manifestObjectId, snapshot.manifestChecksum,
-      snapshot.expiresAt ?? null])
+    await insertSnapshotQuery.run({ snapshotId: snapshot.snapshotId, tenantId, leaseId,
+      providerSnapshotId: snapshot.providerSnapshotId,
+      workspaceArchiveObjectId: snapshot.workspaceArchiveObjectId,
+      manifestObjectId: snapshot.manifestObjectId, manifestChecksum: snapshot.manifestChecksum,
+      expiresAt: snapshot.expiresAt ?? null }, client)
   }
 
   private async snapshotWithClient(client: PoolClient, tenantId: string, snapshotId: string): Promise<Snapshot> {
-    const result = await client.query<SnapshotRow>(`
-      SELECT ${snapshotColumns} FROM hosted_agent_snapshots WHERE snapshot_id = $1 AND tenant_id = $2
-    `, [snapshotId, tenantId])
-    if (!result.rows[0]) throw new DurableStateNotFoundError('snapshot was not found')
-    return snapshotFromRow(result.rows[0])
+    const result = await getSnapshotQuery.run({ snapshotId, tenantId }, client)
+    if (!result[0]) throw new DurableStateNotFoundError('snapshot was not found')
+    return snapshotFromRow(result[0])
   }
 
   private async referenceSnapshotObjects(client: PoolClient, tenantId: string, leaseId: string, snapshot: SnapshotInput): Promise<void> {
@@ -857,43 +722,31 @@ export class PostgresDurableState {
     referenceKind: string, referenceId: string, purpose: string, retainUntil: Date | null,
     expectedKind?: StoredObject['kind']): Promise<void> {
     await this.lockAvailableObject(client, tenantId, objectId, expectedKind)
-    await client.query(`
-      INSERT INTO hosted_agent_object_references
-        (object_id, reference_kind, reference_id, purpose, retain_until)
-      VALUES ($1, $2, $3, $4, $5)
-      ON CONFLICT (object_id, reference_kind, reference_id, purpose)
-      DO UPDATE SET retain_until = CASE
-        WHEN hosted_agent_object_references.retain_until IS NULL OR EXCLUDED.retain_until IS NULL THEN NULL
-        ELSE GREATEST(hosted_agent_object_references.retain_until, EXCLUDED.retain_until)
-      END
-    `, [objectId, referenceKind, referenceId, purpose, retainUntil])
+    await stateUpsertObjectReference.run({ objectId, referenceKind, referenceId,
+      purpose, retainUntil }, client)
   }
 
   private async lockAvailableObject(client: PoolClient, tenantId: string, objectId: string,
     expectedKind?: StoredObject['kind']): Promise<void> {
-    const result = await client.query(`
-      SELECT 1 FROM hosted_agent_objects
-      WHERE object_id = $1 AND tenant_id = $2 AND state = 'available'
-        AND ($3::text IS NULL OR kind = $3)
-      FOR UPDATE
-    `, [objectId, tenantId, expectedKind ?? null])
-    if (result.rowCount !== 1) throw new DurableStateNotFoundError('object was not found')
+    const result = await stateLockAvailableObject.run({ objectId, tenantId,
+      expectedKind: expectedKind ?? null }, client)
+    if (result.length !== 1) throw new DurableStateNotFoundError('object was not found')
   }
 
   private async lockObjectLocation(client: PoolClient, storageBucket: string, storageKey: string): Promise<void> {
-    await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))',
-      [`hosted-agent:object-location:${JSON.stringify([storageBucket, storageKey])}`])
+    await lockTransaction(client,
+      `hosted-agent:object-location:${JSON.stringify([storageBucket, storageKey])}`)
   }
 
   private async transaction<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
     const client = await this.pool.connect()
     try {
-      await client.query('BEGIN')
+      await begin(client)
       const value = await fn(client)
-      await client.query('COMMIT')
+      await commit(client)
       return value
     } catch (error) {
-      await client.query('ROLLBACK').catch(() => undefined)
+      await rollbackQuietly(client)
       throw error
     } finally { client.release() }
   }

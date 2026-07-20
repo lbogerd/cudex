@@ -1,8 +1,13 @@
 import { readFile } from 'node:fs/promises'
-import { Pool, type QueryResult } from 'pg'
+import { Pool } from 'pg'
+import type { IDatabaseConnection } from '@pgtyped/runtime'
 import { Sandbox } from 'e2b'
 import { E2BProvider } from './e2b-provider.js'
 import type { PocAppServerEvidence } from './poc-app-server-client.js'
+import { inspectPocAllocations, inspectPocArtifacts, inspectPocInteractions, inspectPocLeases,
+  inspectPocLiveTickets, inspectPocOperations, inspectPocPatchApplications, inspectPocSnapshots,
+  findActivePocSandbox, inspectPocUnsettled, listPocProviderSnapshots, probeDatabase,
+} from './db/queries/inspection.queries.js'
 
 export interface PocLeaseInspection {
   leaseId: string
@@ -29,15 +34,8 @@ export interface PocDatabaseInspection {
   interactions: Array<{ leaseId: string; connectionGeneration: number; processId: string | null; state: string }>
 }
 
-interface Queryable {
-  query(sql: string, values: unknown[]): Promise<QueryResult<Record<string, unknown>>>
-}
-
-interface LeaseRow extends Record<string, unknown> {
-  lease_id: string; environment_id: string; agent_id: string; owner_agent_id: string | null
-  owner_lease_id: string | null; provider_sandbox_id: string | null; base_snapshot_id: string | null
-  latest_snapshot_id: string | null; state: string
-}
+interface Queryable { query(sql: string, values: unknown[]): Promise<any> }
+function pgTypedConnection(database: Queryable): IDatabaseConnection { return database as IDatabaseConnection }
 
 function numberValue(value: unknown): number {
   const result = Number(value)
@@ -51,10 +49,8 @@ export class PocDatabaseInspector {
   }
 
   async leases(): Promise<PocLeaseInspection[]> {
-    const result = await this.database.query(`SELECT lease_id, environment_id, agent_id,
-      owner_agent_id, owner_lease_id, provider_sandbox_id, base_snapshot_id, latest_snapshot_id, state
-      FROM hosted_agent_leases WHERE tenant_id = $1 ORDER BY created_at`, [this.tenantId])
-    return (result.rows as LeaseRow[]).map(row => ({ leaseId: row.lease_id, environmentId: row.environment_id,
+    const rows = await inspectPocLeases.run({ tenantId: this.tenantId }, pgTypedConnection(this.database))
+    return rows.map(row => ({ leaseId: row.lease_id, environmentId: row.environment_id,
       agentId: row.agent_id, ownerAgentId: row.owner_agent_id, ownerLeaseId: row.owner_lease_id,
       providerSandboxId: row.provider_sandbox_id, baseSnapshotId: row.base_snapshot_id,
       latestSnapshotId: row.latest_snapshot_id, state: row.state }))
@@ -63,45 +59,56 @@ export class PocDatabaseInspector {
   async inspect(): Promise<PocDatabaseInspection> {
     const [leases, operations, snapshots, artifacts, applications, allocations, tickets, interactions] = await Promise.all([
       this.leases(),
-      this.database.query(`SELECT operation, state, primary_lease_id, result_lease_id
-        FROM hosted_agent_operations WHERE tenant_id = $1 ORDER BY started_at`, [this.tenantId]),
-      this.database.query(`SELECT snapshot_id, lease_id, provider_snapshot_id, state
-        FROM hosted_agent_snapshots WHERE tenant_id = $1 ORDER BY created_at`, [this.tenantId]),
-      this.database.query(`SELECT artifact_id, agent_id, source_lease_id, state
-        FROM hosted_agent_artifacts WHERE tenant_id = $1 ORDER BY created_at`, [this.tenantId]),
-      this.database.query(`SELECT application_id, target_lease_id, artifact_id,
-        source_target_snapshot_id, result_snapshot_id, phase
-        FROM hosted_agent_patch_applications WHERE tenant_id = $1 ORDER BY created_at`, [this.tenantId]),
-      this.database.query(`SELECT allocation_kind, resource_id, lease_id, state
-        FROM hosted_agent_operation_allocations WHERE tenant_id = $1 ORDER BY allocation_id`, [this.tenantId]),
-      this.database.query(`SELECT count(*)::text AS count FROM hosted_agent_tickets AS ticket
-        JOIN hosted_agent_leases AS lease ON lease.lease_id = ticket.lease_id
-        WHERE lease.tenant_id = $1 AND ticket.revoked_at IS NULL AND ticket.consumed_at IS NULL
-          AND ticket.expires_at > now()`, [this.tenantId]),
-      this.database.query(`SELECT lease_id, connection_generation::text, process_id, state
-        FROM hosted_agent_lease_interactions WHERE tenant_id = $1 ORDER BY created_at`, [this.tenantId]),
+      inspectPocOperations.run({ tenantId: this.tenantId }, pgTypedConnection(this.database)),
+      inspectPocSnapshots.run({ tenantId: this.tenantId }, pgTypedConnection(this.database)),
+      inspectPocArtifacts.run({ tenantId: this.tenantId }, pgTypedConnection(this.database)),
+      inspectPocPatchApplications.run({ tenantId: this.tenantId }, pgTypedConnection(this.database)),
+      inspectPocAllocations.run({ tenantId: this.tenantId }, pgTypedConnection(this.database)),
+      inspectPocLiveTickets.run({ tenantId: this.tenantId }, pgTypedConnection(this.database)),
+      inspectPocInteractions.run({ tenantId: this.tenantId }, pgTypedConnection(this.database)),
     ])
     return {
       leases,
-      operations: operations.rows.map(row => ({ operation: String(row.operation), state: String(row.state),
+      operations: operations.map(row => ({ operation: row.operation, state: row.state,
         primaryLeaseId: row.primary_lease_id === null ? null : String(row.primary_lease_id),
         resultLeaseId: row.result_lease_id === null ? null : String(row.result_lease_id) })),
-      snapshots: snapshots.rows.map(row => ({ snapshotId: String(row.snapshot_id), leaseId: String(row.lease_id),
+      snapshots: snapshots.map(row => ({ snapshotId: row.snapshot_id, leaseId: row.lease_id,
         providerSnapshotId: row.provider_snapshot_id === null ? null : String(row.provider_snapshot_id), state: String(row.state) })),
-      artifacts: artifacts.rows.map(row => ({ artifactId: String(row.artifact_id), agentId: String(row.agent_id),
+      artifacts: artifacts.map(row => ({ artifactId: row.artifact_id, agentId: row.agent_id,
         sourceLeaseId: String(row.source_lease_id), state: String(row.state) })),
-      patchApplications: applications.rows.map(row => ({ applicationId: String(row.application_id),
+      patchApplications: applications.map(row => ({ applicationId: row.application_id,
         targetLeaseId: String(row.target_lease_id), artifactId: String(row.artifact_id),
         sourceTargetSnapshotId: String(row.source_target_snapshot_id), resultSnapshotId: String(row.result_snapshot_id),
         phase: String(row.phase) })),
-      allocations: allocations.rows.map(row => ({ allocationKind: String(row.allocation_kind),
+      allocations: allocations.map(row => ({ allocationKind: row.allocation_kind,
         resourceId: String(row.resource_id), leaseId: row.lease_id === null ? null : String(row.lease_id), state: String(row.state) })),
-      liveTicketCount: numberValue(tickets.rows[0]?.count),
-      interactions: interactions.rows.map(row => ({ leaseId: String(row.lease_id),
+      liveTicketCount: numberValue(tickets[0]?.count),
+      interactions: interactions.map(row => ({ leaseId: row.lease_id,
         connectionGeneration: numberValue(row.connection_generation),
         processId: row.process_id === null ? null : String(row.process_id), state: String(row.state) })),
-      unfinishedInteractionCount: interactions.rows.filter(row => row.state !== 'finished').length,
+      unfinishedInteractionCount: interactions.filter(row => row.state !== 'finished').length,
     }
+  }
+}
+
+/** Database boundary used by the optional control-plane POC inspection routes. */
+export class PocRouteInspectionRepository {
+  constructor(private readonly database: Queryable, readonly tenantId: string) {}
+
+  async ownsActiveSandbox(providerSandboxId: string): Promise<boolean> {
+    const rows = await findActivePocSandbox.run({ tenantId: this.tenantId, providerSandboxId }, pgTypedConnection(this.database))
+    return rows.length === 1
+  }
+
+  async isFullyReleased(): Promise<boolean> {
+    const [row] = await inspectPocUnsettled.run({ tenantId: this.tenantId }, pgTypedConnection(this.database))
+    return Number(row?.leases) === 0 && Number(row?.operations) === 0
+  }
+
+  async providerSnapshotIds(): Promise<string[]> {
+    const rows = await listPocProviderSnapshots.run({ tenantId: this.tenantId }, pgTypedConnection(this.database))
+    if (rows.length > 1000) throw new Error('POC snapshot cleanup bound exceeded')
+    return rows.flatMap(row => row.provider_snapshot_id === null ? [] : [row.provider_snapshot_id])
   }
 }
 
@@ -236,7 +243,7 @@ export async function openPocDatabaseInspector(databaseUrl: string, tenantId: st
   close(): Promise<void>
 }> {
   const pool = new Pool({ connectionString: databaseUrl })
-  await pool.query('SELECT 1')
+  await probeDatabase.run(undefined, pgTypedConnection(pool))
   return { inspector: new PocDatabaseInspector(pool, tenantId), async close() { await pool.end() } }
 }
 

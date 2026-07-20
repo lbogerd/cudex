@@ -23,7 +23,7 @@ node_major="$(node -p 'process.versions.node.split(".")[0]')"
 (( node_major >= 22 )) || { echo "Cudex requires Node.js 22 or newer" >&2; exit 2; }
 
 npm run build --prefix "${e2b_dir}"
-node "${e2b_dir}/scripts/verify-cudex-release.mjs" "${release_path}" "${revision}"
+node "${e2b_dir}/dist/src/commands/verify-release.js" "${release_path}" "${revision}"
 
 data_root="${XDG_DATA_HOME:-${HOME}/.local/share}"
 bin_root="${XDG_BIN_HOME:-${HOME}/.local/bin}"

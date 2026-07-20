@@ -2427,3 +2427,21 @@ sandbox_template = "e2b-general-v1"
 Set `CODEX_HOSTED_AGENT_TOKEN` in the Codex process. Every hosted role requires a
 non-empty `sandbox_template`. Keep the feature gated until the acceptance matrix
 in [`TODO.md`](TODO.md) passes.
+
+## Dependency-refactor baseline (2026-07-20)
+
+Before the Hono/Zod/T3 Env/PgTyped/Pino/Execa refactor, the clean tracked
+`cudex/coworker-pilot` branch passed `npm ci`, the TypeScript build, and all
+environment-independent tests. The ordinary run reported 358 tests: 230 passed,
+128 PostgreSQL-gated skips, and no failures. Against an isolated PostgreSQL 17
+container, 357 passed, one Docker-POC test remained deliberately gated, and none
+failed. Completion evidence should compare against these counts and explain test
+replacements introduced by the new boundaries.
+
+Final acceptance reports 376 tests. Without PostgreSQL, 246 pass and 130 are
+environment-gated; against the isolated PostgreSQL 17 database, 375 pass and the
+Docker-Compose POC remains the sole deliberate skip. The 18 additional tests
+cover scoped environment parsing, Pino redaction/context, JSON content-type
+enforcement, PgTyped generation/cleanup/staleness, command environment
+allowlisting, and the strict raw-SQL architecture boundary. No baseline test was
+removed; command tests now exercise the compiled TypeScript entry points.

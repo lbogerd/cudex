@@ -1,5 +1,5 @@
 import type { Readable, Writable } from 'node:stream'
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import { execa } from 'execa'
 import { lstat, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { createCodexProcessEnvironment, redactSecrets } from './poc-auth.js'
@@ -156,7 +156,15 @@ export class PocAppServerClient {
 
 export interface PocAppServerProcess {
   client: PocAppServerClient
-  child: ChildProcessWithoutNullStreams
+  child: {
+    readonly pid?: number | undefined
+    kill(signal?: NodeJS.Signals | number): boolean
+    readonly nodeChildProcess: {
+      readonly exitCode: number | null
+      readonly signalCode: NodeJS.Signals | null
+      once(event: 'exit', listener: (...args: any[]) => void): unknown
+    }
+  }
   stop(): Promise<void>
 }
 
@@ -171,9 +179,10 @@ export function startPocAppServer(input: {
   const environment = createCodexProcessEnvironment({ codexHome: input.paths.codexHome,
     caBundlePath: input.caBundlePath, hostedBearer: input.hostedBearer,
     ...(input.accessToken ? { accessToken: input.accessToken } : {}) })
-  const child = spawn(input.provenance.binaryPath, ['app-server', '--listen', 'stdio://', '--strict-config'], {
-    cwd: input.paths.repositoryRoot, env: environment, stdio: ['pipe', 'pipe', 'pipe'],
+  const child = execa(input.provenance.binaryPath, ['app-server', '--listen', 'stdio://', '--strict-config'], {
+    cwd: input.paths.repositoryRoot, env: environment, extendEnv: false, stdio: ['pipe', 'pipe', 'pipe'], reject: false,
   })
+  if (!child.stdin || !child.stdout || !child.stderr) throw new Error('app-server pipes are unavailable')
   const client = new PocAppServerClient(child.stdin, child.stdout)
   const stderr: Buffer[] = []; let stderrBytes = 0
   child.stderr.on('data', chunk => {
@@ -184,9 +193,9 @@ export function startPocAppServer(input: {
   let stopped: Promise<void> | undefined
   return { client, child, stop() {
     stopped ??= (async () => {
-      const exited = new Promise<void>(resolve => child.once('exit', () => resolve()))
-      if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM')
-      if (child.exitCode === null && child.signalCode === null) {
+      const exited = new Promise<void>(resolve => child.nodeChildProcess.once('exit', () => resolve()))
+      if (child.nodeChildProcess.exitCode === null && child.nodeChildProcess.signalCode === null) child.kill('SIGTERM')
+      if (child.nodeChildProcess.exitCode === null && child.nodeChildProcess.signalCode === null) {
         const graceful = await Promise.race([exited.then(() => true), new Promise<false>(resolve => {
           const timer = setTimeout(() => resolve(false), 5_000); timer.unref()
         })])

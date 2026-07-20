@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { z } from 'zod'
 
 const utf8 = new TextEncoder()
 const utf8Decoder = new TextDecoder('utf-8', { fatal: true })
@@ -55,6 +56,9 @@ export interface WorkspaceManifest {
   identity: string
   entries: WorkspaceEntry[]
 }
+
+export const WorkspaceManifestSchema = z.strictObject({ version: z.literal(1), identity: z.string(),
+  entries: z.array(z.unknown()) })
 
 export interface WorkspaceChange {
   path: string
@@ -240,21 +244,14 @@ export function parseWorkspaceManifest(
   let decoded: unknown
   try { decoded = JSON.parse(text) }
   catch { return invalid('workspace manifest is not valid JSON') }
-  if (decoded === null || typeof decoded !== 'object' || Array.isArray(decoded)) {
-    return invalid('workspace manifest must be an object')
-  }
-  const record = decoded as Record<string, unknown>
-  const keys = Object.keys(record).sort(compareText)
-  if (keys.length !== 3 || keys[0] !== 'entries' || keys[1] !== 'identity' || keys[2] !== 'version'
-    || record.version !== 1 || record.identity !== expectedIdentity || !Array.isArray(record.entries)) {
-    return invalid('workspace manifest has an invalid shape')
-  }
+  const parsed = WorkspaceManifestSchema.safeParse(decoded)
+  if (!parsed.success || parsed.data.identity !== expectedIdentity) return invalid('workspace manifest has an invalid shape')
   let canonical: string
   try { canonical = canonicalJson(decoded) }
   catch { return invalid('workspace manifest is not canonical JSON') }
   if (canonical !== text) invalid('workspace manifest bytes are not canonical JSON')
   const manifest = createWorkspaceManifest(
-    expectedIdentity, record.entries as WorkspaceEntry[], limits)
+    expectedIdentity, parsed.data.entries as WorkspaceEntry[], limits)
   if (canonicalJson(manifest) !== canonical) invalid('workspace manifest is not canonical or exact-shape')
   return manifest
 }
