@@ -36,9 +36,10 @@ proposal, and current local files. Conflict-free changes are applied locally
 without staging or committing them. A conflict leaves the checkout unchanged.
 
 Release setup, authentication discovery/login, installation, `doctor`,
-`version`, and `cudex files` are implemented. The end-to-end session runner is
-delivered in later commits on this branch; until then sessions fail before
-allocation.
+`version`, `cudex files`, and the arbitrary-checkout TUI lifecycle are
+implemented. Root-result resolution and local application arrive in the next
+delivery chunk; in the current intermediate revision a successful TUI is
+reported, cleanup runs, and the command returns `1` without local mutation.
 
 ## Command reference
 
@@ -123,6 +124,12 @@ Only one Cudex run per local user is allowed. If a prior process was interrupted
 inspect its redacted state with `cudex status`; use `cudex cleanup` to retry the
 exact run-scoped cleanup. Do not manually remove the lock or current pointer
 until the command reports that no live run owns them.
+
+Each run keeps separate mode-`0600` `session-report.json`, `apply-report.json`,
+and `cleanup-report.json` files below the XDG state directory. Reports contain
+only bounded non-secret outcomes. `cudex status` reads the non-secret current
+pointer and exact tenant lifecycle counts; `cudex cleanup` retries deletion and
+teardown for only that run.
 
 When local application returns status `3`, leave the retained journal in place
 and follow the printed recovery instructions. When it returns status `4`, no

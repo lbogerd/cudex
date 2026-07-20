@@ -33,7 +33,7 @@ const envPath = `${e2bRoot}/poc/.env`
 const pointerPath = `${e2bRoot}/.state/poc/current`
 const exec = promisify(execFile)
 
-function existingTlsMaterial(paths: PocRunPaths): PocTlsMaterial {
+export function existingTlsMaterial(paths: PocRunPaths): PocTlsMaterial {
   return { caCertificatePath: `${paths.tlsDirectory}/ca.crt`, caKeyPath: `${paths.tlsDirectory}/ca.key`,
     serverCertificatePath: `${paths.tlsDirectory}/server.crt`, serverKeyPath: `${paths.tlsDirectory}/server.key`,
     combinedCaBundlePath: `${paths.tlsDirectory}/combined-ca.pem` }
@@ -181,7 +181,7 @@ async function removeCurrentPointer(paths: PocRunPaths): Promise<void> {
   if (current.trim() === paths.runId) await rm(pointerPath, { force: true })
 }
 
-type CleanupRun = Pick<CompleteRun, 'env' | 'paths' | 'docker' | 'tls' | 'runtime'>
+export type CleanupRun = Pick<CompleteRun, 'env' | 'paths' | 'docker' | 'tls' | 'runtime'>
 
 function providerInspector(run: CleanupRun): PocProviderInspector {
   return new PocProviderInspector({ apiKey: run.env.e2bApiKey, apiUrl: run.env.e2bApiUrl,
@@ -262,7 +262,7 @@ async function environmentIdForThread(run: CompleteRun, threadId: string): Promi
   } finally { await opened.close() }
 }
 
-interface CleanupOutcome {
+export interface CleanupOutcome {
   serviceCleanupComplete: boolean
   forcedProviderCleanup: boolean
   dockerVolumesRemoved: boolean
@@ -270,7 +270,7 @@ interface CleanupOutcome {
   database?: PocDatabaseInspection
 }
 
-async function exactCleanup(run: CleanupRun, appServer: PocAppServerProcess | undefined,
+export async function exactCleanup(run: CleanupRun, appServer: PocAppServerProcess | undefined,
   evidence: PocAppServerEvidence | undefined, preserve: boolean): Promise<CleanupOutcome> {
   let deletionComplete = !evidence
   if (appServer && evidence && !evidence.deletedThreadIds.includes(evidence.rootThreadId)) {
@@ -628,7 +628,9 @@ async function main(): Promise<void> {
   usage()
 }
 
-main().catch(error => {
-  console.error(error instanceof Error ? error.message : 'POC command failed')
-  process.exitCode = 2
-})
+if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) {
+  main().catch(error => {
+    console.error(error instanceof Error ? error.message : 'POC command failed')
+    process.exitCode = 2
+  })
+}

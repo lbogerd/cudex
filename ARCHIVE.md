@@ -55,6 +55,24 @@ metadata. Template build and live verification now require Git. Focused transfer
 tests and the full default suite passed: 341 discovered, 215 passed, and 126
 PostgreSQL-gated cases skipped.
 
+The generalized runner now acquires one XDG runtime lock, validates release,
+configuration, auth, Docker, ports, and the Git projection, saves the immutable
+base archive/manifest, starts disposable PostgreSQL and Garage, migrates and
+starts the TLS service in `git-working-set` mode, uploads the source, generates
+strict hosted Codex configuration, and launches the provenance-matched standard
+TUI with approval fixed to `never`. It discovers the exact ownerless root from
+the run tenant, deletes its thread through the standard app-server API, performs
+exact POC-derived provider/service/volume cleanup, and writes separate bounded
+session/apply/cleanup reports.
+
+SIGINT/SIGTERM are forwarded only after TUI allocation and preserve their
+130/143 statuses after successful cleanup. Status and cleanup use the non-secret
+current pointer plus exact run identity; a cleanup failure retains recovery
+state. The fixed POC entrypoint was made import-safe and its public diagnostic
+commands remain unchanged. Focused runner/report/POC regression tests passed.
+The complete default suite then passed with 345 tests discovered: 219 passed
+and 126 PostgreSQL-gated cases skipped.
+
 ## Dedicated CubeSandbox code-mode runtime foundation (2026-07-19)
 
 The Linux hosted path now packages two provenance-bound binaries from the same

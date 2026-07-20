@@ -24,6 +24,7 @@ export interface PocEnvironment {
   garagePort: number
   keepOnFailure: boolean
   verifyTemplate: boolean
+  workspaceMode?: 'git-working-set'
 }
 
 type RawEnvironment = Record<string, string | undefined>

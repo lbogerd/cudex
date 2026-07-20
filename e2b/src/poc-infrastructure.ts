@@ -141,6 +141,16 @@ export async function startControlService(
     HOSTED_AGENT_PATCH_APPLY_STALE_MS: '20000', HOSTED_AGENT_PATCH_APPLY_RECONCILE_MS: '1000',
     HOSTED_AGENT_TICKET_TTL_MS: '60000', HOSTED_AGENT_SOURCE_MAX_TTL_MS: String(4 * 60 * 60_000),
   }
+  if (env.workspaceMode === 'git-working-set') {
+    // TODO(internal-release, PILOT-003): Each pilot user runs disposable PostgreSQL and Garage locally
+    // because this reuses the proven POC. Replace it with the supported internal control-plane topology.
+    serviceEnv.HOSTED_AGENT_WORKSPACE_MODE = 'git-working-set'
+    // TODO(internal-release, PILOT-014): Pilot cleanup uses the POC inspection operations so exact
+    // resources remain recoverable. Replace them with supported authenticated operational interfaces.
+    serviceEnv.HOSTED_AGENT_POC_INSPECTION = 'true'
+    // TODO(internal-release, PILOT-017): Production reconciliation, quotas, monitoring, backup, and
+    // outage hardening are deferred for named pilot users. Complete that queue before broader rollout.
+  }
   serviceEnv.E2B_VALIDATE_API_KEY = String(env.e2bValidateApiKey)
   if (env.providerCaCertificate) serviceEnv.NODE_EXTRA_CA_CERTS = env.providerCaCertificate
   const child = spawn(process.execPath, [`${paths.e2bRoot}/dist/src/main.js`], {
