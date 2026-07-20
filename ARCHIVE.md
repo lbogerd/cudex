@@ -27,6 +27,19 @@ README, a root ignore policy, a per-commit contributor checklist, and an
 automated registry consistency test. The focused build and registry test passed
 on 2026-07-20 before the baseline commit.
 
+Release/setup foundation now uses strict version-1 manifests, validates and
+atomically caches the four shared release files, rejects revision/checksum/mode
+and platform mismatches, and stores XDG configuration separately from the API
+credential with owner-only permissions. Doctor validates the cached release,
+installed Cudex revision, Docker, Git, and existing Codex auth; its opt-in
+template check uses the live canary. Device login writes only to the isolated
+Cudex Codex home. The installer copies an explicit safe runtime file set and
+does not copy the developer POC `.env` or auth directory.
+
+Focused config/release/CLI/installer/registry checks passed, including a complete
+installation under temporary HOME/XDG roots. The full default suite passed with
+337 tests discovered: 211 passed and 126 PostgreSQL-gated cases skipped.
+
 ## Dedicated CubeSandbox code-mode runtime foundation (2026-07-19)
 
 The Linux hosted path now packages two provenance-bound binaries from the same

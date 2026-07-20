@@ -35,9 +35,10 @@ root result. On a successful TUI exit it compares the uploaded base, hosted
 proposal, and current local files. Conflict-free changes are applied locally
 without staging or committing them. A conflict leaves the checkout unchanged.
 
-The implementation is being delivered in reviewable commits. Commands that
-are not yet present on this branch must not be treated as supported merely
-because their intended behavior is documented here.
+Release setup, authentication discovery/login, installation, `doctor`, and
+`version` are implemented. Workspace projection and the end-to-end session
+runner are delivered in later commits on this branch; until then `cudex files`
+and sessions fail before allocation.
 
 ## Command reference
 
@@ -84,6 +85,18 @@ metadata, and release revisions before atomically caching a release under the
 user's XDG data directory. Configuration and run state use XDG paths with
 owner-only permissions. Existing Codex authentication is copied into the
 isolated runtime only for the run and is removed during cleanup.
+
+Interactive setup prompts for the CubeSandbox API URL and asks for its API key
+with terminal echo disabled; the default sandbox domain is `cube.app`. Automated
+setup can provide `CUDEX_API_URL`, `CUDEX_API_KEY`, `CUDEX_DOMAIN`, and optional
+`CUDEX_PROVIDER_CA_CERTIFICATE` environment values. These values replace the
+POC's repository-local `.env`; the API key is stored separately at mode `0600`.
+
+Release manifest version 1 binds the release ID, Cudex and Codex revisions,
+Linux/x86_64 platform, minimum Node version, binary sizes and SHA-256 checksums,
+template metadata checksum and ID, CPU/memory limits, and creation time. Setup
+atomically caches exactly `release.json`, `codex`, `codex-code-mode-host`, and
+`template.json` after validating the complete bundle.
 
 Cudex never stages or commits project changes. It applies only paths proven
 safe by the immutable base/proposed/target comparison and uses a same-filesystem
