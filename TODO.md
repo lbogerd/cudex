@@ -31,9 +31,9 @@ its existing process-owned/in-process behavior; hosted Codex must fail closed.
 - [x] Make provider placement structurally explicit so production hosted paths
   cannot select the shared local provider. Unit-only provisioning uses an
   explicit constructor that disables runtime startup rather than `cfg!(test)`.
-- [ ] Add verified same-generation recovery. Unprovable same-environment
-  reconnects already fail closed and release instead of starting a duplicate;
-  replacement environments use the service's authoritative generation.
+- [x] Add verified same-generation recovery through exec-server's retained
+  exact-process read and deduplicated write resume. Unprovable reconnects fail
+  closed; replacement environments use the authoritative generation.
 - [x] Add explicit graceful provider shutdown, active-cell termination, and
   confirmed exec-server process-group quiescence before lease cleanup continues.
 
@@ -49,11 +49,11 @@ its existing process-owned/in-process behavior; hosted Codex must fail closed.
 
 ### Evidence and acceptance
 
-- [ ] Complete non-secret reconnect telemetry after verified same-generation
-  recovery exists. Start, ready, failure, shutdown, and quiescence events now
-  carry bounded non-secret identity, protocol, duration, and outcome fields.
-- [ ] Add transport, provider, provisioning, authorization, reconnect, and
-  shutdown tests without bypassing remote startup.
+- [x] Emit non-secret reconnect telemetry from the exact process session's
+  monotonic successful-recovery signal, alongside start, ready, failure,
+  shutdown, and quiescence events.
+- [x] Add transport, provider, provisioning, authorization, reconnect, and
+  shutdown coverage, including real remote startup in the live acceptance run.
 - [x] Add trusted runtime-placement evidence and the six code-mode booleans to
   retained POC reports.
 - [x] Run the real root/child CubeSandbox happy-path acceptance with pure

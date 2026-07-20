@@ -487,8 +487,11 @@ impl Inner {
                 Err(error) => Err(error),
             };
             match recovered {
-                Ok(true) => self.remove_session_if(process_id, session),
-                Ok(false) => {}
+                Ok(true) => {
+                    session.note_recovered();
+                    self.remove_session_if(process_id, session);
+                }
+                Ok(false) => session.note_recovered(),
                 Err(error) => {
                     let terminated: Result<TerminateResponse, ExecServerError> = rpc_client
                         .call_for_cleanup(

@@ -2228,6 +2228,17 @@ but the trusted interaction ledger correctly retains an unfinished runtime and
 the acceptance report cannot claim quiescence. Lease release remains the forced
 containment fallback if graceful shutdown cannot be confirmed.
 
+Same-generation transport recovery stays below the code-mode protocol
+connection. Exec-server resumes its authenticated session, performs a retained
+`process/read` for the exact deterministic process ID, restores ordered output,
+and retries writes with the original write ID. The process session now exposes
+a monotonic successful-recovery counter; the hosted provider observes it and
+emits `hosted_code_mode_reconnected` with only the immutable identity, hashed
+process identity, protocol version, recovery count, and outcome. A failed or
+unprovable resume still makes the connection terminal and never starts a second
+host. Replacement generations continue through fresh provisioning and receive
+a different deterministic process identity.
+
 The Linux/musl release build uses linker-plugin LTO across the full CLI graph.
 With the pinned Rust toolchain, the hosted additions push the CLI layout query
 past rustc's default recursion depth; `cli/src/main.rs` therefore declares the

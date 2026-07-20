@@ -161,6 +161,25 @@ impl HostedEnvironmentCodeModeSessionProvider {
                 return Err(error.to_string());
             }
         };
+        let mut recoveries = started.process.subscribe_recoveries();
+        let telemetry_identity = identity.clone();
+        let telemetry_process_identity = process_identity.clone();
+        tokio::spawn(async move {
+            while recoveries.changed().await.is_ok() {
+                tracing::info!(
+                    event = "hosted_code_mode_reconnected",
+                    thread_id = %telemetry_identity.thread_id,
+                    lease_id = %telemetry_identity.lease_id,
+                    environment_id = %telemetry_identity.environment_id,
+                    connection_generation = telemetry_identity.connection_generation,
+                    process_identity = %telemetry_process_identity,
+                    protocol_version = "v1",
+                    recovery_count = *recoveries.borrow_and_update(),
+                    duration_ms = 0_u64,
+                    outcome = "reconnected",
+                );
+            }
+        });
         Ok(Self {
             identity,
             process_identity: process_identity.clone(),

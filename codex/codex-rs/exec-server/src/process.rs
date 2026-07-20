@@ -209,6 +209,14 @@ pub trait ExecProcess: Send + Sync {
 
     fn subscribe_wake(&self) -> watch::Receiver<u64>;
 
+    /// Counts successful transport recoveries that proved and resumed this exact
+    /// retained process. Local and non-recoverable backends keep the default closed
+    /// receiver at zero.
+    fn subscribe_recoveries(&self) -> watch::Receiver<u64> {
+        let (_tx, rx) = watch::channel(0);
+        rx
+    }
+
     fn subscribe_events(&self) -> ExecProcessEventReceiver;
 
     fn read(

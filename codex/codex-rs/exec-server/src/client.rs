@@ -172,6 +172,7 @@ impl RemoteExecServerConnectArgs {
 
 pub(crate) struct SessionState {
     wake_tx: watch::Sender<u64>,
+    recovery_tx: watch::Sender<u64>,
     events: ExecProcessEventLog,
     ordered_events: StdMutex<OrderedSessionEvents>,
     recoverable: AtomicBool,
@@ -1157,8 +1158,10 @@ impl From<RpcCallError> for ExecServerError {
 impl SessionState {
     fn new(recoverable: bool) -> Self {
         let (wake_tx, _wake_rx) = watch::channel(0);
+        let (recovery_tx, _recovery_rx) = watch::channel(0);
         Self {
             wake_tx,
+            recovery_tx,
             events: ExecProcessEventLog::new(
                 PROCESS_EVENT_CHANNEL_CAPACITY,
                 PROCESS_EVENT_RETAINED_BYTES,
@@ -1171,6 +1174,14 @@ impl SessionState {
 
     pub(crate) fn subscribe(&self) -> watch::Receiver<u64> {
         self.wake_tx.subscribe()
+    }
+
+    pub(crate) fn subscribe_recoveries(&self) -> watch::Receiver<u64> {
+        self.recovery_tx.subscribe()
+    }
+
+    pub(crate) fn note_recovered(&self) {
+        self.recovery_tx.send_modify(|count| *count += 1);
     }
 
     pub(crate) fn subscribe_events(&self) -> ExecProcessEventReceiver {
@@ -1348,6 +1359,10 @@ impl Session {
 
     pub(crate) fn subscribe_wake(&self) -> watch::Receiver<u64> {
         self.state.subscribe()
+    }
+
+    pub(crate) fn subscribe_recoveries(&self) -> watch::Receiver<u64> {
+        self.state.subscribe_recoveries()
     }
 
     pub(crate) fn subscribe_events(&self) -> ExecProcessEventReceiver {
@@ -2500,6 +2515,7 @@ mod tests {
             .register_session(&ProcessId::from("proc-write"))
             .await
             .expect("session should register");
+        let mut recoveries = session.subscribe_recoveries();
 
         let response = timeout(Duration::from_secs(2), session.write(b"hello\n".to_vec()))
             .await
@@ -2511,6 +2527,11 @@ mod tests {
                 status: WriteStatus::Accepted
             }
         );
+        timeout(Duration::from_secs(1), recoveries.changed())
+            .await
+            .expect("recovery signal should not time out")
+            .expect("recovery signal should remain open");
+        assert_eq!(*recoveries.borrow_and_update(), 1);
 
         finish_tx.send(()).expect("test should finish");
         server.await.expect("server task should finish");

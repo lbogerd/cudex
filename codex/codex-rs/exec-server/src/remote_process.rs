@@ -85,6 +85,10 @@ impl ExecProcess for RemoteExecProcess {
         self.session.subscribe_wake()
     }
 
+    fn subscribe_recoveries(&self) -> watch::Receiver<u64> {
+        self.session.subscribe_recoveries()
+    }
+
     fn subscribe_events(&self) -> ExecProcessEventReceiver {
         self.session.subscribe_events()
     }
