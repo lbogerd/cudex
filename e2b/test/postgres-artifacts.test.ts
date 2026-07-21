@@ -109,6 +109,7 @@ live('artifact creation is durable, referenced, tenant isolated, and replayable 
   const created = await context.first.create(input)
   assert.equal(created.changedFiles, 3); assert.equal(created.sizeBytes, 8)
   assert.equal((await context.second.getAuthorized('tenant-1', input.artifactId, input.agentId))?.artifactId, input.artifactId)
+  assert.ok(input.ownerAgentId)
   assert.equal((await context.second.getAuthorizedForOwner('tenant-1', input.artifactId, input.ownerAgentId))?.artifactId, input.artifactId)
   assert.equal(await context.second.getAuthorized('tenant-2', input.artifactId, input.agentId), null)
   assert.equal(await context.second.getAuthorized('tenant-1', input.artifactId, 'other-agent'), null)

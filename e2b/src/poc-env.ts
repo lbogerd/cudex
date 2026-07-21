@@ -1,5 +1,8 @@
 import { readFile } from 'node:fs/promises'
 import { parseEnv } from 'node:util'
+import { createEnv } from '@t3-oss/env-core'
+import { z } from 'zod'
+import { explicitBoolean, httpUrl, invalidEnvironment, nonemptyString, positiveInteger, scopedRuntimeEnv } from './config/shared.js'
 
 export const pocEnvKeys = [
   'E2B_API_KEY', 'E2B_API_URL', 'E2B_DOMAIN', 'E2B_VALIDATE_API_KEY', 'POC_PROVIDER_CA_CERTIFICATE',
@@ -24,37 +27,13 @@ export interface PocEnvironment {
   garagePort: number
   keepOnFailure: boolean
   verifyTemplate: boolean
+  workspaceMode?: 'git-working-set'
 }
 
 type RawEnvironment = Record<string, string | undefined>
 const allowed = new Set<string>(pocEnvKeys)
 
-function value(raw: RawEnvironment, key: string): string | undefined {
-  const result = raw[key]?.trim()
-  return result ? result : undefined
-}
-
-function required(raw: RawEnvironment, key: string): string {
-  const result = value(raw, key)
-  if (!result) throw new Error(`${key} is required`)
-  return result
-}
-
-function port(raw: RawEnvironment, key: string, fallback: number): number {
-  const text = value(raw, key)
-  if (text === undefined) return fallback
-  if (!/^(?:[1-9]\d{0,4})$/u.test(text)) throw new Error(`${key} must be a TCP port`)
-  const result = Number(text)
-  if (result > 65_535) throw new Error(`${key} must be a TCP port`)
-  return result
-}
-
-function bool(raw: RawEnvironment, key: string, fallback: boolean): boolean {
-  const text = value(raw, key)
-  if (text === undefined) return fallback
-  if (text !== 'true' && text !== 'false') throw new Error(`${key} must be true or false`)
-  return text === 'true'
-}
+const tcpPort = (fallback: number) => positiveInteger(fallback).refine(value => value <= 65_535, 'must be a TCP port')
 
 export function validatePocEnvironment(raw: RawEnvironment): PocEnvironment {
   for (const key of Object.keys(raw)) {
@@ -62,33 +41,42 @@ export function validatePocEnvironment(raw: RawEnvironment): PocEnvironment {
       throw new Error(`unknown POC configuration key: ${key}`)
     }
   }
-  const accessTokenValue = raw.CODEX_ACCESS_TOKEN
-  const accessToken = accessTokenValue?.trim() ? accessTokenValue : undefined
-  if (accessToken && accessToken !== accessToken.trim()) throw new Error('CODEX_ACCESS_TOKEN must not have surrounding whitespace')
-  const authJsonFile = value(raw, 'CODEX_AUTH_JSON_FILE')
-  if (Boolean(accessToken) === Boolean(authJsonFile)) {
+  for (const key of ['E2B_VALIDATE_API_KEY', 'POC_KEEP_ON_FAILURE', 'POC_VERIFY_TEMPLATE'] as const) {
+    if (raw[key] !== undefined && raw[key] !== 'true' && raw[key] !== 'false') throw new Error(`${key} must be true or false`)
+  }
+  for (const key of ['POC_CONTROL_PORT', 'POC_POSTGRES_PORT', 'POC_GARAGE_PORT'] as const) {
+    if (raw[key] !== undefined && (!/^[1-9]\d{0,4}$/u.test(raw[key]) || Number(raw[key]) > 65_535)) {
+      throw new Error(`${key} must be a TCP port`)
+    }
+  }
+  if (raw.CODEX_ACCESS_TOKEN?.trim() && raw.CODEX_ACCESS_TOKEN !== raw.CODEX_ACCESS_TOKEN.trim()) {
+    throw new Error('CODEX_ACCESS_TOKEN must not have surrounding whitespace')
+  }
+  const absentWhenEmpty = z.preprocess(value => value === '' ? undefined : value, nonemptyString.optional())
+  const env = createEnv({ server: {
+    E2B_API_KEY: nonemptyString, E2B_API_URL: httpUrl, E2B_DOMAIN: nonemptyString.default('cube.app'),
+    E2B_VALIDATE_API_KEY: explicitBoolean.default(true), POC_PROVIDER_CA_CERTIFICATE: nonemptyString.optional(),
+    POC_TEMPLATE_METADATA: nonemptyString, CODEX_ACCESS_TOKEN: absentWhenEmpty,
+    CODEX_AUTH_JSON_FILE: absentWhenEmpty, POC_CODEX_MODEL: absentWhenEmpty,
+    POC_CONTROL_PORT: tcpPort(18_443), POC_POSTGRES_PORT: tcpPort(15_432), POC_GARAGE_PORT: tcpPort(13_900),
+    POC_KEEP_ON_FAILURE: explicitBoolean.default(false), POC_VERIFY_TEMPLATE: explicitBoolean.default(false),
+  }, runtimeEnv: scopedRuntimeEnv(raw, pocEnvKeys), onValidationError: invalidEnvironment })
+  if (Boolean(env.CODEX_ACCESS_TOKEN) === Boolean(env.CODEX_AUTH_JSON_FILE)) {
     throw new Error('configure exactly one of CODEX_ACCESS_TOKEN and CODEX_AUTH_JSON_FILE')
   }
-  const ports = {
-    controlPort: port(raw, 'POC_CONTROL_PORT', 18_443),
-    postgresPort: port(raw, 'POC_POSTGRES_PORT', 15_432),
-    garagePort: port(raw, 'POC_GARAGE_PORT', 13_900),
-  }
+  const ports = { controlPort: env.POC_CONTROL_PORT, postgresPort: env.POC_POSTGRES_PORT,
+    garagePort: env.POC_GARAGE_PORT }
   if (new Set(Object.values(ports)).size !== 3) throw new Error('POC ports must be distinct')
   return {
-    e2bApiKey: required(raw, 'E2B_API_KEY'),
-    e2bApiUrl: required(raw, 'E2B_API_URL'),
-    e2bDomain: value(raw, 'E2B_DOMAIN') ?? 'cube.app',
-    e2bValidateApiKey: bool(raw, 'E2B_VALIDATE_API_KEY', true),
-    ...(value(raw, 'POC_PROVIDER_CA_CERTIFICATE')
-      ? { providerCaCertificate: value(raw, 'POC_PROVIDER_CA_CERTIFICATE')! } : {}),
-    templateMetadata: required(raw, 'POC_TEMPLATE_METADATA'),
-    ...(accessToken ? { accessToken } : {}),
-    ...(authJsonFile ? { authJsonFile } : {}),
-    ...(value(raw, 'POC_CODEX_MODEL') ? { codexModel: value(raw, 'POC_CODEX_MODEL')! } : {}),
+    e2bApiKey: env.E2B_API_KEY, e2bApiUrl: env.E2B_API_URL, e2bDomain: env.E2B_DOMAIN,
+    e2bValidateApiKey: env.E2B_VALIDATE_API_KEY,
+    ...(env.POC_PROVIDER_CA_CERTIFICATE ? { providerCaCertificate: env.POC_PROVIDER_CA_CERTIFICATE } : {}),
+    templateMetadata: env.POC_TEMPLATE_METADATA,
+    ...(env.CODEX_ACCESS_TOKEN ? { accessToken: env.CODEX_ACCESS_TOKEN } : {}),
+    ...(env.CODEX_AUTH_JSON_FILE ? { authJsonFile: env.CODEX_AUTH_JSON_FILE } : {}),
+    ...(env.POC_CODEX_MODEL ? { codexModel: env.POC_CODEX_MODEL } : {}),
     ...ports,
-    keepOnFailure: bool(raw, 'POC_KEEP_ON_FAILURE', false),
-    verifyTemplate: bool(raw, 'POC_VERIFY_TEMPLATE', false),
+    keepOnFailure: env.POC_KEEP_ON_FAILURE, verifyTemplate: env.POC_VERIFY_TEMPLATE,
   }
 }
 

@@ -2,6 +2,9 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { ServiceError } from '../src/types.js'
 import {
+  PatchApplyResponseSchema, ProvisionRequestSchema, ProvisionedAgentSchema,
+} from '../src/contracts/lifecycle.js'
+import {
   contractLimits,
   validateCheckpointRequest,
   validatePatchApplyRequest,
@@ -71,6 +74,13 @@ const patchApplyRequest = () => ({
 function rejectsStatus(status: number, fn: () => unknown): void {
   assert.throws(fn, error => error instanceof ServiceError && error.status === status)
 }
+
+test('Zod lifecycle schemas are the reusable request and service-output boundaries', () => {
+  assert.deepEqual(ProvisionRequestSchema.parse(rootProvision()), rootProvision())
+  assert.deepEqual(ProvisionedAgentSchema.parse(provisioned()), provisioned())
+  rejectsStatus(400, () => ProvisionRequestSchema.parse({ ...rootProvision(), extra: true }))
+  rejectsStatus(503, () => PatchApplyResponseSchema.parse({ type: 'conflict', paths: [] }))
+})
 
 test('request validators accept every current exact request shape', () => {
   assert.deepEqual(validateProvisionRequest(rootProvision()), rootProvision())

@@ -9,6 +9,7 @@ import type {
   SourceSnapshotReference,
 } from './source-snapshots.js'
 import { ServiceError } from './types.js'
+import { z } from 'zod'
 
 const checksumPattern = /^sha256:[0-9a-f]{64}$/
 const sourceSnapshotIdPattern = /^source_[0-9a-f]{32}$/
@@ -19,30 +20,24 @@ export interface SourceSnapshotApiLimits {
   maxArchiveBytes: number
 }
 
-export interface SourceSnapshotCreateBody {
-  checksum: string
-  cwdUri: string
-  workspaceRootUris: string[]
-  expiresAt: string
-}
-
-export interface SourceSnapshotResolveBody {
-  sourceSnapshotId: string
-  checksum: string
-}
-
-export interface SourceSnapshotReferenceBody {
-  sourceSnapshotId: string
-  checksum: string
-  expiresAt: string
-  manifestChecksum: string
-  sizeBytes: number
-}
-
-export interface SourceSnapshotResolutionBody extends SourceSnapshotReferenceBody {
-  cwdUri: string
-  workspaceRootUris: string[]
-}
+const checksumSchema = z.string().regex(checksumPattern)
+const sourceSnapshotIdSchema = z.string().regex(sourceSnapshotIdPattern)
+const canonicalTimestampSchema = z.string().refine(value => {
+  const parsed = new Date(value); return Number.isFinite(parsed.getTime()) && parsed.toISOString() === value
+})
+const workspaceRootUrisSchema = z.array(z.string()).min(1)
+export const SourceSnapshotCreateBodySchema = z.strictObject({ checksum: checksumSchema, cwdUri: z.string(),
+  workspaceRootUris: workspaceRootUrisSchema, expiresAt: canonicalTimestampSchema })
+export const SourceSnapshotResolveBodySchema = z.strictObject({ sourceSnapshotId: sourceSnapshotIdSchema, checksum: checksumSchema })
+export const SourceSnapshotReferenceBodySchema = z.strictObject({ sourceSnapshotId: sourceSnapshotIdSchema,
+  checksum: checksumSchema, expiresAt: canonicalTimestampSchema, manifestChecksum: checksumSchema,
+  sizeBytes: z.number().int().safe().positive() })
+export const SourceSnapshotResolutionBodySchema = SourceSnapshotReferenceBodySchema.extend({
+  cwdUri: z.string(), workspaceRootUris: workspaceRootUrisSchema })
+export type SourceSnapshotCreateBody = z.infer<typeof SourceSnapshotCreateBodySchema>
+export type SourceSnapshotResolveBody = z.infer<typeof SourceSnapshotResolveBodySchema>
+export type SourceSnapshotReferenceBody = z.infer<typeof SourceSnapshotReferenceBodySchema>
+export type SourceSnapshotResolutionBody = z.infer<typeof SourceSnapshotResolutionBodySchema>
 
 export interface SourceSnapshotResolution {
   metadata: SourceSnapshotResolutionBody
@@ -154,13 +149,19 @@ export function validateSourceSnapshotCreateBody(
   limits: SourceSnapshotApiLimits = defaultLimits,
 ): SourceSnapshotCreateBody {
   limits = validateLimits(limits)
-  const body = exactObject(value, ['checksum', 'cwdUri', 'workspaceRootUris', 'expiresAt'], 400, 'source snapshot create body')
+  exactObject(value, ['checksum', 'cwdUri', 'workspaceRootUris', 'expiresAt'], 400, 'source snapshot create body')
+  const parsed = SourceSnapshotCreateBodySchema.safeParse(value)
+  if (!parsed.success) throw new ServiceError(400, 'invalid source snapshot create body')
+  const body = parsed.data
   const paths = workspace(body.cwdUri, body.workspaceRootUris, 400, limits.maxRoots)
   return { checksum: checksum(body.checksum, 400), ...paths, expiresAt: canonicalTimestamp(body.expiresAt, 400) }
 }
 
 export function validateSourceSnapshotResolveBody(value: unknown): SourceSnapshotResolveBody {
-  const body = exactObject(value, ['sourceSnapshotId', 'checksum'], 400, 'source snapshot resolve body')
+  exactObject(value, ['sourceSnapshotId', 'checksum'], 400, 'source snapshot resolve body')
+  const parsed = SourceSnapshotResolveBodySchema.safeParse(value)
+  if (!parsed.success) throw new ServiceError(400, 'invalid source snapshot resolve body')
+  const body = parsed.data
   return { sourceSnapshotId: sourceSnapshotId(body.sourceSnapshotId, 400), checksum: checksum(body.checksum, 400) }
 }
 
@@ -173,7 +174,10 @@ function validateSourceSnapshotReferenceBodyWithLimits(
   limits: SourceSnapshotApiLimits,
 ): SourceSnapshotReferenceBody {
   limits = validateLimits(limits)
-  const body = exactObject(value, ['sourceSnapshotId', 'checksum', 'expiresAt', 'manifestChecksum', 'sizeBytes'], 503, 'source snapshot response')
+  exactObject(value, ['sourceSnapshotId', 'checksum', 'expiresAt', 'manifestChecksum', 'sizeBytes'], 503, 'source snapshot response')
+  const parsed = SourceSnapshotReferenceBodySchema.safeParse(value)
+  if (!parsed.success) throw new ServiceError(503, 'invalid source snapshot response')
+  const body = parsed.data
   return {
     sourceSnapshotId: sourceSnapshotId(body.sourceSnapshotId, 503), checksum: checksum(body.checksum, 503),
     expiresAt: canonicalTimestamp(body.expiresAt, 503), manifestChecksum: checksum(body.manifestChecksum, 503),
@@ -190,7 +194,10 @@ function validateSourceSnapshotResolutionBodyWithLimits(
   limits: SourceSnapshotApiLimits,
 ): SourceSnapshotResolutionBody {
   limits = validateLimits(limits)
-  const body = exactObject(value, ['sourceSnapshotId', 'checksum', 'expiresAt', 'manifestChecksum', 'sizeBytes', 'cwdUri', 'workspaceRootUris'], 503, 'source snapshot resolution')
+  exactObject(value, ['sourceSnapshotId', 'checksum', 'expiresAt', 'manifestChecksum', 'sizeBytes', 'cwdUri', 'workspaceRootUris'], 503, 'source snapshot resolution')
+  const parsed = SourceSnapshotResolutionBodySchema.safeParse(value)
+  if (!parsed.success) throw new ServiceError(503, 'invalid source snapshot resolution')
+  const body = parsed.data
   const paths = workspace(body.cwdUri, body.workspaceRootUris, 503, limits.maxRoots)
   return {
     sourceSnapshotId: sourceSnapshotId(body.sourceSnapshotId, 503), checksum: checksum(body.checksum, 503),

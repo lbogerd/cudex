@@ -15,6 +15,7 @@ RUN echo "${CODEX_BINARY_SHA256}  /usr/local/bin/codex" | sha256sum -c - \
     && mkdir -p /run/cudex \
     && chown 1000:1000 /workspace /run/cudex \
     && /usr/local/bin/codex --version \
+    && git --version \
     && /usr/local/bin/codex exec-server --help >/dev/null \
     && /usr/local/bin/codex-code-mode-host --help >/dev/null
 

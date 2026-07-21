@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { z } from 'zod'
 
 const utf8 = new TextEncoder()
 const utf8Decoder = new TextDecoder('utf-8', { fatal: true })
@@ -56,6 +57,9 @@ export interface WorkspaceManifest {
   entries: WorkspaceEntry[]
 }
 
+export const WorkspaceManifestSchema = z.strictObject({ version: z.literal(1), identity: z.string(),
+  entries: z.array(z.unknown()) })
+
 export interface WorkspaceChange {
   path: string
   base: WorkspaceEntry | null
@@ -103,7 +107,9 @@ export function validateWorkspacePath(path: string, limits: WorkspaceManifestLim
   if (path !== path.normalize('NFC')) invalid('workspace path must use NFC Unicode normalization')
   const segments = path.split('/')
   if (segments.some(segment => segment.length === 0 || segment === '.' || segment === '..')) invalid('workspace path is not canonical')
-  if (segments.some(segment => /[\u0000-\u001f\u007f]/u.test(segment))) invalid('workspace path contains a control character')
+  // LF is valid in POSIX/Git filenames and remains unambiguous because all workspace
+  // transports are NUL-delimited, JSON-escaped, URI-encoded, or tar-header based.
+  if (segments.some(segment => /[\u0000-\u0009\u000b-\u001f\u007f]/u.test(segment))) invalid('workspace path contains a control character')
   if (bytes(path) > limits.maxPathBytes) quota('workspace path byte limit exceeded')
   if (segments.length > limits.maxPathDepth) quota('workspace path depth limit exceeded')
   return path
@@ -120,7 +126,7 @@ export function validateSymlinkTarget(path: string, target: string, limits: Work
   if (bytes(target) > limits.maxLinkTargetBytes) quota('symlink target byte limit exceeded')
   const targetSegments = target.split('/')
   if (targetSegments.some(segment => segment.length === 0 || segment === '.')) invalid('symlink target is not canonical')
-  if (targetSegments.some(segment => /[\u0000-\u001f\u007f]/u.test(segment))) invalid('symlink target contains a control character')
+  if (targetSegments.some(segment => /[\u0000-\u0009\u000b-\u001f\u007f]/u.test(segment))) invalid('symlink target contains a control character')
 
   const resolved = path.split('/').slice(0, -1)
   for (const segment of targetSegments) {
@@ -238,21 +244,14 @@ export function parseWorkspaceManifest(
   let decoded: unknown
   try { decoded = JSON.parse(text) }
   catch { return invalid('workspace manifest is not valid JSON') }
-  if (decoded === null || typeof decoded !== 'object' || Array.isArray(decoded)) {
-    return invalid('workspace manifest must be an object')
-  }
-  const record = decoded as Record<string, unknown>
-  const keys = Object.keys(record).sort(compareText)
-  if (keys.length !== 3 || keys[0] !== 'entries' || keys[1] !== 'identity' || keys[2] !== 'version'
-    || record.version !== 1 || record.identity !== expectedIdentity || !Array.isArray(record.entries)) {
-    return invalid('workspace manifest has an invalid shape')
-  }
+  const parsed = WorkspaceManifestSchema.safeParse(decoded)
+  if (!parsed.success || parsed.data.identity !== expectedIdentity) return invalid('workspace manifest has an invalid shape')
   let canonical: string
   try { canonical = canonicalJson(decoded) }
   catch { return invalid('workspace manifest is not canonical JSON') }
   if (canonical !== text) invalid('workspace manifest bytes are not canonical JSON')
   const manifest = createWorkspaceManifest(
-    expectedIdentity, record.entries as WorkspaceEntry[], limits)
+    expectedIdentity, parsed.data.entries as WorkspaceEntry[], limits)
   if (canonicalJson(manifest) !== canonical) invalid('workspace manifest is not canonical or exact-shape')
   return manifest
 }

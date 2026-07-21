@@ -5,6 +5,7 @@ import {
   type ArchiveManifestLimits,
   type CapturedArchiveManifest,
 } from './archive-manifest.js'
+import { projectedGitExportScript, syntheticGitInitializationScript, type HostedWorkspaceMode } from './synthetic-git.js'
 
 interface TransferFiles {
   write(path: string, data: ArrayBuffer): Promise<unknown>
@@ -29,6 +30,7 @@ export interface WorkspaceTransferOptions {
   maxRoots?: number
   observe?: (metric: WorkspaceTransferMetric) => void
   now?: () => number
+  workspaceMode?: HostedWorkspaceMode
 }
 
 export type WorkspaceTransferDirection = 'upload' | 'export'
@@ -157,6 +159,8 @@ export async function uploadWorkspaceArchive(
   const paths = transferPaths(options)
   const owner = options.owner ?? '1000:1000'
   if (!/^\d+:\d+$/u.test(owner)) throw new Error('invalid workspace owner')
+  const workspaceMode = options.workspaceMode ?? 'default'
+  if (workspaceMode !== 'default' && workspaceMode !== 'git-working-set') throw new Error('invalid workspace mode')
   const cleanup = cleanupScript(paths)
   try {
     await measured(options, 'upload', 'validation', archiveBytes.byteLength, async () => {
@@ -195,6 +199,13 @@ rm -rf -- "$backup"`
     await measured(options, 'upload', 'extraction', archiveBytes.byteLength, async () => {
       const result = await sandbox.commands.run(script, { user: 'root' })
       if (result.exitCode !== 0) throw new Error('workspace materialization failed')
+      if (workspaceMode === 'git-working-set') {
+        // TODO(internal-release, PILOT-006): The pilot creates one synthetic baseline commit because
+        // repository history is excluded from capture. Replace this with bounded history transport.
+        const initialized = await sandbox.commands.run(
+          syntheticGitInitializationScript(paths.workspace, owner), { user: 'root' })
+        if (initialized.exitCode !== 0) throw new Error('workspace materialization failed')
+      }
     })
   } catch {
     throw new Error('workspace materialization failed')
@@ -211,10 +222,14 @@ export async function exportWorkspaceArchive(
   const cleanup = cleanupScript(paths)
   const maxArchiveBytes = options.archiveLimits?.maxArchiveBytes ?? defaultArchiveManifestLimits.maxArchiveBytes
   if (!Number.isSafeInteger(maxArchiveBytes) || maxArchiveBytes <= 0) throw new Error('invalid workspace archive limit')
+  const workspaceMode = options.workspaceMode ?? 'default'
+  if (workspaceMode !== 'default' && workspaceMode !== 'git-working-set') throw new Error('invalid workspace mode')
   try {
     await measured(options, 'export', 'capture', 0, async () => {
       const result = await sandbox.commands.run(
-        `umask 077
+        workspaceMode === 'git-working-set'
+          ? projectedGitExportScript(paths.workspace, paths.archive, paths.stage, maxArchiveBytes)
+          : `umask 077
 tar -cf ${shell(paths.archive)} -C ${shell(paths.workspace)} roots
 size=$(stat -c %s -- ${shell(paths.archive)})
 test "$size" -le ${maxArchiveBytes}`, { user: 'root' })

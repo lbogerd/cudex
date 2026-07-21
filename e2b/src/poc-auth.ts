@@ -1,5 +1,6 @@
 import { copyFile, lstat, mkdir, readFile, realpath, rm, chmod } from 'node:fs/promises'
 import { isAbsolute, relative, resolve, sep } from 'node:path'
+import { loadCommandOsEnv } from './config/command-env.js'
 
 export interface ValidatedAuthJson {
   sourcePath: string
@@ -61,7 +62,7 @@ export function createCodexProcessEnvironment(input: {
   accessToken?: string
 }): NodeJS.ProcessEnv {
   return {
-    PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin', CODEX_HOME: input.codexHome,
+    PATH: loadCommandOsEnv().path, CODEX_HOME: input.codexHome,
     // Shared Codex HTTP/websocket clients read CODEX_CA_CERTIFICATE. The hosted-agent
     // service uses reqwest's Linux native-root loader, which reads SSL_CERT_FILE.
     // Using the same combined bundle keeps every POC Codex transport on one trust policy.

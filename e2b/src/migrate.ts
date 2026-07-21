@@ -3,6 +3,7 @@ import { access, readdir, readFile } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Pool } from 'pg'
+import { loadMigrationEnv } from './config/command-env.js'
 
 const migrationPattern = /^(\d{4})_([a-z0-9_]+)\.sql$/
 
@@ -93,9 +94,8 @@ export async function runMigrations(pool: Pool, directory?: string): Promise<voi
 }
 
 async function main(): Promise<void> {
-  const connectionString = process.env.HOSTED_AGENT_DATABASE_URL ?? process.env.DATABASE_URL
-  if (!connectionString) throw new Error('HOSTED_AGENT_DATABASE_URL or DATABASE_URL is required')
-  const pool = new Pool({ connectionString })
+  const env = loadMigrationEnv()
+  const pool = new Pool({ connectionString: env.databaseUrl })
   try { await runMigrations(pool) } finally { await pool.end() }
 }
 

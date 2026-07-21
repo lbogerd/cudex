@@ -1,4 +1,11 @@
 import type { Pool, PoolClient } from 'pg'
+import type { IDatabaseConnection } from '@pgtyped/runtime'
+import { addPatchArtifactReference, expireAvailablePatchArtifacts, findPatchArtifactForReconciliation,
+  getAuthorizedPatchArtifact, getOwnerAuthorizedPatchArtifact, getPatchArtifact, insertPatchArtifact,
+  lockPatchArtifact, lockPatchArtifactSourceLease, retainPatchArtifact, retainPatchArtifactObject,
+  retainPatchArtifactSnapshots, sharePatchArtifactObjects, sharePatchArtifactSnapshots,
+} from './db/queries/objects.queries.js'
+import { begin, commit, rollbackQuietly } from './db/primitives.js'
 import {
   canonicalJson,
   createWorkspaceManifest,
@@ -8,6 +15,7 @@ import {
 } from './workspace-manifest.js'
 
 const checksumPattern = /^sha256:[0-9a-f]{64}$/
+function connection(value: Pick<PoolClient, 'query'>): IDatabaseConnection { return value as IDatabaseConnection }
 
 export class PatchArtifactConflictError extends Error {}
 export class PatchArtifactNotFoundError extends Error {}
@@ -18,7 +26,7 @@ export interface PatchArtifact {
   artifactId: string
   tenantId: string
   agentId: string
-  ownerAgentId: string
+  ownerAgentId: string | null
   sourceLeaseId: string
   baseSnapshotId: string
   currentSnapshotId: string
@@ -37,7 +45,7 @@ export interface CreatePatchArtifactInput {
   artifactId: string
   tenantId: string
   agentId: string
-  ownerAgentId: string
+  ownerAgentId: string | null
   sourceLeaseId: string
   baseSnapshotId: string
   currentSnapshotId: string
@@ -58,7 +66,7 @@ interface ArtifactRow {
   artifact_id: string
   tenant_id: string
   agent_id: string
-  owner_agent_id: string
+  owner_agent_id: string | null
   source_lease_id: string
   base_snapshot_id: string
   current_snapshot_id: string
@@ -101,7 +109,7 @@ interface ObjectRow {
 }
 
 const artifactColumns = `a.artifact_id, a.tenant_id, a.agent_id,
-  COALESCE(l.owner_agent_id, '') AS owner_agent_id, a.source_lease_id,
+  l.owner_agent_id, a.source_lease_id,
   a.base_snapshot_id, a.current_snapshot_id, a.base_manifest_object_id,
   a.current_manifest_object_id, a.artifact_object_id, a.checksum,
   a.changed_files, a.size_bytes::text, a.state, a.expires_at, a.created_at`
@@ -129,11 +137,12 @@ function validatedInput(input: CreatePatchArtifactInput): {
 } {
   for (const [label, value] of [
     ['artifact ID', input.artifactId], ['tenant ID', input.tenantId], ['agent ID', input.agentId],
-    ['owner agent ID', input.ownerAgentId], ['source lease ID', input.sourceLeaseId],
+    ['source lease ID', input.sourceLeaseId],
     ['base snapshot ID', input.baseSnapshotId], ['current snapshot ID', input.currentSnapshotId],
     ['base manifest object ID', input.baseManifestObjectId],
     ['current manifest object ID', input.currentManifestObjectId], ['artifact object ID', input.artifactObjectId],
   ] as const) validateId(label, value)
+  if (input.ownerAgentId !== null) validateId('owner agent ID', input.ownerAgentId)
   if (!checksumPattern.test(input.checksum)) throw new Error('invalid artifact checksum')
   if (input.state !== 'available') throw new Error('new patch artifact must be available')
   validateDate('artifact expiry', input.expiresAt)
@@ -210,12 +219,12 @@ export class PostgresPatchArtifactRepository {
     if (executor) return this.createWithClient(executor, input, manifests)
     const client = await this.pool.connect()
     try {
-      await client.query('BEGIN')
+      await begin(client)
       const artifact = await this.createWithClient(client, input, manifests)
-      await client.query('COMMIT')
+      await commit(client)
       return artifact
     } catch (error) {
-      await client.query('ROLLBACK').catch(() => undefined)
+      await rollbackQuietly(client)
       if ((error as { code?: string }).code === '23503') throw new PatchArtifactNotFoundError('referenced patch state was not found')
       throw error
     } finally {
@@ -237,17 +246,7 @@ export class PostgresPatchArtifactRepository {
 
       await this.validateLeaseAndSnapshots(client, input, manifests)
       await this.validateObjects(client, input, manifests)
-      await client.query(`
-        INSERT INTO hosted_agent_artifacts
-          (artifact_id, tenant_id, agent_id, source_lease_id, base_snapshot_id,
-           current_snapshot_id, base_manifest_object_id, current_manifest_object_id,
-           artifact_object_id, checksum, changed_files, size_bytes, state, expires_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-        ON CONFLICT (artifact_id) DO NOTHING
-      `, [input.artifactId, input.tenantId, input.agentId, input.sourceLeaseId,
-        input.baseSnapshotId, input.currentSnapshotId, input.baseManifestObjectId,
-        input.currentManifestObjectId, input.artifactObjectId, input.checksum,
-        input.changedFiles, input.sizeBytes, input.state, input.expiresAt])
+      await insertPatchArtifact.run(input, connection(client))
       const row = await this.artifactById(client, input.artifactId, true)
       if (!row || !sameIdentity(row, input)) throw new PatchArtifactConflictError('artifact identity conflicts with its durable record')
       await this.addReferences(client, input, manifests.contentObjectIds)
@@ -260,96 +259,43 @@ export class PostgresPatchArtifactRepository {
 
   async getAuthorized(tenantId: string, artifactId: string, agentId: string, at = new Date()): Promise<PatchArtifact | null> {
     validateId('tenant ID', tenantId); validateId('artifact ID', artifactId); validateId('agent ID', agentId); validateDate('authorization time', at)
-    const result = await this.pool.query<ArtifactRow>(`
-      SELECT ${artifactColumns}
-      FROM hosted_agent_artifacts a
-      JOIN hosted_agent_leases l ON l.lease_id = a.source_lease_id AND l.tenant_id = a.tenant_id
-      WHERE a.artifact_id = $1 AND a.tenant_id = $2 AND a.agent_id = $3
-        AND a.state = 'available' AND (a.expires_at > $4 OR EXISTS (
-          SELECT 1 FROM hosted_agent_artifact_references retained
-          WHERE retained.artifact_id = a.artifact_id
-            AND retained.reference_kind = 'codex_thread' AND retained.reference_id = $3))
-    `, [artifactId, tenantId, agentId, at])
-    return result.rows[0] ? fromRow(result.rows[0]) : null
+    const [row] = await getAuthorizedPatchArtifact.run({ artifactId, tenantId, agentId, at }, connection(this.pool))
+    return row ? fromRow(row as ArtifactRow) : null
   }
 
   async getAuthorizedForOwner(tenantId: string, artifactId: string, ownerAgentId: string, at = new Date()): Promise<PatchArtifact | null> {
     validateId('tenant ID', tenantId); validateId('artifact ID', artifactId); validateId('owner agent ID', ownerAgentId); validateDate('authorization time', at)
-    const result = await this.pool.query<ArtifactRow>(`
-      SELECT ${artifactColumns}
-      FROM hosted_agent_artifacts a
-      JOIN hosted_agent_leases l ON l.lease_id = a.source_lease_id AND l.tenant_id = a.tenant_id
-      WHERE a.artifact_id = $1 AND a.tenant_id = $2 AND l.owner_agent_id = $3
-        AND a.state = 'available' AND (a.expires_at > $4 OR EXISTS (
-          SELECT 1 FROM hosted_agent_artifact_references retained
-          WHERE retained.artifact_id = a.artifact_id
-            AND retained.reference_kind = 'codex_thread'))
-    `, [artifactId, tenantId, ownerAgentId, at])
-    return result.rows[0] ? fromRow(result.rows[0]) : null
+    const [row] = await getOwnerAuthorizedPatchArtifact.run({ artifactId, tenantId, ownerAgentId, at }, connection(this.pool))
+    return row ? fromRow(row as ArtifactRow) : null
   }
 
   /** Exact tenant-scoped durable read for fenced recovery; wall-clock expiry does not rewrite commit history. */
   async findForReconciliation(tenantId: string, artifactId: string,
     executor: Pick<PoolClient, 'query'> = this.pool): Promise<PatchArtifact | null> {
     validateId('tenant ID', tenantId); validateId('artifact ID', artifactId)
-    const result = await executor.query<ArtifactRow>(`
-      SELECT ${artifactColumns}
-      FROM hosted_agent_artifacts a
-      JOIN hosted_agent_leases l ON l.lease_id = a.source_lease_id AND l.tenant_id = a.tenant_id
-      JOIN hosted_agent_objects o ON o.object_id = a.artifact_object_id AND o.tenant_id = a.tenant_id
-      WHERE a.artifact_id = $1 AND a.tenant_id = $2 AND a.state = 'available'
-        AND o.kind = 'patch_artifact' AND o.state = 'available' AND o.checksum = a.checksum
-      FOR SHARE OF a, o
-    `, [artifactId, tenantId])
-    return result.rows[0] ? fromRow(result.rows[0]) : null
+    const [row] = await findPatchArtifactForReconciliation.run({ artifactId, tenantId }, connection(executor))
+    return row ? fromRow(row as ArtifactRow) : null
   }
 
   async addReference(input: { tenantId: string; artifactId: string; referenceKind: 'codex_thread' | 'owner_agent' | 'operation'; referenceId: string; retainUntil?: Date | null }): Promise<void> {
     validateId('tenant ID', input.tenantId); validateId('artifact ID', input.artifactId); validateId('reference ID', input.referenceId)
     if (input.retainUntil) validateDate('retention expiry', input.retainUntil)
-    const result = await this.pool.query(`
-      INSERT INTO hosted_agent_artifact_references
-        (artifact_id, reference_kind, reference_id, retain_until)
-      SELECT artifact_id, $3, $4, $5 FROM hosted_agent_artifacts
-      WHERE artifact_id = $2 AND tenant_id = $1 AND state = 'available' AND expires_at > now()
-      ON CONFLICT (artifact_id, reference_kind, reference_id)
-      DO UPDATE SET retain_until = CASE
-        WHEN hosted_agent_artifact_references.retain_until IS NULL OR EXCLUDED.retain_until IS NULL THEN NULL
-        ELSE GREATEST(hosted_agent_artifact_references.retain_until, EXCLUDED.retain_until)
-      END
-    `, [input.tenantId, input.artifactId, input.referenceKind, input.referenceId, input.retainUntil ?? null])
+    const result = await addPatchArtifactReference.runWithCounts({ ...input, retainUntil: input.retainUntil ?? null }, connection(this.pool))
     if (result.rowCount !== 1) throw new PatchArtifactNotFoundError('artifact was not found')
   }
 
   async expireAvailable(tenantId: string, at = new Date()): Promise<number> {
     validateId('tenant ID', tenantId); validateDate('expiry time', at)
-    const result = await this.pool.query(`
-      UPDATE hosted_agent_artifacts SET state = 'expired'
-      WHERE tenant_id = $1 AND state = 'available' AND expires_at <= $2
-        AND NOT EXISTS (
-          SELECT 1 FROM hosted_agent_artifact_references retained
-          WHERE retained.artifact_id = hosted_agent_artifacts.artifact_id
-            AND retained.reference_kind = 'codex_thread')
-    `, [tenantId, at])
-    return result.rowCount ?? 0
+    return (await expireAvailablePatchArtifacts.runWithCounts({ tenantId, at }, connection(this.pool))).rowCount
   }
 
   private async artifactById(client: PoolClient, artifactId: string, lock: boolean): Promise<ArtifactRow | null> {
-    const result = await client.query<ArtifactRow>(`
-      SELECT ${artifactColumns}
-      FROM hosted_agent_artifacts a
-      JOIN hosted_agent_leases l ON l.lease_id = a.source_lease_id AND l.tenant_id = a.tenant_id
-      WHERE a.artifact_id = $1 ${lock ? 'FOR UPDATE OF a' : ''}
-    `, [artifactId])
-    return result.rows[0] ?? null
+    const [row] = await (lock ? lockPatchArtifact : getPatchArtifact).run({ artifactId }, connection(client))
+    return row as ArtifactRow | undefined ?? null
   }
 
   private async validateLeaseAndSnapshots(client: PoolClient, input: CreatePatchArtifactInput, manifests: { base: WorkspaceManifest; current: WorkspaceManifest }): Promise<void> {
-    const leaseResult = await client.query<LeaseRow>(`
-      SELECT agent_id, owner_agent_id, base_snapshot_id, latest_snapshot_id, state
-      FROM hosted_agent_leases WHERE lease_id = $1 AND tenant_id = $2 FOR UPDATE
-    `, [input.sourceLeaseId, input.tenantId])
-    const lease = leaseResult.rows[0]
+    const [lease] = await lockPatchArtifactSourceLease.run({ leaseId: input.sourceLeaseId, tenantId: input.tenantId }, connection(client))
     if (!lease) throw new PatchArtifactNotFoundError('source lease was not found')
     if (lease.agent_id !== input.agentId || lease.owner_agent_id !== input.ownerAgentId
       || lease.base_snapshot_id !== input.baseSnapshotId || lease.latest_snapshot_id !== input.currentSnapshotId) {
@@ -361,12 +307,9 @@ export class PostgresPatchArtifactRepository {
   }
 
   private async validateSnapshots(client: PoolClient, input: CreatePatchArtifactInput, manifests: { base: WorkspaceManifest; current: WorkspaceManifest }): Promise<void> {
-    const snapshots = await client.query<SnapshotRow>(`
-      SELECT snapshot_id, lease_id, manifest_object_id, manifest_checksum, state, expires_at
-      FROM hosted_agent_snapshots
-      WHERE tenant_id = $1 AND snapshot_id = ANY($2::text[]) FOR SHARE
-    `, [input.tenantId, [input.baseSnapshotId, input.currentSnapshotId]])
-    const byId = new Map(snapshots.rows.map(snapshot => [snapshot.snapshot_id, snapshot]))
+    const snapshots = await sharePatchArtifactSnapshots.run({ tenantId: input.tenantId,
+      snapshotIds: [input.baseSnapshotId, input.currentSnapshotId] }, connection(client))
+    const byId = new Map(snapshots.map(snapshot => [snapshot.snapshot_id, snapshot]))
     for (const [snapshotId, objectId, manifest] of [
       [input.baseSnapshotId, input.baseManifestObjectId, manifests.base],
       [input.currentSnapshotId, input.currentManifestObjectId, manifests.current],
@@ -388,11 +331,8 @@ export class PostgresPatchArtifactRepository {
     contentExpectations: Map<string, { checksum: string; sizeBytes: number }>
   }): Promise<void> {
     const ids = [input.baseManifestObjectId, input.currentManifestObjectId, input.artifactObjectId, ...manifests.contentObjectIds]
-    const result = await client.query<ObjectRow>(`
-      SELECT object_id, tenant_id, kind, checksum, size_bytes::text, state, expires_at
-      FROM hosted_agent_objects WHERE object_id = ANY($1::text[]) FOR SHARE
-    `, [ids])
-    const objects = new Map(result.rows.map(object => [object.object_id, object]))
+    const rows = await sharePatchArtifactObjects.run({ objectIds: ids }, connection(client))
+    const objects = new Map(rows.map(object => [object.object_id, object]))
     for (const [id, kind] of [[input.baseManifestObjectId, 'manifest'], [input.currentManifestObjectId, 'manifest'], [input.artifactObjectId, 'patch_artifact']] as const) {
       const object = objects.get(id)
       if (!object || object.tenant_id !== input.tenantId || object.kind !== kind || object.state !== 'available') {
@@ -422,48 +362,19 @@ export class PostgresPatchArtifactRepository {
       [input.baseManifestObjectId, 'base_manifest'], [input.currentManifestObjectId, 'current_manifest'],
       [input.artifactObjectId, 'patch_artifact'],
     ] as const) {
-      await client.query(`
-        INSERT INTO hosted_agent_object_references
-          (object_id, reference_kind, reference_id, purpose, retain_until)
-        VALUES ($1, 'artifact', $2, $3, $4)
-        ON CONFLICT (object_id, reference_kind, reference_id, purpose)
-        DO UPDATE SET retain_until = CASE
-          WHEN hosted_agent_object_references.retain_until IS NULL OR EXCLUDED.retain_until IS NULL THEN NULL
-          ELSE GREATEST(hosted_agent_object_references.retain_until, EXCLUDED.retain_until)
-        END
-      `, [objectId, input.artifactId, purpose, input.expiresAt])
+      await retainPatchArtifactObject.run({ objectId, artifactId: input.artifactId, purpose,
+        retainUntil: input.expiresAt }, connection(client))
     }
     for (const objectId of contentObjectIds) {
-      await client.query(`
-        INSERT INTO hosted_agent_object_references
-          (object_id, reference_kind, reference_id, purpose, retain_until)
-        VALUES ($1, 'artifact', $2, 'content_blob', $3)
-        ON CONFLICT (object_id, reference_kind, reference_id, purpose)
-        DO UPDATE SET retain_until = CASE
-          WHEN hosted_agent_object_references.retain_until IS NULL OR EXCLUDED.retain_until IS NULL THEN NULL
-          ELSE GREATEST(hosted_agent_object_references.retain_until, EXCLUDED.retain_until)
-        END
-      `, [objectId, input.artifactId, input.expiresAt])
+      await retainPatchArtifactObject.run({ objectId, artifactId: input.artifactId, purpose: 'content_blob',
+        retainUntil: input.expiresAt }, connection(client))
     }
-    await client.query(`
-      INSERT INTO hosted_agent_snapshot_references
-        (snapshot_id, reference_kind, reference_id, retain_until)
-      VALUES ($1, 'artifact_base', $3, $4), ($2, 'artifact_current', $3, $4)
-      ON CONFLICT (snapshot_id, reference_kind, reference_id)
-      DO UPDATE SET retain_until = CASE
-        WHEN hosted_agent_snapshot_references.retain_until IS NULL OR EXCLUDED.retain_until IS NULL THEN NULL
-        ELSE GREATEST(hosted_agent_snapshot_references.retain_until, EXCLUDED.retain_until)
-      END
-    `, [input.baseSnapshotId, input.currentSnapshotId, input.artifactId, input.expiresAt])
-    await client.query(`
-      INSERT INTO hosted_agent_artifact_references
-        (artifact_id, reference_kind, reference_id, retain_until)
-      VALUES ($1, 'owner_agent', $2, $3)
-      ON CONFLICT (artifact_id, reference_kind, reference_id)
-      DO UPDATE SET retain_until = CASE
-        WHEN hosted_agent_artifact_references.retain_until IS NULL OR EXCLUDED.retain_until IS NULL THEN NULL
-        ELSE GREATEST(hosted_agent_artifact_references.retain_until, EXCLUDED.retain_until)
-      END
-    `, [input.artifactId, input.ownerAgentId, input.expiresAt])
+    await retainPatchArtifactSnapshots.run({ baseSnapshotId: input.baseSnapshotId,
+      currentSnapshotId: input.currentSnapshotId, artifactId: input.artifactId,
+      retainUntil: input.expiresAt }, connection(client))
+    const retentionKind = input.ownerAgentId === null ? 'codex_thread' : 'owner_agent'
+    const retentionId = input.ownerAgentId ?? input.agentId
+    await retainPatchArtifact.run({ artifactId: input.artifactId, referenceKind: retentionKind,
+      referenceId: retentionId, retainUntil: input.expiresAt }, connection(client))
   }
 }

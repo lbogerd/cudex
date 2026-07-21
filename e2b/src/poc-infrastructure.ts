@@ -1,30 +1,29 @@
-import { execFile } from 'node:child_process'
+import { execa } from 'execa'
 import { createConnection, createServer } from 'node:net'
-import { readFile, open, writeFile } from 'node:fs/promises'
-import { spawn } from 'node:child_process'
+import { readFile, open, readlink, writeFile } from 'node:fs/promises'
+import { resolve } from 'node:path'
 import { HeadBucketCommand, S3Client } from '@aws-sdk/client-s3'
 import WebSocket from 'ws'
 import { parseEnv } from 'node:util'
-import { promisify } from 'node:util'
 import type { PocEnvironment } from './poc-env.js'
 import type { PocRunPaths } from './poc-config.js'
 import { createTrustedRoles, updateRuntimeValue } from './poc-config.js'
 import type { PocTlsMaterial } from './poc-tls.js'
+import { loadCommandOsEnv } from './config/command-env.js'
 
-const exec = promisify(execFile)
+const exec = execa
 
 export interface DockerCommand { executable: string; prefix: string[] }
 
 function baseEnvironment(): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin' }
-  for (const key of ['DOCKER_HOST', 'DOCKER_CONTEXT', 'NODE_EXTRA_CA_CERTS'] as const) {
-    if (process.env[key]) env[key] = process.env[key]
-  }
-  return env
+  const inherited = loadCommandOsEnv()
+  return { PATH: inherited.path, ...(inherited.dockerHost ? { DOCKER_HOST: inherited.dockerHost } : {}),
+    ...(inherited.dockerContext ? { DOCKER_CONTEXT: inherited.dockerContext } : {}),
+    ...(inherited.nodeExtraCaCerts ? { NODE_EXTRA_CA_CERTS: inherited.nodeExtraCaCerts } : {}) }
 }
 
 async function works(executable: string, args: string[]): Promise<boolean> {
-  try { await exec(executable, args, { env: baseEnvironment(), timeout: 15_000 }); return true }
+  try { await exec(executable, args, { env: baseEnvironment(), extendEnv: false, timeout: 15_000 }); return true }
   catch { return false }
 }
 
@@ -41,7 +40,7 @@ function composeArgs(docker: DockerCommand, paths: PocRunPaths, args: string[]):
 
 export async function runCompose(docker: DockerCommand, paths: PocRunPaths, args: string[]): Promise<string> {
   const result = await exec(docker.executable, composeArgs(docker, paths, args), {
-    cwd: paths.repositoryRoot, env: baseEnvironment(), timeout: 180_000, maxBuffer: 4 * 1024 * 1024,
+    cwd: paths.repositoryRoot, env: baseEnvironment(), extendEnv: false, timeout: 180_000, maxBuffer: 4 * 1024 * 1024,
   })
   return result.stdout
 }
@@ -99,7 +98,7 @@ export async function verifyGarage(env: PocEnvironment, runtime: Record<string, 
 export async function runMigrations(paths: PocRunPaths, databaseUrl: string): Promise<void> {
   await exec(process.execPath, [`${paths.e2bRoot}/dist/src/migrate.js`], {
     cwd: paths.repositoryRoot, timeout: 120_000, maxBuffer: 2 * 1024 * 1024,
-    env: { PATH: baseEnvironment().PATH, HOSTED_AGENT_DATABASE_URL: databaseUrl },
+    extendEnv: false, env: { PATH: baseEnvironment().PATH, HOSTED_AGENT_DATABASE_URL: databaseUrl },
   })
 }
 
@@ -141,13 +140,25 @@ export async function startControlService(
     HOSTED_AGENT_PATCH_APPLY_STALE_MS: '20000', HOSTED_AGENT_PATCH_APPLY_RECONCILE_MS: '1000',
     HOSTED_AGENT_TICKET_TTL_MS: '60000', HOSTED_AGENT_SOURCE_MAX_TTL_MS: String(4 * 60 * 60_000),
   }
+  if (env.workspaceMode === 'git-working-set') {
+    // TODO(internal-release, PILOT-003): Each pilot user runs disposable PostgreSQL and Garage locally
+    // because this reuses the proven POC. Replace it with the supported internal control-plane topology.
+    serviceEnv.HOSTED_AGENT_WORKSPACE_MODE = 'git-working-set'
+    // TODO(internal-release, PILOT-014): Pilot cleanup uses the POC inspection operations so exact
+    // resources remain recoverable. Replace them with supported authenticated operational interfaces.
+    serviceEnv.HOSTED_AGENT_POC_INSPECTION = 'true'
+    // TODO(internal-release, PILOT-017): Production reconciliation, quotas, monitoring, backup, and
+    // outage hardening are deferred for named pilot users. Complete that queue before broader rollout.
+  }
   serviceEnv.E2B_VALIDATE_API_KEY = String(env.e2bValidateApiKey)
   if (env.providerCaCertificate) serviceEnv.NODE_EXTRA_CA_CERTS = env.providerCaCertificate
-  const child = spawn(process.execPath, [`${paths.e2bRoot}/dist/src/main.js`], {
-    cwd: paths.repositoryRoot, env: serviceEnv, detached: true, stdio: ['ignore', log.fd, log.fd],
+  const logOutput = log.createWriteStream({ autoClose: false })
+  const child = execa(process.execPath, [`${paths.e2bRoot}/dist/src/main.js`], {
+    cwd: paths.repositoryRoot, env: serviceEnv, extendEnv: false, detached: true,
+    stdin: 'ignore', stdout: logOutput, stderr: logOutput, reject: false,
   })
   await log.close()
-  child.unref()
+  child.nodeChildProcess.unref()
   if (!child.pid) throw new Error('failed to start POC control service')
   await updateRuntimeValue(paths.runtimeEnv, 'POC_SERVICE_PID', String(child.pid))
   return child.pid
@@ -191,8 +202,15 @@ export async function stopControlService(paths: PocRunPaths): Promise<boolean> {
   const pid = Number(runtime.POC_SERVICE_PID ?? '0')
   if (!Number.isSafeInteger(pid) || pid <= 1) return true
   try {
-    const command = (await readFile(`/proc/${pid}/cmdline`)).toString('utf8')
-    if (!command.includes('dist/src/main.js')) throw new Error('refusing to stop a process that is not the POC control service')
+    const [command, environment, cwd] = await Promise.all([
+      readFile(`/proc/${pid}/cmdline`), readFile(`/proc/${pid}/environ`), readlink(`/proc/${pid}/cwd`),
+    ])
+    const tenant = `HOSTED_AGENT_TENANT_ID=poc-${paths.runId}`
+    if (!command.toString('utf8').includes('dist/src/main.js')
+      || !environment.toString('utf8').split('\0').includes(tenant)
+      || resolve(cwd) !== resolve(paths.repositoryRoot)) {
+      throw new Error('refusing to stop a control service without the exact run identity')
+    }
     process.kill(pid, 'SIGTERM')
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT' || (error as NodeJS.ErrnoException).code === 'ESRCH') return true

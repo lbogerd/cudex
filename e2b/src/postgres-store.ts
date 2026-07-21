@@ -1,5 +1,15 @@
 import { createHash } from 'node:crypto'
 import type { Pool, PoolClient } from 'pg'
+import {
+  completeOperation as completeOperationQuery, failOperation as failOperationQuery,
+  getOperationClaim, heartbeatOperation as heartbeatOperationQuery, insertLeaseOperationClaim,
+  insertOperationClaim, lockOperationClaim, recordAllocation as recordAllocationQuery,
+  updateAllocationState as updateAllocationStateQuery, listAllocations as listAllocationsQuery,
+  hasUnreclaimedAllocation as hasUnreclaimedAllocationQuery, bindPrimaryLease, bindResultLease,
+  adoptAllocations, claimStaleOperations as claimStaleOperationsQuery, lockExistingLeases,
+} from './db/queries/journal.queries.js'
+import { begin, commit, lockLeaseSession, lockLeaseTransaction, rollbackQuietly,
+  setLocalLockTimeout, unlockLeaseSessionQuietly } from './db/primitives.js'
 
 const requestHashPattern = /^sha256:[0-9a-f]{64}$/
 const allocationKinds = new Set(['sandbox', 'capture_sandbox', 'provider_snapshot', 'ticket', 'object'])
@@ -153,34 +163,15 @@ export class PostgresJournal {
   async claimOperation(input: OperationClaimInput): Promise<OperationClaim> {
     validateClaim(input)
     return this.transaction(async client => {
+      const params = { operation: input.operation, idempotencyKey: input.idempotencyKey,
+        tenantId: input.tenantId, requestHash: input.requestHash, workerId: input.workerId,
+        operationSubtype: input.operationSubtype ?? null }
       const inserted = input.primaryLeaseId === undefined
-        ? await client.query<{ generation: string }>(`
-            INSERT INTO hosted_agent_operations
-              (operation, idempotency_key, tenant_id, request_hash, state, worker_id, heartbeat_at,
-               operation_subtype)
-            VALUES ($1, $2, $3, $4, 'in_progress', $5, now(), $6)
-            ON CONFLICT (operation, idempotency_key) DO NOTHING
-            RETURNING generation
-          `, [input.operation, input.idempotencyKey, input.tenantId, input.requestHash,
-            input.workerId, input.operationSubtype ?? null])
-        : await client.query<{ generation: string }>(`
-            INSERT INTO hosted_agent_operations
-              (operation, idempotency_key, tenant_id, request_hash, state, worker_id,
-               heartbeat_at, primary_lease_id, operation_subtype)
-            SELECT $1, $2, $3, $4, 'in_progress', $5, now(), lease_id, $7
-            FROM hosted_agent_leases WHERE tenant_id = $3 AND lease_id = $6
-            ON CONFLICT (operation, idempotency_key) DO NOTHING
-            RETURNING generation
-          `, [input.operation, input.idempotencyKey, input.tenantId, input.requestHash,
-            input.workerId, input.primaryLeaseId, input.operationSubtype ?? null])
-      const result = await client.query<OperationRow>(`
-        SELECT tenant_id, operation_subtype, request_hash, state, logical_response, error_code, error_message,
-               generation::text, heartbeat_at, primary_lease_id, result_lease_id
-        FROM hosted_agent_operations
-        WHERE operation = $1 AND idempotency_key = $2
-        FOR UPDATE
-      `, [input.operation, input.idempotencyKey])
-      const row = result.rows[0]
+        ? await insertOperationClaim.run(params, client)
+        : await insertLeaseOperationClaim.run({ ...params, primaryLeaseId: input.primaryLeaseId }, client)
+      const result = await lockOperationClaim.run({ operation: input.operation,
+        idempotencyKey: input.idempotencyKey }, client)
+      const row = result[0] as OperationRow | undefined
       if (!row && input.primaryLeaseId !== undefined) throw new OperationTargetNotFoundError()
       if (!row) throw new Error('operation claim disappeared')
       if (row.tenant_id !== input.tenantId || row.request_hash !== input.requestHash) {
@@ -192,7 +183,7 @@ export class PostgresJournal {
       if (input.primaryLeaseId !== undefined && row.primary_lease_id !== input.primaryLeaseId) {
         throw new OperationRequestMismatchError()
       }
-      return rowToClaim(row, inserted.rowCount === 1)
+      return rowToClaim(row, inserted.length === 1)
     })
   }
 
@@ -208,13 +199,9 @@ export class PostgresJournal {
     const deadline = Date.now() + timeoutMs
     for (;;) {
       options.signal?.throwIfAborted()
-      const result = await this.pool.query<OperationRow>(`
-        SELECT tenant_id, operation_subtype, request_hash, state, logical_response, error_code, error_message,
-               generation::text, heartbeat_at, primary_lease_id, result_lease_id
-        FROM hosted_agent_operations
-        WHERE operation = $1 AND idempotency_key = $2
-      `, [input.operation, input.idempotencyKey])
-      const row = result.rows[0]
+      const result = await getOperationClaim.run({ operation: input.operation,
+        idempotencyKey: input.idempotencyKey }, this.pool)
+      const row = result[0] as OperationRow | undefined
       if (!row || row.tenant_id !== input.tenantId || row.request_hash !== input.requestHash) {
         throw new OperationRequestMismatchError()
       }
@@ -235,12 +222,8 @@ export class PostgresJournal {
     executor: Pick<PoolClient, 'query'> = this.pool): Promise<boolean> {
     validateIdentity(identity)
     validateGeneration(generation); validateWorkerId(workerId)
-    const result = await executor.query(`
-      UPDATE hosted_agent_operations
-      SET heartbeat_at = now()
-      WHERE operation = $1 AND idempotency_key = $2 AND tenant_id = $3
-        AND generation = $4 AND worker_id = $5 AND state = 'in_progress'
-    `, [identity.operation, identity.idempotencyKey, identity.tenantId, generation, workerId])
+    const result = await heartbeatOperationQuery.runWithCounts({ operation: identity.operation,
+      idempotencyKey: identity.idempotencyKey, tenantId: identity.tenantId, generation, workerId }, executor)
     return result.rowCount === 1
   }
 
@@ -250,13 +233,9 @@ export class PostgresJournal {
     const logicalResponse = sanitizeLogicalResponse(response)
     const encodedResponse = JSON.stringify(logicalResponse)
     if (encodedResponse === undefined || Buffer.byteLength(encodedResponse) > 1024 * 1024) throw new Error('invalid logical response')
-    const result = await executor.query(`
-      UPDATE hosted_agent_operations
-      SET state = 'succeeded', logical_response = $6::jsonb, error_code = NULL,
-          error_message = NULL, completed_at = now(), heartbeat_at = now()
-      WHERE operation = $1 AND idempotency_key = $2 AND tenant_id = $3
-        AND generation = $4 AND worker_id = $5 AND state = 'in_progress'
-    `, [identity.operation, identity.idempotencyKey, identity.tenantId, generation, workerId, encodedResponse])
+    const result = await completeOperationQuery.runWithCounts({ operation: identity.operation,
+      idempotencyKey: identity.idempotencyKey, tenantId: identity.tenantId, generation, workerId,
+      logicalResponse: encodedResponse }, executor)
     if (result.rowCount !== 1) throw new OperationOwnershipError()
   }
 
@@ -265,13 +244,9 @@ export class PostgresJournal {
     validateIdentity(identity); validateGeneration(generation); validateWorkerId(workerId)
     if (!errorCode.trim() || Buffer.byteLength(errorCode) > 512) throw new Error('invalid error code')
     if (Buffer.byteLength(errorMessage) > 4096) throw new Error('error message is too large')
-    const result = await executor.query(`
-      UPDATE hosted_agent_operations
-      SET state = 'failed_terminal', logical_response = NULL, error_code = $6,
-          error_message = $7, completed_at = now(), heartbeat_at = now()
-      WHERE operation = $1 AND idempotency_key = $2 AND tenant_id = $3
-        AND generation = $4 AND worker_id = $5 AND state = 'in_progress'
-    `, [identity.operation, identity.idempotencyKey, identity.tenantId, generation, workerId, errorCode, errorMessage])
+    const result = await failOperationQuery.runWithCounts({ operation: identity.operation,
+      idempotencyKey: identity.idempotencyKey, tenantId: identity.tenantId, generation, workerId,
+      errorCode, errorMessage }, executor)
     if (result.rowCount !== 1) throw new OperationOwnershipError()
   }
 
@@ -285,20 +260,11 @@ export class PostgresJournal {
     validateIdentity(identity); validateGeneration(generation); validateWorkerId(workerId)
     if (!allocationKinds.has(allocation.kind)) throw new Error('invalid allocation kind')
     if (!allocation.resourceId.trim() || Buffer.byteLength(allocation.resourceId) > 2048) throw new Error('invalid resource ID')
-    const result = await executor.query<AllocationRow>(`
-      INSERT INTO hosted_agent_operation_allocations
-        (operation, idempotency_key, tenant_id, allocation_kind, resource_id, lease_id, state, metadata)
-      SELECT operation, idempotency_key, tenant_id, $6, $7, $8, 'allocated', $9::jsonb
-      FROM hosted_agent_operations
-      WHERE operation = $1 AND idempotency_key = $2 AND tenant_id = $3
-        AND generation = $4 AND worker_id = $5 AND state = 'in_progress'
-      ON CONFLICT (operation, idempotency_key, allocation_kind, resource_id)
-      DO UPDATE SET updated_at = hosted_agent_operation_allocations.updated_at
-      RETURNING allocation_id::text, allocation_kind, resource_id, lease_id, state, metadata,
-                allocated_at, updated_at, reclaimed_at
-    `, [identity.operation, identity.idempotencyKey, identity.tenantId, generation, workerId, allocation.kind,
-      allocation.resourceId, allocation.leaseId ?? null, JSON.stringify(allocation.metadata ?? {})])
-    const row = result.rows[0]
+    const result = await recordAllocationQuery.run({ operation: identity.operation,
+      idempotencyKey: identity.idempotencyKey, tenantId: identity.tenantId, generation, workerId,
+      allocationKind: allocation.kind, resourceId: allocation.resourceId,
+      leaseId: allocation.leaseId ?? null, metadata: JSON.stringify(allocation.metadata ?? {}) }, executor)
+    const row = result[0] as AllocationRow | undefined
     if (!row) throw new OperationOwnershipError()
     return allocationFromRow(row)
   }
@@ -312,25 +278,10 @@ export class PostgresJournal {
     executor: Pick<PoolClient, 'query'> = this.pool,
   ): Promise<OperationAllocation> {
     validateIdentity(identity); validateGeneration(generation); validateWorkerId(workerId)
-    const result = await executor.query<AllocationRow>(`
-      UPDATE hosted_agent_operation_allocations AS allocation
-      SET state = $7,
-          reclaimed_at = CASE WHEN $7 = 'reclaimed' THEN now() ELSE NULL END
-      FROM hosted_agent_operations AS operation
-      WHERE allocation.allocation_id = $6::bigint
-        AND allocation.operation = operation.operation
-        AND allocation.idempotency_key = operation.idempotency_key
-        AND allocation.tenant_id = operation.tenant_id
-        AND operation.operation = $1 AND operation.idempotency_key = $2
-        AND operation.tenant_id = $3 AND operation.generation = $4
-        AND operation.worker_id = $5
-        AND operation.state = 'in_progress'
-      RETURNING allocation.allocation_id::text, allocation.allocation_kind,
-                allocation.resource_id, allocation.lease_id, allocation.state,
-                allocation.metadata, allocation.allocated_at, allocation.updated_at,
-                allocation.reclaimed_at
-    `, [identity.operation, identity.idempotencyKey, identity.tenantId, generation, workerId, allocationId, state])
-    const row = result.rows[0]
+    const result = await updateAllocationStateQuery.run({ operation: identity.operation,
+      idempotencyKey: identity.idempotencyKey, tenantId: identity.tenantId, generation, workerId,
+      allocationId, state }, executor)
+    const row = result[0] as AllocationRow | undefined
     if (!row) throw new OperationOwnershipError()
     return allocationFromRow(row)
   }
@@ -339,15 +290,9 @@ export class PostgresJournal {
     executor: Pick<PoolClient, 'query'> = this.pool): Promise<OperationAllocation[]> {
     validateIdentity(identity)
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 10_001) throw new Error('invalid allocation limit')
-    const result = await executor.query<AllocationRow>(`
-      SELECT allocation_id::text, allocation_kind, resource_id, lease_id, state,
-             metadata, allocated_at, updated_at, reclaimed_at
-      FROM hosted_agent_operation_allocations
-      WHERE operation = $1 AND idempotency_key = $2 AND tenant_id = $3
-      ORDER BY allocation_id
-      LIMIT $4
-    `, [identity.operation, identity.idempotencyKey, identity.tenantId, limit])
-    return result.rows.map(allocationFromRow)
+    const result = await listAllocationsQuery.run({ operation: identity.operation,
+      idempotencyKey: identity.idempotencyKey, tenantId: identity.tenantId, limit }, executor)
+    return result.map(row => allocationFromRow(row as AllocationRow))
   }
 
   /** Read-only reconciliation guard: provider inventory must not reclaim a resource owned by any unfinished operation. */
@@ -355,17 +300,7 @@ export class PostgresJournal {
     executor: Pick<PoolClient, 'query'> = this.pool): Promise<boolean> {
     if (!allocationKinds.has(allocationKind)) throw new Error('invalid allocation kind')
     if (!resourceId.trim() || Buffer.byteLength(resourceId) > 2048) throw new Error('invalid resource ID')
-    const result = await executor.query(`
-      SELECT 1
-      FROM hosted_agent_operation_allocations AS allocation
-      JOIN hosted_agent_operations AS operation
-        USING (operation, idempotency_key, tenant_id)
-      WHERE allocation.allocation_kind = $1 AND allocation.resource_id = $2
-        AND allocation.state <> 'reclaimed'
-        AND operation.state = 'in_progress'
-      LIMIT 1
-    `, [allocationKind, resourceId])
-    return result.rowCount === 1
+    return (await hasUnreclaimedAllocationQuery.run({ allocationKind, resourceId }, executor)).length === 1
   }
 
   async bindLeaseAndAdoptAllocations(
@@ -384,26 +319,15 @@ export class PostgresJournal {
       throw new Error('invalid allocation IDs')
     }
     const bind = async (client: PoolClient) => {
-      const operation = await client.query(`
-        UPDATE hosted_agent_operations
-        SET primary_lease_id = $6
-        WHERE operation = $1 AND idempotency_key = $2 AND tenant_id = $3
-          AND generation = $4 AND worker_id = $5 AND state = 'in_progress'
-          AND (primary_lease_id IS NULL OR primary_lease_id = $6)
-      `, [identity.operation, identity.idempotencyKey, identity.tenantId, generation, workerId, leaseId])
+      const operation = await bindPrimaryLease.runWithCounts({ operation: identity.operation,
+        idempotencyKey: identity.idempotencyKey, tenantId: identity.tenantId, generation, workerId, leaseId }, client)
       if (operation.rowCount !== 1) throw new OperationOwnershipError()
       if (uniqueIds.length === 0) return []
-      const allocations = await client.query<AllocationRow>(`
-        UPDATE hosted_agent_operation_allocations
-        SET lease_id = $4, state = 'adopted'
-        WHERE operation = $1 AND idempotency_key = $2 AND tenant_id = $3
-          AND allocation_id = ANY($5::bigint[])
-          AND (state IN ('allocated', 'reclaim_pending') OR (state = 'adopted' AND lease_id = $4))
-        RETURNING allocation_id::text, allocation_kind, resource_id, lease_id, state,
-                  metadata, allocated_at, updated_at, reclaimed_at
-      `, [identity.operation, identity.idempotencyKey, identity.tenantId, leaseId, uniqueIds])
-      if (allocations.rowCount !== uniqueIds.length) throw new OperationOwnershipError()
-      return allocations.rows.map(allocationFromRow)
+      const allocations = await adoptAllocations.run({ operation: identity.operation,
+        idempotencyKey: identity.idempotencyKey, tenantId: identity.tenantId, leaseId,
+        allocationIds: uniqueIds }, client)
+      if (allocations.length !== uniqueIds.length) throw new OperationOwnershipError()
+      return allocations.map(row => allocationFromRow(row as AllocationRow))
     }
     return executor ? bind(executor) : this.transaction(bind)
   }
@@ -418,26 +342,16 @@ export class PostgresJournal {
       throw new Error('invalid allocation IDs')
     }
     const bind = async (client: PoolClient) => {
-      const result = await client.query(`
-        UPDATE hosted_agent_operations
-        SET result_lease_id = $6
-        WHERE operation = $1 AND idempotency_key = $2 AND tenant_id = $3
-          AND generation = $4 AND worker_id = $5 AND state = 'in_progress'
-          AND (result_lease_id IS NULL OR result_lease_id = $6)
-      `, [identity.operation, identity.idempotencyKey, identity.tenantId, generation, workerId, resultLeaseId])
+      const result = await bindResultLease.runWithCounts({ operation: identity.operation,
+        idempotencyKey: identity.idempotencyKey, tenantId: identity.tenantId, generation, workerId,
+        leaseId: resultLeaseId }, client)
       if (result.rowCount !== 1) throw new OperationOwnershipError()
       if (uniqueIds.length === 0) return []
-      const allocations = await client.query<AllocationRow>(`
-        UPDATE hosted_agent_operation_allocations
-        SET lease_id = $4, state = 'adopted'
-        WHERE operation = $1 AND idempotency_key = $2 AND tenant_id = $3
-          AND allocation_id = ANY($5::bigint[])
-          AND (state IN ('allocated', 'reclaim_pending') OR (state = 'adopted' AND lease_id = $4))
-        RETURNING allocation_id::text, allocation_kind, resource_id, lease_id, state,
-                  metadata, allocated_at, updated_at, reclaimed_at
-      `, [identity.operation, identity.idempotencyKey, identity.tenantId, resultLeaseId, uniqueIds])
-      if (allocations.rowCount !== uniqueIds.length) throw new OperationOwnershipError()
-      return allocations.rows.map(allocationFromRow)
+      const allocations = await adoptAllocations.run({ operation: identity.operation,
+        idempotencyKey: identity.idempotencyKey, tenantId: identity.tenantId, leaseId: resultLeaseId,
+        allocationIds: uniqueIds }, client)
+      if (allocations.length !== uniqueIds.length) throw new OperationOwnershipError()
+      return allocations.map(row => allocationFromRow(row as AllocationRow))
     }
     return executor ? bind(executor) : this.transaction(bind)
   }
@@ -467,43 +381,19 @@ export class PostgresJournal {
       throw new Error('invalid excluded operations')
     }
     return this.transaction(async client => {
-      const result = await client.query<StaleRow>(`
-        WITH candidates AS (
-          SELECT operation, idempotency_key, tenant_id, worker_id
-          FROM hosted_agent_operations
-          WHERE state = 'in_progress'
-            AND COALESCE(heartbeat_at, started_at) < $1
-            AND ($4::text IS NULL OR tenant_id = $4)
-            AND ($5::text IS NULL OR operation = $5)
-            AND ($6::text IS NULL OR ($6 = 'none' AND operation_subtype IS NULL)
-              OR operation_subtype = $6)
-            AND ($7::text[] IS NULL OR NOT (operation = ANY($7)))
-          ORDER BY COALESCE(heartbeat_at, started_at), operation, idempotency_key
-          FOR UPDATE SKIP LOCKED
-          LIMIT $2
-        )
-        UPDATE hosted_agent_operations AS operation
-        SET generation = operation.generation + 1, worker_id = $3,
-            heartbeat_at = now()
-        FROM candidates
-        WHERE operation.operation = candidates.operation
-          AND operation.idempotency_key = candidates.idempotency_key
-          AND operation.tenant_id = candidates.tenant_id
-        RETURNING operation.operation, operation.idempotency_key, operation.tenant_id,
-                  operation.operation_subtype, operation.request_hash, operation.generation::text,
-                  candidates.worker_id AS previous_worker_id, operation.worker_id,
-                  operation.primary_lease_id, operation.result_lease_id
-      `, [staleBefore, limit, workerId, tenantId ?? null, operationFilter ?? null,
-        operationSubtypeFilter ?? null, excludedOperations ?? null])
-      return result.rows.map(row => ({
+      const result = await claimStaleOperationsQuery.run({ staleBefore, limit, workerId,
+        tenantId: tenantId ?? null, operationFilter: operationFilter ?? null,
+        subtypeFilter: operationSubtypeFilter ?? null,
+        excludedOperations: excludedOperations ?? null }, client)
+      return result.map(row => ({
         operation: row.operation,
-        operationSubtype: row.operation_subtype,
+        operationSubtype: row.operation_subtype as 'child' | null,
         idempotencyKey: row.idempotency_key,
         tenantId: row.tenant_id,
         requestHash: row.request_hash,
         generation: Number(row.generation),
         previousWorkerId: row.previous_worker_id,
-        workerId: row.worker_id,
+        workerId: row.worker_id!,
         primaryLeaseId: row.primary_lease_id,
         resultLeaseId: row.result_lease_id,
       }))
@@ -520,16 +410,11 @@ export class PostgresJournal {
       .sort((left, right) => left < right ? -1 : left > right ? 1 : 0)
     return this.transaction(async client => {
       for (const leaseId of sorted) {
-        await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [`hosted-agent:lease:${tenantId}:${leaseId}`])
+        await lockLeaseTransaction(client, `hosted-agent:lease:${tenantId}:${leaseId}`)
       }
       if (sorted.length > 0) {
-        const existing = await client.query<{ lease_id: string }>(`
-          SELECT lease_id FROM hosted_agent_leases
-          WHERE tenant_id = $1 AND lease_id = ANY($2::text[])
-          ORDER BY lease_id
-          FOR UPDATE
-        `, [tenantId, sorted])
-        if (existing.rowCount !== sorted.length) throw new Error('lease missing')
+        const existing = await lockExistingLeases.run({ tenantId, leaseIds: sorted }, client)
+        if (existing.length !== sorted.length) throw new Error('lease missing')
       }
       return fn(client)
     })
@@ -552,15 +437,14 @@ export class PostgresJournal {
     const locked: string[] = []
     try {
       for (const key of keys) {
-        await client.query('SELECT pg_advisory_lock(hashtextextended($1, 0))', [key])
+        await lockLeaseSession(client, key)
         locked.push(key)
       }
       return await fn(client)
     } finally {
-      await client.query('ROLLBACK').catch(() => undefined)
+      await rollbackQuietly(client)
       for (const key of locked.reverse()) {
-        await client.query('SELECT pg_advisory_unlock(hashtextextended($1, 0))', [key])
-          .catch(() => undefined)
+        await unlockLeaseSessionQuietly(client, key)
       }
       client.release()
     }
@@ -595,21 +479,21 @@ export class PostgresJournal {
       keys.add(`hosted-agent:provider:${JSON.stringify([resource.kind, resource.resourceId])}`)
     }
     const sorted = [...keys].sort()
-    await executor.query("SET LOCAL lock_timeout = '30s'")
+    await setLocalLockTimeout(executor)
     for (const key of sorted) {
-      await executor.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 0))', [key])
+      await lockLeaseTransaction(executor, key)
     }
   }
 
   private async transaction<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
     const client = await this.pool.connect()
     try {
-      await client.query('BEGIN')
+      await begin(client)
       const result = await fn(client)
-      await client.query('COMMIT')
+      await commit(client)
       return result
     } catch (error) {
-      await client.query('ROLLBACK').catch(() => undefined)
+      await rollbackQuietly(client)
       throw error
     } finally {
       client.release()

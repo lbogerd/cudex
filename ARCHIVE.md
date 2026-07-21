@@ -5,6 +5,128 @@ architecture decisions, and spike results for the hosted-agent E2B backend. It
 is reference material, not a work queue. Remaining implementation work is in
 [`TODO.md`](TODO.md).
 
+## Trusted coworker pilot decision (2026-07-20)
+
+The accepted pilot interface is `cudex` from one selected Git working tree on a
+trusted Linux/x86_64 coworker machine. It projects tracked and non-ignored
+untracked files without `.git` or ignored files, creates one synthetic hosted
+baseline, launches the standard Codex TUI with approval fixed to `never`, and
+automatically applies a conflict-free hosted root result without staging or
+committing. Local PostgreSQL and Garage remain disposable per run, release
+artifacts come from a trusted shared filesystem, existing Codex authentication
+is copied only into the isolated runtime, and one run per user is permitted.
+
+The fixed POC commands remain maintainer diagnostics. Pilot shortcuts are
+tracked by stable PILOT-001 through PILOT-017 IDs in README/TODO/code, and the
+delivery branch is `cudex/coworker-pilot` with reviewable non-force-pushed
+commits. Release publication, privileged live acceptance, the fresh-coworker
+trial, and final approval remain human-in-the-loop work.
+
+The documentation baseline includes the intentionally reviewed top-level
+README, a root ignore policy, a per-commit contributor checklist, and an
+automated registry consistency test. The focused build and registry test passed
+on 2026-07-20 before the baseline commit.
+
+Release/setup foundation now uses strict version-1 manifests, validates and
+atomically caches the four shared release files, rejects revision/checksum/mode
+and platform mismatches, and stores XDG configuration separately from the API
+credential with owner-only permissions. Doctor validates the cached release,
+installed Cudex revision, Docker, Git, and existing Codex auth; its opt-in
+template check uses the live canary. Device login writes only to the isolated
+Cudex Codex home. The installer copies an explicit safe runtime file set and
+does not copy the developer POC `.env` or auth directory.
+
+Focused config/release/CLI/installer/registry checks passed, including a complete
+installation under temporary HOME/XDG roots. The full default suite passed with
+337 tests discovered: 211 passed and 126 PostgreSQL-gated cases skipped.
+
+Git working-set projection now uses one NUL-delimited selector for `cudex files`
+and uploads, preserves bytes/modes/safe relative symlinks and the selected `-C`
+root, produces deterministic canonical archives, and rejects submodules, nested
+repositories, special files, `.git` traversal, unsafe links, and quota excess.
+Coverage includes binary data, ignored and tracked files, deletions, spaces,
+Unicode, LF, and leading-dash names.
+
+The provider has an opt-in `git-working-set` transfer mode; its default is
+unchanged. Pilot materialization creates one fixed synthetic commit in a
+separate `/workspace/.cudex-git` directory. Projected exports retain additions,
+deletions, and mode changes while excluding ignored generated output and Git
+metadata. Template build and live verification now require Git. Focused transfer
+tests and the full default suite passed: 341 discovered, 215 passed, and 126
+PostgreSQL-gated cases skipped.
+
+The generalized runner now acquires one XDG runtime lock, validates release,
+configuration, auth, Docker, ports, and the Git projection, saves the immutable
+base archive/manifest, starts disposable PostgreSQL and Garage, migrates and
+starts the TLS service in `git-working-set` mode, uploads the source, generates
+strict hosted Codex configuration, and launches the provenance-matched standard
+TUI with approval fixed to `never`. It discovers the exact ownerless root from
+the run tenant, deletes its thread through the standard app-server API, performs
+exact POC-derived provider/service/volume cleanup, and writes separate bounded
+session/apply/cleanup reports.
+
+SIGINT/SIGTERM are forwarded only after TUI allocation and preserve their
+130/143 statuses after successful cleanup. Status and cleanup use the non-secret
+current pointer plus exact run identity; a cleanup failure retains recovery
+state. The fixed POC entrypoint was made import-safe and its public diagnostic
+commands remain unchanged. Focused runner/report/POC regression tests passed.
+The complete default suite then passed with 345 tests discovered: 219 passed
+and 126 PostgreSQL-gated cases skipped.
+
+The coworker return path now creates an explicitly internal root artifact only
+for an ownerless lease with the exact uploaded source snapshot. Artifact
+ownership is nullable without a schema change: child artifacts retain their
+`owner_agent` reference and unchanged owner authorization, while root artifacts
+retain themselves through the exact Codex thread. The local resolver verifies
+the exact run tenant and provider marker, sole root, source/base/latest lineage,
+logical response, retention graph, snapshot graph, object locations, sizes,
+checksums, canonical manifests, and content bytes directly against disposable
+PostgreSQL and Garage. No patch download endpoint was added.
+
+Local application reparses the artifact, proves its base equals the immutable
+uploaded projection, plans the complete three-way result before mutation,
+rejects Git metadata and ignored additions, and cannot remove ignored
+descendants during directory changes. It stages exact content in an owner-only
+same-filesystem sibling journal, revalidates the checkout, applies only changed
+paths, and rolls every completed operation back in reverse on failure. A
+concurrent post-image or unprovable rollback retains the journal and requires
+manual recovery; ordinary conflicts and proven failures leave no partial Cudex
+mutation. Git staging and commits are never performed.
+
+Lifecycle signals are installed before allocation, forwarded to the TUI with a
+bounded SIGKILL escalation, and retained through cleanup. Finalization and
+report failures cannot bypass cleanup. An incomplete cleanup preserves the
+exact per-run configuration, credentials, service, and Docker state required by
+`cudex cleanup`; proven cleanup scrubs runtime credentials, Codex auth, TLS,
+source/base material, recovery state, and volumes. Focused tests cover TUI flag
+forwarding and signal escalation, local success/no-change/conflict/concurrency,
+ignored descendants, rollback, retained recovery journals, and report bounds.
+
+A disposable PostgreSQL 17 run passed the final complete 356-test suite with 355
+passes, no failures, and one environment-gated skip. The new
+fake-provider/fake-TUI acceptance exercised durable ownerless-root export,
+exact byte resolution, automatic local apply visible in `git diff`, and lease
+release. The temporary database container was removed after verification.
+
+Post-feature verification added a complete exit-precedence table, TUI signal
+forwarding/escalation coverage, and control-service teardown tests that require
+the exact run tenant, command, and working directory before signaling a PID.
+The shortcut consistency test now requires a one-to-one match between every
+open registry row and every active code comment. The opt-in Docker/Compose
+infrastructure test passed 2/2, including repeatable migrations, Garage object
+round-trip, TLS source upload, and cleanup; a final inventory found no matching
+containers or volumes.
+
+A maintainer-only pre-coworker walkthrough now provides one ordered gate for
+candidate provenance, automated and database-backed tests, release/template
+verification, disposable-checkout projection, successful return, conflict and
+interrupt safety, exact cleanup, the root/child proof, redaction review, and
+the remaining privileged fault-injection evidence. It explicitly keeps H3 open
+when exact sandbox-loss injection is unavailable rather than delegating that
+risk to a coworker. Documentation verification passed the build, shortcut
+registry test, and all 358 default tests (230 passed, 128 environment-gated
+skips, no failures) on 2026-07-20.
+
 ## Dedicated CubeSandbox code-mode runtime foundation (2026-07-19)
 
 The Linux hosted path now packages two provenance-bound binaries from the same
@@ -2305,3 +2427,21 @@ sandbox_template = "e2b-general-v1"
 Set `CODEX_HOSTED_AGENT_TOKEN` in the Codex process. Every hosted role requires a
 non-empty `sandbox_template`. Keep the feature gated until the acceptance matrix
 in [`TODO.md`](TODO.md) passes.
+
+## Dependency-refactor baseline (2026-07-20)
+
+Before the Hono/Zod/T3 Env/PgTyped/Pino/Execa refactor, the clean tracked
+`cudex/coworker-pilot` branch passed `npm ci`, the TypeScript build, and all
+environment-independent tests. The ordinary run reported 358 tests: 230 passed,
+128 PostgreSQL-gated skips, and no failures. Against an isolated PostgreSQL 17
+container, 357 passed, one Docker-POC test remained deliberately gated, and none
+failed. Completion evidence should compare against these counts and explain test
+replacements introduced by the new boundaries.
+
+Final acceptance reports 376 tests. Without PostgreSQL, 246 pass and 130 are
+environment-gated; against the isolated PostgreSQL 17 database, 375 pass and the
+Docker-Compose POC remains the sole deliberate skip. The 18 additional tests
+cover scoped environment parsing, Pino redaction/context, JSON content-type
+enforcement, PgTyped generation/cleanup/staleness, command environment
+allowlisting, and the strict raw-SQL architecture boundary. No baseline test was
+removed; command tests now exercise the compiled TypeScript entry points.

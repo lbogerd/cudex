@@ -1,10 +1,8 @@
-import { execFile } from 'node:child_process'
+import { execa } from 'execa'
 import { X509Certificate } from 'node:crypto'
 import { chmod, lstat, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { isAbsolute, join, resolve } from 'node:path'
-import { promisify } from 'node:util'
-
-const exec = promisify(execFile)
+const exec = execa
 const systemCaPath = '/etc/ssl/certs/ca-certificates.crt'
 
 export interface PocTlsMaterial {

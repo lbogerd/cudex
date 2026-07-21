@@ -1,55 +1,10 @@
-export type SnapshotSource =
-  | { type: 'rootWorkspace'; cwd: string; workspaceRoots: string[] }
-  | { type: 'sourceSnapshot'; sourceSnapshotId: string; checksum: string }
-  | { type: 'agentEnvironment'; ownerLeaseId: string }
-  | { type: 'durableSnapshot'; snapshotId: string }
+import type { ToolPolicy } from './contracts/lifecycle.js'
 
-export interface ProvisionRequest {
-  agentId: string; ownerAgentId: string | null; agentType: string; sandboxTemplate: string
-  source: SnapshotSource; idempotencyKey: string
-}
-export interface ReconnectRequest { leaseId: string; idempotencyKey: string }
-export interface CheckpointRequest { leaseId: string; idempotencyKey: string }
-export interface ReleaseRequest { leaseId: string; idempotencyKey: string }
-export interface RetentionRequest {
-  agentId: string; leaseId: string; baseSnapshotId: string; latestSnapshotId: string
-  artifactId: string | null; expectedRevision: number | null
-}
-export interface RetentionResponse { revision: number; desiredHash: string }
-export interface ReferenceClearRequest {
-  agentId: string; leaseId: string; expectedRevision: number
-}
-export interface PatchExportRequest {
-  leaseId: string
-  agentId: string
-  baseSnapshotId: string
-  idempotencyKey: string
-}
-export interface AgentPatchArtifact {
-  artifactId: string
-  agentId: string
-  baseSnapshotId: string
-  checksum: string
-  changedFiles: number
-  sizeBytes: number
-}
-export interface PatchApplyRequest {
-  targetLeaseId: string
-  artifactId: string
-  idempotencyKey: string
-}
-export type PatchApplyResult =
-  | { type: 'applied'; checkpoint: { snapshotId: string } }
-  | { type: 'conflict'; paths: string[] }
-  | { type: 'rejected'; reason: string }
-export interface ToolPolicy {
-  allowedDomains: string[]
-  allowedTools: Array<{ name: string; namespace: string | null }>
-}
-export interface ProvisionedAgent {
-  leaseId: string; environmentId: string; connection: { execServerUrl: string }; cwd: string
-  workspaceRoots: string[]; baseSnapshotId: string; connectionGeneration: number; toolPolicy: ToolPolicy
-}
+export type {
+  AgentPatchArtifact, CheckpointRequest, PatchApplyRequest, PatchApplyResult, PatchExportRequest,
+  ProvisionedAgent, ProvisionRequest, ReconnectRequest, ReferenceClearRequest, ReleaseRequest,
+  RetentionRequest, RetentionResponse, SnapshotSource, ToolPolicy,
+} from './contracts/lifecycle.js'
 export interface LeaseRecord {
   leaseId: string; environmentId: string; sandboxId: string; agentId: string
   ownerAgentId: string | null; template: string; cwd: string; workspaceRoots: string[]

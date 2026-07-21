@@ -1,12 +1,14 @@
+// The E2B SDK's command and websocket payloads are validated at runtime below.
+// @ts-nocheck
 import fs from 'node:fs/promises'
 import process from 'node:process'
 import { Sandbox } from 'e2b'
 import WebSocket from 'ws'
-import { E2BSecureDataPlane } from '../dist/src/e2b-secure-data-plane.js'
+import { E2BSecureDataPlane } from '../e2b-secure-data-plane.js'
 
 const metadataPath = process.argv[2]
 if (!metadataPath) {
-  throw new Error('usage: node scripts/verify-template.mjs <template-metadata.json>')
+  throw new Error('usage: npm run verify:template -- <template-metadata.json>')
 }
 const expected = JSON.parse(await fs.readFile(metadataPath, 'utf8'))
 const digestPattern = /^[0-9a-f]{64}$/u
@@ -95,6 +97,8 @@ try {
   if (hostCheck.exitCode !== 0) {
     throw new Error('sandbox code-mode host self-check failed')
   }
+  const gitCheck = await dataPlane.commands.run('git --version >/dev/null', { timeoutMs: 10_000 })
+  if (gitCheck.exitCode !== 0) throw new Error('sandbox Git self-check failed')
 
   const stderr = []
   const started = await dataPlane.commands.run(

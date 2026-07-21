@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
-import { rm } from 'node:fs/promises'
-import { dirname, resolve } from 'node:path'
+import { spawn } from 'node:child_process'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { dirname, join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import test from 'node:test'
 import { S3BlobStore } from '../src/blob-store.js'
@@ -9,12 +11,46 @@ import { archiveWorkspace } from '../src/ingress.js'
 import { startServer } from '../src/http-server.js'
 import { createRunId, generateRuntimeSecrets, pocRunPaths, prepareRunFiles } from '../src/poc-config.js'
 import type { PocEnvironment } from '../src/poc-env.js'
-import { detectDocker, readRuntimeEnvironment, runCompose, runMigrations, startCompose, stopCompose, verifyGarage } from '../src/poc-infrastructure.js'
+import { detectDocker, readRuntimeEnvironment, runCompose, runMigrations, startCompose, stopCompose,
+  stopControlService, verifyGarage } from '../src/poc-infrastructure.js'
+import type { PocRunPaths } from '../src/poc-config.js'
 import { createSourceSnapshotRuntime } from '../src/source-runtime.js'
 import { uploadSourceSnapshot } from '../src/source-snapshot-client.js'
 import { generatePocTls } from '../src/poc-tls.js'
 
 const live = process.env.POC_DOCKER_TEST === 'true'
+const waitForExit = async (child: ReturnType<typeof spawn>): Promise<void> => {
+  if (child.exitCode !== null || child.signalCode !== null) return
+  await new Promise<void>(resolveExit => child.once('exit', () => resolveExit()))
+}
+
+test('control-service teardown requires the exact run tenant, command, and working directory', async () => {
+  const repositoryRoot = resolve(dirname(new URL(import.meta.url).pathname), '..', '..', '..')
+  const directory = await mkdtemp(join(tmpdir(), 'cudex-stop-service-'))
+  const paths = { runId: '20260720140000-aaaaaaaaaaaa', repositoryRoot,
+    runtimeEnv: join(directory, 'runtime.env') } as PocRunPaths
+  const unrelated = spawn('sleep', ['30'])
+  try {
+    assert.ok(unrelated.pid)
+    await writeFile(paths.runtimeEnv, `POC_SERVICE_PID=${unrelated.pid}\n`)
+    await assert.rejects(stopControlService(paths), /exact run identity/u)
+    assert.doesNotThrow(() => process.kill(unrelated.pid!, 0))
+  } finally {
+    unrelated.kill('SIGKILL'); await waitForExit(unrelated)
+  }
+
+  const service = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)', 'dist/src/main.js'], {
+    cwd: repositoryRoot, env: { PATH: process.env.PATH,
+      HOSTED_AGENT_TENANT_ID: `poc-${paths.runId}` },
+  })
+  try {
+    assert.ok(service.pid); await writeFile(paths.runtimeEnv, `POC_SERVICE_PID=${service.pid}\n`)
+    assert.equal(await stopControlService(paths), true)
+  } finally {
+    service.kill('SIGKILL'); await waitForExit(service)
+    await rm(directory, { recursive: true, force: true })
+  }
+})
 
 test('POC Compose provides repeatable PostgreSQL migrations and Garage object storage', { skip: !live }, async () => {
   const e2bRoot = resolve(dirname(new URL(import.meta.url).pathname), '..', '..')

@@ -2,10 +2,8 @@ import { chmod, copyFile, lstat, mkdir, mkdtemp, readFile, rm, writeFile } from 
 import { dirname, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import process from 'node:process'
-import { spawn } from 'node:child_process'
+import { execa } from 'execa'
 import { request as httpsRequest } from 'node:https'
-import { execFile } from 'node:child_process'
-import { promisify } from 'node:util'
 import { parseEnv } from 'node:util'
 import { copyAuthJsonToRuntime, createCodexProcessEnvironment, redactSecrets, removeRuntimeAuth, validateAuthJsonFile } from './poc-auth.js'
 import { createRunId, generateCodexConfiguration, generateRuntimeSecrets, pocRunPaths, prepareRunFiles,
@@ -26,14 +24,15 @@ import { assertHostedModelCompatibility, deleteThreadTree, initializeAndReadAcco
 import { evaluatePocCleanupInspection, evaluatePocFunctionalInspection, openPocDatabaseInspector,
   PocProviderInspector, retainedFilesAreRedacted, serializePocReport,
   type PocDatabaseInspection, type PocFunctionalInspection } from './poc-inspector.js'
+import { loadCommandOsEnv } from './config/command-env.js'
 
 const e2bRoot = resolve(dirname(new URL(import.meta.url).pathname), '..', '..')
 const repositoryRoot = resolve(e2bRoot, '..')
 const envPath = `${e2bRoot}/poc/.env`
 const pointerPath = `${e2bRoot}/.state/poc/current`
-const exec = promisify(execFile)
+const exec = execa
 
-function existingTlsMaterial(paths: PocRunPaths): PocTlsMaterial {
+export function existingTlsMaterial(paths: PocRunPaths): PocTlsMaterial {
   return { caCertificatePath: `${paths.tlsDirectory}/ca.crt`, caKeyPath: `${paths.tlsDirectory}/ca.key`,
     serverCertificatePath: `${paths.tlsDirectory}/server.crt`, serverKeyPath: `${paths.tlsDirectory}/server.key`,
     combinedCaBundlePath: `${paths.tlsDirectory}/combined-ca.pem` }
@@ -57,15 +56,14 @@ async function ensureProviderProcessEnvironment(env: PocEnvironment, command: st
   const providerCa = env.providerCaCertificate
     ? await validateProviderCaCertificate(repositoryRoot, env.providerCaCertificate) : undefined
   const validateApiKey = String(env.e2bValidateApiKey)
-  if ((providerCa === undefined || process.env.NODE_EXTRA_CA_CERTS === providerCa)
-    && process.env.E2B_VALIDATE_API_KEY === validateApiKey) return false
-  const child = spawn(process.execPath, [process.argv[1]!, command], { cwd: repositoryRoot, stdio: 'inherit',
-    env: { ...process.env, E2B_VALIDATE_API_KEY: validateApiKey,
+  const inherited = loadCommandOsEnv()
+  if ((providerCa === undefined || inherited.nodeExtraCaCerts === providerCa)
+    && inherited.e2bValidateApiKey === validateApiKey) return false
+  const child = execa(process.execPath, [process.argv[1]!, command], { cwd: repositoryRoot, stdio: 'inherit', reject: false, extendEnv: false,
+    env: { PATH: inherited.path, E2B_VALIDATE_API_KEY: validateApiKey,
       ...(providerCa ? { NODE_EXTRA_CA_CERTS: providerCa } : {}) } })
-  const code = await new Promise<number | null>((resolveExit, reject) => {
-    child.once('error', reject); child.once('exit', resolveExit)
-  })
-  process.exitCode = code ?? 1
+  const result = await child
+  process.exitCode = result.exitCode ?? 1
   return true
 }
 
@@ -98,9 +96,9 @@ async function preflight(configured?: PocEnvironment): Promise<void> {
     } finally { await appServer.stop() }
   } finally { await rm(temporaryRoot, { recursive: true, force: true }) }
   if (env.verifyTemplate) {
-    await exec(process.execPath, [`${e2bRoot}/scripts/verify-template.mjs`, env.templateMetadata], {
-      cwd: repositoryRoot, timeout: 300_000, maxBuffer: 2 * 1024 * 1024,
-      env: { PATH: process.env.PATH, E2B_API_KEY: env.e2bApiKey, E2B_API_URL: env.e2bApiUrl,
+    await exec(process.execPath, [`${e2bRoot}/dist/src/commands/verify-template.js`, env.templateMetadata], {
+      cwd: repositoryRoot, timeout: 300_000, maxBuffer: 2 * 1024 * 1024, extendEnv: false,
+      env: { PATH: loadCommandOsEnv().path, E2B_API_KEY: env.e2bApiKey, E2B_API_URL: env.e2bApiUrl,
       E2B_DOMAIN: env.e2bDomain, E2B_VALIDATE_API_KEY: String(env.e2bValidateApiKey),
         ...(env.providerCaCertificate ? { NODE_EXTRA_CA_CERTS: env.providerCaCertificate } : {}) },
     })
@@ -181,7 +179,7 @@ async function removeCurrentPointer(paths: PocRunPaths): Promise<void> {
   if (current.trim() === paths.runId) await rm(pointerPath, { force: true })
 }
 
-type CleanupRun = Pick<CompleteRun, 'env' | 'paths' | 'docker' | 'tls' | 'runtime'>
+export type CleanupRun = Pick<CompleteRun, 'env' | 'paths' | 'docker' | 'tls' | 'runtime'>
 
 function providerInspector(run: CleanupRun): PocProviderInspector {
   return new PocProviderInspector({ apiKey: run.env.e2bApiKey, apiUrl: run.env.e2bApiUrl,
@@ -262,7 +260,7 @@ async function environmentIdForThread(run: CompleteRun, threadId: string): Promi
   } finally { await opened.close() }
 }
 
-interface CleanupOutcome {
+export interface CleanupOutcome {
   serviceCleanupComplete: boolean
   forcedProviderCleanup: boolean
   dockerVolumesRemoved: boolean
@@ -270,8 +268,9 @@ interface CleanupOutcome {
   database?: PocDatabaseInspection
 }
 
-async function exactCleanup(run: CleanupRun, appServer: PocAppServerProcess | undefined,
-  evidence: PocAppServerEvidence | undefined, preserve: boolean): Promise<CleanupOutcome> {
+export async function exactCleanup(run: CleanupRun, appServer: PocAppServerProcess | undefined,
+  evidence: PocAppServerEvidence | undefined, preserve: boolean,
+  retainOnIncomplete = false): Promise<CleanupOutcome> {
   let deletionComplete = !evidence
   if (appServer && evidence && !evidence.deletedThreadIds.includes(evidence.rootThreadId)) {
     try { await deleteThreadTree(appServer, evidence); deletionComplete = true } catch { deletionComplete = false }
@@ -320,6 +319,9 @@ async function exactCleanup(run: CleanupRun, appServer: PocAppServerProcess | un
   const serviceCleanupComplete = Object.values(cleanupAssertions).every(Boolean)
   if (preserve) return { serviceCleanupComplete, forcedProviderCleanup: false,
     dockerVolumesRemoved: false, assertions: cleanupAssertions, ...(database ? { database } : {}) }
+  if (retainOnIncomplete && !serviceCleanupComplete) return { serviceCleanupComplete: false,
+    forcedProviderCleanup, dockerVolumesRemoved: false, assertions: cleanupAssertions,
+    ...(database ? { database } : {}) }
 
   let serviceStopped = true
   await stopControlService(run.paths).catch(() => { serviceStopped = false })
@@ -467,7 +469,7 @@ async function automated(): Promise<void> {
 async function clipboardCommand(promptPath: string): Promise<string | undefined> {
   for (const [program, command] of [['wl-copy', `wl-copy < ${JSON.stringify(promptPath)}`],
     ['xclip', `xclip -selection clipboard < ${JSON.stringify(promptPath)}`]] as const) {
-    try { await exec('sh', ['-c', `command -v ${program}`], { timeout: 2_000 }); return command } catch {}
+    try { await exec('which', [program], { timeout: 2_000 }); return command } catch {}
   }
   return undefined
 }
@@ -480,20 +482,18 @@ async function interactive(): Promise<void> {
   console.log(`Interactive prompt: ${promptPath}`)
   const clipboard = await clipboardCommand(promptPath)
   if (clipboard) console.log(`Clipboard: ${clipboard}`)
-  const child = spawn(run.provenance.binaryPath, ['--strict-config', '-C', `${e2bRoot}/poc/fixture`, '-a', 'never',
-    ...(env.codexModel ? ['-m', env.codexModel] : [])], { cwd: `${e2bRoot}/poc/fixture`,
+  const child = execa(run.provenance.binaryPath, ['--strict-config', '-C', `${e2bRoot}/poc/fixture`, '-a', 'never',
+    ...(env.codexModel ? ['-m', env.codexModel] : [])], { cwd: `${e2bRoot}/poc/fixture`, extendEnv: false,
     env: createCodexProcessEnvironment({ codexHome: run.paths.codexHome, caBundlePath: run.tls.combinedCaBundlePath,
       hostedBearer: run.runtime.POC_SERVICE_BEARER!, ...(env.accessToken ? { accessToken: env.accessToken } : {}) }),
-    stdio: 'inherit' })
+    stdio: 'inherit', reject: false })
   const onSigint = () => child.kill('SIGINT')
   const onSigterm = () => child.kill('SIGTERM')
   process.once('SIGINT', onSigint); process.once('SIGTERM', onSigterm)
   let exitCode: number | null = null
   let childFailure: unknown
   try {
-    exitCode = await new Promise<number | null>((resolveExit, reject) => {
-      child.once('error', reject); child.once('exit', resolveExit)
-    })
+    exitCode = (await child).exitCode ?? null
   } catch (error) { childFailure = error }
   finally { process.off('SIGINT', onSigint); process.off('SIGTERM', onSigterm) }
   const inspection = await inspectFunctionalRun(run, undefined).catch(() => ({ workspaceVerified: false } as FunctionalRunInspection))
@@ -524,12 +524,9 @@ async function auth(): Promise<void> {
   const destination = `${secretsDirectory}/auth.json`
   try {
     await writeFile(`${loginHome}/config.toml`, 'cli_auth_credentials_store = "file"\n', { mode: 0o600 })
-    const child = spawn(provenance.binaryPath, ['login', '--device-auth'], { cwd: repositoryRoot,
-      env: { PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin', CODEX_HOME: loginHome }, stdio: 'inherit' })
-    const code = await new Promise<number | null>((resolveExit, reject) => {
-      child.once('error', reject); child.once('exit', resolveExit)
-    })
-    if (code !== 0) throw new Error('Codex device login did not complete')
+    const child = execa(provenance.binaryPath, ['login', '--device-auth'], { cwd: repositoryRoot, extendEnv: false,
+      env: { PATH: loadCommandOsEnv().path, CODEX_HOME: loginHome }, stdio: 'inherit', reject: false })
+    if ((await child).exitCode !== 0) throw new Error('Codex device login did not complete')
     const validated = await validateAuthJsonFile(repositoryRoot, `${loginHome}/auth.json`)
     const existing = await lstat(destination).catch(() => undefined)
     if (existing?.isSymbolicLink() || (existing && !existing.isFile())) throw new Error('refusing to replace an unsafe auth JSON destination')
@@ -628,7 +625,9 @@ async function main(): Promise<void> {
   usage()
 }
 
-main().catch(error => {
-  console.error(error instanceof Error ? error.message : 'POC command failed')
-  process.exitCode = 2
-})
+if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url) {
+  main().catch(error => {
+    console.error(error instanceof Error ? error.message : 'POC command failed')
+    process.exitCode = 2
+  })
+}

@@ -88,6 +88,8 @@ export class E2BProvider implements ProviderAdapter {
       // independently requires the provider's public-port proxy to mint and
       // enforce a per-sandbox traffic token. Keep both explicit: CubeSandbox
       // and E2B expose the latter through their shared network-policy shape.
+      // TODO(internal-release, PILOT-013): The pilot retains this secured public CubeSandbox route
+      // because it is proven on the trusted LAN. Replace exec traffic with approved private transport.
       secure: true,
       network: { allowPublicTraffic: false },
       lifecycle: { onTimeout: 'pause', autoResume: false },

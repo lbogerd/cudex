@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { z } from 'zod'
 import {
   canonicalJson,
   createWorkspaceManifest,
@@ -166,23 +167,12 @@ export function serializePatchArtifact(
   }
 }
 
-function record(value: unknown, label: string): Record<string, unknown> {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) throw invalid(`${label} must be an object`)
-  return value as Record<string, unknown>
-}
-
-function exactKeys(value: Record<string, unknown>, keys: readonly string[], label: string): void {
-  const actual = Object.keys(value).sort(compareText)
-  const expected = [...keys].sort(compareText)
-  if (actual.length !== expected.length || actual.some((key, index) => key !== expected[index])) throw invalid(`${label} has an invalid shape`)
-}
-
-function parsedManifest(value: unknown, label: string): WorkspaceManifest {
-  const manifest = record(value, label)
-  exactKeys(manifest, ['version', 'identity', 'entries'], label)
-  if (manifest.version !== 1 || typeof manifest.identity !== 'string' || !Array.isArray(manifest.entries)) throw invalid(`${label} is invalid`)
-  return manifest as unknown as WorkspaceManifest
-}
+const embeddedManifestSchema = z.strictObject({ version: z.literal(1), identity: z.string(), entries: z.array(z.unknown()) })
+const patchChangeSchema = z.strictObject({ path: z.string(), contentObjectId: z.string().nullable() })
+export const PatchArtifactSchema = z.strictObject({ version: z.literal(1), agentId: z.string(),
+  baseSnapshotId: z.string(), currentSnapshotId: z.string(), baseManifest: embeddedManifestSchema,
+  currentManifest: embeddedManifestSchema, changes: z.array(patchChangeSchema),
+  changedFiles: z.number().int().safe(), sizeBytes: z.number().int().safe() })
 
 export function parsePatchArtifact(
   bytes: Uint8Array,
@@ -202,23 +192,13 @@ export function parsePatchArtifact(
   try { canonical = canonicalJson(decoded) } catch { throw invalid('patch artifact is not canonical JSON') }
   if (text !== canonical) throw invalid('patch artifact bytes are not canonical JSON')
 
-  const artifact = record(decoded, 'patch artifact')
-  exactKeys(artifact, [
-    'version', 'agentId', 'baseSnapshotId', 'currentSnapshotId', 'baseManifest',
-    'currentManifest', 'changes', 'changedFiles', 'sizeBytes',
-  ], 'patch artifact')
-  if (artifact.version !== 1 || typeof artifact.agentId !== 'string'
-    || typeof artifact.baseSnapshotId !== 'string' || typeof artifact.currentSnapshotId !== 'string'
-    || !Array.isArray(artifact.changes) || !Number.isSafeInteger(artifact.changedFiles)
-    || !Number.isSafeInteger(artifact.sizeBytes)) throw invalid('patch artifact fields are invalid')
-  const baseManifest = parsedManifest(artifact.baseManifest, 'base manifest')
-  const currentManifest = parsedManifest(artifact.currentManifest, 'current manifest')
-  const contentObjects: PatchContentObject[] = artifact.changes.map((value, index) => {
-    const change = record(value, `patch change ${index}`)
-    exactKeys(change, ['path', 'contentObjectId'], `patch change ${index}`)
-    if (typeof change.path !== 'string' || (change.contentObjectId !== null && typeof change.contentObjectId !== 'string')) {
-      throw invalid(`patch change ${index} is invalid`)
-    }
+  const parsed = PatchArtifactSchema.safeParse(decoded)
+  if (!parsed.success) throw invalid(parsed.error.issues.some(issue => issue.code === 'unrecognized_keys')
+    ? 'patch artifact has an invalid shape' : 'patch artifact fields are invalid')
+  const artifact = parsed.data
+  const baseManifest = artifact.baseManifest as WorkspaceManifest
+  const currentManifest = artifact.currentManifest as WorkspaceManifest
+  const contentObjects: PatchContentObject[] = artifact.changes.map(change => {
     return change.contentObjectId === null ? null : { path: change.path, objectId: change.contentObjectId }
   }).filter((value): value is PatchContentObject => value !== null)
 
