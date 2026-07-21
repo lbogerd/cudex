@@ -1,12 +1,13 @@
 import { createHash } from 'node:crypto'
 import { execa } from 'execa'
-import { chmod, lstat, mkdir, open, readFile, readlink, rename, rm, rmdir, stat, symlink,
+import { constants } from 'node:fs'
+import { chmod, lstat, mkdir, open, readFile, readlink, realpath, rename, rm, rmdir, stat, symlink,
   writeFile } from 'node:fs/promises'
 import { basename, dirname, join, relative, resolve, sep } from 'node:path'
 import { projectGitWorkspace } from './git-workspace.js'
 import type { LocalPatchContentObject, ResolvedRootPatch } from './local-patch-source.js'
 import { planPatchApplication, type PatchContentMaterial } from './patch-apply.js'
-import { canonicalJson, diffWorkspaceManifests, type WorkspaceEntry,
+import { canonicalJson, createWorkspaceManifest, diffWorkspaceManifests, type WorkspaceEntry,
   type WorkspaceManifest } from './workspace-manifest.js'
 
 const exec = execa
@@ -26,12 +27,12 @@ export interface LocalPatchApplyInput {
   fault?: (action: string, path: string) => void | Promise<void>
 }
 
-type JournalAction =
-  | { kind: 'backup'; path: string }
-  | { kind: 'rmdir'; path: string; mode: number }
-  | { kind: 'mkdir'; path: string }
-  | { kind: 'install'; path: string }
-  | { kind: 'chmod'; path: string; mode: number }
+type JournalAction = {
+  kind: 'backup' | 'rmdir' | 'mkdir' | 'install' | 'chmod'
+  path: string
+  before: WorkspaceEntry | null
+  after: WorkspaceEntry | null
+}
 
 interface JournalRecord {
   version: 1
@@ -46,6 +47,11 @@ function sameEntry(left: WorkspaceEntry | null, right: WorkspaceEntry | null): b
 }
 
 function depth(path: string): number { return path.split('/').length }
+
+function below(path: string, root: string): boolean {
+  const child = relative(root, path)
+  return child === '' || (child !== '..' && !child.startsWith(`..${sep}`))
+}
 
 function digest(bytes: Uint8Array): string {
   return `sha256:${createHash('sha256').update(bytes).digest('hex')}`
@@ -66,6 +72,24 @@ function localPath(checkout: string, path: string): string {
   const child = relative(checkout, absolute)
   if (!child || child === '..' || child.startsWith(`..${sep}`)) throw new Error('patch path escaped the checkout')
   return absolute
+}
+
+async function withSafeParent<T>(checkout: string, path: string,
+  action: (anchoredPath: string) => Promise<T>): Promise<T> {
+  const target = localPath(checkout, path)
+  const parent = dirname(target)
+  const handle = await open(parent, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW)
+  try {
+    const anchoredParent = `/proc/self/fd/${handle.fd}`
+    const actualParent = await realpath(anchoredParent)
+    if (!below(actualParent, checkout)) throw new Error('patch path has an unsafe local ancestor')
+    return await action(join(anchoredParent, basename(target)))
+  } finally { await handle.close() }
+}
+
+async function appendIntent(journalPath: string, record: JournalRecord, action: JournalAction): Promise<void> {
+  record.actions.push(action)
+  await atomicJournal(journalPath, record)
 }
 
 async function entryAt(checkout: string, path: string): Promise<WorkspaceEntry | null> {
@@ -155,43 +179,69 @@ async function stageEntry(stageRoot: string, relativePath: string, entry: Worksp
   }
 }
 
-async function rollback(checkout: string, journalRoot: string, record: JournalRecord,
-  original: Map<string, WorkspaceEntry>, proposed: Map<string, WorkspaceEntry>): Promise<boolean> {
+async function rollback(checkout: string, journalRoot: string, record: JournalRecord): Promise<boolean> {
   record.state = 'rolling-back'
   await atomicJournal(join(journalRoot, 'journal.json'), record).catch(() => undefined)
   try {
-    const lastAction = new Map<string, JournalAction>()
-    for (const action of record.actions) lastAction.set(action.path, action)
-    for (const [path, action] of lastAction) {
-      const expected = ['install', 'mkdir', 'chmod'].includes(action.kind)
-        ? proposed.get(path) ?? null : null
-      if (!sameEntry(await entryAt(checkout, path), expected)) return false
-    }
     const discard = join(journalRoot, 'rollback-discard')
     await mkdir(discard, { recursive: true, mode: 0o700 })
     for (const action of [...record.actions].reverse()) {
-      const target = localPath(checkout, action.path)
+      const current = await entryAt(checkout, action.path)
+      if (sameEntry(current, action.before)) continue
+      if (!sameEntry(current, action.after)) return false
       if (action.kind === 'install') {
         const destination = localPath(discard, action.path)
         await mkdir(dirname(destination), { recursive: true, mode: 0o700 })
-        await rename(target, destination)
+        await withSafeParent(checkout, action.path, target => rename(target, destination))
       } else if (action.kind === 'mkdir') {
-        await rmdir(target)
+        await withSafeParent(checkout, action.path, target => rmdir(target))
       } else if (action.kind === 'chmod') {
-        await chmod(target, action.mode)
+        await withSafeParent(checkout, action.path, target => chmod(target, action.before!.mode))
       } else if (action.kind === 'rmdir') {
-        await mkdir(target, { mode: action.mode }); await chmod(target, action.mode)
+        await withSafeParent(checkout, action.path, async target => {
+          await mkdir(target, { mode: action.before!.mode }); await chmod(target, action.before!.mode)
+        })
       } else {
         const backup = localPath(join(journalRoot, 'backup'), action.path)
-        await mkdir(dirname(target), { recursive: true })
-        await rename(backup, target)
+        await withSafeParent(checkout, action.path, target => rename(backup, target))
       }
     }
-    for (const path of lastAction.keys()) {
-      if (!sameEntry(await entryAt(checkout, path), original.get(path) ?? null)) return false
+    const original = new Map<string, WorkspaceEntry | null>()
+    for (const action of record.actions) if (!original.has(action.path)) original.set(action.path, action.before)
+    for (const [path, entry] of original) {
+      if (!sameEntry(await entryAt(checkout, path), entry)) return false
     }
     return true
   } catch { return false }
+}
+
+function recoveryJournalPath(checkout: string, runId: string): string {
+  return join(dirname(checkout), `.${basename(checkout)}.cudex-journal-${runId}`)
+}
+
+export async function recoverLocalRootPatch(runId: string, selectedDirectory: string): Promise<boolean> {
+  if (!/^\d{14}-[0-9a-f]{12}$/u.test(runId)) throw new Error('local patch run identity is invalid')
+  const checkout = resolve(selectedDirectory)
+  const journalRoot = recoveryJournalPath(checkout, runId)
+  const journalPath = join(journalRoot, 'journal.json')
+  const metadata = await lstat(journalPath).catch(() => undefined)
+  if (!metadata) return true
+  if (!metadata.isFile() || metadata.isSymbolicLink() || (metadata.mode & 0o077) !== 0
+    || metadata.size > 16 * 1024 * 1024) throw new Error('local recovery journal is unsafe')
+  const record = JSON.parse(await readFile(journalPath, 'utf8')) as JournalRecord
+  if (record.version !== 1 || record.runId !== runId || resolve(record.checkout) !== checkout
+    || !Array.isArray(record.actions)) throw new Error('local recovery journal is invalid')
+  for (const action of record.actions) {
+    if (!action || !['backup', 'rmdir', 'mkdir', 'install', 'chmod'].includes(action.kind)
+      || typeof action.path !== 'string') throw new Error('local recovery journal is invalid')
+    for (const entry of [action.before, action.after]) if (entry !== null) {
+      const [validated] = createWorkspaceManifest('local-recovery', [entry]).entries
+      if (!validated || validated.path !== action.path) throw new Error('local recovery journal is invalid')
+    }
+  }
+  const restored = await rollback(checkout, journalRoot, record)
+  if (restored) await rm(journalRoot, { recursive: true, force: true })
+  return restored
 }
 
 /** Applies one exact root result without touching Git metadata or unrelated paths. */
@@ -235,17 +285,13 @@ export async function applyLocalRootPatch(input: LocalPatchApplyInput): Promise<
     .filter(entry => entry.path.startsWith(`${prefix}/`))
     .map(entry => [entry.path.slice(prefix.length + 1), { ...entry,
       path: entry.path.slice(prefix.length + 1) } as WorkspaceEntry]))
-  const proposedByPath = new Map(artifact.currentManifest.entries
-    .filter(entry => entry.path.startsWith(`${prefix}/`))
-    .map(entry => [entry.path.slice(prefix.length + 1), { ...entry,
-      path: entry.path.slice(prefix.length + 1) } as WorkspaceEntry]))
   const mutations = changed.filter(change => !sameEntry(targetByPath.get(change.path) ?? null, change.proposed))
   if (mutations.length === 0) return { type: 'no-change' }
 
   // TODO(internal-release, PILOT-012): The pilot uses an owner-only same-filesystem rollback journal
   // because portable multi-path filesystem transactions do not exist. Evaluate atomic worktree swaps
   // and formal crash recovery guarantees before an internal release.
-  const journalRoot = join(dirname(checkout), `.${basename(checkout)}.cudex-journal-${input.runId}`)
+  const journalRoot = recoveryJournalPath(checkout, input.runId)
   if (await lstat(journalRoot).catch(() => undefined)) {
     return { type: 'manual-recovery', reason: 'an apply recovery journal already exists', journalPath: journalRoot }
   }
@@ -256,6 +302,7 @@ export async function applyLocalRootPatch(input: LocalPatchApplyInput): Promise<
     return { type: 'failed', reason: 'apply journal is not on the checkout filesystem' }
   }
   const stageRoot = join(journalRoot, 'stage'); const backupRoot = join(journalRoot, 'backup')
+  const journalPath = join(journalRoot, 'journal.json')
   await Promise.all([mkdir(stageRoot, { mode: 0o700 }), mkdir(backupRoot, { mode: 0o700 })])
   const record: JournalRecord = { version: 1, runId: input.runId, checkout, state: 'staged', actions: [] }
   try {
@@ -264,11 +311,11 @@ export async function applyLocalRootPatch(input: LocalPatchApplyInput): Promise<
       await stageEntry(stageRoot, change.path, { ...change.proposed, path: change.path } as WorkspaceEntry,
         contents, change.contentId)
     }
-    await atomicJournal(join(journalRoot, 'journal.json'), record)
+    await atomicJournal(journalPath, record)
     const revalidated = await projectGitWorkspace(checkout)
     if (canonicalJson(revalidated.captured.manifest.entries)
       !== canonicalJson(target.captured.manifest.entries)) throw new Error('local workspace changed while staging the patch')
-    record.state = 'applying'; await atomicJournal(join(journalRoot, 'journal.json'), record)
+    record.state = 'applying'; await atomicJournal(journalPath, record)
 
     const remove = mutations.filter(change => {
       const current = targetByPath.get(change.path)
@@ -280,15 +327,16 @@ export async function applyLocalRootPatch(input: LocalPatchApplyInput): Promise<
       if (!sameEntry(await entryAt(checkout, change.path), { ...current, path: change.path } as WorkspaceEntry)) {
         throw new Error('local path changed immediately before patch application')
       }
+      const before = { ...current, path: change.path } as WorkspaceEntry
+      await appendIntent(journalPath, record, { kind: current.type === 'directory' ? 'rmdir' : 'backup',
+        path: change.path, before, after: null })
       if (current.type === 'directory') {
-        await rmdir(localPath(checkout, change.path))
-        record.actions.push({ kind: 'rmdir', path: change.path, mode: current.mode })
+        await withSafeParent(checkout, change.path, target => rmdir(target))
       } else {
         const backup = localPath(backupRoot, change.path); await mkdir(dirname(backup), { recursive: true, mode: 0o700 })
-        await rename(localPath(checkout, change.path), backup)
-        record.actions.push({ kind: 'backup', path: change.path })
+        await withSafeParent(checkout, change.path, target => rename(target, backup))
       }
-      await input.fault?.('remove', change.path); await atomicJournal(join(journalRoot, 'journal.json'), record)
+      await input.fault?.('remove', change.path)
     }
 
     const construct = mutations.filter(change => change.proposed !== null)
@@ -301,19 +349,24 @@ export async function applyLocalRootPatch(input: LocalPatchApplyInput): Promise<
         if (!sameEntry(await entryAt(checkout, change.path), { ...current, path: change.path } as WorkspaceEntry)) {
           throw new Error('local directory changed immediately before mode application')
         }
-        await chmod(localPath(checkout, change.path), proposed.mode)
-        record.actions.push({ kind: 'chmod', path: change.path, mode: current.mode })
+        await appendIntent(journalPath, record, { kind: 'chmod', path: change.path,
+          before: { ...current, path: change.path }, after: { ...proposed, path: change.path } as WorkspaceEntry })
+        await withSafeParent(checkout, change.path, target => chmod(target, proposed.mode))
       } else if (proposed.type === 'directory') {
         if (await entryAt(checkout, change.path) !== null) throw new Error('local path appeared during patch application')
-        await mkdir(localPath(checkout, change.path), { mode: proposed.mode }); await chmod(localPath(checkout, change.path), proposed.mode)
-        record.actions.push({ kind: 'mkdir', path: change.path })
+        await appendIntent(journalPath, record, { kind: 'mkdir', path: change.path,
+          before: null, after: { ...proposed, path: change.path } as WorkspaceEntry })
+        await withSafeParent(checkout, change.path, async target => {
+          await mkdir(target, { mode: proposed.mode }); await chmod(target, proposed.mode)
+        })
       } else {
         if (await entryAt(checkout, change.path) !== null) throw new Error('local path appeared during patch application')
-        await mkdir(dirname(localPath(checkout, change.path)), { recursive: true })
-        await rename(localPath(stageRoot, change.path), localPath(checkout, change.path))
-        record.actions.push({ kind: 'install', path: change.path })
+        await appendIntent(journalPath, record, { kind: 'install', path: change.path,
+          before: null, after: { ...proposed, path: change.path } as WorkspaceEntry })
+        await withSafeParent(checkout, change.path,
+          target => rename(localPath(stageRoot, change.path), target))
       }
-      await input.fault?.('construct', change.path); await atomicJournal(join(journalRoot, 'journal.json'), record)
+      await input.fault?.('construct', change.path)
     }
     const applied = await projectGitWorkspace(checkout)
     if (canonicalJson(applied.captured.manifest.entries) !== canonicalJson(plan.manifest.entries)) {
@@ -322,7 +375,7 @@ export async function applyLocalRootPatch(input: LocalPatchApplyInput): Promise<
     await rm(journalRoot, { recursive: true, force: true })
     return { type: 'applied', changedFiles: changes.length }
   } catch (error) {
-    const restored = await rollback(checkout, journalRoot, record, targetByPath, proposedByPath)
+    const restored = await rollback(checkout, journalRoot, record)
     if (restored) {
       await rm(journalRoot, { recursive: true, force: true })
       return { type: 'failed', reason: error instanceof Error ? error.message : 'local patch application failed' }

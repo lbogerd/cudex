@@ -8,7 +8,7 @@ import { loadCudexConfig, loadCudexCredentials, validateCudexConfig, validateCud
   type CudexConfig, type CudexCredentials, type CudexPaths } from './cudex-config.js'
 import { validateCachedRelease, type CudexReleaseManifest } from './cudex-release.js'
 import { projectGitWorkspace, type GitWorkspaceProjection } from './git-workspace.js'
-import { applyLocalRootPatch, type LocalPatchApplyResult } from './local-patch-apply.js'
+import { applyLocalRootPatch, recoverLocalRootPatch, type LocalPatchApplyResult } from './local-patch-apply.js'
 import { resolveRootPatch } from './local-patch-source.js'
 import { createCodexProcessEnvironment } from './poc-auth.js'
 import { initializeAndReadAccount, startPocAppServer } from './poc-app-server-client.js'
@@ -34,6 +34,7 @@ interface CurrentRunState {
   startedAt: string
   selectedDirectory: string
   phase: 'preparing' | 'tui' | 'finalizing' | 'cleanup' | 'recovery'
+  cleanupComplete?: boolean
 }
 
 export interface PreparedCudexRun {
@@ -112,7 +113,8 @@ function validateState(value: unknown): CurrentRunState {
   if (state.version !== 1 || !/^\d{14}-[0-9a-f]{12}$/u.test(state.runId)
     || !Number.isSafeInteger(state.pid) || state.pid <= 1 || !Number.isFinite(Date.parse(state.startedAt))
     || !resolve(state.selectedDirectory).startsWith('/')
-    || !['preparing', 'tui', 'finalizing', 'cleanup', 'recovery'].includes(state.phase)) {
+    || !['preparing', 'tui', 'finalizing', 'cleanup', 'recovery'].includes(state.phase)
+    || (state.cleanupComplete !== undefined && typeof state.cleanupComplete !== 'boolean')) {
     throw new Error('current Cudex run state is invalid')
   }
   return state
@@ -287,13 +289,14 @@ async function deleteRootThread(run: Pick<PreparedCudexRun, 'provenance' | 'path
   finally { await appServer.stop().catch(() => undefined) }
 }
 
-async function cleanupPrepared(run: PreparedCudexRun, root: PocLeaseInspection | undefined) {
+async function cleanupPrepared(run: PreparedCudexRun, root: PocLeaseInspection | undefined,
+  retainRecoveryFiles = false) {
   const cleanupRoot = root ?? await rootLease(run).catch(() => undefined)
   const deleted = await deleteRootThread(run, cleanupRoot)
   if (!deleted) return { serviceCleanupComplete: false, forcedProviderCleanup: false,
     dockerVolumesRemoved: false, deleted }
   const outcome = await exactCleanup(run, undefined, undefined, false, true)
-  if (deleted && outcome.serviceCleanupComplete && outcome.dockerVolumesRemoved) {
+  if (deleted && outcome.serviceCleanupComplete && outcome.dockerVolumesRemoved && !retainRecoveryFiles) {
     await Promise.all([
       rm(run.paths.runtimeEnv, { force: true }), rm(run.paths.composeEnv, { force: true }),
       rm(run.paths.garageConfig, { force: true }), rm(run.paths.codexHome, { recursive: true, force: true }),
@@ -426,19 +429,20 @@ async function runSession(parsed: Extract<CudexArguments, { command: 'session' }
       .catch(() => { reportFailure = true })
   } finally {
     state.phase = 'cleanup'; await ownerJson(paths.currentRunFile, state).catch(error => { operationalFailure ??= error })
-    cleanup = await cleanupPrepared(run, root).catch(error => {
+    cleanup = await cleanupPrepared(run, root, result.type === 'manual-recovery').catch(error => {
       operationalFailure ??= error
       return { serviceCleanupComplete: false, forcedProviderCleanup: false,
         dockerVolumesRemoved: false, deleted: false }
     })
   }
   const cleanupComplete = cleanup.deleted && cleanup.serviceCleanupComplete && cleanup.dockerVolumesRemoved
+  state.cleanupComplete = cleanupComplete
   await record(run, 'cleanup', cleanupComplete ? 'succeeded' : 'manual-recovery', {
     threadDeleted: cleanup.deleted, serviceCleanupComplete: cleanup.serviceCleanupComplete,
     forcedProviderCleanup: cleanup.forcedProviderCleanup, dockerVolumesRemoved: cleanup.dockerVolumesRemoved,
   }, cleanupStarted).catch(() => { reportFailure = true })
   let ownershipCleared = false
-  if (cleanupComplete) {
+  if (cleanupComplete && result.type !== 'manual-recovery') {
     try { await clearOwnership(paths, lock); ownershipCleared = true } catch { /* Retain recovery state below. */ }
   }
   if (!ownershipCleared) {
@@ -463,6 +467,24 @@ async function cleanupCurrent(paths: CudexPaths): Promise<number> {
   if (!cleanupLock) { console.error('another Cudex cleanup is active'); return 3 }
   try {
     const runPaths = pilotRunPaths(paths, state.runId)
+    const localRecoveryComplete = await recoverLocalRootPatch(state.runId, state.selectedDirectory)
+      .catch(() => false)
+    if (!localRecoveryComplete) {
+      console.error('local patch recovery could not be proven complete')
+      return 3
+    }
+    if (state.cleanupComplete) {
+      await Promise.all([rm(runPaths.runtimeEnv, { force: true }), rm(runPaths.composeEnv, { force: true }),
+        rm(runPaths.garageConfig, { force: true }), rm(runPaths.codexHome, { recursive: true, force: true }),
+        rm(runPaths.tlsDirectory, { recursive: true, force: true }),
+        rm(join(runPaths.runDirectory, 'base.tar'), { force: true }),
+        rm(join(runPaths.runDirectory, 'base-manifest.json'), { force: true }),
+        rm(join(runPaths.runDirectory, 'recovery-config.json'), { force: true })])
+      await clearOwnership(paths)
+      console.log(JSON.stringify({ runId: state.runId, cleaned: true, localRecoveryComplete: true,
+        threadDeleted: true, forcedProviderCleanup: false, dockerVolumesRemoved: true }))
+      return 0
+    }
     const [{ config, credentials }, docker, runtime] = await Promise.all([
       loadRecovery(runPaths), detectDocker(), readRuntimeEnvironment(runPaths),
     ])

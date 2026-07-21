@@ -7,7 +7,7 @@ import { basename, dirname, join } from 'node:path'
 import test from 'node:test'
 import { promisify } from 'node:util'
 import { projectGitWorkspace } from '../src/git-workspace.js'
-import { applyLocalRootPatch } from '../src/local-patch-apply.js'
+import { applyLocalRootPatch, recoverLocalRootPatch } from '../src/local-patch-apply.js'
 import { serializePatchArtifact } from '../src/patch-artifact.js'
 import { createWorkspaceManifest, type WorkspaceEntry } from '../src/workspace-manifest.js'
 
@@ -163,9 +163,41 @@ test('post-image corruption retains a mode-0700 manual recovery journal', async 
     assert.equal(result.type, 'manual-recovery')
     assert.equal((await lstat(journal)).mode & 0o077, 0)
     assert.equal((await lstat(join(journal, 'journal.json'))).mode & 0o077, 0)
+    await writeFile(join(directory, 'alpha.bin'), proposed)
+    assert.equal(await recoverLocalRootPatch(runId, directory), true)
+    assert.deepEqual(await readFile(join(directory, 'alpha.bin')), Buffer.from([0, 1, 2, 3]))
+    await assert.rejects(lstat(journal))
   } finally {
     await rm(journal, { recursive: true, force: true })
     await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('an ancestor replaced by a symlink cannot redirect a patch outside the checkout', async () => {
+  const directory = await repository(); const outside = await mkdtemp(join(tmpdir(), 'cudex-apply-outside-'))
+  const runId = '20260720120000-abababababab'
+  try {
+    await mkdir(join(directory, 'nested')); await writeFile(join(directory, 'nested', 'value.txt'), 'base\n')
+    await exec('git', ['-C', directory, 'add', 'nested/value.txt']); await exec('git', ['-C', directory, 'commit', '-qm', 'nested'])
+    const proposed = Buffer.from('hosted\n')
+    const material = await patch(directory, (entries, prefix) => {
+      entries.set(`${prefix}/nested/value.txt`, { path: `${prefix}/nested/value.txt`, type: 'file', mode: 0o644,
+        digest: sha(proposed), sizeBytes: proposed.byteLength })
+      return { contents: [{ path: `${prefix}/nested/value.txt`, bytes: proposed, objectId: 'content-nested' }] }
+    })
+    const result = await applyLocalRootPatch({ runId, selectedDirectory: directory,
+      immutableBaseManifest: material.projection.captured.manifest, patch: material.resolved,
+      async fault(action) {
+        if (action === 'remove') {
+          await rm(join(directory, 'nested'), { recursive: true })
+          await import('node:fs/promises').then(fs => fs.symlink(outside, join(directory, 'nested')))
+        }
+      } })
+    assert.equal(result.type, 'manual-recovery')
+    await assert.rejects(readFile(join(outside, 'value.txt')))
+  } finally {
+    await rm(join(dirname(directory), `.${basename(directory)}.cudex-journal-${runId}`), { recursive: true, force: true })
+    await rm(directory, { recursive: true, force: true }); await rm(outside, { recursive: true, force: true })
   }
 })
 
