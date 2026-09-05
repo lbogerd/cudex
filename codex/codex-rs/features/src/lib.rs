@@ -116,6 +116,8 @@ pub enum Feature {
     CodeModeBufferedExec,
     /// Run JavaScript code mode in the standalone host process.
     CodeModeHost,
+    /// Bind each agent to a separately owned Cudex hosted environment.
+    HostedAgents,
     /// Establish the code-mode host connection during session startup.
     CodeModePrewarm,
     /// Terminate active code mode cells when their turn is interrupted.
@@ -1006,6 +1008,12 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::CodeModePrewarm,
         key: "code_mode_prewarm",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::HostedAgents,
+        key: "hosted_agents",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },

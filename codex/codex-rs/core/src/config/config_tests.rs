@@ -8272,6 +8272,7 @@ async fn load_config_rejects_missing_agent_role_config_file() -> std::io::Result
             roles: BTreeMap::from([(
                 "researcher".to_string(),
                 AgentRoleToml {
+                    sandbox_template: None,
                     description: Some("Research role".to_string()),
                     config_file: Some(missing_path.abs()),
                     nickname_candidates: None,
@@ -9287,6 +9288,7 @@ async fn load_config_normalizes_agent_role_nickname_candidates() -> std::io::Res
             roles: BTreeMap::from([(
                 "researcher".to_string(),
                 AgentRoleToml {
+                    sandbox_template: None,
                     description: Some("Research role".to_string()),
                     config_file: None,
                     nickname_candidates: Some(vec![
@@ -9333,6 +9335,7 @@ async fn load_config_rejects_empty_agent_role_nickname_candidates() -> std::io::
             roles: BTreeMap::from([(
                 "researcher".to_string(),
                 AgentRoleToml {
+                    sandbox_template: None,
                     description: Some("Research role".to_string()),
                     config_file: None,
                     nickname_candidates: Some(Vec::new()),
@@ -9373,6 +9376,7 @@ async fn load_config_rejects_duplicate_agent_role_nickname_candidates() -> std::
             roles: BTreeMap::from([(
                 "researcher".to_string(),
                 AgentRoleToml {
+                    sandbox_template: None,
                     description: Some("Research role".to_string()),
                     config_file: None,
                     nickname_candidates: Some(vec!["Hypatia".to_string(), " Hypatia ".to_string()]),
@@ -9413,6 +9417,7 @@ async fn load_config_rejects_unsafe_agent_role_nickname_candidates() -> std::io:
             roles: BTreeMap::from([(
                 "researcher".to_string(),
                 AgentRoleToml {
+                    sandbox_template: None,
                     description: Some("Research role".to_string()),
                     config_file: None,
                     nickname_candidates: Some(vec!["Agent <One>".to_string()]),

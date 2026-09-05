@@ -443,6 +443,10 @@ pub struct ConfigToml {
     /// Agent-related settings (thread limits, etc.).
     pub agents: Option<AgentsToml>,
 
+    /// Cudex hosted-runtime settings, validated by the hosted integration before startup.
+    #[schemars(with = "Option<serde_json::Value>")]
+    pub hosted_agents: Option<toml::Value>,
+
     /// Goal-related settings.
     pub goals: Option<GoalsToml>,
 
@@ -706,6 +710,8 @@ pub struct AgentsToml {
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
 #[schemars(deny_unknown_fields)]
 pub struct AgentRoleToml {
+    /// Cudex control-plane template name for this hosted role.
+    pub sandbox_template: Option<String>,
     /// Human-facing role documentation used in spawn tool guidance.
     /// Required unless supplied by the referenced agent role file.
     pub description: Option<String>,

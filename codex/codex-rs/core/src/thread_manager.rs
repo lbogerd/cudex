@@ -341,6 +341,7 @@ pub(crate) struct ResumeThreadWithHistoryOptions {
 /// `Arc` reference that can be downgraded to by `AgentControl` while preventing every single
 /// function to require an `Arc<&Self>`.
 pub(crate) struct ThreadManagerState {
+    hosted: crate::hosted::HostedManagers,
     threads: Arc<RwLock<HashMap<ThreadId, Arc<CodexThread>>>>,
     thread_created_tx: broadcast::Sender<ThreadId>,
     thread_id_generator: ThreadIdGenerator,
@@ -481,6 +482,7 @@ impl ThreadManager {
                 plugins_manager,
                 mcp_manager,
                 code_mode_session_provider,
+                hosted: crate::hosted::HostedManagers::default(),
                 extensions,
                 user_instructions_provider,
                 thread_store,
@@ -629,6 +631,7 @@ impl ThreadManager {
                 plugins_manager,
                 mcp_manager,
                 code_mode_session_provider: Arc::new(DisabledCodeModeSessionProvider),
+                hosted: crate::hosted::HostedManagers::default(),
                 extensions: empty_extension_registry(),
                 user_instructions_provider: Arc::new(
                     crate::test_support::EmptyUserInstructionsProvider,
@@ -812,6 +815,44 @@ impl ThreadManager {
 
     pub fn subscribe_thread_created(&self) -> broadcast::Receiver<ThreadId> {
         self.state.thread_created_tx.subscribe()
+    }
+
+    pub fn subscribe_hosted_agent_patch_available(
+        &self,
+    ) -> broadcast::Receiver<crate::HostedAgentPatchAvailable> {
+        self.state.hosted.patch_tx.subscribe()
+    }
+
+    /// Journals remote cleanup before local deletion; safe to retry after a crash.
+    pub async fn prepare_delete_hosted_thread(
+        &self,
+        thread_id: ThreadId,
+        config: &Config,
+    ) -> CodexResult<()> {
+        self.state
+            .hosted
+            .delete(thread_id, config)
+            .await
+            .map_err(CodexErr::Fatal)
+    }
+
+    pub async fn apply_hosted_agent_patch(
+        &self,
+        owner: ThreadId,
+        child: ThreadId,
+        artifact: &str,
+    ) -> CodexResult<codex_hosted_agent::PatchApplyResult> {
+        let thread = self.get_thread(owner).await?;
+        let hosted = thread
+            .session
+            .services
+            .thread_extension_data
+            .get::<crate::hosted::HostedThread>()
+            .ok_or_else(|| CodexErr::InvalidRequest("thread has no hosted runtime".into()))?;
+        hosted
+            .apply_patch(child, artifact)
+            .await
+            .map_err(CodexErr::InvalidRequest)
     }
 
     pub async fn get_thread(&self, thread_id: ThreadId) -> CodexResult<Arc<CodexThread>> {
@@ -1862,12 +1903,12 @@ impl ThreadManagerState {
             parent_thread_id,
             forked_from_thread_id,
             fork_persistence,
-            inherited_environments,
+            mut inherited_environments,
             inherited_exec_policy,
             user_shell_override,
         } = request;
         let StartThreadOptions {
-            config,
+            mut config,
             allow_provider_model_fallback,
             initial_history,
             history_mode,
@@ -1877,12 +1918,13 @@ impl ThreadManagerState {
             metrics_service_name,
             parent_trace,
             environments,
-            thread_extension_init,
+            mut thread_extension_init,
             client_mcp_extensions,
-            reserved_thread_id,
+            mut reserved_thread_id,
         } = options;
+        let hosted_requested = crate::hosted::enabled(&config).map_err(CodexErr::InvalidRequest)?;
         let session_source = session_source.unwrap_or_else(|| self.session_source.clone());
-        let environments = environments.unwrap_or_else(|| {
+        let mut environments = environments.unwrap_or_else(|| {
             default_thread_environment_selections(
                 self.environment_manager.as_ref(),
                 &config.cwd,
@@ -1899,6 +1941,17 @@ impl ThreadManagerState {
             let mut threads = self.threads.write().await;
             if let Some(thread) = threads.get(&resumed.conversation_id).cloned() {
                 if thread.is_running() {
+                    let running_hosted = thread
+                        .session
+                        .services
+                        .thread_extension_data
+                        .get::<crate::hosted::HostedThread>()
+                        .is_some();
+                    if hosted_requested != running_hosted {
+                        return Err(CodexErr::InvalidRequest(
+                            "cannot change a running thread's hosted execution boundary".into(),
+                        ));
+                    }
                     if let Some(requested_rollout_path) = resumed.rollout_path.as_deref()
                         && thread.rollout_path().as_deref() != Some(requested_rollout_path)
                     {
@@ -1980,7 +2033,40 @@ impl ThreadManagerState {
         } else {
             codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile
         };
-        let (session, io) = Session::spawn(SessionSpawnArgs {
+        let thread_id = match &initial_history {
+            InitialHistory::Resumed(history) => history.conversation_id,
+            InitialHistory::New | InitialHistory::Cleared | InitialHistory::Forked(_) => {
+                *reserved_thread_id.get_or_insert_with(|| agent_control.generate_thread_id())
+            }
+        };
+        let hosted = self
+            .hosted
+            .prepare(
+                &config,
+                thread_id,
+                parent_thread_id,
+                forked_from_thread_id,
+                &session_source,
+                Arc::clone(&self.environment_manager),
+            )
+            .await
+            .map_err(CodexErr::Fatal)?;
+        let code_mode_session_provider: Arc<dyn CodeModeSessionProvider> =
+            if let Some(hosted) = hosted {
+                if let Err(error) = hosted.configure(&mut config) {
+                    hosted.startup_failed().await;
+                    return Err(CodexErr::Fatal(error));
+                }
+                environments = vec![hosted.selection()];
+                inherited_environments = None;
+                let provider = hosted.code_mode.clone();
+                thread_extension_init.insert(hosted);
+                provider
+            } else {
+                Arc::clone(&self.code_mode_session_provider)
+            };
+        let hosted_cleanup = thread_extension_init.get::<crate::hosted::HostedThread>();
+        let spawned = Session::spawn(SessionSpawnArgs {
             config,
             allow_provider_model_fallback,
             user_instructions,
@@ -1992,7 +2078,7 @@ impl ThreadManagerState {
             skills_service: Arc::clone(&self.skills_service),
             plugins_manager: Arc::clone(&self.plugins_manager),
             mcp_manager,
-            code_mode_session_provider: Arc::clone(&self.code_mode_session_provider),
+            code_mode_session_provider,
             extensions,
             conversation_history: initial_history,
             requested_history_mode: history_mode,
@@ -2022,7 +2108,16 @@ impl ThreadManagerState {
             git_enrichment_policy: GitEnrichmentPolicy::Fresh,
             windows_sandbox_proxy_settings_mode,
         })
-        .await?;
+        .await;
+        let (session, io) = match spawned {
+            Ok(session) => session,
+            Err(error) => {
+                if let Some(hosted) = hosted_cleanup {
+                    hosted.startup_failed().await;
+                }
+                return Err(error);
+            }
+        };
         // Enable Full Access form input only after session startup so a required MCP server cannot
         // block startup while waiting for form input.
         if session

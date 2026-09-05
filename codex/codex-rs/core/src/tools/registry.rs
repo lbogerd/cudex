@@ -497,6 +497,7 @@ impl ToolRegistry {
         mut invocation: ToolInvocation,
         terminal_outcome_reached: Option<Arc<AtomicBool>>,
     ) -> Result<AnyToolResult, FunctionCallError> {
+        crate::hosted::authorize(&invocation)?;
         let tool_name = invocation.tool_name.clone();
         let call_id_owned = invocation.call_id.clone();
         let otel = invocation.turn.session_telemetry.clone();
@@ -773,6 +774,8 @@ async fn handle_any_tool(
     tool: &dyn CoreToolRuntime,
     invocation: ToolInvocation,
 ) -> Result<AnyToolResult, FunctionCallError> {
+    // Recheck after pre-tool hooks have finalized the invocation payload.
+    crate::hosted::authorize(&invocation)?;
     let call_id = invocation.call_id.clone();
     let payload = invocation.payload.clone();
     let output = tool.handle(invocation.clone()).await?;

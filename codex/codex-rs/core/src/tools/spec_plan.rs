@@ -345,6 +345,11 @@ pub(crate) fn extension_tool_executors<'a>(
                 step_store,
             )
         })
+        .chain(codex_extension_api::ToolContributor::tools(
+            &crate::hosted::HostedTools,
+            &session.services.session_extension_data,
+            &session.services.thread_extension_data,
+        ))
 }
 
 #[instrument(level = "trace", skip_all)]

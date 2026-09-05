@@ -3148,6 +3148,9 @@ impl Config {
         codex_home: AbsolutePathBuf,
         config_layer_stack: ConfigLayerStack,
     ) -> std::io::Result<Self> {
+        codex_hosted_agent::reject_legacy_state(codex_home.as_path()).map_err(|error| {
+            std::io::Error::other(crate::hosted::HostedConfigurationError(error.to_string()))
+        })?;
         // Keep the large config-construction future off small test thread stacks.
         Box::pin(async move {
         if cfg.experimental_thread_store_endpoint.is_some() {
@@ -3963,6 +3966,8 @@ impl Config {
             .cloned()
             .or(sqlite_home_env)
             .unwrap_or_else(|| codex_home.clone());
+        codex_hosted_agent::reject_legacy_state(sqlite_home.as_path())
+            .map_err(|error| std::io::Error::other(crate::hosted::HostedConfigurationError(error.to_string())))?;
         let original_permission_profile = permission_profile.clone();
         apply_requirement_constrained_value(
             "approval_policy",
@@ -4380,6 +4385,8 @@ impl Config {
                 .unwrap_or_default(),
             otel,
         };
+        crate::hosted::validate_config(&config)
+            .map_err(|error| std::io::Error::other(crate::hosted::HostedConfigurationError(error)))?;
         Ok(config)
         })
         .await

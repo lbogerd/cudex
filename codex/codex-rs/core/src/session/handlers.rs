@@ -429,6 +429,7 @@ pub(super) async fn shutdown_session_runtime(sess: &Arc<Session>) {
     sess.guardian_review_session.shutdown().await;
 
     crate::hook_runtime::run_session_end_hooks(sess).await;
+    crate::hosted::shutdown(sess).await;
 }
 
 pub(super) async fn emit_thread_stop_lifecycle(sess: &Session) {

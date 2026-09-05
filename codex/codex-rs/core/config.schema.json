@@ -27,6 +27,10 @@
             "type": "string"
           },
           "type": "array"
+        },
+        "sandbox_template": {
+          "description": "Cudex control-plane template name for this hosted role.",
+          "type": "string"
         }
       },
       "type": "object"
@@ -778,6 +782,9 @@
               "$ref": "#/definitions/FeatureToml_for_GuardianV2ConfigToml"
             },
             "hooks": {
+              "type": "boolean"
+            },
+            "hosted_agents": {
               "type": "boolean"
             },
             "image_detail_original": {
@@ -6105,6 +6112,9 @@
         "hooks": {
           "type": "boolean"
         },
+        "hosted_agents": {
+          "type": "boolean"
+        },
         "image_detail_original": {
           "type": "boolean"
         },
@@ -6456,6 +6466,9 @@
         }
       ],
       "description": "Lifecycle hooks configured inline in TOML plus user-level overrides."
+    },
+    "hosted_agents": {
+      "description": "Cudex hosted-runtime settings, validated by the hosted integration before startup."
     },
     "include_apps_instructions": {
       "description": "Whether to inject the `<apps_instructions>` developer block.",

@@ -2068,7 +2068,8 @@ impl Session {
     }
 
     /// Persist the event to rollout and send it to clients.
-    pub(crate) async fn send_event(&self, turn_context: &TurnContext, msg: EventMsg) {
+    pub(crate) async fn send_event(&self, turn_context: &TurnContext, mut msg: EventMsg) {
+        crate::hosted::before_event(self, &mut msg).await;
         let legacy_source = msg.clone();
         if let EventMsg::Error(error) = &legacy_source
             && error

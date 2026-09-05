@@ -109,6 +109,23 @@ impl Session {
         updates: &SessionSettingsUpdate,
     ) -> ConstraintResult<SessionConfiguration> {
         let current_environments = self.services.turn_environments.selections();
+        if self
+            .services
+            .thread_extension_data
+            .get::<crate::hosted::HostedThread>()
+            .is_some()
+            && updates
+                .environments
+                .as_ref()
+                .is_some_and(|update| update.environments != current_environments)
+        {
+            return Err(ConstraintError::InvalidValue {
+                field_name: "environments",
+                candidate: "hosted environment replacement".into(),
+                allowed: "the immutable lease-bound environment selection".into(),
+                requirement_source: codex_config::RequirementSource::Unknown,
+            });
+        }
         if let Some(environments) = &updates.environments
             && let Some(environment) = environments.environments.iter().find(|environment| {
                 environment.config == EnvironmentConfigState::FromThread
