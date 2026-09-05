@@ -95,6 +95,10 @@ pub(crate) async fn shutdown(session: &Session) {
             }
             Err(error) => {
                 tracing::warn!(%error, "hosted finalization failed; retaining lease for recovery");
+                let _ = hosted
+                    .environments
+                    .remove_environment(&hosted.binding.provisioned.environment_id)
+                    .await;
                 return;
             }
         }

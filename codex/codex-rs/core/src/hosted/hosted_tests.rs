@@ -128,3 +128,34 @@ checksum = "sha256:{}"
     assert!(super::is_hosted_configuration_error(&error));
     assert!(error.to_string().contains("ambient MCP"));
 }
+
+#[tokio::test]
+async fn persisted_hosted_identity_cannot_resume_or_delete_without_hosted_configuration() {
+    let home = tempfile::tempdir().unwrap();
+    let mut config = crate::config::test_config().await;
+    config.codex_home = codex_utils_absolute_path::AbsolutePathBuf::try_from(home.path()).unwrap();
+    let thread_id = ThreadId::new();
+    let journals = home.path().join("cudex-runtime/hosted-runtime-v1");
+    std::fs::create_dir_all(&journals).unwrap();
+    // Even an unreadable/corrupt hosted identity must not be mistaken for a local thread.
+    let journal = journals.join(format!("{thread_id}.json"));
+    std::fs::write(&journal, "interrupted journal write").unwrap();
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("test"),
+        config.model_provider.clone(),
+        home.path().to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let mut options = StartThreadOptions::new(config.clone());
+    options.initial_history = InitialHistory::Resumed(ResumedHistory {
+        conversation_id: thread_id,
+        history: Arc::new(Vec::new()),
+        rollout_path: None,
+    });
+    assert!(manager.start_thread(options).await.is_err());
+    assert_eq!(manager.list_thread_ids().await, Vec::<ThreadId>::new());
+    assert!(manager.prepare_delete_hosted_thread(thread_id, &config).await.is_err());
+    assert_eq!(std::fs::read_to_string(journal).unwrap(), "interrupted journal write");
+    // Ordinary local identities still need no remote cleanup configuration.
+    manager.prepare_delete_hosted_thread(ThreadId::new(), &config).await.unwrap();
+}

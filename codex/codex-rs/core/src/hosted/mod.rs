@@ -86,6 +86,14 @@ pub(crate) struct HostedThread {
 impl HostedManagers {
     pub async fn delete(&self, id: ThreadId, config: &Config) -> Result<(), String> {
         let Some(settings) = config::Settings::resolve(config)? else {
+            if codex_hosted_agent::has_hosted_thread(
+                config.codex_home.join("cudex-runtime").as_path(),
+                id,
+            )
+            .map_err(|error| error.to_string())?
+            {
+                return Err("hosted thread cleanup requires its hosted configuration".into());
+            }
             return Ok(());
         };
         let state_dir = config.codex_home.join("cudex-runtime");
@@ -119,6 +127,14 @@ impl HostedManagers {
         environments: Arc<EnvironmentManager>,
     ) -> Result<Option<HostedThread>, String> {
         let Some(settings) = config::Settings::resolve(config)? else {
+            if codex_hosted_agent::has_hosted_thread(
+                config.codex_home.join("cudex-runtime").as_path(),
+                thread_id,
+            )
+            .map_err(|error| error.to_string())?
+            {
+                return Err("resuming a hosted thread requires its hosted configuration".into());
+            }
             return Ok(None);
         };
         if config.ephemeral {
@@ -276,6 +292,10 @@ impl HostedThread {
         }
         config.permissions.approval_policy =
             crate::config::Constrained::allow_only(codex_protocol::protocol::AskForApproval::Never);
+        // Provider-native search never reaches our tool authorization boundary.
+        config.web_search_mode = crate::config::Constrained::allow_only(
+            codex_protocol::config_types::WebSearchMode::Disabled,
+        );
         config
             .permissions
             .replace_permission_profile_from_session_snapshot(

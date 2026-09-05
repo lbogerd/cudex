@@ -605,6 +605,9 @@ fn hosted_model_tool_specs(
     // Responses Lite accepts schemas for client-executed tools, not hosted Responses tools.
     if model_info.use_responses_lite
         || crate::guardian::is_basic_session_source(&turn_context.session_source)
+        // Provider-native tools execute outside the hosted lease policy gate.
+        // Keep this guard even if a later turn attempts to re-enable search.
+        || turn_context.config.features.enabled(Feature::HostedAgents)
     {
         return Vec::new();
     }
@@ -1539,3 +1542,7 @@ fn code_mode_namespace_name<'a>(
 #[cfg(test)]
 #[path = "spec_plan_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "hosted_policy_spec_tests.rs"]
+mod hosted_tests;
