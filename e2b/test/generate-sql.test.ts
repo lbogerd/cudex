@@ -9,11 +9,11 @@ import { assertGeneratedCurrent, generateSql } from '../src/commands/generate-sq
 const databaseUrl = process.env.HOSTED_AGENT_TEST_DATABASE_URL
 
 async function schemaExists(pool: Pool, schema: string): Promise<boolean> {
-  const result = await pool.query('SELECT 1 FROM pg_namespace WHERE nspname = $1', [schema])
+  const result = await pool.query('SELECT 1 FROM pg_database WHERE datname = $1', [schema])
   return result.rowCount === 1
 }
 
-test('SQL checking is deterministic and drops its temporary schema on success', {
+test('SQL checking is deterministic and drops its temporary database on success', {
   skip: databaseUrl ? false : 'HOSTED_AGENT_TEST_DATABASE_URL is not set',
 }, async () => {
   let schema = ''
@@ -23,7 +23,7 @@ test('SQL checking is deterministic and drops its temporary schema on success', 
   try { assert.equal(await schemaExists(pool, schema), false) } finally { await pool.end() }
 })
 
-test('SQL generation drops its schema on failure without exposing credentials', {
+test('SQL generation drops its database on failure without exposing credentials', {
   skip: databaseUrl ? false : 'HOSTED_AGENT_TEST_DATABASE_URL is not set',
 }, async () => {
   let schema = ''

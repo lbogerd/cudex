@@ -41,26 +41,29 @@ export async function assertGeneratedCurrent(expectedRoot: string, actualRoot: s
   if (stale.length > 0) throw new Error(`PgTyped output is stale: ${stale.sort().join(', ')}`)
 }
 
-function schemaConnection(databaseUrl: string, schema: string): string {
+function isolatedConnection(databaseUrl: string, database: string): string {
   const value = new URL(databaseUrl)
-  value.searchParams.set('options', `-c search_path=${schema}`)
+  value.pathname = `/${database}`
+  value.searchParams.delete('options')
   return value.toString()
 }
 
 export async function generateSql(
   check: boolean,
   databaseUrl: string,
-  hooks: { afterMigrate?(schema: string): Promise<void> | void } = {},
+  hooks: { afterMigrate?(database: string): Promise<void> | void } = {},
 ): Promise<void> {
-  const schema = `pgtyped_${randomBytes(12).toString('hex')}`
+  const database = `pgtyped_${randomBytes(12).toString('hex')}`
   const admin = new Pool({ connectionString: databaseUrl })
   let temporaryRoot: string | undefined
   try {
-    await admin.query(`CREATE SCHEMA ${schema}`)
-    const scopedUrl = schemaConnection(databaseUrl, schema)
+    // PgTyped uses its own wire client and ignores libpq PGOPTIONS/search_path.
+    // An isolated database makes its default public schema unambiguous.
+    await admin.query(`CREATE DATABASE ${database}`)
+    const scopedUrl = isolatedConnection(databaseUrl, database)
     const scoped = new Pool({ connectionString: scopedUrl })
     try { await runMigrations(scoped) } finally { await scoped.end() }
-    await hooks.afterMigrate?.(schema)
+    await hooks.afterMigrate?.(database)
 
     let configPath = committedConfig
     let generatedRoot = sourceQueries
@@ -74,15 +77,19 @@ export async function generateSql(
         transforms: [{ mode: 'sql', include: '**/*.sql', emitTemplate: '{{dir}}/{{name}}.queries.ts' }],
       }))
     }
-    await execa(resolve(packageRoot, 'node_modules/.bin/pgtyped'), ['-c', configPath], {
-      cwd: temporaryRoot ?? packageRoot, env: { PATH: process.env.PATH, PGURI: scopedUrl,
-        PGOPTIONS: `-c search_path=${schema}` }, extendEnv: false, reject: true,
+    const output = await execa(resolve(packageRoot, 'node_modules/.bin/pgtyped'), ['-c', configPath], {
+      cwd: temporaryRoot ?? packageRoot, env: { PATH: process.env.PATH, PGURI: scopedUrl },
+      extendEnv: false, reject: true,
     })
+    // Some PgTyped worker failures are printed despite a zero process exit code.
+    if (/Error (?:in query|processing)|Error:/u.test(`${output.stdout}\n${output.stderr}`)) {
+      throw new Error('SQL generation reported query errors')
+    }
     await normalizeGeneratedFiles(generatedRoot)
     if (check) await assertGeneratedCurrent(sourceQueries, generatedRoot)
   } finally {
     if (temporaryRoot) await rm(temporaryRoot, { recursive: true, force: true })
-    await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`).catch(() => undefined)
+    await admin.query(`DROP DATABASE IF EXISTS ${database} WITH (FORCE)`).catch(() => undefined)
     await admin.end()
   }
 }
