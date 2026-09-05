@@ -92,9 +92,43 @@ impl<'call> ToolExecutor<ToolCall<'call>> for ApplyAgentPatch {
                 .apply_patch(arguments.agent_id, &arguments.artifact_id)
                 .await
                 .map_err(FunctionCallError::RespondToModel)?;
-            let value = serde_json::to_value(result)
-                .map_err(|error| FunctionCallError::Fatal(error.to_string()))?;
+            let value = model_patch_result(result);
             Ok(Box::new(JsonToolOutput::new(value)) as Box<dyn ToolOutput>)
         })
     }
 }
+
+// Tool results enter model history; the full control-plane response may be 1 MiB.
+const MAX_MODEL_PATCH_RESULT_BYTES: usize = 8192;
+
+fn model_patch_result(result: codex_hosted_agent::PatchApplyResult) -> serde_json::Value {
+    use codex_hosted_agent::PatchApplyResult;
+
+    match result {
+        PatchApplyResult::Applied { .. } => json!({"type": "applied"}),
+        PatchApplyResult::Conflict { paths } => {
+            let count = paths.len();
+            let value = json!({"type": "conflict", "paths": paths});
+            if value.to_string().len() <= MAX_MODEL_PATCH_RESULT_BYTES {
+                value
+            } else {
+                json!({
+                    "type": "conflict", "paths": [], "omittedPathCount": count,
+                    "summary": "Conflict path details exceeded the model result limit; no changes were applied."
+                })
+            }
+        }
+        PatchApplyResult::Rejected { reason } => {
+            let value = json!({"type": "rejected", "reason": reason});
+            if value.to_string().len() <= MAX_MODEL_PATCH_RESULT_BYTES {
+                value
+            } else {
+                json!({"type": "rejected", "reason": "Rejection details exceeded the model result limit; no changes were applied."})
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "patch_tool_tests.rs"]
+mod tests;
