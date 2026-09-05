@@ -37,6 +37,7 @@ trap 'rm -f "${output_file}" "${watch_file}"' EXIT
 
 echo "Publishing CubeSandbox template from ${image_ref}"
 sudo cubemastercli tpl create-from-image \
+  --detach \
   --image "${image_ref}" \
   --writable-layer-size "${writable_layer_size}" \
   --cpu "${cpu_millicores}" \

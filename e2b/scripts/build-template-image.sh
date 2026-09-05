@@ -29,7 +29,8 @@ if [[ "${binary_sha256}" != "${actual_sha256}" || "${code_mode_host_sha256}" != 
   exit 1
 fi
 
-base_image=${CUBE_BASE_IMAGE:-cubesandbox-codex:0.1.0}
+base_image=${CUBE_BASE_IMAGE:-ghcr.io/tencentcloud/cubesandbox-base@sha256:a1dd972a4eef85448f967daed3bda42c6be2b7f42bf64c1f4d38e63b3e935472}
+node_image=${CUBE_NODE_IMAGE:-node:22-bullseye-slim@sha256:5736e7ef1f3f2109be7ef8aea0cbdf931804aee9a18c6760507b8ded078b25a9}
 image_ref=${CUBE_IMAGE_REF:-"127.0.0.1:5000/cudex-codex:${build_id}"}
 build_dir="${e2b_dir}/template/.build"
 image_metadata_dir="${e2b_dir}/.artifacts/images"
@@ -41,6 +42,7 @@ install -m 0644 "${metadata}" "${build_dir}/build.json"
 sudo docker build \
   --file "${e2b_dir}/template/Dockerfile" \
   --build-arg "BASE_IMAGE=${base_image}" \
+  --build-arg "NODE_IMAGE=${node_image}" \
   --build-arg "CODEX_REVISION=${revision}" \
   --build-arg "CODEX_BINARY_SHA256=${binary_sha256}" \
   --build-arg "CODEX_CODE_MODE_HOST_SHA256=${code_mode_host_sha256}" \
@@ -57,10 +59,11 @@ jq -n \
   --arg image "${image_ref}" \
   --arg imageDigest "${image_digest}" \
   --arg baseImage "${base_image}" \
+  --arg nodeImage "${node_image}" \
   --arg revision "${revision}" \
   --arg sha256 "${binary_sha256}" \
   --arg codeModeHostSha256 "${code_mode_host_sha256}" \
-  '{buildId: $buildId, image: $image, imageDigest: $imageDigest, baseImage: $baseImage, revision: $revision, codexSha256: $sha256, codeModeHostSha256: $codeModeHostSha256}' \
+  '{buildId: $buildId, image: $image, imageDigest: $imageDigest, baseImage: $baseImage, nodeImage: $nodeImage, revision: $revision, codexSha256: $sha256, codeModeHostSha256: $codeModeHostSha256}' \
   >"${image_metadata_dir}/${build_id}.json"
 
 printf 'image=%s\nimage_digest=%s\nmetadata=%s\n' \
