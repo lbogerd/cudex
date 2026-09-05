@@ -22,7 +22,7 @@ interface Pending { value: PendingValue; forwarded: boolean }
 interface RpcObject { [key: string]: unknown }
 
 const requestMethods = new Set([
-  'initialize', 'environment/info', 'environment/status',
+  'initialize', 'environment/info', 'environment/status', 'environmentConfig/read',
   'process/start', 'process/read', 'process/write', 'process/signal', 'process/terminate',
   'fs/readFile', 'fs/open', 'fs/readBlock', 'fs/close', 'fs/writeFile',
   'fs/createDirectory', 'fs/getMetadata', 'fs/canonicalize', 'fs/readDirectory',
@@ -33,17 +33,19 @@ const filesystemMutations = new Set([
 ])
 const serverNotifications = new Set([
   'process/output', 'process/exited', 'process/closed', 'process/quiesced',
-  'http/request/bodyDelta',
+  'http/request/bodyDelta', 'network/policyDecision',
 ])
+const maxPendingNetworkPolicyRequests = 256
+const networkProtocols = new Set(['http', 'https_connect', 'socks5_tcp', 'socks5_udp'])
 const decoder = new TextDecoder('utf-8', { fatal: true })
 
 export class ExecInteractionProtocolError extends Error {
   constructor() { super('invalid tracked exec protocol') }
 }
 
-function bounded(value: unknown): string {
+function bounded(value: unknown, maxBytes = 512): string {
   if (typeof value !== 'string' || !value.trim() || value !== value.trim()
-    || Buffer.byteLength(value) > 512 || /[\u0000-\u001f\u007f]/u.test(value)) {
+    || Buffer.byteLength(value) > maxBytes || /[\u0000-\u001f\u007f]/u.test(value)) {
     throw new ExecInteractionProtocolError()
   }
   return value
@@ -67,6 +69,29 @@ function requestKey(value: unknown): string {
   return typeof id === 'string' ? `s:${id}` : `i:${id}`
 }
 
+function validateNetworkTarget(value: RpcObject): void {
+  if (!networkProtocols.has(bounded(value.protocol))
+    || !Number.isInteger(value.port) || Number(value.port) < 0 || Number(value.port) > 65535) {
+    throw new ExecInteractionProtocolError()
+  }
+  bounded(value.host, 253)
+}
+
+function validateNetworkPolicyResponse(message: RpcObject): void {
+  const isResult = Object.hasOwn(message, 'result')
+  if (isResult === Object.hasOwn(message, 'error')) throw new ExecInteractionProtocolError()
+  if (!isResult) {
+    const error = object(message.error)
+    if (!Number.isSafeInteger(error.code)) throw new ExecInteractionProtocolError()
+    bounded(error.message, 1024)
+    return
+  }
+  const decision = object(object(message.result).decision)
+  if (decision.type === 'allow') return
+  if (decision.type !== 'deny' && decision.type !== 'ask') throw new ExecInteractionProtocolError()
+  bounded(decision.reason, 1024)
+}
+
 function decode(data: WebSocket.RawData): RpcObject {
   let body: Uint8Array
   if (Array.isArray(data)) body = Buffer.concat(data)
@@ -84,6 +109,7 @@ export class ExecInteractionTracker {
   private readonly pending = new Map<string, Pending>()
   private readonly processes = new Map<string, LeaseInteractionIdentity>()
   private readonly preInitializeQuiesced = new Set<string>()
+  private readonly pendingNetworkPolicyRequests = new Set<string>()
   private sessionId: string | undefined
 
   constructor(
@@ -100,6 +126,13 @@ export class ExecInteractionTracker {
 
   async clientFrame(data: WebSocket.RawData, _binary: boolean): Promise<string | null> {
     const message = decode(data)
+    if (!Object.hasOwn(message, 'method')) {
+      const key = requestKey(message.id)
+      if (!this.pendingNetworkPolicyRequests.has(key)) throw new ExecInteractionProtocolError()
+      validateNetworkPolicyResponse(message)
+      this.pendingNetworkPolicyRequests.delete(key)
+      return null
+    }
     if (typeof message.method !== 'string') throw new ExecInteractionProtocolError()
     if (!Object.hasOwn(message, 'id')) {
       if (message.method !== 'initialized') throw new ExecInteractionProtocolError()
@@ -174,8 +207,37 @@ export class ExecInteractionTracker {
   async serverFrame(data: WebSocket.RawData, _binary: boolean): Promise<void> {
     const message = decode(data)
     if (typeof message.method === 'string') {
+      if (Object.hasOwn(message, 'id')) {
+        if (message.method !== 'network/policyRequest'
+          || Object.hasOwn(message, 'result') || Object.hasOwn(message, 'error')) {
+          throw new ExecInteractionProtocolError()
+        }
+        this.requireSession()
+        const key = requestKey(message.id)
+        if (this.pendingNetworkPolicyRequests.has(key)
+          || this.pendingNetworkPolicyRequests.size >= maxPendingNetworkPolicyRequests) {
+          throw new ExecInteractionProtocolError()
+        }
+        const params = object(message.params)
+        if (!this.processes.has(bounded(params.processId, 256))) throw new ExecInteractionProtocolError()
+        validateNetworkTarget(object(params.request))
+        this.pendingNetworkPolicyRequests.add(key)
+        return
+      }
       if (Object.hasOwn(message, 'id') || !serverNotifications.has(message.method)) {
         throw new ExecInteractionProtocolError()
+      }
+      if (message.method === 'network/policyDecision') {
+        const params = object(message.params)
+        if (!this.processes.has(bounded(params.processId, 256))) throw new ExecInteractionProtocolError()
+        validateNetworkTarget(params)
+        for (const key of ['timestamp', 'scope', 'decision', 'source', 'reason']) bounded(params[key], 1024)
+        for (const key of ['method', 'client']) {
+          if (params[key] !== undefined && params[key] !== null) bounded(params[key])
+        }
+        if (params.policyOverride !== undefined && typeof params.policyOverride !== 'boolean') {
+          throw new ExecInteractionProtocolError()
+        }
       }
       if (message.method === 'process/quiesced') {
         const processId = bounded(object(message.params).processId)
@@ -240,6 +302,7 @@ export class ExecInteractionTracker {
   }
 
   async detach(): Promise<void> {
+    this.pendingNetworkPolicyRequests.clear()
     const unfinished = new Map<string, LeaseInteractionIdentity>()
     const neverForwarded = new Map<string, LeaseInteractionIdentity>()
     for (const identity of this.processes.values()) unfinished.set(identity.interactionId, identity)

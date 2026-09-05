@@ -89,6 +89,87 @@ async function initialized(tracker: ExecInteractionTracker, sessionId = 'session
   await tracker.serverFrame(frame({ id: 1, result: { sessionId } }), false)
 }
 
+test('passes stable executor configuration reads without creating a mutation interaction', async () => {
+  const ledger = new FakeLedger()
+  const tracker = new ExecInteractionTracker({ tenantId: 'tenant', ledger }, 'lease', 0)
+  await initialized(tracker)
+  const before = [...ledger.calls]
+  const key = await tracker.clientFrame(frame({
+    id: 'config', method: 'environmentConfig/read', params: { cwd: 'file:///workspace' },
+  }), false)
+  tracker.markForwarded(key)
+  await tracker.serverFrame(frame({ id: 'config', result: { config: { layers: [] } } }), false)
+  assert.deepEqual(ledger.calls, before)
+  assert.equal(ledger.values.size, 0)
+})
+
+async function trackedProcess(): Promise<{ ledger: FakeLedger; tracker: ExecInteractionTracker }> {
+  const ledger = new FakeLedger()
+  const tracker = new ExecInteractionTracker({ tenantId: 'tenant', ledger }, 'lease', 0)
+  await initialized(tracker)
+  const key = await tracker.clientFrame(frame({
+    id: 'start', method: 'process/start', params: { processId: 'process-1' },
+  }), false)
+  tracker.markForwarded(key)
+  await tracker.serverFrame(frame({ id: 'start', result: { processId: 'process-1' } }), false)
+  return { ledger, tracker }
+}
+
+const policyRequest = (id: string | number, processId = 'process-1'): unknown => ({
+  id, method: 'network/policyRequest', params: {
+    processId, request: { protocol: 'https_connect', host: 'example.com', port: 443 },
+  },
+})
+
+test('correlates network policy replies without bypassing process or filesystem interactions', async () => {
+  const { ledger, tracker } = await trackedProcess()
+  const write = await tracker.clientFrame(frame({
+    id: 'shared', method: 'fs/writeFile', params: { path: 'file:///workspace/file' },
+  }), false)
+  tracker.markForwarded(write)
+  const before = [...ledger.calls]
+  await tracker.serverFrame(frame(policyRequest('shared')), false)
+  assert.equal(await tracker.clientFrame(frame({
+    id: 'shared', result: { decision: { type: 'deny', reason: 'not_allowed' } },
+  }), false), null)
+  await tracker.serverFrame(frame({ method: 'network/policyDecision', params: {
+    processId: 'process-1', timestamp: '2026-09-05T00:00:00.000Z', scope: 'domain',
+    decision: 'deny', source: 'baseline_policy', reason: 'not_allowed',
+    protocol: 'https_connect', host: 'example.com', port: 443, policyOverride: false,
+  } }), false)
+  assert.deepEqual(ledger.calls, before)
+  assert.equal([...ledger.values.values()].filter(value => value.state === 'active').length, 2)
+  await tracker.serverFrame(frame({ id: 'shared', result: {} }), false)
+  assert.equal([...ledger.values.values()].filter(value => value.state === 'active').length, 1)
+})
+
+test('rejects unsolicited, mismatched, duplicate and malformed network policy messages', async () => {
+  const { tracker } = await trackedProcess()
+  const response = (id: string): Buffer => frame({ id, result: { decision: { type: 'allow' } } })
+  await assert.rejects(tracker.clientFrame(response('unknown'), false), ExecInteractionProtocolError)
+  await tracker.serverFrame(frame(policyRequest('policy')), false)
+  await assert.rejects(tracker.serverFrame(frame(policyRequest('policy')), false), ExecInteractionProtocolError)
+  await assert.rejects(tracker.clientFrame(response('different'), false), ExecInteractionProtocolError)
+  await assert.rejects(tracker.clientFrame(frame({ id: 'policy', result: { decision: { type: 'other' } } }), false), ExecInteractionProtocolError)
+  await assert.rejects(tracker.clientFrame(frame({ id: 'policy', result: {}, error: {} }), false), ExecInteractionProtocolError)
+  await tracker.clientFrame(response('policy'), false)
+  await assert.rejects(tracker.clientFrame(response('policy'), false), ExecInteractionProtocolError)
+  await assert.rejects(tracker.serverFrame(frame(policyRequest('cross-lease', 'other-process')), false), ExecInteractionProtocolError)
+  await assert.rejects(tracker.serverFrame(frame({ id: 'write', method: 'fs/writeFile', params: {} }), false), ExecInteractionProtocolError)
+  await assert.rejects(tracker.serverFrame(frame({ method: 'network/policyDecision', params: { processId: 'process-1' } }), false), ExecInteractionProtocolError)
+})
+
+test('bounds reverse network requests and clears correlation when transport detaches', async () => {
+  const { tracker, ledger } = await trackedProcess()
+  for (let id = 0; id < 256; id++) await tracker.serverFrame(frame(policyRequest(id)), false)
+  await assert.rejects(tracker.serverFrame(frame(policyRequest(256)), false), ExecInteractionProtocolError)
+  await tracker.clientFrame(frame({ id: 0, error: { code: -32603, message: 'cancelled' } }), false)
+  await tracker.serverFrame(frame(policyRequest(256)), false)
+  await tracker.detach()
+  await assert.rejects(tracker.clientFrame(frame({ id: 1, result: { decision: { type: 'allow' } } }), false), ExecInteractionProtocolError)
+  assert.equal([...ledger.values.values()][0]?.state, 'detached')
+})
+
 test('tracks process quiescence and filesystem completion before releasing frames', async () => {
   const ledger = new FakeLedger()
   const tracker = new ExecInteractionTracker({ tenantId: 'tenant', ledger }, 'lease', 0)
