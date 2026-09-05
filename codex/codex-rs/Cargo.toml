@@ -49,6 +49,7 @@ members = [
     "hooks",
     "history",
     "http-client",
+    "hosted-agent",
     "secrets",
     "exec",
     "file-system",
@@ -188,6 +189,7 @@ codex-code-mode-protocol = { path = "code-mode-protocol" }
 codex-code-mode-runtime = { path = "code-mode-runtime" }
 codex-home = { path = "codex-home" }
 codex-http-client = { path = "http-client" }
+codex-hosted-agent = { path = "hosted-agent" }
 codex-websocket-client = { path = "websocket-client" }
 codex-config = { path = "config" }
 codex-connectors = { path = "connectors" }

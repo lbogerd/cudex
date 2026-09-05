@@ -26,6 +26,7 @@ codex-otel = { workspace = true }
 codex-otel-trace-websocket = { workspace = true }
 codex-protocol = { workspace = true }
 futures = { workspace = true }
+libc = { workspace = true }
 prost = "0.14.3"
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["io-std", "io-util", "macros", "net", "process", "rt", "sync", "time"] }
