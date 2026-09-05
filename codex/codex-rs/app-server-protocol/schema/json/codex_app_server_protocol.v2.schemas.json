@@ -388,6 +388,146 @@
         }
       ]
     },
+    "AgentPatchApplyParams": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {
+        "agentId": {
+          "type": "string"
+        },
+        "artifactId": {
+          "type": "string"
+        },
+        "threadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "agentId",
+        "artifactId",
+        "threadId"
+      ],
+      "title": "AgentPatchApplyParams",
+      "type": "object"
+    },
+    "AgentPatchApplyResponse": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "oneOf": [
+        {
+          "properties": {
+            "type": {
+              "enum": [
+                "applied"
+              ],
+              "title": "Appliedv2::AgentPatchApplyResponseType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "Appliedv2::AgentPatchApplyResponse",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "paths": {
+              "items": {
+                "$ref": "#/definitions/PathUri"
+              },
+              "type": "array"
+            },
+            "type": {
+              "enum": [
+                "conflict"
+              ],
+              "title": "Conflictv2::AgentPatchApplyResponseType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "paths",
+            "type"
+          ],
+          "title": "Conflictv2::AgentPatchApplyResponse",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "reason": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "rejected"
+              ],
+              "title": "Rejectedv2::AgentPatchApplyResponseType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "reason",
+            "type"
+          ],
+          "title": "Rejectedv2::AgentPatchApplyResponse",
+          "type": "object"
+        }
+      ],
+      "title": "AgentPatchApplyResponse"
+    },
+    "AgentPatchArtifactMetadata": {
+      "description": "Non-secret, durable metadata for a hosted workspace patch.",
+      "properties": {
+        "agentId": {
+          "type": "string"
+        },
+        "artifactId": {
+          "type": "string"
+        },
+        "baseSnapshotId": {
+          "type": "string"
+        },
+        "changedFiles": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "checksum": {
+          "type": "string"
+        },
+        "sizeBytes": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "agentId",
+        "artifactId",
+        "baseSnapshotId",
+        "changedFiles",
+        "checksum",
+        "sizeBytes"
+      ],
+      "type": "object"
+    },
+    "AgentPatchAvailableNotification": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "Delivered only to subscribers of the owner eligible to apply this patch.",
+      "properties": {
+        "artifact": {
+          "$ref": "#/definitions/AgentPatchArtifactMetadata"
+        },
+        "threadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "artifact",
+        "threadId"
+      ],
+      "title": "AgentPatchAvailableNotification",
+      "type": "object"
+    },
     "AgentPath": {
       "type": "string"
     },
@@ -1719,6 +1859,30 @@
         },
         {
           "description": "NEW APIs",
+          "properties": {
+            "id": {
+              "$ref": "#/definitions/RequestId"
+            },
+            "method": {
+              "enum": [
+                "agent/patchApply"
+              ],
+              "title": "Agent/patchApplyRequestMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/AgentPatchApplyParams"
+            }
+          },
+          "required": [
+            "id",
+            "method",
+            "params"
+          ],
+          "title": "Agent/patchApplyRequest",
+          "type": "object"
+        },
+        {
           "properties": {
             "id": {
               "$ref": "#/definitions/RequestId"
@@ -15588,6 +15752,26 @@
           "properties": {
             "method": {
               "enum": [
+                "agent/patchAvailable"
+              ],
+              "title": "Agent/patchAvailableNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/AgentPatchAvailableNotification"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "Agent/patchAvailableNotification",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "enum": [
                 "thread/unarchived"
               ],
               "title": "Thread/unarchivedNotificationMethod",
@@ -21174,6 +21358,13 @@
     "ThreadStartParams": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
+        "agentType": {
+          "description": "Cudex hosted role. The configured default is used when omitted.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "approvalPolicy": {
           "anyOf": [
             {

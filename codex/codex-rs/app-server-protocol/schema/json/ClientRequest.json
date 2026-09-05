@@ -78,6 +78,25 @@
         }
       ]
     },
+    "AgentPatchApplyParams": {
+      "properties": {
+        "agentId": {
+          "type": "string"
+        },
+        "artifactId": {
+          "type": "string"
+        },
+        "threadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "agentId",
+        "artifactId",
+        "threadId"
+      ],
+      "type": "object"
+    },
     "ApprovalsReviewer": {
       "description": "Configures who approval requests are routed to for review. Examples include sandbox escapes, blocked network access, MCP approval prompts, and ARC escalations. Defaults to `user`. `auto_review` uses a carefully prompted subagent to gather relevant context and apply a risk-based decision framework before approving or denying the request. The legacy value `guardian_subagent` is accepted for compatibility.",
       "enum": [
@@ -5045,6 +5064,13 @@
     },
     "ThreadStartParams": {
       "properties": {
+        "agentType": {
+          "description": "Cudex hosted role. The configured default is used when omitted.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "approvalPolicy": {
           "anyOf": [
             {
@@ -5735,6 +5761,30 @@
     },
     {
       "description": "NEW APIs",
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/RequestId"
+        },
+        "method": {
+          "enum": [
+            "agent/patchApply"
+          ],
+          "title": "Agent/patchApplyRequestMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/AgentPatchApplyParams"
+        }
+      },
+      "required": [
+        "id",
+        "method",
+        "params"
+      ],
+      "title": "Agent/patchApplyRequest",
+      "type": "object"
+    },
+    {
       "properties": {
         "id": {
           "$ref": "#/definitions/RequestId"

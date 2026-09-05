@@ -44,6 +44,15 @@ impl ThreadRequestProcessor {
             self.prepare_thread_for_delete(thread_id_to_delete).await;
         }
 
+        // Complete or durably retain remote cleanup before forgetting local identity.
+        // A failed clear leaves the local thread available for an exact retry.
+        for thread_id_to_delete in thread_ids.iter().rev().copied() {
+            self.thread_manager
+                .prepare_delete_hosted_thread(thread_id_to_delete, &self.config)
+                .await
+                .map_err(|error| internal_error(format!("hosted cleanup pending: {error}")))?;
+        }
+
         let mut delete_order: Vec<_> = thread_ids.iter().skip(1).rev().copied().collect();
         delete_order.push(thread_id);
 

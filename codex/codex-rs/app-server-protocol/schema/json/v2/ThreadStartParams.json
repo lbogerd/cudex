@@ -301,6 +301,13 @@
     }
   },
   "properties": {
+    "agentType": {
+      "description": "Cudex hosted role. The configured default is used when omitted.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "approvalPolicy": {
       "anyOf": [
         {

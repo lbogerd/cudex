@@ -60,6 +60,9 @@ pub enum ThreadStartSource {
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct ThreadStartParams {
+    /// Cudex hosted role. The configured default is used when omitted.
+    #[ts(optional = nullable)]
+    pub agent_type: Option<String>,
     #[ts(optional = nullable)]
     pub model: Option<String>,
     #[ts(optional = nullable)]

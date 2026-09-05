@@ -7,7 +7,6 @@ use codex_code_mode::GrpcCodeModeSessionProvider;
 use codex_config::LoaderOverrides;
 use codex_config::NoopThreadConfigLoader;
 use codex_core::config::Config;
-use codex_core::config::UnsupportedUntrustedApprovalPolicyError;
 use codex_core::resolve_installation_id;
 use codex_login::AuthManager;
 #[cfg(debug_assertions)]
@@ -55,8 +54,6 @@ use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::TextPosition as AppTextPosition;
 use codex_app_server_protocol::TextRange as AppTextRange;
 use codex_config::ConfigLayerSource;
-use codex_config::ConfigLoadError;
-use codex_config::TextRange as CoreTextRange;
 use codex_core::ExecPolicyError;
 use codex_core::check_execpolicy_for_warnings;
 use codex_core::config::find_codex_home;
@@ -81,14 +78,6 @@ use tracing_subscriber::registry::Registry;
 use tracing_subscriber::util::SubscriberInitExt;
 
 const SQLITE_RECOVERY_CONFIG_WARNING_SUMMARY: &str = "Codex rebuilt its local database.";
-
-fn is_unsupported_untrusted_approval_policy_error(err: &std::io::Error) -> bool {
-    err.get_ref().is_some_and(
-        <dyn std::error::Error + Send + Sync + 'static>::is::<
-            UnsupportedUntrustedApprovalPolicyError,
-        >,
-    )
-}
 
 mod analytics_utils;
 mod app_info;
@@ -284,34 +273,6 @@ impl ShutdownState {
     }
 }
 
-fn config_warning_from_error(
-    summary: impl Into<String>,
-    err: &std::io::Error,
-) -> ConfigWarningNotification {
-    let (path, range) = match config_error_location(err) {
-        Some((path, range)) => (Some(path), Some(range)),
-        None => (None, None),
-    };
-    ConfigWarningNotification {
-        summary: summary.into(),
-        details: Some(err.to_string()),
-        path,
-        range,
-    }
-}
-
-fn config_error_location(err: &std::io::Error) -> Option<(String, AppTextRange)> {
-    err.get_ref()
-        .and_then(|err| err.downcast_ref::<ConfigLoadError>())
-        .map(|err| {
-            let config_error = err.config_error();
-            (
-                config_error.path.to_string_lossy().to_string(),
-                app_text_range(&config_error.range),
-            )
-        })
-}
-
 fn exec_policy_warning_location(err: &ExecPolicyError) -> (Option<String>, Option<AppTextRange>) {
     match err {
         ExecPolicyError::ParsePolicy { path, source } => {
@@ -341,19 +302,6 @@ fn exec_policy_config_warning(err: &ExecPolicyError) -> ConfigWarningNotificatio
         details: Some(err.to_string()),
         path,
         range,
-    }
-}
-
-fn app_text_range(range: &CoreTextRange) -> AppTextRange {
-    AppTextRange {
-        start: AppTextPosition {
-            line: range.start.line,
-            column: range.start.column,
-        },
-        end: AppTextPosition {
-            line: range.end.line,
-            column: range.end.column,
-        },
     }
 }
 
@@ -516,41 +464,16 @@ pub async fn run_main_with_transport_options(
                 config.http_client_factory(),
             );
         }
-        Err(err) if is_unsupported_untrusted_approval_policy_error(&err) => {
-            return Err(err);
-        }
         Err(err) => {
-            warn!(error = %err, "Failed to preload config for cloud config bundle");
-            // If this fails, we cannot install cloud/thread config loaders, so non-strict
-            // startup continues without managed cloud config.
+            // Invalid hosted configuration must never become a local default session.
+            return Err(err);
         }
     };
     let mut config_warnings = Vec::new();
-    let mut plugin_startup_config = PluginStartupConfig::Current;
-    let config = match config_manager
+    let plugin_startup_config = PluginStartupConfig::Current;
+    let config = config_manager
         .load_latest_config(/*fallback_cwd*/ None)
-        .await
-    {
-        Ok(config) => config,
-        Err(err) if is_unsupported_untrusted_approval_policy_error(&err) => {
-            return Err(err);
-        }
-        Err(err) => {
-            if strict_config {
-                return Err(err);
-            }
-
-            let message = config_warning_from_error("Invalid configuration; using defaults.", &err);
-            config_warnings.push(message);
-            plugin_startup_config = PluginStartupConfig::Defaults;
-            config_manager.load_default_config().await.map_err(|e| {
-                std::io::Error::new(
-                    ErrorKind::InvalidData,
-                    format!("error loading default config after config error: {e}"),
-                )
-            })?
-        }
-    };
+        .await?;
     config.auth_config().validate()?;
     let code_mode_session_provider: Option<Arc<dyn CodeModeSessionProvider>> =
         match &runtime_options.code_mode_host_transport {
@@ -928,6 +851,7 @@ pub async fn run_main_with_transport_options(
             .then_some(plugin_startup_config),
         }));
         let mut thread_created_rx = processor.thread_created_receiver();
+        let mut hosted_patch_rx = processor.hosted_patch_receiver();
         let mut running_turn_count_rx = processor.subscribe_running_assistant_turn_count();
         let mut connections = HashMap::<ConnectionId, ConnectionState>::new();
         let mut connection_cleanup_tasks = ConnectionCleanupTasks::new();
@@ -936,6 +860,7 @@ pub async fn run_main_with_transport_options(
         let transport_shutdown_token = transport_shutdown_token.clone();
         async move {
             let mut listen_for_threads = true;
+            let mut listen_for_hosted_patches = true;
             let mut shutdown_state = ShutdownState::default();
             let exit_reason = loop {
                 let running_turn_count = {
@@ -1143,6 +1068,18 @@ pub async fn run_main_with_transport_options(
                         initialize_notification_sender
                             .send_server_notification(notification)
                             .await;
+                    }
+                    patch = hosted_patch_rx.recv(), if listen_for_hosted_patches => {
+                        match patch {
+                            Ok(patch) => processor.hosted_patch_available(patch).await,
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                // Artifacts remain durable; notification delivery is advisory.
+                                warn!("hosted patch notification receiver lagged");
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                listen_for_hosted_patches = false;
+                            }
+                        }
                     }
                     created = thread_created_rx.recv(), if listen_for_threads => {
                         match created {

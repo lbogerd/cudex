@@ -2925,3 +2925,16 @@ For server-initiated request payloads, annotate the field the same way so schema
    ```bash
    just test -p codex-app-server-protocol
    ```
+
+## Cudex hosted-agent additions
+
+This fork adds the following v2 surface while retaining the upstream thread API:
+
+- `thread/start` accepts optional `agentType`, selecting a configured hosted role. It requires hosted mode to be enabled; role/template policy remains enforced by the control plane.
+- `agent/patchAvailable` carries `{ threadId, artifact }`. `threadId` is the owning recipient, while `artifact.agentId` is the producing child. Only the owner's subscribed connections receive it. Metadata includes the artifact ID, base snapshot ID, checksum, changed-file count, and byte size; it contains no execution credentials. Notifications are advisory; the artifact is durable.
+- `agent/patchApply` accepts `{ threadId, agentId, artifactId }`, where `threadId` identifies the active owner. It uses the same owner/policy gate as the model-facing `apply_agent_patch` tool. Its tagged response is `{"type":"applied"}`, `{"type":"conflict","paths":[...]}`, or `{"type":"rejected","reason":"..."}`. Internal checkpoint data is not exposed in that response.
+- `thread/delete` performs durable hosted cleanup before deleting local thread identity. Failure preserves the local record for retry. Disabling hosted configuration does not bypass cleanup for a persisted hosted thread.
+
+Hosted startup and cold resume require consistent hosted configuration and a remote binding; there is no local execution fallback. Independent root history forks are rejected. Child turn completion publishes a patch but keeps the child resident for followups; explicit shutdown finalizes cleanup.
+
+Configuration-load errors are fatal at app-server startup in this fork, including malformed configuration. The server does not substitute defaults that could accidentally disable hosted mode. See the repository's [architecture](../../../docs/architecture.md) and [development guide](../../../docs/development.md) for configuration and recovery boundaries.

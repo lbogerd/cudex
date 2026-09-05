@@ -1,0 +1,21 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "properties": {
+    "agentId": {
+      "type": "string"
+    },
+    "artifactId": {
+      "type": "string"
+    },
+    "threadId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "agentId",
+    "artifactId",
+    "threadId"
+  ],
+  "title": "AgentPatchApplyParams",
+  "type": "object"
+}

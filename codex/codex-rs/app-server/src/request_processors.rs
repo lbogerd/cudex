@@ -682,6 +682,7 @@ fn resolve_runtime_workspace_roots(workspace_roots: Vec<AbsolutePathBuf>) -> Vec
 }
 
 mod config_errors;
+mod hosted_agent;
 mod request_errors;
 mod thread_delete;
 mod thread_goal_processor;

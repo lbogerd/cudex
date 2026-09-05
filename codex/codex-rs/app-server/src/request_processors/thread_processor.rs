@@ -1114,6 +1114,7 @@ impl ThreadRequestProcessor {
         request_context: RequestContext,
     ) -> Result<(), JSONRPCErrorError> {
         let ThreadStartParams {
+            agent_type,
             model,
             model_provider,
             allow_provider_model_fallback,
@@ -1124,7 +1125,7 @@ impl ThreadRequestProcessor {
             approvals_reviewer,
             sandbox,
             permissions,
-            config,
+            mut config,
             service_name,
             base_instructions,
             developer_instructions,
@@ -1141,6 +1142,22 @@ impl ThreadRequestProcessor {
             project_id,
             environments,
         } = params;
+        if let Some(agent_type) = agent_type {
+            if !self
+                .config
+                .features
+                .enabled(codex_features::Feature::HostedAgents)
+            {
+                return Err(invalid_request("agentType requires hosted agents"));
+            }
+            if agent_type.trim().is_empty() {
+                return Err(invalid_request("agentType must not be empty"));
+            }
+            config.get_or_insert_with(HashMap::new).insert(
+                "hosted_agents.default_agent_type".to_owned(),
+                serde_json::Value::String(agent_type),
+            );
+        }
         if matches!(
             history_mode,
             Some(codex_app_server_protocol::ThreadHistoryMode::Paginated)

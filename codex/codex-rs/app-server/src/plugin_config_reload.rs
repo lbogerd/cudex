@@ -9,19 +9,9 @@ use std::sync::Arc;
 /// The config-loading path used to select marketplaces for startup tasks.
 pub(crate) enum PluginStartupConfig {
     Current,
-    Defaults,
 }
 
 pub(crate) fn for_cwd(manager: ConfigManager, cwd: AbsolutePathBuf) -> ConfigLayerReload {
     let runtime = tokio::runtime::Handle::current();
     Arc::new(move || runtime.block_on(manager.load_config_layers_for_cwd(cwd.clone())))
-}
-
-pub(crate) fn defaults(manager: ConfigManager) -> ConfigLayerReload {
-    let runtime = tokio::runtime::Handle::current();
-    Arc::new(move || {
-        runtime
-            .block_on(manager.load_default_config())
-            .map(|config| config.config_layer_stack)
-    })
 }

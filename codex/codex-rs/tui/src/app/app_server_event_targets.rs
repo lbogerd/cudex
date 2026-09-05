@@ -54,6 +54,9 @@ pub(super) fn server_notification_thread_target(
         ServerNotification::ThreadReverted(notification) => Some(notification.thread_id.as_str()),
         ServerNotification::ThreadArchived(notification) => Some(notification.thread_id.as_str()),
         ServerNotification::ThreadDeleted(notification) => Some(notification.thread_id.as_str()),
+        ServerNotification::AgentPatchAvailable(notification) => {
+            Some(notification.thread_id.as_str())
+        }
         ServerNotification::ThreadUnarchived(notification) => Some(notification.thread_id.as_str()),
         ServerNotification::ThreadClosed(notification) => Some(notification.thread_id.as_str()),
         ServerNotification::ThreadNameUpdated(notification) => {
@@ -351,5 +354,28 @@ mod tests {
         let target = server_notification_thread_target(&notification);
 
         assert_eq!(target, ServerNotificationThreadTarget::Thread(thread_id));
+    }
+
+    #[test]
+    fn hosted_patch_routes_to_owner_not_producer() {
+        let owner = ThreadId::new();
+        let producer = ThreadId::new();
+        let notification = ServerNotification::AgentPatchAvailable(
+            codex_app_server_protocol::AgentPatchAvailableNotification {
+                thread_id: owner.to_string(),
+                artifact: codex_app_server_protocol::AgentPatchArtifactMetadata {
+                    artifact_id: "artifact-1".to_owned(),
+                    agent_id: producer.to_string(),
+                    base_snapshot_id: "snapshot-1".to_owned(),
+                    checksum: "sha256:00".to_owned(),
+                    changed_files: 1,
+                    size_bytes: 42,
+                },
+            },
+        );
+        assert_eq!(
+            server_notification_thread_target(&notification),
+            ServerNotificationThreadTarget::Thread(owner)
+        );
     }
 }

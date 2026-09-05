@@ -177,6 +177,58 @@
       ],
       "type": "object"
     },
+    "AgentPatchArtifactMetadata": {
+      "description": "Non-secret, durable metadata for a hosted workspace patch.",
+      "properties": {
+        "agentId": {
+          "type": "string"
+        },
+        "artifactId": {
+          "type": "string"
+        },
+        "baseSnapshotId": {
+          "type": "string"
+        },
+        "changedFiles": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "checksum": {
+          "type": "string"
+        },
+        "sizeBytes": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "agentId",
+        "artifactId",
+        "baseSnapshotId",
+        "changedFiles",
+        "checksum",
+        "sizeBytes"
+      ],
+      "type": "object"
+    },
+    "AgentPatchAvailableNotification": {
+      "description": "Delivered only to subscribers of the owner eligible to apply this patch.",
+      "properties": {
+        "artifact": {
+          "$ref": "#/definitions/AgentPatchArtifactMetadata"
+        },
+        "threadId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "artifact",
+        "threadId"
+      ],
+      "type": "object"
+    },
     "AgentPath": {
       "type": "string"
     },
@@ -6803,6 +6855,26 @@
         "params"
       ],
       "title": "Thread/deletedNotification",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "method": {
+          "enum": [
+            "agent/patchAvailable"
+          ],
+          "title": "Agent/patchAvailableNotificationMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/AgentPatchAvailableNotification"
+        }
+      },
+      "required": [
+        "method",
+        "params"
+      ],
+      "title": "Agent/patchAvailableNotification",
       "type": "object"
     },
     {

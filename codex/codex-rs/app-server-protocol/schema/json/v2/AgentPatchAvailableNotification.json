@@ -1,0 +1,56 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "definitions": {
+    "AgentPatchArtifactMetadata": {
+      "description": "Non-secret, durable metadata for a hosted workspace patch.",
+      "properties": {
+        "agentId": {
+          "type": "string"
+        },
+        "artifactId": {
+          "type": "string"
+        },
+        "baseSnapshotId": {
+          "type": "string"
+        },
+        "changedFiles": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "checksum": {
+          "type": "string"
+        },
+        "sizeBytes": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "agentId",
+        "artifactId",
+        "baseSnapshotId",
+        "changedFiles",
+        "checksum",
+        "sizeBytes"
+      ],
+      "type": "object"
+    }
+  },
+  "description": "Delivered only to subscribers of the owner eligible to apply this patch.",
+  "properties": {
+    "artifact": {
+      "$ref": "#/definitions/AgentPatchArtifactMetadata"
+    },
+    "threadId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "artifact",
+    "threadId"
+  ],
+  "title": "AgentPatchAvailableNotification",
+  "type": "object"
+}

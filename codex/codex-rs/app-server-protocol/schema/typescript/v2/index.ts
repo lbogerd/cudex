@@ -16,6 +16,10 @@ export type { AdditionalNetworkPermissions } from "./AdditionalNetworkPermission
 export type { AdditionalPermissionProfile } from "./AdditionalPermissionProfile";
 export type { AgentMessageDelivery } from "./AgentMessageDelivery";
 export type { AgentMessageDeltaNotification } from "./AgentMessageDeltaNotification";
+export type { AgentPatchApplyParams } from "./AgentPatchApplyParams";
+export type { AgentPatchApplyResponse } from "./AgentPatchApplyResponse";
+export type { AgentPatchArtifactMetadata } from "./AgentPatchArtifactMetadata";
+export type { AgentPatchAvailableNotification } from "./AgentPatchAvailableNotification";
 export type { AllowDenyRequirement } from "./AllowDenyRequirement";
 export type { AnalyticsConfig } from "./AnalyticsConfig";
 export type { AppBranding } from "./AppBranding";

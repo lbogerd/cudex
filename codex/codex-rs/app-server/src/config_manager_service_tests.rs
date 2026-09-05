@@ -670,56 +670,6 @@ async fn write_value_defaults_to_selected_user_config_path() {
 }
 
 #[tokio::test]
-async fn load_default_config_preserves_managed_requirements_and_selected_user_config_path() {
-    let tmp = tempdir().expect("tempdir");
-    std::fs::write(tmp.path().join(CONFIG_TOML_FILE), "model = \"gpt-main\"").unwrap();
-    std::fs::write(
-        tmp.path().join("requirements.toml"),
-        "allowed_login_methods = [\"api\"]\nallowed_chatgpt_workspaces = [\"managed-workspace\"]\n",
-    )
-    .unwrap();
-    let selected_path = tmp.path().join("work.config.toml");
-    std::fs::write(&selected_path, "not valid toml").unwrap();
-    let selected_file =
-        AbsolutePathBuf::from_absolute_path(&selected_path).expect("selected config path");
-
-    let mut loader_overrides =
-        LoaderOverrides::with_managed_config_path_for_tests(tmp.path().join("managed_config.toml"));
-    loader_overrides.user_config_path = Some(selected_file.clone());
-    loader_overrides.user_config_profile = Some("work".parse().expect("profile-v2 name"));
-    let service = ConfigManager::new_for_tests(
-        tmp.path().to_path_buf(),
-        vec![],
-        loader_overrides,
-        CloudConfigBundleLoader::default(),
-    );
-
-    service
-        .load_latest_config(/*fallback_cwd*/ None)
-        .await
-        .expect_err("selected config should fail to load");
-    let config = service
-        .load_default_config()
-        .await
-        .expect("default config loads after selected config error");
-
-    assert_eq!(
-        config.config_layer_stack.get_user_config_file(),
-        Some(&selected_file)
-    );
-    assert_eq!(
-        config
-            .config_layer_stack
-            .requirements()
-            .managed_auth_policy(),
-        codex_config::ManagedAuthPolicy {
-            allowed_login_methods: Some(vec![codex_protocol::config_types::ForcedLoginMethod::Api]),
-            allowed_chatgpt_workspaces: Some(vec!["managed-workspace".to_string()]),
-        }
-    );
-}
-
-#[tokio::test]
 async fn managed_auth_policy_survives_unusable_requirements_file_changes() -> Result<()> {
     let tmp = tempdir()?;
     std::fs::write(tmp.path().join(CONFIG_TOML_FILE), "")?;

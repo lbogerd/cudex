@@ -528,9 +528,6 @@ impl MessageProcessor {
                 PluginStartupConfig::Current => {
                     plugin_config_reload::for_cwd(config_manager.clone(), config.cwd.clone())
                 }
-                PluginStartupConfig::Defaults => {
-                    plugin_config_reload::defaults(config_manager.clone())
-                }
             };
             let on_effective_plugins_changed =
                 plugin_processor.effective_plugins_changed_callback();
@@ -735,6 +732,21 @@ impl MessageProcessor {
 
     pub(crate) fn thread_created_receiver(&self) -> broadcast::Receiver<ThreadId> {
         self.thread_processor.thread_created_receiver()
+    }
+
+    pub(crate) fn hosted_patch_receiver(
+        &self,
+    ) -> broadcast::Receiver<codex_core::HostedAgentPatchAvailable> {
+        self.thread_processor.hosted_patch_receiver()
+    }
+
+    pub(crate) async fn hosted_patch_available(
+        &self,
+        available: codex_core::HostedAgentPatchAvailable,
+    ) {
+        self.thread_processor
+            .hosted_patch_available(available)
+            .await;
     }
 
     pub(crate) async fn send_initialize_notifications_to_connection(
@@ -1180,6 +1192,11 @@ impl MessageProcessor {
                     .thread_delete(request_id.clone(), params)
                     .await
             }
+            ClientRequest::AgentPatchApply { params, .. } => self
+                .thread_processor
+                .hosted_patch_apply(params)
+                .await
+                .map(|response| Some(response.into())),
             ClientRequest::ThreadIncrementElicitation { params, .. } => {
                 self.thread_processor
                     .thread_increment_elicitation(params)

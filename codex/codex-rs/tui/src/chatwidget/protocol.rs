@@ -261,6 +261,9 @@ impl ChatWidget {
             | ServerNotification::ProjectChanged(_)
             | ServerNotification::ThreadProjectUpdated(_) => {}
             ServerNotification::ContextCompacted(_) => {}
+            // Durable patch metadata is consumed by Cudex; the child completion
+            // message already describes the artifact to the user and parent agent.
+            ServerNotification::AgentPatchAvailable(_) => {}
         }
         self.thread_usage.replaying_turn_completion = was_replaying_turn_completion;
     }

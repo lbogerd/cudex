@@ -509,6 +509,11 @@ client_request_definitions! {
     },
 
     /// NEW APIs
+    AgentPatchApply => "agent/patchApply" {
+        params: v2::AgentPatchApplyParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::AgentPatchApplyResponse,
+    },
     // Thread lifecycle
     // Uses `inspect_params` because only some fields are experimental.
     ThreadStart => "thread/start" {
@@ -1845,6 +1850,7 @@ server_notification_definitions! {
     ThreadStatusChanged => "thread/status/changed" (v2::ThreadStatusChangedNotification),
     ThreadArchived => "thread/archived" (v2::ThreadArchivedNotification),
     ThreadDeleted => "thread/deleted" (v2::ThreadDeletedNotification),
+    AgentPatchAvailable => "agent/patchAvailable" (v2::AgentPatchAvailableNotification),
     ThreadUnarchived => "thread/unarchived" (v2::ThreadUnarchivedNotification),
     ThreadClosed => "thread/closed" (v2::ThreadClosedNotification),
     ThreadReverted => "thread/reverted" (v2::ThreadRevertedNotification),
