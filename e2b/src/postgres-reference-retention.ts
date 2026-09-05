@@ -2,6 +2,7 @@ import type { Pool, PoolClient } from 'pg'
 import { createHash } from 'node:crypto'
 import type { ReferenceClearRequest, RetentionRequest, RetentionResponse } from './types.js'
 import { ServiceError } from './types.js'
+import { baselineLease, resolveRestoreLineage } from './restore-lineage.js'
 import { begin, commit, lockLeaseTransaction, rollbackQuietly, setLocalLockTimeout } from './db/primitives.js'
 import { addCodexArtifactReference, addCodexSnapshotReferences, authorizeCodexArtifact,
   authorizeCodexLease, authorizeCodexSnapshot, clearCodexReferenceSet,
@@ -33,6 +34,11 @@ export class PostgresReferenceRetention {
       await setLocalLockTimeout(client)
       await lockLeaseTransaction(client, `codex-reference:${this.tenantId}:${input.agentId}`)
       await this.authorizeLease(client, input)
+      const lineage = await resolveRestoreLineage(client, this.tenantId, input.leaseId)
+      baselineLease(lineage, input.baseSnapshotId)
+      if (lineage[0]!.latest_snapshot_id !== input.latestSnapshotId) {
+        throw new ServiceError(409, 'retained latest snapshot does not match the current lease')
+      }
       await this.authorizeSnapshot(client, input.agentId, input.baseSnapshotId)
       await this.authorizeSnapshot(client, input.agentId, input.latestSnapshotId)
       if (input.artifactId !== null) await this.authorizeArtifact(client, input.agentId, input.artifactId)

@@ -1,6 +1,8 @@
 /** Types generated for queries found in "src/db/queries/patches.sql" */
 import { PreparedQuery } from '@pgtyped/runtime';
 
+export type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
+
 export type NumberOrString = number | string;
 
 export type stringArray = (string)[];
@@ -15,12 +17,17 @@ export interface IResolvePatchExportLeaseParams {
 export interface IResolvePatchExportLeaseResult {
   agent_id: string;
   base_snapshot_id: string | null;
+  cwd_uri: string;
   latest_snapshot_id: string | null;
   lease_id: string;
   owner_agent_id: string | null;
   owner_lease_id: string | null;
+  restore_source_lease_id: string | null;
+  restore_source_snapshot_id: string | null;
+  sandbox_template: string;
   source_snapshot_id: string | null;
   state: string;
+  workspace_root_uris: Json;
 }
 
 /** 'ResolvePatchExportLease' query type */
@@ -29,13 +36,14 @@ export interface IResolvePatchExportLeaseQuery {
   result: IResolvePatchExportLeaseResult;
 }
 
-const resolvePatchExportLeaseIR: any = {"usedParamSet":{"tenantId":true,"leaseId":true},"params":[{"name":"tenantId","required":true,"transform":{"type":"scalar"},"locs":[{"a":168,"b":177}]},{"name":"leaseId","required":true,"transform":{"type":"scalar"},"locs":[{"a":194,"b":202}]}],"statement":"SELECT lease_id, agent_id, owner_agent_id, owner_lease_id, source_snapshot_id,\n  base_snapshot_id, latest_snapshot_id, state\nFROM hosted_agent_leases WHERE tenant_id = :tenantId! AND lease_id = :leaseId!"};
+const resolvePatchExportLeaseIR: any = {"usedParamSet":{"tenantId":true,"leaseId":true},"params":[{"name":"tenantId","required":true,"transform":{"type":"scalar"},"locs":[{"a":271,"b":280}]},{"name":"leaseId","required":true,"transform":{"type":"scalar"},"locs":[{"a":297,"b":305}]}],"statement":"SELECT lease_id, agent_id, owner_agent_id, owner_lease_id, source_snapshot_id,\n  base_snapshot_id, latest_snapshot_id, state, restore_source_lease_id,\n  restore_source_snapshot_id, sandbox_template, cwd_uri, workspace_root_uris\nFROM hosted_agent_leases WHERE tenant_id = :tenantId! AND lease_id = :leaseId!"};
 
 /**
  * Query generated from SQL:
  * ```
  * SELECT lease_id, agent_id, owner_agent_id, owner_lease_id, source_snapshot_id,
- *   base_snapshot_id, latest_snapshot_id, state
+ *   base_snapshot_id, latest_snapshot_id, state, restore_source_lease_id,
+ *   restore_source_snapshot_id, sandbox_template, cwd_uri, workspace_root_uris
  * FROM hosted_agent_leases WHERE tenant_id = :tenantId! AND lease_id = :leaseId!
  * ```
  */

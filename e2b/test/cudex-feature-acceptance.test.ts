@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { createHash, randomUUID } from 'node:crypto'
 import { execFile } from 'node:child_process'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 import test from 'node:test'
@@ -112,6 +112,33 @@ test('fake-provider/fake-TUI acceptance returns an exact root change into git di
     await state.beginRelease(tenantId, 'lease-root'); await state.releaseLease(tenantId, 'lease-root')
     const leases = await pool.query<{ state: string }>('SELECT state FROM hosted_agent_leases WHERE tenant_id = $1', [tenantId])
     assert.deepEqual(leases.rows, [{ state: 'released' }])
+
+    // A clean restoration materializes a new current/base snapshot, but local
+    // return must still compose against the original immutable Git projection.
+    const restoredManifest = createWorkspaceManifest('restored-current', current.entries)
+    const restoredManifestObject = await stored(state, objects, tenantId, 'manifest-restored', 'manifest',
+      Buffer.from(canonicalJson(restoredManifest)))
+    await state.createLeaseWithBaseSnapshot({ leaseId: 'lease-restored', environmentId: 'environment-restored',
+      tenantId, agentId: 'agent-root', ownerAgentId: null, ownerLeaseId: null,
+      restoreSourceLeaseId: 'lease-root', restoreSourceSnapshotId: current.identity,
+      providerSandboxId: 'sandbox-restored', sandboxTemplate: 'template-pilot',
+      cwdUri: projection.cwd, workspaceRootUris: projection.roots, toolPolicy: {}, policyVersion: 1,
+      baseSnapshot: { snapshotId: restoredManifest.identity, providerSnapshotId: 'provider-restored',
+        workspaceArchiveObjectId: currentArchive.objectId, manifestObjectId: restoredManifestObject.objectId,
+        manifestChecksum: workspaceManifestChecksum(restoredManifest), contentObjectIds: [currentContent.objectId] } })
+    const restoredRoot = { ...root, leaseId: 'lease-restored', environmentId: 'environment-restored',
+      providerSandboxId: 'sandbox-restored', baseSnapshotId: restoredManifest.identity, latestSnapshotId: restoredManifest.identity }
+    const restoredPatch = await resolveRootPatchFromStores({ ...resolverInput, root: restoredRoot }, pool, objects,
+      async database => database.leases.some(lease => lease.providerSandboxId === 'sandbox-restored'))
+    assert.equal(restoredPatch.serialized.artifact.baseSnapshotId, base.identity)
+    await writeFile(join(directory, 'app.txt'), baseBytes)
+    await chmod(join(directory, 'app.txt'), base.entries.find(entry => entry.path === `${prefix}/app.txt`)!.mode)
+    assert.deepEqual((await projectGitWorkspace(directory)).captured.manifest.entries.find(entry => entry.path === `${prefix}/app.txt`),
+      base.entries.find(entry => entry.path === `${prefix}/app.txt`))
+    const restoredApplied = await applyLocalRootPatch({ runId, selectedDirectory: directory,
+      immutableBaseManifest: projection.captured.manifest, patch: restoredPatch })
+    assert.deepEqual(restoredApplied, { type: 'applied', changedFiles: 1 })
+    assert.equal(await readFile(join(directory, 'app.txt'), 'utf8'), proposedBytes.toString())
   } finally {
     await pool?.end(); await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`); await admin.end()
     await rm(directory, { recursive: true, force: true })

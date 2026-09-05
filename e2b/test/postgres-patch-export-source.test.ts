@@ -8,6 +8,12 @@ import {
   PostgresPatchExportSourceResolver,
 } from '../src/postgres-patch-export-source.js'
 import { PostgresDurableState, type StoredObject } from '../src/postgres-state.js'
+import { PostgresReferenceRetention } from '../src/postgres-reference-retention.js'
+import { PostgresPatchExportCoordinator } from '../src/postgres-patch-export.js'
+import { PostgresPatchArtifactRepository } from '../src/postgres-artifacts.js'
+import { PostgresJournal } from '../src/postgres-store.js'
+import { PostgresObjectReclaimer } from '../src/postgres-object-reclaimer.js'
+import { selectRootLease } from '../src/restore-lineage.js'
 import { ServiceError } from '../src/types.js'
 import {
   canonicalJson,
@@ -108,6 +114,7 @@ async function register(context: Fixture, objectId: string, kind: StoredObject['
 }
 
 async function prepared(context: Fixture, options: {
+  root?: boolean
   currentManifestBytes?: (manifest: WorkspaceManifest) => Uint8Array
   currentManifestSizeDelta?: number
 } = {}): Promise<Prepared> {
@@ -134,9 +141,18 @@ async function prepared(context: Fixture, options: {
   const currentContent = await register(context, 'content-current', 'content_blob', currentBytes)
   const addedContent = await register(context, 'content-added', 'content_blob', addedBytes)
 
+  if (options.root) {
+    const sourceArchive = await register(context, 'source-archive', 'source_archive', encoded('source archive'))
+    await context.state.registerSourceSnapshot({ sourceSnapshotId: 'source-original',
+      tenantId: 'tenant-1', archiveObjectId: sourceArchive.objectId, checksum: sourceArchive.checksum,
+      cwdUri: 'file:///workspace/roots', workspaceRootUris: ['file:///workspace/roots'],
+      state: 'available', expiresAt: new Date(Date.now() + 60_000) })
+  }
+
   await context.state.createLeaseWithBaseSnapshot({
     leaseId: 'lease-child', environmentId: 'environment-child', tenantId: 'tenant-1',
-    agentId: 'agent-child', ownerAgentId: 'agent-owner', providerSandboxId: 'sandbox-child',
+    agentId: 'agent-child', ownerAgentId: options.root ? null : 'agent-owner', providerSandboxId: 'sandbox-child',
+    sourceSnapshotId: options.root ? 'source-original' : null,
     sandboxTemplate: 'general-v1', cwdUri: 'file:///workspace/roots',
     workspaceRootUris: ['file:///workspace/roots'], toolPolicy: {}, policyVersion: 1,
     baseSnapshot: {
@@ -232,4 +248,67 @@ live('fails closed on checksummed canonical manifest corruption', async context 
   })) })
   await assert.rejects(context.resolver.resolve(request),
     serviceFailure(503, 'patch export source unavailable'))
+})
+
+async function restored(context: Fixture, original: Prepared, ownerAgentId: string | null): Promise<void> {
+  await context.pool.query("UPDATE hosted_agent_leases SET state='lost' WHERE lease_id='lease-child'")
+  const manifest = createWorkspaceManifest('snapshot-restored', original.currentManifest.entries)
+  const archive = await register(context, 'archive-restored', 'workspace_archive', encoded('restored archive'))
+  const manifestObject = await register(context, 'manifest-restored', 'manifest', encoded(canonicalJson(manifest)))
+  await context.state.createLeaseWithBaseSnapshot({ leaseId: 'lease-restored', environmentId: 'environment-restored',
+    tenantId: 'tenant-1', agentId: 'agent-child', ownerAgentId, providerSandboxId: 'sandbox-restored',
+    restoreSourceLeaseId: 'lease-child', restoreSourceSnapshotId: 'snapshot-current',
+    sandboxTemplate: 'general-v1', cwdUri: 'file:///workspace/roots', workspaceRootUris: ['file:///workspace/roots'],
+    toolPolicy: {}, policyVersion: 1, baseSnapshot: { snapshotId: 'snapshot-restored', providerSnapshotId: 'provider-restored',
+      workspaceArchiveObjectId: archive.objectId, manifestObjectId: manifestObject.objectId,
+      manifestChecksum: manifestObject.checksum, contentObjectIds: [original.currentContent.objectId, original.addedContent.objectId] } })
+}
+
+for (const root of [false, true]) live(`restored ${root ? 'root' : 'child'} exports and retains its exact ancestral baseline`, async context => {
+  const original = await prepared(context, { root })
+  const retained = new PostgresReferenceRetention(context.pool, 'tenant-1')
+  const initial = await retained.retain({ agentId: 'agent-child', leaseId: 'lease-child', baseSnapshotId: 'snapshot-base',
+    latestSnapshotId: 'snapshot-current', artifactId: null, expectedRevision: null })
+  await restored(context, original, root ? null : 'agent-owner')
+  const next = await retained.retain({ agentId: 'agent-child', leaseId: 'lease-restored', baseSnapshotId: 'snapshot-base',
+    latestSnapshotId: 'snapshot-restored', artifactId: null, expectedRevision: initial.revision })
+  assert.equal(next.revision, initial.revision + 1)
+  const coordinator = new PostgresPatchExportCoordinator(new PostgresJournal(context.pool), context.state,
+    context.resolver, new PostgresPatchArtifactRepository(context.pool), context.objects,
+    new PostgresObjectReclaimer(context.pool, context.objects), { tenantId: 'tenant-1', workerId: 'restore-test' })
+  const request = { leaseId: 'lease-restored', agentId: 'agent-child', baseSnapshotId: 'snapshot-base', idempotencyKey: 'restored-export' }
+  const artifact = root ? await coordinator.exportRootPatch(request, 'source-original') : await coordinator.exportPatch(request)
+  assert.equal(artifact.baseSnapshotId, 'snapshot-base')
+  assert.equal(artifact.changedFiles, 2)
+  const source = await context.resolver.resolve({ ...request, tenantId: 'tenant-1',
+    ...(root ? { rootSourceSnapshotId: 'source-original' } : {}) })
+  assert.deepEqual(source.base.manifest, original.baseManifest)
+  if (root) {
+    const chosen = await selectRootLease(context.pool, 'tenant-1', [
+      { leaseId: 'lease-child', ownerAgentId: null, ownerLeaseId: null },
+      { leaseId: 'lease-restored', ownerAgentId: null, ownerLeaseId: null },
+    ])
+    assert.equal(chosen?.leaseId, 'lease-restored')
+  }
+})
+
+live('restore ancestry cannot borrow another owner baseline even for the same agent', async context => {
+  const original = await prepared(context)
+  await restored(context, original, 'different-owner')
+  await assert.rejects(context.resolver.resolve({ ...request, leaseId: 'lease-restored' }),
+    error => error instanceof ServiceError && error.status === 409)
+  const retained = new PostgresReferenceRetention(context.pool, 'tenant-1')
+  await assert.rejects(retained.retain({ agentId: 'agent-child', leaseId: 'lease-restored',
+    baseSnapshotId: 'snapshot-base', latestSnapshotId: 'snapshot-restored', artifactId: null, expectedRevision: null }),
+    error => error instanceof ServiceError && error.status === 409)
+  assert.equal(context.objects.gets.length, 0)
+})
+
+live('restore ancestry rejects active ancestors before exposing snapshot bytes', async context => {
+  const original = await prepared(context)
+  await restored(context, original, 'agent-owner')
+  await context.pool.query("UPDATE hosted_agent_leases SET state='active' WHERE lease_id='lease-child'")
+  await assert.rejects(context.resolver.resolve({ ...request, leaseId: 'lease-restored' }),
+    error => error instanceof ServiceError && error.status === 409)
+  assert.equal(context.objects.gets.length, 0)
 })

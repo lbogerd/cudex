@@ -3,8 +3,9 @@ import type { Pool, PoolClient } from 'pg'
 import type { ObjectStore } from './blob-store.js'
 import { parseWorkspaceManifest, type WorkspaceManifest } from './workspace-manifest.js'
 import { ServiceError } from './types.js'
+import { resolveRestoreLineage } from './restore-lineage.js'
 import type { IDatabaseConnection } from '@pgtyped/runtime'
-import { resolvePatchExportLease, resolvePatchExportSnapshotMaterial,
+import { resolvePatchExportSnapshotMaterial,
   type IResolvePatchExportSnapshotMaterialResult } from './db/queries/patches.queries.js'
 
 type SnapshotMaterialRow = IResolvePatchExportSnapshotMaterialResult
@@ -38,22 +39,25 @@ export class PostgresPatchExportSourceResolver {
   async resolve(input: { tenantId: string; leaseId: string; agentId: string;
     baseSnapshotId: string; rootSourceSnapshotId?: string }, executor: Queryable = this.pool): Promise<ResolvedPatchExportSource> {
     try {
-      const [lease] = await resolvePatchExportLease.run({ tenantId: input.tenantId, leaseId: input.leaseId }, connection(executor))
+      const chain = await resolveRestoreLineage(executor, input.tenantId, input.leaseId)
+      const lease = chain[0]
       if (!lease) throw new ServiceError(404, 'lease missing')
       const allowedOwner = input.rootSourceSnapshotId === undefined
         ? lease.owner_agent_id !== null
         : lease.owner_agent_id === null && lease.owner_lease_id === null
-          && lease.source_snapshot_id === input.rootSourceSnapshotId
+          && chain.at(-1)!.source_snapshot_id === input.rootSourceSnapshotId
       if (!['active', 'paused'].includes(lease.state) || lease.agent_id !== input.agentId
-        || !allowedOwner || lease.base_snapshot_id !== input.baseSnapshotId
+        || !allowedOwner
         || lease.latest_snapshot_id === null) throw new ServiceError(409, 'lease cannot export a patch')
+      const baseLease = chain.find(candidate => candidate.base_snapshot_id === input.baseSnapshotId)
+      if (!baseLease) throw new ServiceError(409, 'lease cannot export a patch')
       const snapshots = await Promise.all([
-        this.snapshot(executor, input.tenantId, lease.lease_id, input.baseSnapshotId),
+        this.snapshot(executor, input.tenantId, baseLease.lease_id, input.baseSnapshotId),
         this.snapshot(executor, input.tenantId, lease.lease_id, lease.latest_snapshot_id),
       ])
       return {
         lease: { leaseId: lease.lease_id, agentId: lease.agent_id,
-          ownerAgentId: lease.owner_agent_id, baseSnapshotId: lease.base_snapshot_id,
+          ownerAgentId: lease.owner_agent_id, baseSnapshotId: input.baseSnapshotId,
           latestSnapshotId: lease.latest_snapshot_id },
         base: snapshots[0], current: snapshots[1],
       }

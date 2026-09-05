@@ -1,5 +1,6 @@
 import type { Pool, PoolClient } from 'pg'
 import type { IDatabaseConnection } from '@pgtyped/runtime'
+import { baselineLease, resolveRestoreLineage } from './restore-lineage.js'
 import { addPatchArtifactReference, expireAvailablePatchArtifacts, findPatchArtifactForReconciliation,
   getAuthorizedPatchArtifact, getOwnerAuthorizedPatchArtifact, getPatchArtifact, insertPatchArtifact,
   lockPatchArtifact, lockPatchArtifactSourceLease, retainPatchArtifact, retainPatchArtifactObject,
@@ -298,7 +299,7 @@ export class PostgresPatchArtifactRepository {
     const [lease] = await lockPatchArtifactSourceLease.run({ leaseId: input.sourceLeaseId, tenantId: input.tenantId }, connection(client))
     if (!lease) throw new PatchArtifactNotFoundError('source lease was not found')
     if (lease.agent_id !== input.agentId || lease.owner_agent_id !== input.ownerAgentId
-      || lease.base_snapshot_id !== input.baseSnapshotId || lease.latest_snapshot_id !== input.currentSnapshotId) {
+      || lease.latest_snapshot_id !== input.currentSnapshotId) {
       throw new PatchArtifactConflictError('artifact lineage does not match the source lease')
     }
     if (!['active', 'paused'].includes(lease.state)) throw new PatchArtifactConflictError('source lease cannot export a new artifact')
@@ -307,6 +308,14 @@ export class PostgresPatchArtifactRepository {
   }
 
   private async validateSnapshots(client: PoolClient, input: CreatePatchArtifactInput, manifests: { base: WorkspaceManifest; current: WorkspaceManifest }): Promise<void> {
+    let baseLeaseId: string
+    try {
+      const chain = await resolveRestoreLineage(client, input.tenantId, input.sourceLeaseId)
+      if (chain[0]!.agent_id !== input.agentId || chain[0]!.owner_agent_id !== input.ownerAgentId) {
+        throw new Error('identity mismatch')
+      }
+      baseLeaseId = baselineLease(chain, input.baseSnapshotId).lease_id
+    } catch { throw new PatchArtifactConflictError('artifact restore lineage is unauthorized') }
     const snapshots = await sharePatchArtifactSnapshots.run({ tenantId: input.tenantId,
       snapshotIds: [input.baseSnapshotId, input.currentSnapshotId] }, connection(client))
     const byId = new Map(snapshots.map(snapshot => [snapshot.snapshot_id, snapshot]))
@@ -316,7 +325,8 @@ export class PostgresPatchArtifactRepository {
     ] as const) {
       const snapshot = byId.get(snapshotId)
       if (!snapshot) throw new PatchArtifactNotFoundError('artifact snapshot was not found')
-      if (snapshot.lease_id !== input.sourceLeaseId || snapshot.manifest_object_id !== objectId
+      const expectedLeaseId = snapshotId === input.baseSnapshotId ? baseLeaseId : input.sourceLeaseId
+      if (snapshot.lease_id !== expectedLeaseId || snapshot.manifest_object_id !== objectId
         || snapshot.manifest_checksum !== workspaceManifestChecksum(manifest) || snapshot.state !== 'available'
         || (snapshot.expires_at !== null && snapshot.expires_at.getTime() <= Date.now())) {
         throw new PatchArtifactConflictError('artifact snapshot identity does not match its manifest')

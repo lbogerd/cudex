@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises'
-import { Pool } from 'pg'
+import { Pool, type PoolClient } from 'pg'
+import { selectRootLease } from './restore-lineage.js'
 import type { IDatabaseConnection } from '@pgtyped/runtime'
 import { Sandbox } from 'e2b'
 import { E2BProvider } from './e2b-provider.js'
@@ -54,6 +55,10 @@ export class PocDatabaseInspector {
       agentId: row.agent_id, ownerAgentId: row.owner_agent_id, ownerLeaseId: row.owner_lease_id,
       providerSandboxId: row.provider_sandbox_id, baseSnapshotId: row.base_snapshot_id,
       latestSnapshotId: row.latest_snapshot_id, state: row.state }))
+  }
+
+  async rootLease(): Promise<PocLeaseInspection | undefined> {
+    return selectRootLease(this.database as Pick<PoolClient, 'query'>, this.tenantId, await this.leases())
   }
 
   async inspect(): Promise<PocDatabaseInspection> {

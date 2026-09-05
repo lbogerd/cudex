@@ -10,6 +10,7 @@ import { PostgresPatchExportCoordinator } from './postgres-patch-export.js'
 import { PostgresObjectReclaimer } from './postgres-object-reclaimer.js'
 import { PostgresDurableState } from './postgres-state.js'
 import { PostgresJournal } from './postgres-store.js'
+import { baselineLease, resolveRestoreLineage, selectRootLease } from './restore-lineage.js'
 import { PocDatabaseInspector, PocProviderInspector, type PocLeaseInspection } from './poc-inspector.js'
 import { canonicalJson, parseWorkspaceManifest, workspaceManifestChecksum } from './workspace-manifest.js'
 import { resolveLocalRootPatchArtifact, shareLocalPatchArtifactRetention,
@@ -127,14 +128,17 @@ async function resolveMaterial(client: PoolClient, store: ObjectStore, tenantId:
   const [artifactRow] = await resolveLocalRootPatchArtifact.run({ tenantId,
     artifactId: response.artifactId }, connection(client))
   const artifact = artifactRow as RootArtifactRow | undefined
+  const lineage = await resolveRestoreLineage(client, tenantId, input.root.leaseId)
+  const origin = lineage.at(-1)!
+  const baseLease = baselineLease(lineage, response.baseSnapshotId)
   const now = new Date()
   if (!artifact || artifact.artifact_id !== response.artifactId
     || artifact.agent_id !== response.agentId || artifact.agent_id !== input.root.agentId
     || artifact.lease_agent_id !== input.root.agentId || artifact.source_lease_id !== input.root.leaseId
     || artifact.owner_agent_id !== null || artifact.owner_lease_id !== null
-    || artifact.source_snapshot_id !== input.sourceSnapshotId
+    || origin.source_snapshot_id !== input.sourceSnapshotId
     || artifact.base_snapshot_id !== response.baseSnapshotId
-    || artifact.base_snapshot_id !== input.root.baseSnapshotId
+    || artifact.base_snapshot_id !== origin.base_snapshot_id
     || artifact.current_snapshot_id !== input.root.latestSnapshotId
     || artifact.lease_base_snapshot_id !== input.root.baseSnapshotId
     || artifact.lease_latest_snapshot_id !== input.root.latestSnapshotId
@@ -158,7 +162,8 @@ async function resolveMaterial(client: PoolClient, store: ObjectStore, tenantId:
     [artifact.current_snapshot_id, artifact.current_manifest_object_id],
   ] as const) {
     const snapshot = snapshotById.get(snapshotId)
-    if (!snapshot || snapshot.lease_id !== input.root.leaseId
+    const expectedLeaseId = snapshotId === artifact.base_snapshot_id ? baseLease.lease_id : input.root.leaseId
+    if (!snapshot || snapshot.lease_id !== expectedLeaseId
       || snapshot.manifest_object_id !== manifestObjectId || snapshot.state !== 'available'
       || (snapshot.expires_at !== null && snapshot.expires_at <= now)) {
       throw new Error('root patch snapshot lineage is invalid')
@@ -254,8 +259,8 @@ export async function resolveRootPatchFromStores(input: ResolveRootPatchInput, p
   if (!/^\d{14}-[0-9a-f]{12}$/u.test(input.runId)) throw new Error('invalid root patch run ID')
   const tenantId = `poc-${input.runId}`
   const database = await new PocDatabaseInspector(pool, tenantId).inspect()
-  const roots = database.leases.filter(lease => lease.ownerAgentId === null && lease.ownerLeaseId === null)
-  if (roots.length !== 1 || !sameLease(roots[0]!, input.root) || !input.root.providerSandboxId) {
+  const root = await selectRootLease(pool, tenantId, database.leases)
+  if (!root || !sameLease(root, input.root) || !input.root.providerSandboxId) {
     throw new Error('root patch lease identity is invalid')
   }
   if (!await verifyProviderOwnership(database)) throw new Error('root patch provider ownership is invalid')
@@ -266,9 +271,14 @@ export async function resolveRootPatchFromStores(input: ResolveRootPatchInput, p
   const coordinator = new PostgresPatchExportCoordinator(journal, state,
     new PostgresPatchExportSourceResolver(pool, store), artifacts, store, reclaimer,
     { tenantId, workerId: `cudex-root-return-${input.runId}` })
+  const lineage = await resolveRestoreLineage(pool, tenantId, input.root.leaseId)
+  const originalBase = lineage.at(-1)!.base_snapshot_id
+  if (!originalBase) throw new Error('root restore lineage has no baseline')
   const response = await coordinator.exportRootPatch({ leaseId: input.root.leaseId,
-    agentId: input.root.agentId, baseSnapshotId: input.root.baseSnapshotId!,
-    idempotencyKey: `cudex-root-return-${input.runId}` }, input.sourceSnapshotId)
+    agentId: input.root.agentId, baseSnapshotId: originalBase,
+    idempotencyKey: `cudex-root-return-${createHash('sha256').update(JSON.stringify([
+      input.runId, input.root.leaseId, originalBase, input.root.latestSnapshotId,
+    ])).digest('hex')}` }, input.sourceSnapshotId)
   const client = await pool.connect()
   try {
     await beginRepeatableRead(client)

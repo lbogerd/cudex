@@ -1,6 +1,7 @@
 /* @name ResolvePatchExportLease */
 SELECT lease_id, agent_id, owner_agent_id, owner_lease_id, source_snapshot_id,
-  base_snapshot_id, latest_snapshot_id, state
+  base_snapshot_id, latest_snapshot_id, state, restore_source_lease_id,
+  restore_source_snapshot_id, sandbox_template, cwd_uri, workspace_root_uris
 FROM hosted_agent_leases WHERE tenant_id = :tenantId! AND lease_id = :leaseId!;
 
 /* @name ResolvePatchExportSnapshotMaterial */

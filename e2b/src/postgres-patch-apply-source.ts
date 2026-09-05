@@ -9,6 +9,7 @@ import {
 } from './patch-apply.js'
 import { parsePatchArtifact, type SerializedPatchArtifact } from './patch-artifact.js'
 import { ServiceError } from './types.js'
+import { baselineLease, resolveRestoreLineage } from './restore-lineage.js'
 import {
   canonicalJson,
   parseWorkspaceManifest,
@@ -249,8 +250,11 @@ export class PostgresPatchApplySourceResolver {
       { artifactId: input.artifactId }, connection(executor))).length === 1
     if (!artifact || artifact.state !== 'available' || (artifact.expires_at <= now && !retainedArtifact)
       || artifact.agent_id !== artifact.source_agent_id
-      || artifact.source_owner_agent_id !== target.agent_id
-      || artifact.source_owner_lease_id !== target.lease_id) {
+      || artifact.source_owner_agent_id !== target.agent_id) {
+      throw new PatchApplyRejectedError('artifact is unavailable')
+    }
+    const targetLineage = await resolveRestoreLineage(executor, input.tenantId, target.lease_id)
+    if (!targetLineage.some(lease => lease.lease_id === artifact.source_owner_lease_id)) {
       throw new PatchApplyRejectedError('artifact is unavailable')
     }
     const artifactValidationTime = retainedArtifact ? new Date(0) : now
@@ -304,6 +308,8 @@ export class PostgresPatchApplySourceResolver {
 
   private async artifactSnapshots(executor: Queryable, tenantId: string, artifact: ArtifactRow,
     now: Date): Promise<Map<string, SnapshotRow>> {
+    const chain = await resolveRestoreLineage(executor, tenantId, artifact.source_lease_id)
+    const baseLeaseId = baselineLease(chain, artifact.base_snapshot_id).lease_id
     const rows = await sharePatchApplySnapshots.run({ tenantId,
       snapshotIds: [artifact.base_snapshot_id, artifact.current_snapshot_id] }, connection(executor))
     const snapshots = new Map(rows.map(row => [row.snapshot_id, row as SnapshotRow]))
@@ -312,7 +318,8 @@ export class PostgresPatchApplySourceResolver {
       [artifact.current_snapshot_id, artifact.current_manifest_object_id],
     ] as const) {
       const snapshot = snapshots.get(snapshotId)
-      if (!snapshot || snapshot.lease_id !== artifact.source_lease_id
+      const expectedLeaseId = snapshotId === artifact.base_snapshot_id ? baseLeaseId : artifact.source_lease_id
+      if (!snapshot || snapshot.lease_id !== expectedLeaseId
         || snapshot.manifest_object_id !== manifestObjectId || snapshot.state !== 'available'
         || (snapshot.expires_at !== null && snapshot.expires_at <= now)) {
         throw new ServiceError(503, 'patch apply artifact lineage unavailable')

@@ -10,6 +10,7 @@ import { validateCachedRelease, type CudexReleaseManifest } from './cudex-releas
 import { projectGitWorkspace, type GitWorkspaceProjection } from './git-workspace.js'
 import { applyLocalRootPatch, recoverLocalRootPatch, type LocalPatchApplyResult } from './local-patch-apply.js'
 import { resolveRootPatch } from './local-patch-source.js'
+import { assertRootHandoff } from './root-handoff.js'
 import { createCodexProcessEnvironment } from './poc-auth.js'
 import { initializeAndReadAccount, startPocAppServer } from './poc-app-server-client.js'
 import { createRunId, generateCodexConfiguration, generateRuntimeSecrets, prepareRunFiles,
@@ -266,9 +267,8 @@ async function rootLease(run: Pick<PreparedCudexRun, 'runtime' | 'paths'>): Prom
   try {
     const deadline = Date.now() + 30_000
     do {
-      const roots = (await opened.inspector.leases()).filter(lease => lease.ownerLeaseId === null)
-      if (roots.length > 1) throw new Error('Cudex run has ambiguous hosted roots')
-      if (roots.length === 1) return roots[0]
+      const root = await opened.inspector.rootLease()
+      if (root) return root
       if (Date.now() >= deadline) return undefined
       await new Promise(resolveWait => setTimeout(resolveWait, 100))
     } while (true)
@@ -324,6 +324,7 @@ async function resolveAndApply(run: PreparedCudexRun,
   if (!root.baseSnapshotId || !root.latestSnapshotId || !root.providerSandboxId) {
     throw new Error('hosted root did not finalize an exact workspace lineage')
   }
+  await assertRootHandoff(run.paths.codexHome, root, run.source.sourceSnapshotId)
   const required = (name: string): string => {
     const value = run.runtime[name]
     if (!value) throw new Error('Cudex patch storage configuration is incomplete')

@@ -11,6 +11,10 @@ import {
 import { serializePatchArtifact } from '../src/patch-artifact.js'
 import { PostgresPatchArtifactRepository } from '../src/postgres-artifacts.js'
 import { PostgresReferenceRetention } from '../src/postgres-reference-retention.js'
+import { PostgresPatchExportCoordinator } from '../src/postgres-patch-export.js'
+import { PostgresPatchExportSourceResolver } from '../src/postgres-patch-export-source.js'
+import { PostgresJournal } from '../src/postgres-store.js'
+import { PostgresObjectReclaimer } from '../src/postgres-object-reclaimer.js'
 import {
   PostgresDurableState,
   type SnapshotInput,
@@ -208,6 +212,33 @@ const request = {
 
 const serviceFailure = (status: number, message: string) => (error: unknown): boolean =>
   error instanceof ServiceError && error.status === status && error.message === message
+
+live('restored child artifact applies only through its authenticated owner restore chain', async context => {
+  const setup = await prepared(context)
+  await context.firstPool.query("UPDATE hosted_agent_leases SET state='lost' WHERE lease_id IN ('lease-child','lease-target')")
+  const childManifest = createWorkspaceManifest('restored-child-base', setup.currentManifest.entries)
+  await context.firstState.createLeaseWithBaseSnapshot({ leaseId: 'restored-child', environmentId: 'restored-child-env',
+    tenantId: 'tenant-1', agentId: 'agent-child', ownerAgentId: 'agent-owner', ownerLeaseId: 'lease-target',
+    providerSandboxId: 'restored-child-sandbox', sandboxTemplate: 'general-v1', cwdUri: 'file:///workspace/roots',
+    workspaceRootUris: ['file:///workspace/roots'], toolPolicy: {}, policyVersion: 1,
+    restoreSourceLeaseId: 'lease-child', restoreSourceSnapshotId: setup.currentManifest.identity,
+    baseSnapshot: await snapshot(context, 'restored-child', childManifest, ['content-changed']) })
+  const targetManifest = createWorkspaceManifest('restored-target-base', setup.targetManifest.entries)
+  await context.firstState.createLeaseWithBaseSnapshot({ leaseId: 'restored-target', environmentId: 'restored-target-env',
+    tenantId: 'tenant-1', agentId: 'agent-owner', providerSandboxId: 'restored-target-sandbox',
+    sandboxTemplate: 'general-v1', cwdUri: 'file:///workspace/roots', workspaceRootUris: ['file:///workspace/roots'],
+    toolPolicy: {}, policyVersion: 1, restoreSourceLeaseId: 'lease-target', restoreSourceSnapshotId: setup.targetManifest.identity,
+    baseSnapshot: await snapshot(context, 'restored-target', targetManifest, ['content-base', 'content-owner']) })
+  const exporter = new PostgresPatchExportCoordinator(new PostgresJournal(context.firstPool), context.firstState,
+    new PostgresPatchExportSourceResolver(context.firstPool, context.objects), context.artifacts, context.objects,
+    new PostgresObjectReclaimer(context.firstPool, context.objects), { tenantId: 'tenant-1', workerId: 'restore-apply' })
+  const artifact = await exporter.exportPatch({ leaseId: 'restored-child', agentId: 'agent-child',
+    baseSnapshotId: setup.baseManifest.identity, idempotencyKey: 'restored-child-export' })
+  const resolved = await context.resolver.resolve({ ...request, targetLeaseId: 'restored-target', artifactId: artifact.artifactId })
+  assert.equal(resolved.plan.type, 'ready')
+  assert.equal(resolved.artifact.sourceLeaseId, 'restored-child')
+  assert.equal(resolved.artifact.serialized.artifact.baseSnapshotId, setup.baseManifest.identity)
+})
 
 live('resolves exact verified material and a complete plan after the child is released', async context => {
   const setup = await prepared(context)
