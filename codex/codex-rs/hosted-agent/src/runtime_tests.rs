@@ -26,7 +26,8 @@ async fn hosted_ownership_detection_is_read_only_and_includes_tombstones() {
     let request = request();
     assert!(!has_hosted_thread(&state, request.agent_id).expect("absent"));
     assert!(!state.exists());
-    let manager = HostedRuntimeManager::with_service(FakeHostedAgentService::default(), &state).expect("manager");
+    let manager = HostedRuntimeManager::with_service(FakeHostedAgentService::default(), &state)
+        .expect("manager");
     manager.prepare(request.clone()).await.expect("prepare");
     assert!(has_hosted_thread(&state, request.agent_id).expect("owned"));
     manager.delete(request.agent_id).await.expect("delete");
@@ -40,7 +41,8 @@ fn hosted_ownership_detection_rejects_symlinked_journals() {
     let root = home.path().join("hosted-runtime-v1");
     fs::create_dir(&root).expect("directory");
     let id = ThreadId::new();
-    std::os::unix::fs::symlink(home.path().join("absent"), root.join(format!("{id}.json"))).expect("symlink");
+    std::os::unix::fs::symlink(home.path().join("absent"), root.join(format!("{id}.json")))
+        .expect("symlink");
     assert!(has_hosted_thread(home.path(), id).is_err());
 }
 
@@ -48,7 +50,8 @@ fn hosted_ownership_detection_rejects_symlinked_journals() {
 async fn root_resume_rejects_a_different_source_even_with_a_live_binding() {
     let home = tempfile::tempdir().expect("home");
     let service = FakeHostedAgentService::default();
-    let manager = HostedRuntimeManager::with_service(service.clone(), home.path()).expect("manager");
+    let manager =
+        HostedRuntimeManager::with_service(service.clone(), home.path()).expect("manager");
     let mut request = request();
     let binding = manager.prepare(request.clone()).await.expect("prepare");
     request.source = ProjectSnapshotSource::RootWorkspace {
@@ -58,7 +61,8 @@ async fn root_resume_rejects_a_different_source_even_with_a_live_binding() {
     assert!(manager.prepare(request.clone()).await.is_err());
     drop(binding);
     drop(manager);
-    let manager = HostedRuntimeManager::with_service(service.clone(), home.path()).expect("restart");
+    let manager =
+        HostedRuntimeManager::with_service(service.clone(), home.path()).expect("restart");
     assert!(manager.prepare(request).await.is_err());
     assert_eq!(service.active_lease_count(), 1);
 }
@@ -68,24 +72,31 @@ async fn reconnect_rejects_changed_immutable_workspace_identity() {
     for field in ["cwd", "roots", "base"] {
         let home = tempfile::tempdir().expect("home");
         let service = FakeHostedAgentService::default();
-        let manager = HostedRuntimeManager::with_service(service.clone(), home.path()).expect("manager");
+        let manager =
+            HostedRuntimeManager::with_service(service.clone(), home.path()).expect("manager");
         let request = request();
         let binding = manager.prepare(request.clone()).await.expect("prepare");
         let original_record = manager.record(request.agent_id).expect("record");
         let mut changed = binding.provisioned.clone();
         match field {
             "cwd" => changed.cwd = PathUri::parse("file:///workspace/other").expect("cwd"),
-            "roots" => changed.workspace_roots.push(PathUri::parse("file:///extra").expect("root")),
+            "roots" => changed
+                .workspace_roots
+                .push(PathUri::parse("file:///extra").expect("root")),
             "base" => changed.base_snapshot_id = "unrelated-base".into(),
             _ => unreachable!(),
         }
         service.replace_binding(changed);
         drop(binding);
         drop(manager);
-        let manager = HostedRuntimeManager::with_service(service.clone(), home.path()).expect("restart");
+        let manager =
+            HostedRuntimeManager::with_service(service.clone(), home.path()).expect("restart");
         assert!(manager.prepare(request.clone()).await.is_err(), "{field}");
         assert!(manager.binding(request.agent_id).is_none());
-        assert_eq!(manager.record(request.agent_id).expect("record"), original_record);
+        assert_eq!(
+            manager.record(request.agent_id).expect("record"),
+            original_record
+        );
         assert_eq!(service.active_lease_count(), 1);
     }
 }
@@ -180,7 +191,10 @@ async fn finalized_child_patch_applies_and_released_root_restores_original_linea
     manager.release(root_id).await.expect("release");
     drop(manager);
     let manager = HostedRuntimeManager::with_service(service.clone(), home.path()).expect("reopen");
-    let restored = manager.prepare(root_request.clone()).await.expect("restore");
+    let restored = manager
+        .prepare(root_request.clone())
+        .await
+        .expect("restore");
     assert_ne!(restored.provisioned.lease_id, old_lease);
     assert_eq!(
         service
@@ -193,8 +207,12 @@ async fn finalized_child_patch_applies_and_released_root_restores_original_linea
     let restored_identity = restored.provisioned.clone();
     drop(restored);
     drop(manager);
-    let manager = HostedRuntimeManager::with_service(service, home.path()).expect("reopen restored");
-    let resumed = manager.prepare(root_request).await.expect("reconnect restored lease");
+    let manager =
+        HostedRuntimeManager::with_service(service, home.path()).expect("reopen restored");
+    let resumed = manager
+        .prepare(root_request)
+        .await
+        .expect("reconnect restored lease");
     assert_eq!(resumed.provisioned, restored_identity);
 }
 

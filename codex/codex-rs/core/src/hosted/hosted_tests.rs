@@ -154,8 +154,19 @@ async fn persisted_hosted_identity_cannot_resume_or_delete_without_hosted_config
     });
     assert!(manager.start_thread(options).await.is_err());
     assert_eq!(manager.list_thread_ids().await, Vec::<ThreadId>::new());
-    assert!(manager.prepare_delete_hosted_thread(thread_id, &config).await.is_err());
-    assert_eq!(std::fs::read_to_string(journal).unwrap(), "interrupted journal write");
+    assert!(
+        manager
+            .prepare_delete_hosted_thread(thread_id, &config)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        std::fs::read_to_string(journal).unwrap(),
+        "interrupted journal write"
+    );
     // Ordinary local identities still need no remote cleanup configuration.
-    manager.prepare_delete_hosted_thread(ThreadId::new(), &config).await.unwrap();
+    manager
+        .prepare_delete_hosted_thread(ThreadId::new(), &config)
+        .await
+        .unwrap();
 }

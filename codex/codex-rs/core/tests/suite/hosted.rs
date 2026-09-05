@@ -47,19 +47,27 @@ async fn hosted_startup_rejects_incoherent_settings_before_model_requests() -> R
     let cases = [
         (true, toml::Value::Table(Default::default()), "requires"),
         (false, hosted_settings(), "must agree"),
-        (true, {
-            let mut settings = hosted_settings();
-            settings["hosted_agents"]
-                .as_table_mut()
-                .unwrap()
-                .insert("unexpected".into(), true.into());
-            settings
-        }, "unknown field"),
-        (true, {
-            let mut settings = hosted_settings();
-            settings["hosted_agents"]["service_url"] = "http://localhost/".into();
-            settings
-        }, "HTTPS"),
+        (
+            true,
+            {
+                let mut settings = hosted_settings();
+                settings["hosted_agents"]
+                    .as_table_mut()
+                    .unwrap()
+                    .insert("unexpected".into(), true.into());
+                settings
+            },
+            "unknown field",
+        ),
+        (
+            true,
+            {
+                let mut settings = hosted_settings();
+                settings["hosted_agents"]["service_url"] = "http://localhost/".into();
+                settings
+            },
+            "HTTPS",
+        ),
     ];
     for (enabled, settings, expected) in cases {
         let mut builder = test_codex().with_config(move |config| {
@@ -85,7 +93,11 @@ async fn hosted_startup_never_runs_an_otherwise_trusted_local_hook() -> Result<(
     let server = start_mock_server().await;
     // First establish that this exact discovered/trusted hook runs in an ordinary session.
     // Then prove both hosted configuration failure and ambient-hook rejection happen before it.
-    for mode in ["local", "missing-hosted-settings", "hosted-with-ambient-hook"] {
+    for mode in [
+        "local",
+        "missing-hosted-settings",
+        "hosted-with-ambient-hook",
+    ] {
         let requests_before = server.received_requests().await.unwrap().len();
         let home = Arc::new(TempDir::new()?);
         let marker = home.path().join("startup-hook-ran");
@@ -113,7 +125,8 @@ async fn hosted_startup_never_runs_an_otherwise_trusted_local_hook() -> Result<(
                     responses::ev_assistant_message("message", "done"),
                     responses::ev_completed("local-control"),
                 ]),
-            ).await;
+            )
+            .await;
             test.submit_turn("run the startup hook").await?;
             response.single_request();
             assert_eq!(std::fs::read_to_string(&marker)?.trim(), "ran");
@@ -129,7 +142,10 @@ async fn hosted_startup_never_runs_an_otherwise_trusted_local_hook() -> Result<(
             };
             assert!(format!("{error:#}").contains(expected), "{error:#}");
             assert!(!marker.exists(), "hosted startup executed a local hook");
-            assert_eq!(server.received_requests().await.unwrap().len(), requests_before);
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                requests_before
+            );
         }
     }
     Ok(())

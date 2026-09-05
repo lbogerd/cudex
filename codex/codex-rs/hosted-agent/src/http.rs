@@ -149,8 +149,8 @@ impl HttpHostedAgentService {
             .connect_timeout(CONNECT_TIMEOUT.min(request_timeout))
             .timeout(request_timeout)
             .redirect(reqwest::redirect::Policy::none());
-        let client = codex_http_client::build_reqwest_client_with_custom_ca(builder)
-            .map_err(|_| {
+        let client =
+            codex_http_client::build_reqwest_client_with_custom_ca(builder).map_err(|_| {
                 HostedAgentError::new(
                     HostedAgentErrorCategory::ConnectionFailed,
                     "failed to construct HTTP client",
