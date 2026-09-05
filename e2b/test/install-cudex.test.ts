@@ -39,6 +39,8 @@ test('installer writes an isolated runnable CLI under temporary HOME without cop
   assert.match(result.stdout, /Installed cudex/)
   const launcher = join(binary, 'cudex'); assert.ok((await lstat(launcher)).isSymbolicLink())
   const target = resolve(dirname(launcher), await readlink(launcher)); await access(target)
+  const help = await exec(launcher, ['--help'], { env: { PATH: process.env.PATH, HOME: home } })
+  assert.match(help.stdout, /cudex -C <directory>/)
   const current = join(data, 'cudex', 'cli', 'current')
   await access(join(current, 'dist', 'src', 'cudex-cli.js'))
   await access(join(current, 'node_modules'))
