@@ -52,10 +52,6 @@ pub(crate) trait ChildTerminator: Send + Sync {
     fn signal(&mut self, signal: ProcessSignal) -> io::Result<()>;
 
     fn kill(&mut self) -> io::Result<()>;
-
-    fn process_group_id(&self) -> Option<u32> {
-        None
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,7 +111,6 @@ type ResizeFn = Box<dyn FnMut(TerminalSize) -> anyhow::Result<()> + Send>;
 pub struct ProcessHandle {
     writer_tx: StdMutex<Option<mpsc::Sender<Vec<u8>>>>,
     killer: StdMutex<Option<Box<dyn ChildTerminator>>>,
-    process_group_id: Option<u32>,
     reader_handle: StdMutex<Option<JoinHandle<()>>>,
     reader_abort_handles: StdMutex<Vec<AbortHandle>>,
     writer_handle: StdMutex<Option<JoinHandle<()>>>,
@@ -150,11 +145,9 @@ impl ProcessHandle {
         pty_handles: Option<PtyHandles>,
         resizer: Option<ResizeFn>,
     ) -> Self {
-        let process_group_id = killer.process_group_id();
         Self {
             writer_tx: StdMutex::new(Some(writer_tx)),
             killer: StdMutex::new(Some(killer)),
-            process_group_id,
             reader_handle: StdMutex::new(Some(reader_handle)),
             reader_abort_handles: StdMutex::new(reader_abort_handles),
             writer_handle: StdMutex::new(Some(writer_handle)),
@@ -233,28 +226,6 @@ impl ProcessHandle {
         }
     }
 
-    /// Kill the complete process group and wait until the kernel confirms it is gone.
-    ///
-    /// A direct child exit is insufficient: descendants can outlive their leader and
-    /// continue mutating the workspace. Linux callers use this confirmation before
-    /// publishing a command-quiesced event.
-    pub async fn terminate_confirmed(&self) -> io::Result<bool> {
-        self.request_terminate();
-        let Some(process_group_id) = self.process_group_id else {
-            return Ok(false);
-        };
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-        loop {
-            if crate::process_group::process_group_is_quiescent(process_group_id)? {
-                return Ok(true);
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Ok(false);
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    }
-
     pub fn signal(&self, signal: ProcessSignal) -> io::Result<()> {
         let Ok(mut killer_opt) = self.killer.lock() else {
             return Ok(());
@@ -263,10 +234,15 @@ impl ProcessHandle {
             return Ok(());
         };
 
-        killer.signal(signal)
+        let result = killer.signal(signal);
+        #[cfg(windows)]
+        if result.is_ok() {
+            killer_opt.take();
+        }
+        result
     }
 
-    /// Attempts to kill the child and abort helper tasks.
+    /// Attempts to kill the child and abort I/O helper tasks.
     pub fn terminate(&self) {
         self.request_terminate();
 
@@ -288,7 +264,8 @@ impl ProcessHandle {
         if let Ok(mut h) = self.wait_handle.lock()
             && let Some(handle) = h.take()
         {
-            handle.abort();
+            // Even a queued PTY waiter must run to reap the terminated child.
+            drop(handle);
         }
     }
 }
@@ -302,10 +279,17 @@ impl Drop for ProcessHandle {
 /// Adapts a closure into a `ChildTerminator` implementation.
 struct ClosureTerminator {
     inner: Option<Box<dyn FnMut() + Send + Sync>>,
+    #[cfg(windows)]
+    interrupt_terminates: bool,
 }
 
 impl ChildTerminator for ClosureTerminator {
     fn signal(&mut self, signal: ProcessSignal) -> io::Result<()> {
+        #[cfg(windows)]
+        if self.interrupt_terminates {
+            return self.kill();
+        }
+
         Err(unsupported_signal(signal))
     }
 
@@ -385,6 +369,9 @@ pub struct ProcessDriver {
     pub terminator: Option<Box<dyn FnMut() + Send + Sync>>,
     pub writer_handle: Option<JoinHandle<()>>,
     pub resizer: Option<ResizeFn>,
+    /// Whether this Windows process is attached to a pseudo-console.
+    #[cfg(windows)]
+    pub tty: bool,
 }
 
 /// Build a `SpawnedProcess` from a driver that supplies stdin/output/exit channels.
@@ -397,7 +384,12 @@ pub fn spawn_from_driver(driver: ProcessDriver) -> SpawnedProcess {
         terminator,
         writer_handle,
         resizer,
+        #[cfg(windows)]
+        tty,
     } = driver;
+
+    #[cfg(windows)]
+    let interrupt_terminates = terminator.is_some() && !tty;
 
     let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(256);
     let (stderr_tx, stderr_rx) = mpsc::channel::<Vec<u8>>(256);
@@ -462,7 +454,11 @@ pub fn spawn_from_driver(driver: ProcessDriver) -> SpawnedProcess {
 
     let handle = ProcessHandle::new(
         writer_tx,
-        Box::new(ClosureTerminator { inner: terminator }),
+        Box::new(ClosureTerminator {
+            inner: terminator,
+            #[cfg(windows)]
+            interrupt_terminates,
+        }),
         reader_handle,
         stderr_reader_handle
             .map(|handle| handle.abort_handle())

@@ -3,6 +3,7 @@ use std::io;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use codex_exec_server_protocol::JSONRPCErrorError;
+use codex_protocol::config_types::WindowsSandboxLevel;
 
 use crate::CapabilityRootsDiscoverParams;
 use crate::CapabilityRootsDiscoverResponse;
@@ -10,7 +11,10 @@ use crate::CopyOptions;
 use crate::CreateDirectoryOptions;
 use crate::ExecServerRuntimePaths;
 use crate::ExecutorFileSystem;
+use crate::GetMetadataOptions;
+use crate::ReadFileOptions;
 use crate::RemoveOptions;
+use crate::WriteFileOptions;
 use crate::file_read::FileReadHandleManager;
 use crate::local_file_system::LocalFileSystem;
 use crate::protocol::FS_READ_DIRECTORY_METHOD;
@@ -40,7 +44,6 @@ use crate::protocol::FsWalkParams;
 use crate::protocol::FsWalkResponse;
 use crate::protocol::FsWriteFileParams;
 use crate::protocol::FsWriteFileResponse;
-use crate::rpc::file_system_permission_denied;
 use crate::rpc::internal_error;
 use crate::rpc::invalid_request;
 use crate::rpc::not_found;
@@ -72,6 +75,42 @@ impl FileSystemHandler {
         &self,
         params: CapabilityRootsDiscoverParams,
     ) -> Result<CapabilityRootsDiscoverResponse, JSONRPCErrorError> {
+        let sandbox = params
+            .roots
+            .first()
+            .and_then(|root| root.sandbox.as_ref())
+            .filter(|sandbox| {
+                sandbox.should_run_in_sandbox()
+                    && (!cfg!(target_os = "windows")
+                        || sandbox.windows_sandbox_level != WindowsSandboxLevel::Disabled)
+                    && params
+                        .roots
+                        .iter()
+                        .all(|root| root.sandbox.as_ref() == Some(*sandbox))
+            })
+            .cloned();
+
+        if let Some(sandbox) = sandbox {
+            let mut batched_params = params.clone();
+            for root in &mut batched_params.roots {
+                root.sandbox = None;
+            }
+            let result = match self.file_system.sandboxed() {
+                Ok(file_system) => {
+                    file_system
+                        .discover_capability_roots(batched_params, &sandbox)
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+            match result {
+                Ok(response) => return Ok(response),
+                Err(error) => {
+                    tracing::warn!(%error, "batched capability discovery failed; retrying roots separately");
+                }
+            }
+        }
+
         crate::discover_capability_roots(&self.file_system, params)
             .await
             .map_err(|error| invalid_request(error.to_string()))
@@ -126,7 +165,13 @@ impl FileSystemHandler {
     ) -> Result<FsReadFileResponse, JSONRPCErrorError> {
         let bytes = self
             .file_system
-            .read_file(&params.path, params.sandbox.as_ref())
+            .read_file(
+                &params.path,
+                ReadFileOptions {
+                    follow_symlinks: params.follow_symlinks.unwrap_or(true),
+                },
+                params.sandbox.as_ref(),
+            )
             .await
             .map_err(map_fs_error)?;
         Ok(FsReadFileResponse {
@@ -144,7 +189,14 @@ impl FileSystemHandler {
             ))
         })?;
         self.file_system
-            .write_file(&params.path, bytes, params.sandbox.as_ref())
+            .write_file(
+                &params.path,
+                bytes,
+                WriteFileOptions {
+                    follow_symlinks: params.follow_symlinks.unwrap_or(true),
+                },
+                params.sandbox.as_ref(),
+            )
             .await
             .map_err(map_fs_error)?;
         Ok(FsWriteFileResponse {})
@@ -158,7 +210,10 @@ impl FileSystemHandler {
         self.file_system
             .create_directory(
                 &params.path,
-                CreateDirectoryOptions { recursive },
+                CreateDirectoryOptions {
+                    recursive,
+                    follow_symlinks: params.follow_symlinks.unwrap_or(true),
+                },
                 params.sandbox.as_ref(),
             )
             .await
@@ -172,7 +227,13 @@ impl FileSystemHandler {
     ) -> Result<FsGetMetadataResponse, JSONRPCErrorError> {
         let metadata = self
             .file_system
-            .get_metadata(&params.path, params.sandbox.as_ref())
+            .get_metadata(
+                &params.path,
+                GetMetadataOptions {
+                    follow_symlinks: params.follow_symlinks.unwrap_or(true),
+                },
+                params.sandbox.as_ref(),
+            )
             .await
             .map_err(map_fs_error)?;
         Ok(FsGetMetadataResponse {
@@ -242,7 +303,11 @@ impl FileSystemHandler {
         self.file_system
             .remove(
                 &params.path,
-                RemoveOptions { recursive, force },
+                RemoveOptions {
+                    recursive,
+                    force,
+                    follow_symlinks: params.follow_symlinks.unwrap_or(true),
+                },
                 params.sandbox.as_ref(),
             )
             .await
@@ -281,8 +346,9 @@ fn validate_file_read_handle_id(handle_id: &str) -> Result<(), JSONRPCErrorError
 fn map_fs_error(err: io::Error) -> JSONRPCErrorError {
     match err.kind() {
         io::ErrorKind::NotFound => not_found(err.to_string()),
-        io::ErrorKind::InvalidInput => invalid_request(err.to_string()),
-        io::ErrorKind::PermissionDenied => file_system_permission_denied(err.to_string()),
+        io::ErrorKind::InvalidInput | io::ErrorKind::PermissionDenied => {
+            invalid_request(err.to_string())
+        }
         _ => internal_error(err.to_string()),
     }
 }
@@ -298,23 +364,6 @@ mod tests {
     use crate::FileSystemSandboxContext;
     use crate::protocol::FsReadFileParams;
     use crate::protocol::FsWriteFileParams;
-
-    #[test]
-    fn permission_denied_errors_keep_a_typed_wire_code() {
-        let error = map_fs_error(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "hosted sandbox rejected the operation",
-        ));
-
-        assert_eq!(
-            error,
-            JSONRPCErrorError {
-                code: codex_exec_server_protocol::FILE_SYSTEM_PERMISSION_DENIED_ERROR_CODE,
-                data: None,
-                message: "hosted sandbox rejected the operation".to_string(),
-            }
-        );
-    }
 
     #[tokio::test]
     async fn no_platform_sandbox_policies_do_not_require_configured_sandbox_helper() {
@@ -349,6 +398,7 @@ mod tests {
             handler
                 .write_file(FsWriteFileParams {
                     path: path.clone(),
+                    follow_symlinks: None,
                     data_base64: STANDARD.encode("ok"),
                     sandbox: Some(sandbox_context(sandbox_policy.clone())),
                 })
@@ -373,6 +423,7 @@ mod tests {
             let response = handler
                 .read_file(FsReadFileParams {
                     path,
+                    follow_symlinks: None,
                     sandbox: Some(sandbox_context(sandbox_policy)),
                 })
                 .await

@@ -1,48 +1,302 @@
 use super::*;
-use crate::codex_thread::CodexThreadSettingsOverrides;
+use crate::agent::control::SpawnAgentOptions;
 use crate::config::test_config;
 use crate::init_state_db;
 use crate::installation_id::INSTALLATION_ID_FILENAME;
+use crate::mcp::McpEnvironmentScope;
+use crate::mcp::McpThreadIdentity;
 use crate::rollout::RolloutRecorder;
 use crate::session::session::SessionSettingsUpdate;
 use crate::session::tests::build_world_state_from_turn_context;
 use crate::session::tests::make_session_and_context;
 use crate::tasks::InterruptedTurnHistoryMarker;
 use crate::tasks::interrupted_turn_history_marker;
+use crate::windows_sandbox::WindowsSandboxLevelExt;
 use codex_extension_api::empty_extension_registry;
-use codex_hosted_agent::HostedAgentService;
+use codex_history::InitialHistory;
+use codex_history::ResumedHistory;
 use codex_models_manager::manager::RefreshStrategy;
 use codex_protocol::ResponseItemId;
 use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
+use codex_protocol::config_types::WindowsSandboxLevel;
+use codex_protocol::mcp::ClientMcpExtensions;
+use codex_protocol::mcp::MCP_APP_UI_EXTENSION_ID;
+use codex_protocol::mcp::OPENAI_FORM_EXTENSION_ID;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::ContentItemKind;
+use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use codex_protocol::models::ReasoningItemReasoningSummary;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelsResponse;
 use codex_protocol::protocol::AgentMessageEvent;
-use codex_protocol::protocol::InitialHistory;
+use codex_protocol::protocol::EnvironmentConfigState;
 use codex_protocol::protocol::InternalSessionSource;
-use codex_protocol::protocol::ResumedHistory;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadSource;
-use codex_protocol::protocol::TurnAbortReason;
-use codex_protocol::protocol::TurnAbortedEvent;
-use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::UserMessageEvent;
+use codex_protocol::user_input::UserInput;
 use codex_utils_path_uri::PathUri;
 use core_test_support::PathBufExt;
 use core_test_support::PathExt;
 use core_test_support::responses::mount_models_once;
+use core_test_support::responses::strip_response_item_ids_from_json;
 use pretty_assertions::assert_eq;
 use std::time::Duration;
 use tempfile::tempdir;
-use tokio_util::sync::CancellationToken;
 use wiremock::MockServer;
 
 const TEST_INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
+
+/// Controls without a custom allocation policy still produce distinct thread identifiers.
+#[test]
+fn thread_id_generator_defaults_to_standard_ids() {
+    let agent_control = AgentControl::default();
+
+    assert_ne!(
+        agent_control.generate_thread_id(),
+        agent_control.generate_thread_id()
+    );
+}
+
+#[tokio::test]
+async fn reserved_thread_id_is_used_without_changing_normal_id_generation() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+
+    let generated_ids = [
+        ThreadId::from_u128(/*value*/ 0x018f_0000_0000_7000_8000_0000_0000_0001),
+        ThreadId::from_u128(/*value*/ 0x018f_0000_0000_7000_8000_0000_0000_0002),
+        ThreadId::from_u128(/*value*/ 0x018f_0000_0000_7000_8000_0000_0000_0003),
+    ];
+    let next_id = std::sync::atomic::AtomicUsize::new(0);
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    )
+    .with_thread_id_generator(move || generated_ids[next_id.fetch_add(1, Ordering::Relaxed)]);
+
+    let reserved_id = manager.reserve_thread_id();
+    let mut reserved_options = StartThreadOptions::new(config.clone());
+    reserved_options.reserved_thread_id = Some(reserved_id);
+    let reserved = manager
+        .start_thread(reserved_options)
+        .await
+        .expect("start reserved thread");
+    let mut resumed_options = StartThreadOptions::new(config.clone());
+    resumed_options.initial_history = InitialHistory::Resumed(ResumedHistory {
+        conversation_id: reserved.thread_id,
+        history: Arc::new(Vec::new()),
+        rollout_path: None,
+    });
+    let resumed_id = manager.reserve_thread_id();
+    resumed_options.reserved_thread_id = Some(resumed_id);
+    let resume_error = manager
+        .start_thread(resumed_options)
+        .await
+        .err()
+        .expect("reject reserved ID for resume");
+    let generated = manager
+        .start_thread(StartThreadOptions::new(config.clone()))
+        .await
+        .expect("start generated thread");
+
+    assert_eq!(reserved.thread_id, generated_ids[0]);
+    assert!(matches!(
+        resume_error.details(),
+        codex_protocol::error::CodexErrorDetails::InvalidRequest(message)
+            if message == "reserved thread ID cannot be used when resuming a thread"
+    ));
+    assert_eq!(generated.thread_id, generated_ids[2]);
+}
+
+/// One custom ID factory supplies identifiers for roots, actual child agents, and forks.
+#[tokio::test]
+async fn thread_id_generator_applies_to_roots_children_and_forks() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+
+    let generated_ids = [
+        ThreadId::from_u128(/*value*/ 0x018f_0000_0000_7000_8000_0000_0000_0001),
+        ThreadId::from_u128(/*value*/ 0x018f_0000_0000_7000_8000_0000_0000_0002),
+        ThreadId::from_u128(/*value*/ 0x018f_0000_0000_7000_8000_0000_0000_0003),
+    ];
+    let next_id = std::sync::atomic::AtomicUsize::new(0);
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    )
+    .with_thread_id_generator(move || generated_ids[next_id.fetch_add(1, Ordering::Relaxed)]);
+    let root = manager
+        .start_thread(StartThreadOptions::new(config.clone()))
+        .await
+        .expect("start root thread");
+    let child = root
+        .thread
+        .session
+        .services
+        .agent_control
+        .spawn_agent_with_metadata(
+            config.clone(),
+            vec![UserInput::Text {
+                text: "child task".to_string(),
+                text_elements: Vec::new(),
+            }],
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: root.thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: None,
+            })),
+            SpawnAgentOptions {
+                parent_thread_id: Some(root.thread_id),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("spawn actual child agent");
+    let fork = manager
+        .spawn_subagent(root.thread_id, StartThreadOptions::new(config))
+        .await
+        .expect("fork root thread");
+
+    assert_eq!(
+        [root.thread_id, child.thread_id, fork.thread_id],
+        generated_ids
+    );
+
+    let report = manager
+        .shutdown_all_threads_bounded(Duration::from_secs(10))
+        .await;
+    assert_eq!(report.completed.len(), 3);
+}
+
+/// Resuming a thread preserves its stored ID instead of invoking the new manager's factory.
+#[tokio::test]
+async fn thread_id_generator_does_not_replace_resumed_thread_id() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+
+    let original_thread_id =
+        ThreadId::from_u128(/*value*/ 0x018f_0000_0000_7000_8000_0000_0000_0001);
+    let original_manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    )
+    .with_thread_id_generator(move || original_thread_id);
+    let original = original_manager
+        .start_thread(StartThreadOptions::new(config.clone()))
+        .await
+        .expect("start source thread");
+    original.thread.ensure_rollout_materialized().await;
+    original
+        .thread
+        .flush_rollout()
+        .await
+        .expect("flush source rollout");
+    let rollout_path = original
+        .thread
+        .rollout_path()
+        .expect("source rollout path should exist");
+    assert_eq!(original.thread_id, original_thread_id);
+    original
+        .thread
+        .shutdown_and_wait()
+        .await
+        .expect("shut down source thread");
+    let _ = original_manager.remove_thread(&original_thread_id).await;
+
+    let resumed_manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    )
+    .with_thread_id_generator(|| panic!("resuming must not allocate a new thread ID"));
+    let resumed = resumed_manager
+        .resume_thread_from_rollout(
+            config,
+            rollout_path,
+            Arc::clone(&resumed_manager.state.auth_manager),
+            /*parent_trace*/ None,
+            ClientMcpExtensions::default(),
+        )
+        .await
+        .expect("resume existing source thread");
+
+    assert_eq!(resumed.thread_id, original_thread_id);
+    resumed
+        .thread
+        .shutdown_and_wait()
+        .await
+        .expect("shut down resumed thread");
+}
+
+#[tokio::test]
+async fn child_session_inherits_client_mcp_extensions() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let parent = manager
+        .start_thread(StartThreadOptions {
+            client_mcp_extensions: ClientMcpExtensions::new(HashMap::from([
+                (OPENAI_FORM_EXTENSION_ID.to_string(), serde_json::json!({})),
+                (
+                    MCP_APP_UI_EXTENSION_ID.to_string(),
+                    serde_json::json!({
+                        "mimeTypes": ["text/html;profile=mcp-app"],
+                    }),
+                ),
+            ])),
+            ..StartThreadOptions::new(config)
+        })
+        .await
+        .expect("start parent thread");
+
+    assert_eq!(
+        manager
+            .state
+            .client_mcp_extensions_for_child(Some(parent.thread_id))
+            .await,
+        ClientMcpExtensions::new(HashMap::from([
+            (OPENAI_FORM_EXTENSION_ID.to_string(), serde_json::json!({})),
+            (
+                MCP_APP_UI_EXTENSION_ID.to_string(),
+                serde_json::json!({
+                    "mimeTypes": ["text/html;profile=mcp-app"],
+                }),
+            ),
+        ]))
+    );
+}
 
 struct FakeAgentGraphStore {
     root_thread_id: ThreadId,
@@ -118,1958 +372,6 @@ fn contextual_user_interrupted_marker() -> ResponseItem {
 fn developer_interrupted_marker() -> ResponseItem {
     interrupted_turn_history_marker(InterruptedTurnHistoryMarker::Developer)
         .expect("developer interrupted marker should be enabled")
-}
-
-fn start_thread_options(config: Config) -> StartThreadOptions {
-    StartThreadOptions {
-        config,
-        allow_provider_model_fallback: false,
-        initial_history: InitialHistory::New,
-        history_mode: None,
-        session_source: None,
-        thread_source: None,
-        dynamic_tools: Vec::new(),
-        metrics_service_name: None,
-        parent_trace: None,
-        environments: Vec::new(),
-        thread_extension_init: ExtensionDataInit::default(),
-        supports_openai_form_elicitation: false,
-    }
-}
-
-async fn hosted_thread_manager_for_tests() -> (
-    tempfile::TempDir,
-    Config,
-    ThreadManager,
-    Arc<codex_hosted_agent::FakeHostedAgentService>,
-) {
-    hosted_thread_manager_with_durable_store_for_tests(/*durable_store*/ true).await
-}
-
-async fn hosted_thread_manager_with_durable_store_for_tests(
-    durable_store: bool,
-) -> (
-    tempfile::TempDir,
-    Config,
-    ThreadManager,
-    Arc<codex_hosted_agent::FakeHostedAgentService>,
-) {
-    let temp_dir = tempdir().expect("tempdir");
-    let mut config = test_config().await;
-    config.codex_home = temp_dir.path().join("codex-home").abs();
-    config.cwd = temp_dir.path().join("workspace").abs();
-    config.workspace_roots = vec![config.cwd.clone()];
-    config.hosted_agents = crate::config::HostedAgentsConfig {
-        enabled: true,
-        service_url: Some("https://hosted.invalid".to_string()),
-        default_agent_type: "default".to_string(),
-        source_snapshot: None,
-    };
-    config.agent_roles.insert(
-        "default".to_string(),
-        crate::config::AgentRoleConfig {
-            description: Some("Hosted test agent".to_string()),
-            sandbox_template: Some("general-v1".to_string()),
-            ..Default::default()
-        },
-    );
-    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
-    std::fs::create_dir_all(&config.cwd).expect("create workspace");
-
-    let environment_manager = Arc::new(EnvironmentManager::without_environments());
-    let mut manager = ThreadManager::with_models_provider_and_home_for_tests(
-        CodexAuth::from_api_key("dummy"),
-        config.model_provider.clone(),
-        config.codex_home.to_path_buf(),
-        Arc::clone(&environment_manager),
-    );
-    let hosted_service = Arc::new(codex_hosted_agent::FakeHostedAgentService::default());
-    let provisioner = Arc::new(HostedAgentProvisioner::new_without_code_mode_for_tests(
-        Arc::clone(&hosted_service),
-        environment_manager,
-    ));
-    let manager_state =
-        Arc::get_mut(&mut manager.state).expect("new thread manager state must be unshared");
-    manager_state.hosted_agent_provisioner = Ok(Some(provisioner));
-    if durable_store {
-        let state_db = codex_state::StateRuntime::init(
-            config.sqlite_home.clone(),
-            config.model_provider_id.clone(),
-        )
-        .await
-        .expect("state db should initialize");
-        manager_state.thread_store = Arc::new(LocalThreadStore::new(
-            LocalThreadStoreConfig::from_config(&config),
-            Some(state_db),
-        ));
-    }
-
-    (temp_dir, config, manager, hosted_service)
-}
-
-fn hosted_provision_request(
-    service: &codex_hosted_agent::FakeHostedAgentService,
-    thread_id: ThreadId,
-) -> codex_hosted_agent::AgentProvisionRequest {
-    service
-        .provision_request(&format!("hosted-agent:{thread_id}:provision"))
-        .expect("hosted provision request")
-}
-
-async fn start_hosted_owned_agent(
-    manager: &ThreadManager,
-    config: &Config,
-) -> (NewThread, NewThread) {
-    let owner = manager
-        .start_thread_with_options(start_thread_options(config.clone()))
-        .await
-        .expect("start hosted owner");
-    let agent = manager
-        .spawn_subagent(owner.thread_id, start_thread_options(config.clone()))
-        .await
-        .expect("spawn hosted owned agent");
-    (owner, agent)
-}
-
-async fn grant_hosted_patch_application(manager: &ThreadManager, thread_id: ThreadId) {
-    let runtime = manager
-        .state
-        .hosted_agent_runtimes
-        .read()
-        .await
-        .get(&thread_id)
-        .cloned()
-        .expect("hosted runtime");
-    let mut value = runtime.snapshot();
-    value
-        .tool_policy
-        .allowed_domains
-        .insert(codex_tools::ToolExecutionDomainKind::ControlPlane);
-    value
-        .tool_policy
-        .allowed_tools
-        .insert(codex_tools::ToolName::plain(
-            crate::thread_manager::hosted_agent_patch_apply::HOSTED_AGENT_PATCH_APPLY_TOOL_NAME,
-        ));
-    runtime.replace(value);
-}
-
-#[tokio::test]
-async fn hosted_runtime_is_durable_and_checkpoints_only_successful_turns() {
-    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
-    let root = manager
-        .start_thread_with_options(start_thread_options(config))
-        .await
-        .expect("start hosted root");
-    let request = hosted_provision_request(&hosted_service, root.thread_id);
-    let lease_id = hosted_service
-        .provisioned_lease_id(&request.idempotency_key)
-        .expect("hosted lease");
-    let initial_record = manager
-        .state
-        .thread_store
-        .get_hosted_agent_runtime(root.thread_id)
-        .await
-        .expect("read initial hosted runtime")
-        .expect("initial hosted runtime record");
-    assert_eq!(
-        initial_record,
-        codex_hosted_agent::HostedAgentRuntimeRecord {
-            owner_agent_id: request.owner_agent_id,
-            agent_type: request.agent_type,
-            sandbox_template: request.sandbox_template,
-            lease_id: lease_id.clone(),
-            environment_id: hosted_service.provisioned_environment_ids()[0].clone(),
-            connection_generation: 0,
-            base_snapshot_id: initial_record.base_snapshot_id.clone(),
-            latest_snapshot_id: Some(initial_record.base_snapshot_id.clone()),
-            last_exported_patch: None,
-            reference_revision: initial_record.reference_revision,
-            lifecycle_state: codex_hosted_agent::HostedAgentLifecycleState::Active,
-        }
-    );
-
-    hosted_service.set_checkpoint_failure(Some(codex_hosted_agent::HostedAgentError::new(
-        codex_hosted_agent::HostedAgentErrorCategory::Unavailable,
-        "checkpoint unavailable",
-    )));
-    let failed_turn = root
-        .thread
-        .session
-        .new_default_turn_with_sub_id("failed-checkpoint-turn".to_string())
-        .await;
-    root.thread
-        .session
-        .send_event(
-            &failed_turn,
-            EventMsg::TurnComplete(TurnCompleteEvent {
-                turn_id: failed_turn.sub_id.clone(),
-                last_agent_message: Some("done".to_string()),
-                error: None,
-                started_at: None,
-                completed_at: None,
-                duration_ms: None,
-                time_to_first_token_ms: None,
-            }),
-        )
-        .await;
-    assert_eq!(
-        manager
-            .state
-            .thread_store
-            .get_hosted_agent_runtime(root.thread_id)
-            .await
-            .expect("read hosted runtime after failed checkpoint"),
-        Some(initial_record.clone())
-    );
-
-    hosted_service.set_checkpoint_failure(None);
-    let completed_turn = root
-        .thread
-        .session
-        .new_default_turn_with_sub_id("completed-turn".to_string())
-        .await;
-    root.thread
-        .session
-        .send_event(
-            &completed_turn,
-            EventMsg::TurnComplete(TurnCompleteEvent {
-                turn_id: completed_turn.sub_id.clone(),
-                last_agent_message: Some("done".to_string()),
-                error: None,
-                started_at: None,
-                completed_at: None,
-                duration_ms: None,
-                time_to_first_token_ms: None,
-            }),
-        )
-        .await;
-    let checkpointed_record = manager
-        .state
-        .thread_store
-        .get_hosted_agent_runtime(root.thread_id)
-        .await
-        .expect("read checkpointed hosted runtime")
-        .expect("checkpointed hosted runtime record");
-    assert_eq!(
-        checkpointed_record.latest_snapshot_id,
-        hosted_service.latest_snapshot_id(&lease_id)
-    );
-    assert_ne!(checkpointed_record, initial_record);
-
-    let aborted_turn = root
-        .thread
-        .session
-        .new_default_turn_with_sub_id("aborted-turn".to_string())
-        .await;
-    root.thread
-        .session
-        .send_event(
-            &aborted_turn,
-            EventMsg::TurnAborted(TurnAbortedEvent {
-                turn_id: Some(aborted_turn.sub_id.clone()),
-                reason: TurnAbortReason::Interrupted,
-                started_at: None,
-                completed_at: None,
-                duration_ms: None,
-            }),
-        )
-        .await;
-    assert_eq!(
-        manager
-            .state
-            .thread_store
-            .get_hosted_agent_runtime(root.thread_id)
-            .await
-            .expect("read hosted runtime after aborted turn"),
-        Some(checkpointed_record)
-    );
-
-    let report = manager
-        .shutdown_all_threads_bounded(Duration::from_secs(10))
-        .await;
-    assert_eq!(report.completed, vec![root.thread_id]);
-}
-
-#[tokio::test]
-async fn hosted_finalization_persists_patch_notifies_owner_and_releases() {
-    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
-    let mut patch_available = manager.subscribe_hosted_agent_patch_available();
-    let (owner, agent) = start_hosted_owned_agent(&manager, &config).await;
-    let owner_thread_id = owner.thread_id;
-    let request = hosted_provision_request(&hosted_service, agent.thread_id);
-    let lease_id = hosted_service
-        .provisioned_lease_id(&request.idempotency_key)
-        .expect("hosted lease");
-    let initial_record = manager
-        .state
-        .thread_store
-        .get_hosted_agent_runtime(agent.thread_id)
-        .await
-        .expect("read initial agent runtime")
-        .expect("initial agent runtime record");
-    assert_eq!(initial_record.owner_agent_id, Some(owner_thread_id));
-    let environment_id = initial_record.environment_id.clone();
-
-    let error = manager
-        .state
-        .finalize_hosted_runtime(agent.thread_id, ThreadId::new())
-        .await
-        .expect_err("non-owner must not finalize hosted agent");
-    assert!(error.to_string().contains("does not own hosted agent"));
-    assert_eq!(
-        manager
-            .state
-            .thread_store
-            .get_hosted_agent_runtime(agent.thread_id)
-            .await
-            .expect("read runtime after unauthorized finalization"),
-        Some(initial_record)
-    );
-
-    let artifact = manager
-        .state
-        .finalize_hosted_runtime(agent.thread_id, owner_thread_id)
-        .await
-        .expect("finalize hosted agent")
-        .expect("hosted patch artifact");
-    assert_eq!(
-        patch_available.recv().await.expect("patch notification"),
-        HostedAgentPatchAvailable {
-            owner_thread_id,
-            artifact: artifact.clone(),
-        }
-    );
-    let record = manager
-        .state
-        .thread_store
-        .get_hosted_agent_runtime(agent.thread_id)
-        .await
-        .expect("read finalized runtime")
-        .expect("finalized runtime record");
-    assert_eq!(record.last_exported_patch, Some(artifact));
-    assert_eq!(
-        record.lifecycle_state,
-        codex_hosted_agent::HostedAgentLifecycleState::Released
-    );
-    assert_eq!(
-        record.latest_snapshot_id,
-        hosted_service.latest_snapshot_id(&lease_id)
-    );
-    assert_eq!(hosted_service.active_lease_count(), 1);
-    assert!(
-        manager
-            .state
-            .environment_manager
-            .get_environment(&environment_id)
-            .is_none()
-    );
-
-    let report = manager
-        .shutdown_all_threads_bounded(Duration::from_secs(10))
-        .await;
-    assert_eq!(report.completed.len(), 2);
-}
-
-#[tokio::test]
-async fn hosted_patch_apply_persists_checkpoint_and_retry_is_idempotent() {
-    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
-    let (owner, agent) = start_hosted_owned_agent(&manager, &config).await;
-    let artifact = manager
-        .state
-        .finalize_hosted_runtime(agent.thread_id, owner.thread_id)
-        .await
-        .expect("finalize hosted agent")
-        .expect("hosted patch artifact");
-    grant_hosted_patch_application(&manager, owner.thread_id).await;
-    let initial_record = manager
-        .state
-        .thread_store
-        .get_hosted_agent_runtime(owner.thread_id)
-        .await
-        .expect("read owner runtime")
-        .expect("owner runtime record");
-
-    assert_eq!(
-        manager
-            .apply_hosted_agent_patch(owner.thread_id, agent.thread_id, &artifact.artifact_id,)
-            .await
-            .expect("apply hosted patch"),
-        HostedAgentPatchApplyResult::Applied
-    );
-    let applied_record = manager
-        .state
-        .thread_store
-        .get_hosted_agent_runtime(owner.thread_id)
-        .await
-        .expect("read applied owner runtime")
-        .expect("applied owner runtime record");
-    assert_ne!(
-        applied_record.latest_snapshot_id,
-        initial_record.latest_snapshot_id
-    );
-    assert_eq!(
-        applied_record.latest_snapshot_id,
-        hosted_service.latest_snapshot_id(&applied_record.lease_id)
-    );
-    assert_eq!(
-        manager
-            .state
-            .hosted_agent_runtimes
-            .read()
-            .await
-            .get(&owner.thread_id)
-            .expect("owner runtime")
-            .snapshot()
-            .latest_snapshot_id,
-        applied_record.latest_snapshot_id
-    );
-
-    assert_eq!(
-        manager
-            .apply_hosted_agent_patch(owner.thread_id, agent.thread_id, &artifact.artifact_id,)
-            .await
-            .expect("retry hosted patch"),
-        HostedAgentPatchApplyResult::Applied
-    );
-    assert_eq!(
-        manager
-            .state
-            .thread_store
-            .get_hosted_agent_runtime(owner.thread_id)
-            .await
-            .expect("read retried owner runtime"),
-        Some(applied_record)
-    );
-}
-
-#[tokio::test]
-async fn hosted_patch_apply_conflict_leaves_owner_unchanged() {
-    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
-    let (owner, agent) = start_hosted_owned_agent(&manager, &config).await;
-    let artifact = manager
-        .state
-        .finalize_hosted_runtime(agent.thread_id, owner.thread_id)
-        .await
-        .expect("finalize hosted agent")
-        .expect("hosted patch artifact");
-    grant_hosted_patch_application(&manager, owner.thread_id).await;
-    let conflict_path = PathUri::parse("file:///workspace/conflicted.rs").expect("conflict path");
-    hosted_service.set_patch_conflict(&artifact.artifact_id, vec![conflict_path.clone()]);
-    let initial_record = manager
-        .state
-        .thread_store
-        .get_hosted_agent_runtime(owner.thread_id)
-        .await
-        .expect("read owner runtime")
-        .expect("owner runtime record");
-
-    assert_eq!(
-        manager
-            .apply_hosted_agent_patch(owner.thread_id, agent.thread_id, &artifact.artifact_id,)
-            .await
-            .expect("apply conflicting hosted patch"),
-        HostedAgentPatchApplyResult::Conflict {
-            paths: vec![conflict_path],
-        }
-    );
-    assert_eq!(
-        manager
-            .state
-            .thread_store
-            .get_hosted_agent_runtime(owner.thread_id)
-            .await
-            .expect("read owner runtime after conflict"),
-        Some(initial_record)
-    );
-}
-
-#[tokio::test]
-async fn hosted_patch_apply_rejects_missing_policy_stale_artifact_and_non_owner() {
-    let (_temp_dir, config, manager, _hosted_service) = hosted_thread_manager_for_tests().await;
-    let (owner, agent) = start_hosted_owned_agent(&manager, &config).await;
-    let artifact = manager
-        .state
-        .finalize_hosted_runtime(agent.thread_id, owner.thread_id)
-        .await
-        .expect("finalize hosted agent")
-        .expect("hosted patch artifact");
-    let owner_before = manager
-        .state
-        .thread_store
-        .get_hosted_agent_runtime(owner.thread_id)
-        .await
-        .expect("read owner runtime")
-        .expect("owner runtime record");
-
-    assert!(matches!(
-        manager
-            .apply_hosted_agent_patch(owner.thread_id, agent.thread_id, &artifact.artifact_id,)
-            .await
-            .expect("policy rejection"),
-        HostedAgentPatchApplyResult::Rejected { .. }
-    ));
-
-    grant_hosted_patch_application(&manager, owner.thread_id).await;
-    assert!(matches!(
-        manager
-            .apply_hosted_agent_patch(owner.thread_id, agent.thread_id, "stale-artifact")
-            .await
-            .expect("stale artifact rejection"),
-        HostedAgentPatchApplyResult::Rejected { .. }
-    ));
-
-    let unrelated_owner = manager
-        .start_thread_with_options(start_thread_options(config))
-        .await
-        .expect("start unrelated hosted owner");
-    grant_hosted_patch_application(&manager, unrelated_owner.thread_id).await;
-    assert!(matches!(
-        manager
-            .apply_hosted_agent_patch(
-                unrelated_owner.thread_id,
-                agent.thread_id,
-                &artifact.artifact_id,
-            )
-            .await
-            .expect("ownership rejection"),
-        HostedAgentPatchApplyResult::Rejected { .. }
-    ));
-    assert_eq!(
-        manager
-            .state
-            .thread_store
-            .get_hosted_agent_runtime(owner.thread_id)
-            .await
-            .expect("read unchanged owner runtime"),
-        Some(owner_before)
-    );
-}
-
-#[tokio::test]
-async fn finalized_hosted_agent_rejects_followup_turns() {
-    let (_temp_dir, config, manager, _hosted_service) = hosted_thread_manager_for_tests().await;
-    let (owner, agent) = start_hosted_owned_agent(&manager, &config).await;
-    manager
-        .state
-        .finalize_hosted_runtime(agent.thread_id, owner.thread_id)
-        .await
-        .expect("finalize hosted agent")
-        .expect("hosted patch artifact");
-
-    manager
-        .state
-        .ensure_hosted_runtime_active(owner.thread_id)
-        .await
-        .expect("active hosted owner can start another turn");
-    let error = manager
-        .state
-        .ensure_hosted_runtime_active(agent.thread_id)
-        .await
-        .expect_err("finalized hosted agent must reject a followup turn");
-    assert!(error.to_string().contains("spawn a new agent instead"));
-}
-
-#[tokio::test]
-async fn hosted_finalization_checkpoint_failure_preserves_pending_lease() {
-    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
-    let mut patch_available = manager.subscribe_hosted_agent_patch_available();
-    let (owner, agent) = start_hosted_owned_agent(&manager, &config).await;
-    hosted_service.set_checkpoint_failure(Some(codex_hosted_agent::HostedAgentError::new(
-        codex_hosted_agent::HostedAgentErrorCategory::Unavailable,
-        "checkpoint unavailable",
-    )));
-
-    let error = manager
-        .state
-        .finalize_hosted_runtime(agent.thread_id, owner.thread_id)
-        .await
-        .expect_err("failed checkpoint must keep completion pending");
-    assert!(
-        error
-            .to_string()
-            .contains("failed to checkpoint hosted-agent lease")
-    );
-    let record = manager
-        .state
-        .thread_store
-        .get_hosted_agent_runtime(agent.thread_id)
-        .await
-        .expect("read pending runtime")
-        .expect("pending runtime record");
-    assert_eq!(
-        record.lifecycle_state,
-        codex_hosted_agent::HostedAgentLifecycleState::PendingFinalization
-    );
-    assert_eq!(record.last_exported_patch, None);
-    assert_eq!(hosted_service.active_lease_count(), 2);
-    assert!(matches!(
-        patch_available.try_recv(),
-        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-    ));
-
-    let report = manager
-        .shutdown_all_threads_bounded(Duration::from_secs(10))
-        .await;
-    assert_eq!(report.completed.len(), 2);
-    assert_eq!(hosted_service.active_lease_count(), 1);
-}
-
-#[tokio::test]
-async fn hosted_finalization_export_failure_persists_checkpoint_and_preserves_lease() {
-    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
-    let mut patch_available = manager.subscribe_hosted_agent_patch_available();
-    let (owner, agent) = start_hosted_owned_agent(&manager, &config).await;
-    let request = hosted_provision_request(&hosted_service, agent.thread_id);
-    let lease_id = hosted_service
-        .provisioned_lease_id(&request.idempotency_key)
-        .expect("hosted lease");
-    hosted_service.set_export_failure(Some(codex_hosted_agent::HostedAgentError::new(
-        codex_hosted_agent::HostedAgentErrorCategory::Unavailable,
-        "export unavailable",
-    )));
-
-    let error = manager
-        .state
-        .finalize_hosted_runtime(agent.thread_id, owner.thread_id)
-        .await
-        .expect_err("failed export must keep completion pending");
-    assert!(
-        error
-            .to_string()
-            .contains("failed to export hosted-agent patch")
-    );
-    let record = manager
-        .state
-        .thread_store
-        .get_hosted_agent_runtime(agent.thread_id)
-        .await
-        .expect("read pending runtime")
-        .expect("pending runtime record");
-    assert_eq!(
-        record.lifecycle_state,
-        codex_hosted_agent::HostedAgentLifecycleState::PendingFinalization
-    );
-    assert_eq!(
-        record.latest_snapshot_id,
-        hosted_service.latest_snapshot_id(&lease_id)
-    );
-    assert_ne!(record.latest_snapshot_id, Some(record.base_snapshot_id));
-    assert_eq!(record.last_exported_patch, None);
-    assert_eq!(hosted_service.active_lease_count(), 2);
-    assert!(matches!(
-        patch_available.try_recv(),
-        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-    ));
-}
-
-#[tokio::test]
-async fn hosted_finalization_failure_persists_error_before_failed_completion() {
-    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
-    let (owner, agent) = start_hosted_owned_agent(&manager, &config).await;
-    hosted_service.set_export_failure(Some(codex_hosted_agent::HostedAgentError::new(
-        codex_hosted_agent::HostedAgentErrorCategory::Unavailable,
-        "export unavailable",
-    )));
-    let mut turn = agent
-        .thread
-        .session
-        .new_default_turn_with_sub_id("hosted-finalization-failure".to_string())
-        .await;
-    Arc::get_mut(&mut turn)
-        .expect("new turn context must be uniquely owned")
-        .parent_thread_id = Some(owner.thread_id);
-
-    agent
-        .thread
-        .session
-        .send_event(
-            &turn,
-            EventMsg::TurnComplete(TurnCompleteEvent {
-                turn_id: turn.sub_id.clone(),
-                last_agent_message: Some("done".to_string()),
-                error: None,
-                started_at: None,
-                completed_at: None,
-                duration_ms: None,
-                time_to_first_token_ms: None,
-            }),
-        )
-        .await;
-    let mut terminal_events = Vec::new();
-    while terminal_events.len() < 2 {
-        let event = tokio::time::timeout(Duration::from_secs(5), agent.thread.next_event())
-            .await
-            .expect("timed out waiting for finalization events")
-            .expect("read finalization event");
-        match event.msg {
-            EventMsg::Error(error) if error.message.contains("failed to finalize hosted agent") => {
-                terminal_events.push(EventMsg::Error(error));
-            }
-            EventMsg::TurnComplete(event) if event.turn_id == turn.sub_id => {
-                terminal_events.push(EventMsg::TurnComplete(event));
-            }
-            _ => {}
-        }
-    }
-    let [EventMsg::Error(error), EventMsg::TurnComplete(completion)] = terminal_events.as_slice()
-    else {
-        panic!("expected Error followed by TurnComplete, got {terminal_events:?}");
-    };
-    assert_eq!(completion.error.as_ref(), Some(error));
-    assert!(matches!(
-        agent.thread.agent_status().await,
-        codex_protocol::protocol::AgentStatus::Errored(_)
-    ));
-}
-
-#[tokio::test]
-async fn hosted_finalization_release_failure_is_durable_and_cleanup_retries() {
-    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
-    let mut patch_available = manager.subscribe_hosted_agent_patch_available();
-    let (owner, agent) = start_hosted_owned_agent(&manager, &config).await;
-    hosted_service.set_release_failure(Some(codex_hosted_agent::HostedAgentError::new(
-        codex_hosted_agent::HostedAgentErrorCategory::Unavailable,
-        "release unavailable",
-    )));
-
-    let artifact = manager
-        .state
-        .finalize_hosted_runtime(agent.thread_id, owner.thread_id)
-        .await
-        .expect("durable artifact makes finalization successful")
-        .expect("hosted patch artifact");
-    assert_eq!(
-        patch_available
-            .recv()
-            .await
-            .expect("patch notification")
-            .artifact,
-        artifact
-    );
-    let record = manager
-        .state
-        .thread_store
-        .get_hosted_agent_runtime(agent.thread_id)
-        .await
-        .expect("read release-pending runtime")
-        .expect("release-pending runtime record");
-    assert_eq!(
-        record.lifecycle_state,
-        codex_hosted_agent::HostedAgentLifecycleState::ReleasePending
-    );
-    assert!(
-        manager
-            .hosted_runtime_cleanup_pending(agent.thread_id)
-            .await
-    );
-    assert_eq!(hosted_service.active_lease_count(), 2);
-
-    hosted_service.set_release_failure(None);
-    manager.retry_hosted_runtime_cleanup(agent.thread_id).await;
-    let record = manager
-        .state
-        .thread_store
-        .get_hosted_agent_runtime(agent.thread_id)
-        .await
-        .expect("read released runtime")
-        .expect("released runtime record");
-    assert_eq!(
-        record.lifecycle_state,
-        codex_hosted_agent::HostedAgentLifecycleState::Released
-    );
-    assert!(
-        !manager
-            .hosted_runtime_cleanup_pending(agent.thread_id)
-            .await
-    );
-    assert_eq!(hosted_service.active_lease_count(), 1);
-}
-
-#[tokio::test]
-async fn hosted_cleanup_retry_does_not_remove_an_active_runtime_generation() {
-    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
-    let root = manager
-        .start_thread_with_options(start_thread_options(config))
-        .await
-        .expect("start hosted root");
-
-    manager.retry_hosted_runtime_cleanup(root.thread_id).await;
-
-    assert!(manager.get_thread(root.thread_id).await.is_ok());
-    manager
-        .state
-        .ensure_hosted_runtime_active(root.thread_id)
-        .await
-        .expect("cleanup retry must preserve active generation");
-    assert_eq!(hosted_service.active_lease_count(), 1);
-}
-
-#[tokio::test]
-async fn removing_pending_finalization_retries_before_releasing_the_runtime() {
-    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
-    let (owner, agent) = start_hosted_owned_agent(&manager, &config).await;
-    hosted_service.set_checkpoint_failure(Some(codex_hosted_agent::HostedAgentError::new(
-        codex_hosted_agent::HostedAgentErrorCategory::Unavailable,
-        "checkpoint unavailable",
-    )));
-    manager
-        .state
-        .finalize_hosted_runtime(agent.thread_id, owner.thread_id)
-        .await
-        .expect_err("initial finalization must remain pending");
-    agent
-        .thread
-        .shutdown_and_wait()
-        .await
-        .expect("stop pending hosted agent");
-    let mut patch_available = manager.subscribe_hosted_agent_patch_available();
-
-    assert!(manager.remove_thread(&agent.thread_id).await.is_some());
-    let still_pending_record = manager
-        .state
-        .thread_store
-        .get_hosted_agent_runtime(agent.thread_id)
-        .await
-        .expect("read still-pending runtime")
-        .expect("still-pending runtime record");
-    assert_eq!(
-        still_pending_record.lifecycle_state,
-        codex_hosted_agent::HostedAgentLifecycleState::PendingFinalization
-    );
-    assert_eq!(hosted_service.active_lease_count(), 2);
-    assert!(matches!(
-        patch_available.try_recv(),
-        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-    ));
-
-    hosted_service.set_checkpoint_failure(None);
-    assert!(manager.remove_thread(&agent.thread_id).await.is_none());
-    let released_record = manager
-        .state
-        .thread_store
-        .get_hosted_agent_runtime(agent.thread_id)
-        .await
-        .expect("read finalized runtime")
-        .expect("finalized runtime record");
-    let notification = patch_available.recv().await.expect("patch notification");
-
-    assert_eq!(notification.owner_thread_id, owner.thread_id);
-    assert_eq!(
-        released_record.last_exported_patch,
-        Some(notification.artifact)
-    );
-    assert_eq!(
-        released_record.lifecycle_state,
-        codex_hosted_agent::HostedAgentLifecycleState::Released
-    );
-    assert!(
-        manager
-            .state
-            .hosted_agent_runtimes
-            .read()
-            .await
-            .get(&agent.thread_id)
-            .is_none()
-    );
-    assert_eq!(hosted_service.active_lease_count(), 1);
-}
-
-#[tokio::test]
-async fn hosted_startup_rolls_back_when_runtime_metadata_cannot_be_stored() {
-    let (_temp_dir, config, manager, hosted_service) =
-        hosted_thread_manager_with_durable_store_for_tests(/*durable_store*/ false).await;
-    let error = match manager
-        .start_thread_with_options(start_thread_options(config))
-        .await
-    {
-        Ok(_) => panic!("hosted startup must require durable runtime storage"),
-        Err(error) => error,
-    };
-    assert!(
-        error
-            .to_string()
-            .contains("failed to persist hosted-agent runtime")
-    );
-    assert_eq!(hosted_service.active_lease_count(), 0);
-    for environment_id in hosted_service.provisioned_environment_ids() {
-        assert!(
-            manager
-                .state
-                .environment_manager
-                .get_environment(&environment_id)
-                .is_none()
-        );
-    }
-    assert!(manager.state.hosted_agent_runtimes.read().await.is_empty());
-}
-
-#[tokio::test]
-async fn hosted_provision_failure_leaves_no_thread_runtime_environment_or_lease() {
-    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
-    hosted_service.set_provision_failure(Some(codex_hosted_agent::HostedAgentError::new(
-        codex_hosted_agent::HostedAgentErrorCategory::QuotaExceeded,
-        "test quota exhausted",
-    )));
-    let initial_thread_ids = manager.list_thread_ids().await;
-
-    let error = match manager
-        .start_thread_with_options(start_thread_options(config))
-        .await
-    {
-        Ok(_) => panic!("hosted provision failure must prevent thread startup"),
-        Err(error) => error,
-    };
-
-    assert!(error.to_string().contains("test quota exhausted"));
-    assert_eq!(manager.list_thread_ids().await, initial_thread_ids);
-    assert!(manager.state.hosted_agent_runtimes.read().await.is_empty());
-    assert_eq!(
-        manager.state.environment_manager.default_environment_ids(),
-        Vec::<String>::new()
-    );
-    assert_eq!(hosted_service.active_lease_count(), 0);
-    assert!(hosted_service.provisioned_environment_ids().is_empty());
-}
-
-#[tokio::test]
-async fn stopped_hosted_thread_reconnects_without_releasing_its_lease() {
-    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
-    let root = manager
-        .start_thread_with_options(start_thread_options(config.clone()))
-        .await
-        .expect("start hosted root");
-    let original_record = manager
-        .state
-        .thread_store
-        .get_hosted_agent_runtime(root.thread_id)
-        .await
-        .expect("read hosted runtime")
-        .expect("hosted runtime record");
-    root.thread
-        .shutdown_and_wait()
-        .await
-        .expect("stop hosted thread");
-
-    let resumed = manager
-        .resume_thread_with_history(
-            config,
-            InitialHistory::Resumed(ResumedHistory {
-                conversation_id: root.thread_id,
-                history: Arc::new(Vec::new()),
-                rollout_path: root.session_configured.rollout_path.clone(),
-            }),
-            manager.auth_manager(),
-            /*parent_trace*/ None,
-            /*supports_openai_form_elicitation*/ false,
-        )
-        .await
-        .expect("resume hosted thread");
-    let resumed_runtime = manager
-        .state
-        .hosted_agent_runtimes
-        .read()
-        .await
-        .get(&root.thread_id)
-        .expect("resumed runtime")
-        .snapshot();
-    assert_eq!(resumed_runtime.lease_id, original_record.lease_id);
-    assert_eq!(hosted_service.active_lease_count(), 1);
-    assert_eq!(hosted_service.provisioned_environment_ids().len(), 1);
-
-    resumed
-        .thread
-        .shutdown_and_wait()
-        .await
-        .expect("stop resumed thread");
-    manager.remove_thread(&resumed.thread_id).await;
-}
-
-#[tokio::test]
-async fn pending_finalization_resume_finishes_without_starting_a_new_turn() {
-    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
-    let (owner, agent) = start_hosted_owned_agent(&manager, &config).await;
-    hosted_service.set_export_failure(Some(codex_hosted_agent::HostedAgentError::new(
-        codex_hosted_agent::HostedAgentErrorCategory::Unavailable,
-        "export unavailable",
-    )));
-    manager
-        .state
-        .finalize_hosted_runtime(agent.thread_id, owner.thread_id)
-        .await
-        .expect_err("initial finalization must remain pending");
-    let pending_record = manager
-        .state
-        .thread_store
-        .get_hosted_agent_runtime(agent.thread_id)
-        .await
-        .expect("read pending runtime")
-        .expect("pending runtime record");
-    assert_eq!(
-        pending_record.lifecycle_state,
-        codex_hosted_agent::HostedAgentLifecycleState::PendingFinalization
-    );
-    agent
-        .thread
-        .shutdown_and_wait()
-        .await
-        .expect("stop pending hosted agent");
-    hosted_service.set_export_failure(None);
-    let mut patch_available = manager.subscribe_hosted_agent_patch_available();
-
-    let error = match manager
-        .resume_thread_with_history(
-            config,
-            InitialHistory::Resumed(ResumedHistory {
-                conversation_id: agent.thread_id,
-                history: Arc::new(Vec::new()),
-                rollout_path: agent.session_configured.rollout_path.clone(),
-            }),
-            manager.auth_manager(),
-            /*parent_trace*/ None,
-            /*supports_openai_form_elicitation*/ false,
-        )
-        .await
-    {
-        Ok(_) => panic!("finalized hosted agent must not start another turn"),
-        Err(error) => error,
-    };
-    let released_record = manager
-        .state
-        .thread_store
-        .get_hosted_agent_runtime(agent.thread_id)
-        .await
-        .expect("read recovered runtime")
-        .expect("recovered runtime record");
-    let notification = patch_available.recv().await.expect("patch notification");
-
-    assert!(
-        error
-            .to_string()
-            .contains("is finalized and cannot be resumed")
-    );
-    assert_eq!(
-        released_record.lifecycle_state,
-        codex_hosted_agent::HostedAgentLifecycleState::Released
-    );
-    assert_eq!(notification.owner_thread_id, owner.thread_id);
-    assert_eq!(
-        released_record.last_exported_patch,
-        Some(notification.artifact)
-    );
-    assert!(manager.get_thread(agent.thread_id).await.is_err());
-    assert_eq!(hosted_service.active_lease_count(), 1);
-    assert_eq!(hosted_service.provisioned_environment_ids().len(), 2);
-}
-
-#[tokio::test]
-async fn completed_hosted_thread_resume_retries_release_without_restoring() {
-    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
-    let root = manager
-        .start_thread_with_options(start_thread_options(config.clone()))
-        .await
-        .expect("start hosted root");
-    let mut record = manager
-        .state
-        .thread_store
-        .get_hosted_agent_runtime(root.thread_id)
-        .await
-        .expect("read hosted runtime")
-        .expect("hosted runtime record");
-    let artifact = codex_hosted_agent::AgentPatchArtifact {
-        artifact_id: "artifact-completed-resume".to_string(),
-        agent_id: root.thread_id,
-        base_snapshot_id: record.base_snapshot_id.clone(),
-        checksum: "sha256:completed-resume".to_string(),
-        changed_files: 1,
-        size_bytes: 128,
-    };
-    hosted_service.register_patch_artifact(artifact.clone());
-    record.last_exported_patch = Some(artifact);
-    record.lifecycle_state = codex_hosted_agent::HostedAgentLifecycleState::Completed;
-    manager
-        .state
-        .thread_store
-        .set_hosted_agent_runtime(root.thread_id, record)
-        .await
-        .expect("persist completed runtime");
-    root.thread
-        .shutdown_and_wait()
-        .await
-        .expect("stop hosted thread");
-
-    let error = match manager
-        .resume_thread_with_history(
-            config,
-            InitialHistory::Resumed(ResumedHistory {
-                conversation_id: root.thread_id,
-                history: Arc::new(Vec::new()),
-                rollout_path: root.session_configured.rollout_path.clone(),
-            }),
-            manager.auth_manager(),
-            /*parent_trace*/ None,
-            /*supports_openai_form_elicitation*/ false,
-        )
-        .await
-    {
-        Ok(_) => panic!("completed hosted thread must not resume"),
-        Err(error) => error,
-    };
-    let released_record = manager
-        .state
-        .thread_store
-        .get_hosted_agent_runtime(root.thread_id)
-        .await
-        .expect("read released hosted runtime")
-        .expect("released hosted runtime record");
-
-    assert!(
-        error
-            .to_string()
-            .contains("is finalized and cannot be resumed")
-    );
-    assert_eq!(
-        released_record.lifecycle_state,
-        codex_hosted_agent::HostedAgentLifecycleState::Released
-    );
-    assert_eq!(hosted_service.active_lease_count(), 0);
-    assert_eq!(hosted_service.provisioned_environment_ids().len(), 1);
-}
-
-#[tokio::test]
-async fn stopped_hosted_thread_restores_a_missing_lease_and_persists_it() {
-    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
-    let root = manager
-        .start_thread_with_options(start_thread_options(config.clone()))
-        .await
-        .expect("start hosted root");
-    let original_record = manager
-        .state
-        .thread_store
-        .get_hosted_agent_runtime(root.thread_id)
-        .await
-        .expect("read hosted runtime")
-        .expect("hosted runtime record");
-    root.thread
-        .shutdown_and_wait()
-        .await
-        .expect("stop hosted thread");
-    hosted_service
-        .release(codex_hosted_agent::AgentReleaseRequest {
-            lease_id: original_record.lease_id.clone(),
-            idempotency_key: format!("hosted-agent:{}:expire-before-restore", root.thread_id),
-        })
-        .await
-        .expect("expire lease before restore");
-
-    let resumed = manager
-        .resume_thread_with_history(
-            config,
-            InitialHistory::Resumed(ResumedHistory {
-                conversation_id: root.thread_id,
-                history: Arc::new(Vec::new()),
-                rollout_path: root.session_configured.rollout_path.clone(),
-            }),
-            manager.auth_manager(),
-            /*parent_trace*/ None,
-            /*supports_openai_form_elicitation*/ false,
-        )
-        .await
-        .expect("restore hosted thread");
-    let restored_record = manager
-        .state
-        .thread_store
-        .get_hosted_agent_runtime(root.thread_id)
-        .await
-        .expect("read restored runtime")
-        .expect("restored runtime record");
-    assert_ne!(restored_record.lease_id, original_record.lease_id);
-    assert_ne!(
-        restored_record.environment_id,
-        original_record.environment_id
-    );
-    assert_eq!(
-        restored_record.base_snapshot_id,
-        original_record.base_snapshot_id
-    );
-    assert_eq!(
-        restored_record.latest_snapshot_id,
-        original_record.latest_snapshot_id
-    );
-    assert_eq!(hosted_service.active_lease_count(), 1);
-    assert_eq!(hosted_service.provisioned_environment_ids().len(), 2);
-
-    resumed
-        .thread
-        .shutdown_and_wait()
-        .await
-        .expect("stop restored thread");
-    manager.remove_thread(&resumed.thread_id).await;
-}
-
-#[tokio::test]
-async fn hosted_resume_without_snapshot_fails_without_reprovisioning() {
-    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
-    let root = manager
-        .start_thread_with_options(start_thread_options(config.clone()))
-        .await
-        .expect("start hosted root");
-    let mut record = manager
-        .state
-        .thread_store
-        .get_hosted_agent_runtime(root.thread_id)
-        .await
-        .expect("read hosted runtime")
-        .expect("hosted runtime record");
-    record.latest_snapshot_id = None;
-    let lease_id = record.lease_id.clone();
-    manager
-        .state
-        .thread_store
-        .set_hosted_agent_runtime(root.thread_id, record)
-        .await
-        .expect("remove durable snapshot");
-    root.thread
-        .shutdown_and_wait()
-        .await
-        .expect("stop hosted thread");
-    hosted_service
-        .release(codex_hosted_agent::AgentReleaseRequest {
-            lease_id,
-            idempotency_key: format!("hosted-agent:{}:expire-before-resume", root.thread_id),
-        })
-        .await
-        .expect("expire lease before resume");
-
-    let error = match manager
-        .resume_thread_with_history(
-            config,
-            InitialHistory::Resumed(ResumedHistory {
-                conversation_id: root.thread_id,
-                history: Arc::new(Vec::new()),
-                rollout_path: root.session_configured.rollout_path.clone(),
-            }),
-            manager.auth_manager(),
-            /*parent_trace*/ None,
-            /*supports_openai_form_elicitation*/ false,
-        )
-        .await
-    {
-        Ok(_) => panic!("resume without a durable snapshot must fail"),
-        Err(error) => error,
-    };
-    assert!(
-        error
-            .to_string()
-            .contains("hosted-agent runtime has no durable snapshot")
-    );
-    assert_eq!(hosted_service.active_lease_count(), 0);
-    assert_eq!(hosted_service.provisioned_environment_ids().len(), 1);
-    assert!(
-        manager
-            .state
-            .hosted_agent_runtimes
-            .read()
-            .await
-            .get(&root.thread_id)
-            .is_none()
-    );
-}
-
-#[tokio::test]
-async fn hosted_provisioning_separates_ownership_from_snapshot_lineage() {
-    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
-    let root = manager
-        .start_thread_with_options(start_thread_options(config.clone()))
-        .await
-        .expect("start hosted root");
-    let root_request = hosted_provision_request(&hosted_service, root.thread_id);
-    assert_eq!(root_request.owner_agent_id, None);
-    assert_eq!(
-        root_request.source,
-        ProjectSnapshotSource::RootWorkspace {
-            cwd: PathUri::from_abs_path(&config.cwd),
-            workspace_roots: vec![PathUri::from_abs_path(&config.cwd)],
-        }
-    );
-    let root_lease_id = hosted_service
-        .provisioned_lease_id(&root_request.idempotency_key)
-        .expect("root lease");
-
-    let detached = manager
-        .spawn_subagent(root.thread_id, start_thread_options(config.clone()))
-        .await
-        .expect("spawn hosted detached subagent");
-    let detached_request = hosted_provision_request(&hosted_service, detached.thread_id);
-    assert_eq!(detached_request.owner_agent_id, Some(root.thread_id));
-    assert_eq!(
-        detached_request.source,
-        ProjectSnapshotSource::AgentEnvironment {
-            owner_lease_id: root_lease_id.clone(),
-        }
-    );
-
-    root.thread.ensure_rollout_materialized().await;
-    root.thread
-        .flush_rollout()
-        .await
-        .expect("flush hosted root");
-    let fork = manager
-        .fork_thread(
-            ForkSnapshot::Interrupted,
-            config.clone(),
-            root.thread.rollout_path().expect("root rollout path"),
-            Some(ThreadSource::User),
-            /*parent_trace*/ None,
-        )
-        .await
-        .expect("fork hosted root");
-    let fork_request = hosted_provision_request(&hosted_service, fork.thread_id);
-    assert_eq!(fork_request.owner_agent_id, None);
-    assert_eq!(
-        fork_request.source,
-        ProjectSnapshotSource::AgentEnvironment {
-            owner_lease_id: root_lease_id,
-        }
-    );
-
-    let mut non_hosted_config = config;
-    non_hosted_config.hosted_agents.enabled = false;
-    let non_hosted = manager
-        .start_thread_with_options(start_thread_options(non_hosted_config))
-        .await
-        .expect("start non-hosted root");
-    assert!(
-        hosted_service
-            .provision_request(&format!("hosted-agent:{}:provision", non_hosted.thread_id))
-            .is_none()
-    );
-    assert!(
-        manager
-            .state
-            .hosted_agent_runtimes
-            .read()
-            .await
-            .get(&non_hosted.thread_id)
-            .is_none()
-    );
-
-    let report = manager
-        .shutdown_all_threads_bounded(Duration::from_secs(10))
-        .await;
-    assert_eq!(report.completed.len(), 4);
-}
-
-#[tokio::test]
-async fn hosted_root_uses_trusted_source_snapshot_without_client_host_paths() {
-    let (_temp_dir, mut config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
-    let source_snapshot_id = "source_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
-    let checksum =
-        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
-    let remote_root = PathUri::parse("file:///workspace/roots/0/project").expect("remote root");
-    let remote_cwd = PathUri::parse("file:///workspace/roots/0/project/src").expect("remote cwd");
-    config.hosted_agents.source_snapshot = Some(crate::config::HostedSourceSnapshotConfig {
-        source_snapshot_id: source_snapshot_id.clone(),
-        checksum: checksum.clone(),
-    });
-    hosted_service.register_source_snapshot(
-        source_snapshot_id.clone(),
-        checksum.clone(),
-        remote_cwd,
-        vec![remote_root],
-    );
-
-    let root = manager
-        .start_thread_with_options(start_thread_options(config))
-        .await
-        .expect("start hosted root from immutable source");
-    let request = hosted_provision_request(&hosted_service, root.thread_id);
-    assert_eq!(request.owner_agent_id, None);
-    assert_eq!(
-        request.source,
-        ProjectSnapshotSource::SourceSnapshot {
-            source_snapshot_id,
-            checksum,
-        }
-    );
-}
-
-#[tokio::test]
-async fn hosted_codex_delegate_owns_and_releases_an_isolated_runtime() {
-    let (_temp_dir, config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
-    let root = manager
-        .start_thread_with_options(start_thread_options(config.clone()))
-        .await
-        .expect("start hosted root");
-    let root_request = hosted_provision_request(&hosted_service, root.thread_id);
-    let root_lease_id = hosted_service
-        .provisioned_lease_id(&root_request.idempotency_key)
-        .expect("root lease");
-    let parent_turn = root.thread.session.new_default_turn().await;
-    let (delegate, delegate_io) = crate::codex_delegate::run_codex_thread_interactive(
-        config,
-        Arc::clone(&root.thread.session.services.auth_manager),
-        Arc::clone(&root.thread.session.services.models_manager),
-        Arc::clone(&root.thread.session),
-        Arc::clone(&parent_turn),
-        CancellationToken::new(),
-        SubAgentSource::Review,
-        /*initial_history*/ None,
-    )
-    .await
-    .expect("start hosted delegate");
-    let delegate_id = delegate.thread_id();
-    let delegate_request = hosted_provision_request(&hosted_service, delegate_id);
-    assert_eq!(delegate_request.owner_agent_id, Some(root.thread_id));
-    assert_eq!(
-        delegate_request.source,
-        ProjectSnapshotSource::AgentEnvironment {
-            owner_lease_id: root_lease_id,
-        }
-    );
-    assert_eq!(manager.list_thread_ids().await, vec![root.thread_id]);
-    assert!(matches!(
-        manager.get_thread(delegate_id).await,
-        Err(CodexErr::ThreadNotFound(thread_id)) if thread_id == delegate_id
-    ));
-
-    let delegate_snapshot = delegate.thread_config_snapshot().await;
-    assert_eq!(delegate_snapshot.approval_policy, AskForApproval::Never);
-    assert!(matches!(
-        delegate_snapshot.permission_profile,
-        PermissionProfile::External { .. }
-    ));
-    assert_ne!(
-        delegate_snapshot.environments.environments,
-        parent_turn.environments.to_selections()
-    );
-    assert!(!Arc::ptr_eq(
-        &delegate.services.exec_policy,
-        &root.thread.session.services.exec_policy
-    ));
-    let delegate_lease_id = hosted_service
-        .provisioned_lease_id(&delegate_request.idempotency_key)
-        .expect("delegate lease");
-
-    delegate_io
-        .shutdown_and_wait()
-        .await
-        .expect("shut down hosted delegate");
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while manager
-            .state
-            .hosted_agent_runtimes
-            .read()
-            .await
-            .contains_key(&delegate_id)
-        {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("delegate runtime release timed out");
-    hosted_service
-        .reconnect(codex_hosted_agent::AgentReconnectRequest {
-            lease_id: delegate_lease_id,
-            idempotency_key: format!("hosted-agent:{delegate_id}:delegate-release-check"),
-        })
-        .await
-        .expect_err("delegate lease must be released after shutdown");
-}
-
-#[tokio::test]
-async fn non_hosted_codex_delegate_preserves_parent_runtime_inheritance() {
-    let (_temp_dir, mut config, manager, hosted_service) = hosted_thread_manager_for_tests().await;
-    config.hosted_agents.enabled = false;
-    let root = manager
-        .start_thread_with_options(start_thread_options(config.clone()))
-        .await
-        .expect("start non-hosted root");
-    let parent_turn = root.thread.session.new_default_turn().await;
-    let parent_environments = parent_turn.environments.to_selections();
-    let (delegate, delegate_io) = crate::codex_delegate::run_codex_thread_interactive(
-        config,
-        Arc::clone(&root.thread.session.services.auth_manager),
-        Arc::clone(&root.thread.session.services.models_manager),
-        Arc::clone(&root.thread.session),
-        Arc::clone(&parent_turn),
-        CancellationToken::new(),
-        SubAgentSource::Review,
-        /*initial_history*/ None,
-    )
-    .await
-    .expect("start non-hosted delegate");
-
-    assert_eq!(
-        delegate
-            .thread_config_snapshot()
-            .await
-            .environments
-            .environments,
-        parent_environments
-    );
-    assert!(Arc::ptr_eq(
-        &delegate.services.exec_policy,
-        &root.thread.session.services.exec_policy
-    ));
-    assert!(
-        hosted_service
-            .provision_request(&format!("hosted-agent:{}:provision", delegate.thread_id()))
-            .is_none()
-    );
-    delegate_io
-        .shutdown_and_wait()
-        .await
-        .expect("shut down non-hosted delegate");
-}
-
-#[tokio::test]
-async fn hosted_root_and_spawned_threads_own_distinct_provisioned_environments() {
-    let temp_dir = tempdir().expect("tempdir");
-    let mut config = test_config().await;
-    config.codex_home = temp_dir.path().join("codex-home").abs();
-    config.cwd = temp_dir.path().join("workspace").abs();
-    config.workspace_roots = vec![config.cwd.clone()];
-    config.permissions.approval_policy =
-        crate::config::Constrained::allow_any(AskForApproval::OnRequest);
-    config
-        .set_legacy_sandbox_policy(codex_protocol::protocol::SandboxPolicy::ReadOnly {
-            network_access: false,
-        })
-        .expect("set restrictive local sandbox policy");
-    config.permissions.network = Some(
-        crate::config::NetworkProxySpec::from_config_and_constraints(
-            codex_network_proxy::NetworkProxyConfig::default(),
-            Some(codex_config::NetworkConstraints {
-                enabled: Some(true),
-                ..Default::default()
-            }),
-            config.permissions.permission_profile(),
-        )
-        .expect("create managed network proxy spec"),
-    );
-    config.hosted_agents = crate::config::HostedAgentsConfig {
-        enabled: true,
-        service_url: Some("https://hosted.invalid".to_string()),
-        default_agent_type: "default".to_string(),
-        source_snapshot: None,
-    };
-    config.agent_roles.insert(
-        "default".to_string(),
-        crate::config::AgentRoleConfig {
-            description: Some("Hosted test agent".to_string()),
-            sandbox_template: Some("general-v1".to_string()),
-            ..Default::default()
-        },
-    );
-    config.agent_roles.insert(
-        "researcher".to_string(),
-        crate::config::AgentRoleConfig {
-            description: Some("Hosted research agent".to_string()),
-            sandbox_template: Some("research-v1".to_string()),
-            ..Default::default()
-        },
-    );
-    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
-    std::fs::create_dir_all(&config.cwd).expect("create workspace");
-
-    let environment_manager = Arc::new(EnvironmentManager::without_environments());
-    let mut manager = ThreadManager::with_models_provider_and_home_for_tests(
-        CodexAuth::from_api_key("dummy"),
-        config.model_provider.clone(),
-        config.codex_home.to_path_buf(),
-        Arc::clone(&environment_manager),
-    );
-    let hosted_service = Arc::new(codex_hosted_agent::FakeHostedAgentService::default());
-    let provisioner = Arc::new(HostedAgentProvisioner::new_without_code_mode_for_tests(
-        Arc::clone(&hosted_service),
-        Arc::clone(&environment_manager),
-    ));
-    let manager_state =
-        Arc::get_mut(&mut manager.state).expect("new thread manager state must be unshared");
-    manager_state.hosted_agent_provisioner = Ok(Some(provisioner));
-    manager_state.thread_store = InMemoryThreadStore::for_id(format!(
-        "hosted-role-selection-test-{}",
-        uuid::Uuid::new_v4()
-    ));
-
-    let blank_agent_type_error = manager
-        .start_thread_with_options_and_agent_type(
-            start_thread_options(config.clone()),
-            "  ".to_string(),
-        )
-        .await
-        .err()
-        .expect("blank root agent type must fail");
-    assert_eq!(
-        blank_agent_type_error.to_string(),
-        "agentType must not be blank"
-    );
-
-    let mut non_hosted_config = config.clone();
-    non_hosted_config.hosted_agents.enabled = false;
-    let non_hosted_agent_type_error = manager
-        .start_thread_with_options_and_agent_type(
-            start_thread_options(non_hosted_config),
-            "researcher".to_string(),
-        )
-        .await
-        .err()
-        .expect("non-hosted root agent type must fail");
-    assert_eq!(
-        non_hosted_agent_type_error.to_string(),
-        "agentType requires hosted agents to be enabled"
-    );
-
-    let new_thread = manager
-        .start_thread_with_options_and_agent_type(
-            start_thread_options(config.clone()),
-            " researcher ".to_string(),
-        )
-        .await
-        .expect("start hosted thread");
-    let snapshot = new_thread.thread.config_snapshot().await;
-    assert_eq!(snapshot.approval_policy, AskForApproval::Never);
-    assert_eq!(
-        snapshot.permission_profile,
-        PermissionProfile::External {
-            network: NetworkSandboxPolicy::Enabled,
-        }
-    );
-    assert_eq!(snapshot.active_permission_profile, None);
-    assert!(
-        new_thread
-            .thread
-            .config()
-            .await
-            .permissions
-            .network
-            .is_none()
-    );
-    let approval_override_error = new_thread
-        .thread
-        .preview_thread_settings_overrides(CodexThreadSettingsOverrides {
-            approval_policy: Some(AskForApproval::OnRequest),
-            ..Default::default()
-        })
-        .await
-        .expect_err("hosted approval policy must be immutable");
-    assert!(
-        approval_override_error
-            .to_string()
-            .contains("approval_policy")
-    );
-    let sandbox_override_error = new_thread
-        .thread
-        .preview_thread_settings_overrides(CodexThreadSettingsOverrides {
-            sandbox_policy: Some(codex_protocol::protocol::SandboxPolicy::ReadOnly {
-                network_access: false,
-            }),
-            ..Default::default()
-        })
-        .await
-        .expect_err("hosted sandbox policy must be immutable");
-    assert!(
-        sandbox_override_error
-            .to_string()
-            .contains("sandbox_policy")
-    );
-    let mut mismatched_environments = snapshot.environments.clone();
-    mismatched_environments.environments[0].environment_id = "other-environment".to_string();
-    let environment_override_error = new_thread
-        .thread
-        .preview_thread_settings_overrides(CodexThreadSettingsOverrides {
-            environments: Some(mismatched_environments),
-            ..Default::default()
-        })
-        .await
-        .expect_err("hosted environment selection must be immutable");
-    assert!(
-        environment_override_error
-            .to_string()
-            .contains("environments")
-    );
-    let permission_profile_override_error = new_thread
-        .thread
-        .preview_thread_settings_overrides(CodexThreadSettingsOverrides {
-            permission_profile: Some(PermissionProfile::Disabled),
-            ..Default::default()
-        })
-        .await
-        .expect_err("hosted permission profile must be immutable");
-    assert!(
-        permission_profile_override_error
-            .to_string()
-            .contains("permission_profile")
-    );
-    let active_profile_override_error = new_thread
-        .thread
-        .preview_thread_settings_overrides(CodexThreadSettingsOverrides {
-            active_permission_profile: Some(
-                codex_protocol::models::ActivePermissionProfile::read_only(),
-            ),
-            ..Default::default()
-        })
-        .await
-        .expect_err("hosted active permission profile must remain unset");
-    assert!(
-        active_profile_override_error
-            .to_string()
-            .contains("active_permission_profile")
-    );
-    let profile_roots_override_error = new_thread
-        .thread
-        .preview_thread_settings_overrides(CodexThreadSettingsOverrides {
-            profile_workspace_roots: Some(snapshot.workspace_roots.clone()),
-            ..Default::default()
-        })
-        .await
-        .expect_err("hosted profile workspace roots must remain unset");
-    assert!(
-        profile_roots_override_error
-            .to_string()
-            .contains("profile_workspace_roots")
-    );
-    let [selection] = snapshot.environments.environments.as_slice() else {
-        panic!("hosted thread must select exactly one environment");
-    };
-    {
-        let runtime = manager
-            .state
-            .hosted_agent_runtimes
-            .read()
-            .await
-            .get(&new_thread.thread_id)
-            .cloned()
-            .expect("thread must own a hosted runtime");
-        let runtime = runtime.snapshot();
-        assert_eq!(selection.environment_id, runtime.environment_id);
-        assert_eq!(runtime.agent_type, "researcher");
-        assert_eq!(runtime.sandbox_template, "research-v1");
-    }
-    assert!(environment_manager.try_local_environment().is_none());
-
-    let child_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-        parent_thread_id: new_thread.thread_id,
-        depth: 1,
-        agent_path: None,
-        agent_nickname: None,
-        agent_role: Some("default".to_string()),
-    });
-    let inherited_environments = new_thread
-        .thread
-        .session
-        .services
-        .turn_environments
-        .snapshot()
-        .await;
-    let inherited_exec_policy = Arc::clone(&new_thread.thread.session.services.exec_policy);
-    let inherited_environment_selections = inherited_environments.to_selections();
-    let child = manager
-        .state
-        .spawn_new_thread_with_source(
-            config,
-            manager.agent_control(),
-            child_source,
-            /*history_mode*/ None,
-            /*parent_thread_id*/ Some(new_thread.thread_id),
-            /*forked_from_thread_id*/ None,
-            /*thread_source*/ Some(ThreadSource::Subagent),
-            /*metrics_service_name*/ None,
-            /*inherited_environments*/ Some(inherited_environments),
-            /*inherited_exec_policy*/ Some(Arc::clone(&inherited_exec_policy)),
-            /*environments*/ Some(inherited_environment_selections),
-        )
-        .await
-        .expect("start hosted child thread");
-    let child_snapshot = child.thread.config_snapshot().await;
-    assert_eq!(child_snapshot.approval_policy, AskForApproval::Never);
-    assert_eq!(
-        child_snapshot.permission_profile,
-        PermissionProfile::External {
-            network: NetworkSandboxPolicy::Enabled,
-        }
-    );
-    assert_eq!(child_snapshot.active_permission_profile, None);
-    assert!(child.thread.config().await.permissions.network.is_none());
-    assert!(!Arc::ptr_eq(
-        &child.thread.session.services.exec_policy,
-        &inherited_exec_policy
-    ));
-    let [child_selection] = child_snapshot.environments.environments.as_slice() else {
-        panic!("hosted child must select exactly one environment");
-    };
-    let (root_environment_id, root_lease_id, child_environment_id, child_lease_id) = {
-        let runtimes = manager.state.hosted_agent_runtimes.read().await;
-        let root_runtime = runtimes
-            .get(&new_thread.thread_id)
-            .cloned()
-            .expect("root hosted runtime");
-        let child_runtime = runtimes
-            .get(&child.thread_id)
-            .cloned()
-            .expect("child hosted runtime");
-        drop(runtimes);
-        let root_runtime = root_runtime.snapshot();
-        let child_runtime = child_runtime.snapshot();
-
-        assert_eq!(child_selection.environment_id, child_runtime.environment_id);
-        assert_ne!(child_runtime.lease_id, root_runtime.lease_id);
-        assert_ne!(child_runtime.environment_id, root_runtime.environment_id);
-        (
-            root_runtime.environment_id.clone(),
-            root_runtime.lease_id,
-            child_runtime.environment_id.clone(),
-            child_runtime.lease_id,
-        )
-    };
-
-    child
-        .thread
-        .shutdown_and_wait()
-        .await
-        .expect("shut down hosted child");
-    assert!(manager.remove_thread(&child.thread_id).await.is_some());
-
-    assert!(
-        manager
-            .state
-            .hosted_agent_runtimes
-            .read()
-            .await
-            .get(&child.thread_id)
-            .is_none()
-    );
-    assert!(
-        manager
-            .state
-            .hosted_agent_runtimes
-            .read()
-            .await
-            .get(&new_thread.thread_id)
-            .is_some()
-    );
-    assert!(
-        environment_manager
-            .get_environment(&child_environment_id)
-            .is_none()
-    );
-    assert!(
-        environment_manager
-            .get_environment(&root_environment_id)
-            .is_some()
-    );
-    hosted_service
-        .reconnect(codex_hosted_agent::AgentReconnectRequest {
-            lease_id: child_lease_id,
-            idempotency_key: format!("hosted-agent:{}:removed-child-reconnect", child.thread_id),
-        })
-        .await
-        .expect_err("removed child lease must be released");
-    hosted_service
-        .reconnect(codex_hosted_agent::AgentReconnectRequest {
-            lease_id: root_lease_id.clone(),
-            idempotency_key: format!(
-                "hosted-agent:{}:remaining-root-reconnect",
-                new_thread.thread_id
-            ),
-        })
-        .await
-        .expect("removing a child must not release its root lease");
-
-    let shutdown_report = manager
-        .shutdown_all_threads_bounded(Duration::from_secs(10))
-        .await;
-    assert_eq!(shutdown_report.completed, vec![new_thread.thread_id]);
-    assert!(manager.state.hosted_agent_runtimes.read().await.is_empty());
-    assert!(
-        environment_manager
-            .get_environment(&root_environment_id)
-            .is_none()
-    );
-    hosted_service
-        .reconnect(codex_hosted_agent::AgentReconnectRequest {
-            lease_id: root_lease_id,
-            idempotency_key: format!(
-                "hosted-agent:{}:shutdown-root-reconnect",
-                new_thread.thread_id
-            ),
-        })
-        .await
-        .expect_err("manager shutdown must release the root lease");
-}
-
-#[tokio::test]
-async fn deleted_hosted_reference_clear_forwards_the_durable_revision() {
-    let (_temp_dir, config, manager, _hosted_service) = hosted_thread_manager_for_tests().await;
-    let state_db = codex_state::StateRuntime::init(
-        config.sqlite_home.clone(),
-        config.model_provider_id.clone(),
-    )
-    .await
-    .expect("open state db");
-    let root = manager
-        .start_thread_with_options(start_thread_options(config))
-        .await
-        .expect("start hosted root");
-    let record = manager
-        .state
-        .thread_store
-        .get_hosted_agent_runtime(root.thread_id)
-        .await
-        .expect("read hosted runtime")
-        .expect("hosted runtime record");
-    let expected_revision = record
-        .reference_revision
-        .expect("hosted runtime has a retained revision");
-    root.thread
-        .shutdown_and_wait()
-        .await
-        .expect("stop hosted root");
-    assert!(manager.remove_thread(&root.thread_id).await.is_some());
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while manager.has_hosted_runtime(root.thread_id).await {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("hosted release timed out");
-    assert!(
-        manager
-            .clear_deleted_hosted_references(
-                root.thread_id,
-                record.lease_id.clone(),
-                expected_revision,
-            )
-            .await
-            .is_err(),
-        "remote references must remain while the local rollout exists"
-    );
-    manager
-        .state
-        .thread_store
-        .delete_thread(codex_thread_store::DeleteThreadParams {
-            thread_id: root.thread_id,
-        })
-        .await
-        .expect("delete hosted rollout before reference clear");
-    state_db
-        .delete_thread(root.thread_id)
-        .await
-        .expect("delete hosted state row before reference clear");
-
-    let cleared = manager
-        .clear_deleted_hosted_references(root.thread_id, record.lease_id.clone(), expected_revision)
-        .await
-        .expect("clear deleted references");
-    assert_eq!(cleared, expected_revision + 1);
-    assert_eq!(
-        manager
-            .clear_deleted_hosted_references(root.thread_id, record.lease_id, expected_revision,)
-            .await
-            .expect("replay deleted reference clear"),
-        cleared
-    );
 }
 
 #[test]
@@ -2160,6 +462,7 @@ fn truncates_before_requested_user_message() {
             name: "tool".to_string(),
             namespace: None,
             arguments: "{}".to_string(),
+            encrypted_function_args: None,
             internal_chat_message_metadata_passthrough: None,
         },
         assistant_msg("a4"),
@@ -2168,7 +471,7 @@ fn truncates_before_requested_user_message() {
     let initial: Vec<RolloutItem> = items
         .iter()
         .cloned()
-        .map(RolloutItem::ResponseItem)
+        .map(|item| RolloutItem::ResponseItem(item.into()))
         .collect();
     let truncated = truncate_before_nth_user_message(
         InitialHistory::Forked(initial),
@@ -2182,9 +485,9 @@ fn truncates_before_requested_user_message() {
     );
     let got_items = truncated.get_rollout_items();
     let expected_items = vec![
-        RolloutItem::ResponseItem(items[0].clone()),
-        RolloutItem::ResponseItem(items[1].clone()),
-        RolloutItem::ResponseItem(items[2].clone()),
+        RolloutItem::ResponseItem(items[0].clone().into()),
+        RolloutItem::ResponseItem(items[1].clone().into()),
+        RolloutItem::ResponseItem(items[2].clone().into()),
     ];
     assert_eq!(
         serde_json::to_value(got_items).unwrap(),
@@ -2194,7 +497,7 @@ fn truncates_before_requested_user_message() {
     let initial2: Vec<RolloutItem> = items
         .iter()
         .cloned()
-        .map(RolloutItem::ResponseItem)
+        .map(|item| RolloutItem::ResponseItem(item.into()))
         .collect();
     let truncated2 = truncate_before_nth_user_message(
         InitialHistory::Forked(initial2.clone()),
@@ -2215,10 +518,10 @@ fn truncates_before_requested_user_message() {
 #[test]
 fn out_of_range_truncation_drops_only_unfinished_suffix_mid_turn() {
     let items = vec![
-        RolloutItem::ResponseItem(user_msg("u1")),
-        RolloutItem::ResponseItem(assistant_msg("a1")),
-        RolloutItem::ResponseItem(user_msg("u2")),
-        RolloutItem::ResponseItem(assistant_msg("partial")),
+        RolloutItem::ResponseItem(user_msg("u1").into()),
+        RolloutItem::ResponseItem(assistant_msg("a1").into()),
+        RolloutItem::ResponseItem(user_msg("u2").into()),
+        RolloutItem::ResponseItem(assistant_msg("partial").into()),
     ];
 
     let truncated = truncate_before_nth_user_message(
@@ -2260,8 +563,8 @@ fn fork_thread_accepts_legacy_usize_snapshot_argument() {
 #[test]
 fn out_of_range_truncation_drops_pre_user_active_turn_prefix() {
     let items = vec![
-        RolloutItem::ResponseItem(user_msg("u1")),
-        RolloutItem::ResponseItem(assistant_msg("a1")),
+        RolloutItem::ResponseItem(user_msg("u1").into()),
+        RolloutItem::ResponseItem(assistant_msg("a1").into()),
         RolloutItem::EventMsg(EventMsg::TurnStarted(TurnStartedEvent {
             turn_id: "turn-2".to_string(),
             trace_id: None,
@@ -2269,8 +572,8 @@ fn out_of_range_truncation_drops_pre_user_active_turn_prefix() {
             model_context_window: None,
             collaboration_mode_kind: Default::default(),
         })),
-        RolloutItem::ResponseItem(user_msg("u2")),
-        RolloutItem::ResponseItem(assistant_msg("partial")),
+        RolloutItem::ResponseItem(user_msg("u2").into()),
+        RolloutItem::ResponseItem(assistant_msg("partial").into()),
     ];
 
     let snapshot_state = snapshot_turn_state(&InitialHistory::Forked(items.clone()));
@@ -2312,7 +615,7 @@ async fn ignores_session_prefix_messages_when_truncating() {
     let rollout_items: Vec<RolloutItem> = items
         .iter()
         .cloned()
-        .map(RolloutItem::ResponseItem)
+        .map(|item| RolloutItem::ResponseItem(item.into()))
         .collect();
 
     let truncated = truncate_before_nth_user_message(
@@ -2328,10 +631,10 @@ async fn ignores_session_prefix_messages_when_truncating() {
     let got_items = truncated.get_rollout_items();
 
     let expected: Vec<RolloutItem> = vec![
-        RolloutItem::ResponseItem(items[0].clone()),
-        RolloutItem::ResponseItem(items[1].clone()),
-        RolloutItem::ResponseItem(items[2].clone()),
-        RolloutItem::ResponseItem(items[3].clone()),
+        RolloutItem::ResponseItem(items[0].clone().into()),
+        RolloutItem::ResponseItem(items[1].clone().into()),
+        RolloutItem::ResponseItem(items[2].clone().into()),
+        RolloutItem::ResponseItem(items[3].clone().into()),
     ];
 
     assert_eq!(
@@ -2355,12 +658,12 @@ async fn shutdown_all_threads_bounded_submits_shutdown_to_every_thread() {
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
     );
     let thread_1 = manager
-        .start_thread(config.clone())
+        .start_thread(StartThreadOptions::new(config.clone()))
         .await
         .expect("start first thread")
         .thread_id;
     let thread_2 = manager
-        .start_thread(config.clone())
+        .start_thread(StartThreadOptions::new(config.clone()))
         .await
         .expect("start second thread")
         .thread_id;
@@ -2385,18 +688,20 @@ async fn code_mode_session_provider_is_shared_across_threads() {
     config.cwd = config.codex_home.abs();
     std::fs::create_dir_all(&config.codex_home).expect("create codex home");
 
+    let provider: Arc<dyn CodeModeSessionProvider> = Arc::new(DisabledCodeModeSessionProvider);
     let manager = ThreadManager::with_models_provider_and_home_for_tests(
         CodexAuth::from_api_key("dummy"),
         config.model_provider.clone(),
         config.codex_home.to_path_buf(),
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
-    );
+    )
+    .with_code_mode_session_provider(Arc::clone(&provider));
     let first = manager
-        .start_thread(config.clone())
+        .start_thread(StartThreadOptions::new(config.clone()))
         .await
         .expect("start first thread");
     let second = manager
-        .start_thread(config)
+        .start_thread(StartThreadOptions::new(config))
         .await
         .expect("start second thread");
 
@@ -2413,6 +718,7 @@ async fn code_mode_session_provider_is_shared_across_threads() {
         .code_mode_service
         .session_provider();
     assert!(Arc::ptr_eq(&first_provider, &second_provider));
+    assert!(Arc::ptr_eq(&first_provider, &provider));
     assert!(Arc::ptr_eq(
         &first_provider,
         &manager.state.code_mode_session_provider
@@ -2434,6 +740,102 @@ async fn code_mode_session_provider_is_shared_across_threads() {
 }
 
 #[tokio::test]
+async fn mcp_invalidation_refreshes_threads_that_are_still_starting() {
+    struct BlockingThreadStartup {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        refreshed: tokio::sync::Notify,
+        projections: std::sync::atomic::AtomicUsize,
+    }
+
+    impl codex_extension_api::ThreadLifecycleContributor<Config> for BlockingThreadStartup {
+        fn on_thread_start<'a>(
+            &'a self,
+            _input: codex_extension_api::ThreadStartInput<'a, Config>,
+        ) -> codex_extension_api::ExtensionFuture<'a, ()> {
+            Box::pin(async move {
+                self.entered.notify_one();
+                self.release.notified().await;
+            })
+        }
+    }
+
+    impl codex_extension_api::McpServerContributor<Config> for BlockingThreadStartup {
+        fn id(&self) -> &'static str {
+            "starting_mcp_runtime_refresh_test"
+        }
+
+        fn contribute<'a>(
+            &'a self,
+            _context: codex_extension_api::McpServerContributionContext<'a, Config>,
+        ) -> codex_extension_api::ExtensionFuture<'a, Vec<codex_extension_api::McpServerContribution>>
+        {
+            Box::pin(async move {
+                if self.projections.fetch_add(1, Ordering::AcqRel) != 0 {
+                    self.refreshed.notify_one();
+                }
+                Vec::new()
+            })
+        }
+    }
+
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+
+    let observer = Arc::new(BlockingThreadStartup {
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+        refreshed: tokio::sync::Notify::new(),
+        projections: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let mut extensions = codex_extension_api::ExtensionRegistryBuilder::new();
+    extensions.thread_lifecycle_contributor(observer.clone());
+    extensions.mcp_server_contributor(observer.clone());
+    let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy"));
+    let manager = Arc::new(ThreadManager::new(
+        &config,
+        Arc::clone(&auth_manager),
+        build_models_manager(&config, auth_manager),
+        crate::CodexAppsToolsCache::default(),
+        SessionSource::Exec,
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        Arc::new(extensions.build()),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
+        /*analytics_events_client*/ None,
+        thread_store_from_config(&config, /*state_db*/ None),
+        /*agent_graph_store*/ None,
+        TEST_INSTALLATION_ID.to_string(),
+        /*attestation_provider*/ None,
+        /*external_time_provider*/ None,
+    ));
+    let starting = tokio::spawn({
+        let manager = Arc::clone(&manager);
+        async move { manager.start_thread(StartThreadOptions::new(config)).await }
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), observer.entered.notified())
+        .await
+        .expect("thread should enter its startup lifecycle");
+    assert!(manager.list_thread_ids().await.is_empty());
+    manager.invalidate_mcp_runtimes().await;
+    observer.release.notify_one();
+    starting
+        .await
+        .expect("thread startup task should finish")
+        .expect("thread should start");
+    tokio::time::timeout(Duration::from_secs(5), observer.refreshed.notified())
+        .await
+        .expect("invalidation during startup should refresh the newly published thread");
+    let shutdown = manager
+        .shutdown_all_threads_bounded(Duration::from_secs(5))
+        .await;
+    assert!(shutdown.timed_out.is_empty());
+}
+
+#[tokio::test]
 async fn start_thread_keeps_internal_threads_hidden_from_normal_lookups() {
     let temp_dir = tempdir().expect("tempdir");
     let mut config = test_config().await;
@@ -2448,27 +850,24 @@ async fn start_thread_keeps_internal_threads_hidden_from_normal_lookups() {
         Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
     );
     let thread = manager
-        .start_thread_with_options(StartThreadOptions {
-            config,
-            allow_provider_model_fallback: false,
-            initial_history: InitialHistory::New,
-            history_mode: None,
+        .start_thread(StartThreadOptions {
             session_source: Some(SessionSource::Internal(
                 InternalSessionSource::MemoryConsolidation,
             )),
-            thread_source: None,
-            dynamic_tools: Vec::new(),
-            metrics_service_name: None,
-            parent_trace: None,
-            environments: Vec::new(),
-            thread_extension_init: Default::default(),
-            supports_openai_form_elicitation: false,
+            environments: Some(Vec::new()),
+            ..StartThreadOptions::new(config)
         })
         .await
         .expect("internal thread should start");
 
     assert_eq!(manager.list_thread_ids().await, Vec::new());
     assert!(manager.get_thread(thread.thread_id).await.is_err());
+    assert!(
+        codex_diagnostics::snapshot()
+            .gauges
+            .iter()
+            .any(|gauge| gauge.name == "core.threads.live" && gauge.value > 0)
+    );
 
     let report = manager
         .shutdown_all_threads_bounded(Duration::from_secs(10))
@@ -2480,10 +879,326 @@ async fn start_thread_keeps_internal_threads_hidden_from_normal_lookups() {
 }
 
 #[tokio::test]
+async fn spawn_internal_guardian_session_preserves_windows_sandbox_proxy_settings() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let parent = manager
+        .start_thread(StartThreadOptions::new(config.clone()))
+        .await
+        .expect("start parent thread");
+    let reviewer = manager
+        .spawn_internal_session(
+            parent.thread_id,
+            StartThreadOptions {
+                session_source: Some(SessionSource::Internal(InternalSessionSource::Guardian)),
+                ..StartThreadOptions::new(config)
+            },
+        )
+        .await
+        .expect("start internal reviewer");
+
+    assert_eq!(
+        (
+            parent.thread.session.windows_sandbox_proxy_settings_mode,
+            reviewer.thread.session.windows_sandbox_proxy_settings_mode,
+        ),
+        (
+            codex_sandboxing::WindowsSandboxProxySettingsMode::Reconcile,
+            codex_sandboxing::WindowsSandboxProxySettingsMode::Preserve,
+        )
+    );
+
+    manager
+        .shutdown_all_threads_bounded(Duration::from_secs(10))
+        .await;
+}
+
+#[tokio::test]
+async fn spawn_internal_session_preserves_parent_lineage_without_forking_history() {
+    struct ParentLifecycleContributor {
+        observed_mcp_sources: Arc<std::sync::Mutex<Vec<SessionSource>>>,
+    }
+
+    impl codex_extension_api::ThreadLifecycleContributor<Config> for ParentLifecycleContributor {}
+
+    impl codex_extension_api::McpServerContributor<Config> for ParentLifecycleContributor {
+        fn id(&self) -> &'static str {
+            "parent_mcp_contributor"
+        }
+
+        fn contribute<'a>(
+            &'a self,
+            context: codex_extension_api::McpServerContributionContext<'a, Config>,
+        ) -> codex_extension_api::ExtensionFuture<'a, Vec<codex_extension_api::McpServerContribution>>
+        {
+            Box::pin(async move {
+                if let Some(session_source) = context.session_source() {
+                    self.observed_mcp_sources
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(session_source.clone());
+                }
+                Vec::new()
+            })
+        }
+    }
+
+    struct ParentInstructionsProvider(codex_extension_api::Instructions);
+
+    impl codex_extension_api::UserInstructionsProvider for ParentInstructionsProvider {
+        fn load_user_instructions(&self) -> codex_extension_api::LoadUserInstructionsFuture<'_> {
+            Box::pin(async move {
+                codex_extension_api::LoadedUserInstructions {
+                    instructions: Some(self.0.clone()),
+                    warnings: Vec::new(),
+                }
+            })
+        }
+    }
+
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+
+    let mut managed_exec_policy = codex_execpolicy::Policy::empty();
+    managed_exec_policy
+        .add_prefix_rule(&["rm".to_string()], codex_execpolicy::Decision::Forbidden)
+        .expect("add managed execution restriction");
+    let mut requirements = config.config_layer_stack.requirements().clone();
+    requirements.exec_policy = Some(codex_config::Sourced::new(
+        codex_execpolicy::RequirementsExecPolicy::new(managed_exec_policy),
+        codex_config::RequirementSource::Unknown,
+    ));
+    requirements.additional_developer_instructions = Some(codex_config::Sourced::new(
+        "managed instructions must not shape the reviewer".to_string(),
+        codex_config::RequirementSource::Unknown,
+    ));
+    let mut requirements_toml = config.config_layer_stack.requirements_toml().clone();
+    requirements_toml.additional_developer_instructions =
+        Some("managed instructions must not shape the reviewer".to_string());
+    config.config_layer_stack = codex_config::ConfigLayerStack::new(
+        config
+            .config_layer_stack
+            .all_layers_low_to_high()
+            .cloned()
+            .collect(),
+        requirements,
+        requirements_toml,
+    )
+    .expect("managed requirements stack");
+
+    let parent_instructions = codex_extension_api::Instructions {
+        text: "parent user instructions must not be inherited".to_string(),
+        source: config.codex_home.join("AGENTS.md"),
+    };
+    let mut manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let observed_mcp_sources = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let parent_contributor = Arc::new(ParentLifecycleContributor {
+        observed_mcp_sources: Arc::clone(&observed_mcp_sources),
+    });
+    let mut extensions = codex_extension_api::ExtensionRegistryBuilder::new();
+    extensions.thread_lifecycle_contributor(parent_contributor.clone());
+    extensions.mcp_server_contributor(parent_contributor);
+    let manager_state = Arc::get_mut(&mut manager.state).expect("unshared thread manager state");
+    manager_state.extensions = Arc::new(extensions.build());
+    manager_state.mcp_manager = Arc::new(McpManager::new_with_extensions(
+        Arc::clone(&manager_state.plugins_manager),
+        Arc::clone(&manager_state.extensions),
+        manager_state.mcp_manager.codex_apps_tools_cache(),
+    ));
+    manager_state.user_instructions_provider =
+        Arc::new(ParentInstructionsProvider(parent_instructions.clone()));
+    let parent = manager
+        .start_thread(StartThreadOptions {
+            metrics_service_name: Some("codex_work_desktop".to_string()),
+            ..StartThreadOptions::new(config.clone())
+        })
+        .await
+        .expect("start parent thread");
+    parent
+        .thread
+        .session
+        .set_multi_agent_version_if_unset(MultiAgentVersion::V2);
+    assert_eq!(
+        parent.thread.session.user_instructions().await,
+        Some(parent_instructions)
+    );
+    assert_eq!(
+        parent
+            .thread
+            .session
+            .services
+            .extensions
+            .thread_lifecycle_contributors()
+            .len(),
+        1
+    );
+    let mut reviewer_environments = parent
+        .thread
+        .session
+        .services
+        .turn_environments
+        .selections();
+    let reviewer_environment = reviewer_environments
+        .first_mut()
+        .expect("parent should have an environment");
+    reviewer_environment.config =
+        EnvironmentConfigState::Ready(codex_protocol::protocol::EnvironmentConfig {
+            allow_login_shell: true,
+            workspace_roots: reviewer_environment.workspace_roots.clone(),
+            permission_profile: config.permissions.permission_profile_state().snapshot(),
+            shell_environment_policy: Default::default(),
+            windows_sandbox_level: WindowsSandboxLevel::from_config(&config),
+            windows_sandbox_private_desktop: config.permissions.windows_sandbox_private_desktop,
+            use_legacy_landlock: config.features.use_legacy_landlock(),
+            exec_policy: Some(codex_execpolicy::RequirementsExecPolicy::new(
+                codex_execpolicy::Policy::empty(),
+            )),
+            mcp_policy: None,
+            network_policy: None,
+            selected_capability_roots: Vec::new(),
+        });
+    let reviewer = manager
+        .spawn_internal_session(
+            parent.thread_id,
+            StartThreadOptions {
+                session_source: Some(SessionSource::Internal(InternalSessionSource::Guardian)),
+                initial_history: InitialHistory::Forked(vec![RolloutItem::ResponseItem(
+                    user_msg("parent history must not be inherited").into(),
+                )]),
+                environments: Some(reviewer_environments),
+                ..StartThreadOptions::new(config)
+            },
+        )
+        .await
+        .expect("start internal reviewer");
+    let reviewer_config = reviewer.thread.config_snapshot().await;
+
+    assert_eq!(
+        reviewer.session_configured.session_id,
+        parent.session_configured.session_id
+    );
+    assert!(std::ptr::eq(
+        reviewer
+            .thread
+            .session
+            .services
+            .agent_control
+            .rollout_budget(),
+        parent
+            .thread
+            .session
+            .services
+            .agent_control
+            .rollout_budget(),
+    ));
+    assert_eq!(reviewer_config.parent_thread_id, Some(parent.thread_id));
+    assert_eq!(reviewer_config.forked_from_thread_id, None);
+    assert_eq!(reviewer_config.originator, "codex_work_desktop");
+    assert_eq!(
+        reviewer.thread.multi_agent_version(),
+        Some(MultiAgentVersion::Disabled)
+    );
+    assert_eq!(
+        reviewer.session_configured.parent_thread_id,
+        Some(parent.thread_id)
+    );
+    assert_eq!(reviewer.session_configured.forked_from_id, None);
+    assert!(reviewer.thread.session.user_instructions().await.is_none());
+    assert!(
+        reviewer
+            .thread
+            .session
+            .services
+            .exec_policy
+            .current()
+            .rules()
+            .contains_key("rm")
+    );
+    let reviewer_turn = reviewer.thread.session.new_default_turn().await;
+    let reviewer_world_state =
+        build_world_state_from_turn_context(&reviewer.thread.session, &reviewer_turn).await;
+    let reviewer_context = reviewer
+        .thread
+        .session
+        .build_initial_context_with_world_state(&reviewer_turn, &reviewer_world_state)
+        .await;
+    assert!(
+        !serde_json::to_string(&reviewer_context)
+            .expect("reviewer context should serialize")
+            .contains("managed instructions must not shape the reviewer")
+    );
+    let reviewer_environment = reviewer
+        .thread
+        .environment_selections()
+        .await
+        .into_iter()
+        .next()
+        .expect("reviewer should retain its selected environment");
+    assert!(matches!(
+        reviewer_environment.config,
+        EnvironmentConfigState::Ready(config) if config.exec_policy.is_some()
+    ));
+    assert!(
+        reviewer
+            .thread
+            .session
+            .services
+            .extensions
+            .thread_lifecycle_contributors()
+            .is_empty()
+    );
+    {
+        let observed_mcp_sources = observed_mcp_sources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(!observed_mcp_sources.is_empty());
+        assert!(
+            observed_mcp_sources
+                .iter()
+                .all(|source| !source.is_internal())
+        );
+    }
+    assert_eq!(manager.list_thread_ids().await, vec![parent.thread_id]);
+    assert!(manager.get_thread(reviewer.thread_id).await.is_err());
+    assert!(
+        reviewer
+            .thread
+            .session
+            .clone_history()
+            .await
+            .raw_items()
+            .next()
+            .is_none()
+    );
+
+    manager
+        .shutdown_all_threads_bounded(Duration::from_secs(10))
+        .await;
+}
+
+#[tokio::test]
 async fn start_thread_seeds_extension_data_for_mcp_and_lifecycle_contributors() {
     struct InitialDataRecorder {
         lifecycle_observed: Arc<std::sync::Mutex<Vec<(String, String)>>>,
-        mcp_observed: Arc<std::sync::Mutex<Vec<String>>>,
+        mcp_observed: Arc<std::sync::Mutex<Vec<(String, SessionSource)>>>,
     }
 
     impl codex_extension_api::ThreadLifecycleContributor<Config> for InitialDataRecorder {
@@ -2529,7 +1244,13 @@ async fn start_thread_seeds_extension_data_for_mcp_and_lifecycle_contributors() 
                 self.mcp_observed
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .push(selected_root.id.clone());
+                    .push((
+                        selected_root.id.clone(),
+                        context
+                            .session_source()
+                            .expect("thread-scoped MCP resolution should identify its source")
+                            .clone(),
+                    ));
                 let mut server = codex_mcp::codex_apps_mcp_server_config(
                     "https://selected.invalid",
                     /*apps_mcp_product_sku*/ None,
@@ -2601,36 +1322,21 @@ async fn start_thread_seeds_extension_data_for_mcp_and_lifecycle_contributors() 
     };
 
     let first_thread = manager
-        .start_thread_with_options(StartThreadOptions {
-            config: config.clone(),
-            allow_provider_model_fallback: false,
-            initial_history: InitialHistory::New,
-            history_mode: None,
-            session_source: None,
-            thread_source: None,
-            dynamic_tools: Vec::new(),
+        .start_thread(StartThreadOptions {
             metrics_service_name: Some("codex_work_desktop".to_string()),
-            parent_trace: None,
-            environments: Vec::new(),
+            environments: Some(Vec::new()),
             thread_extension_init: selected_root_init("selected-a", "env-a"),
-            supports_openai_form_elicitation: false,
+            ..StartThreadOptions::new(config.clone())
         })
         .await
         .expect("start first thread");
+    let second_session_source = SessionSource::SubAgent(SubAgentSource::Review);
     let second_thread = manager
-        .start_thread_with_options(StartThreadOptions {
-            config: config.clone(),
-            allow_provider_model_fallback: false,
-            initial_history: InitialHistory::New,
-            history_mode: None,
-            session_source: None,
-            thread_source: None,
-            dynamic_tools: Vec::new(),
-            metrics_service_name: None,
-            parent_trace: None,
-            environments: Vec::new(),
+        .start_thread(StartThreadOptions {
+            environments: Some(Vec::new()),
+            session_source: Some(second_session_source.clone()),
             thread_extension_init: selected_root_init("selected-b", "env-b"),
-            supports_openai_form_elicitation: false,
+            ..StartThreadOptions::new(config.clone())
         })
         .await
         .expect("start second thread");
@@ -2643,7 +1349,11 @@ async fn start_thread_seeds_extension_data_for_mcp_and_lifecycle_contributors() 
             &config,
             &first_session.services.mcp_thread_init,
             &first_session.services.thread_extension_data,
-            &first_originator,
+            McpThreadIdentity {
+                session_source: &SessionSource::Exec,
+                originator: &first_originator,
+                environments: McpEnvironmentScope::Live(&first_session.services.turn_environments),
+            },
             /*ready_selected_capability_roots*/ &[],
             /*executor_capability_discovery*/ None,
         )
@@ -2657,7 +1367,11 @@ async fn start_thread_seeds_extension_data_for_mcp_and_lifecycle_contributors() 
             &config,
             &second_session.services.mcp_thread_init,
             &second_session.services.thread_extension_data,
-            &second_originator,
+            McpThreadIdentity {
+                session_source: &second_session_source,
+                originator: &second_originator,
+                environments: McpEnvironmentScope::Live(&second_session.services.turn_environments),
+            },
             /*ready_selected_capability_roots*/ &[],
             /*executor_capability_discovery*/ None,
         )
@@ -2680,10 +1394,10 @@ async fn start_thread_seeds_extension_data_for_mcp_and_lifecycle_contributors() 
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner),
         vec![
-            "selected-a".to_string(),
-            "selected-b".to_string(),
-            "selected-a".to_string(),
-            "selected-b".to_string(),
+            ("selected-a".to_string(), SessionSource::Exec),
+            ("selected-b".to_string(), second_session_source.clone()),
+            ("selected-a".to_string(), SessionSource::Exec),
+            ("selected-b".to_string(), second_session_source),
         ]
     );
     let selected_servers = |config: &codex_mcp::McpConfig| {
@@ -2740,9 +1454,7 @@ async fn selected_capability_roots_round_trip_through_fork() {
         },
     }];
     let inherited = manager
-        .start_thread_with_options(StartThreadOptions {
-            config,
-            allow_provider_model_fallback: false,
+        .start_thread(StartThreadOptions {
             initial_history: InitialHistory::Forked(vec![RolloutItem::SessionMeta(
                 SessionMetaLine {
                     meta: SessionMeta {
@@ -2752,15 +1464,8 @@ async fn selected_capability_roots_round_trip_through_fork() {
                     git: None,
                 },
             )]),
-            history_mode: None,
-            session_source: None,
-            thread_source: None,
-            dynamic_tools: Vec::new(),
-            metrics_service_name: None,
-            parent_trace: None,
-            environments: Vec::new(),
-            thread_extension_init: Default::default(),
-            supports_openai_form_elicitation: false,
+            environments: Some(Vec::new()),
+            ..StartThreadOptions::new(config)
         })
         .await
         .expect("start inherited fork");
@@ -2818,24 +1523,15 @@ async fn resume_and_fork_do_not_restore_thread_environments_from_rollout() {
         environment_id: "local".to_string(),
         cwd: PathUri::from_abs_path(&selected_cwd),
         workspace_roots: Vec::new(),
+        config: EnvironmentConfigState::FromThread,
     }];
     let default_cwd = config.cwd.clone();
     let mut source_config = config.clone();
     source_config.cwd = selected_cwd.clone();
     let source = manager
-        .start_thread_with_options(StartThreadOptions {
-            config: source_config,
-            allow_provider_model_fallback: false,
-            initial_history: InitialHistory::New,
-            history_mode: None,
-            session_source: None,
-            thread_source: None,
-            dynamic_tools: Vec::new(),
-            metrics_service_name: None,
-            parent_trace: None,
-            environments: environments.clone(),
-            thread_extension_init: Default::default(),
-            supports_openai_form_elicitation: false,
+        .start_thread(StartThreadOptions {
+            environments: Some(environments.clone()),
+            ..StartThreadOptions::new(source_config)
         })
         .await
         .expect("start source thread");
@@ -2862,16 +1558,21 @@ async fn resume_and_fork_do_not_restore_thread_environments_from_rollout() {
             rollout_path.clone(),
             auth_manager,
             /*parent_trace*/ None,
-            /*supports_openai_form_elicitation*/ false,
+            ClientMcpExtensions::default(),
         )
         .await
         .expect("resume source thread");
-    let resumed_turn = resumed
+    let (prepared_turn, _) = resumed
         .thread
         .session
-        .new_turn_with_sub_id("resume-turn".to_string(), SessionSettingsUpdate::default())
+        .new_turn_with_sub_id(
+            "resume-turn".to_string(),
+            SessionSettingsUpdate::default(),
+            Default::default(),
+        )
         .await
         .expect("build resumed turn context");
+    let resumed_turn = prepared_turn;
     assert_eq!(resumed_turn.environments.turn_environments().count(), 1);
     assert_eq!(
         resumed_turn
@@ -2900,12 +1601,17 @@ async fn resume_and_fork_do_not_restore_thread_environments_from_rollout() {
         )
         .await
         .expect("fork source thread");
-    let forked_turn = forked
+    let (prepared_turn, _) = forked
         .thread
         .session
-        .new_turn_with_sub_id("fork-turn".to_string(), SessionSettingsUpdate::default())
+        .new_turn_with_sub_id(
+            "fork-turn".to_string(),
+            SessionSettingsUpdate::default(),
+            Default::default(),
+        )
         .await
         .expect("build forked turn context");
+    let forked_turn = prepared_turn;
     assert_eq!(forked_turn.environments.turn_environments().count(), 1);
     assert_eq!(
         forked_turn
@@ -2956,7 +1662,7 @@ async fn explicit_installation_id_skips_codex_home_file() {
     );
 
     let thread = manager
-        .start_thread(config.clone())
+        .start_thread(StartThreadOptions::new(config.clone()))
         .await
         .expect("start thread with explicit installation id");
 
@@ -2999,7 +1705,7 @@ async fn resume_active_thread_from_rollout_returns_running_thread() {
     );
 
     let source = manager
-        .start_thread(config.clone())
+        .start_thread(StartThreadOptions::new(config.clone()))
         .await
         .expect("start source thread");
     source.thread.ensure_rollout_materialized().await;
@@ -3019,7 +1725,7 @@ async fn resume_active_thread_from_rollout_returns_running_thread() {
             rollout_path,
             auth_manager,
             /*parent_trace*/ None,
-            /*supports_openai_form_elicitation*/ false,
+            ClientMcpExtensions::default(),
         )
         .await
         .expect("resume active source thread");
@@ -3061,7 +1767,7 @@ async fn resume_stopped_thread_from_rollout_spawns_new_thread() {
     );
 
     let source = manager
-        .start_thread(config.clone())
+        .start_thread(StartThreadOptions::new(config.clone()))
         .await
         .expect("start source thread");
     source.thread.ensure_rollout_materialized().await;
@@ -3086,7 +1792,7 @@ async fn resume_stopped_thread_from_rollout_spawns_new_thread() {
             rollout_path,
             auth_manager,
             /*parent_trace*/ None,
-            /*supports_openai_form_elicitation*/ false,
+            ClientMcpExtensions::default(),
         )
         .await
         .expect("resume stopped source thread");
@@ -3130,19 +1836,10 @@ async fn resume_stopped_thread_from_rollout_preserves_thread_source() {
     );
 
     let source = manager
-        .start_thread_with_options(StartThreadOptions {
-            config: config.clone(),
-            allow_provider_model_fallback: false,
-            initial_history: InitialHistory::New,
-            history_mode: None,
-            session_source: None,
+        .start_thread(StartThreadOptions {
             thread_source: Some(ThreadSource::User),
-            dynamic_tools: Vec::new(),
-            metrics_service_name: None,
-            parent_trace: None,
-            environments: Vec::new(),
-            thread_extension_init: Default::default(),
-            supports_openai_form_elicitation: false,
+            environments: Some(Vec::new()),
+            ..StartThreadOptions::new(config.clone())
         })
         .await
         .expect("start source thread");
@@ -3169,7 +1866,7 @@ async fn resume_stopped_thread_from_rollout_preserves_thread_source() {
             rollout_path,
             auth_manager,
             /*parent_trace*/ None,
-            /*supports_openai_form_elicitation*/ false,
+            ClientMcpExtensions::default(),
         )
         .await
         .expect("resume source thread");
@@ -3271,7 +1968,7 @@ async fn rollout_path_resume_and_fork_read_history_through_thread_store() {
     );
 
     let source = manager
-        .start_thread(config.clone())
+        .start_thread(StartThreadOptions::new(config.clone()))
         .await
         .expect("start source thread");
     source
@@ -3290,12 +1987,12 @@ async fn rollout_path_resume_and_fork_read_history_through_thread_store() {
             config.clone(),
             InitialHistory::Resumed(ResumedHistory {
                 conversation_id: source.thread_id,
-                history: Arc::new(vec![RolloutItem::ResponseItem(user_msg("hello"))]),
+                history: Arc::new(vec![RolloutItem::ResponseItem(user_msg("hello").into())]),
                 rollout_path: Some(rollout_path.clone()),
             }),
             auth_manager.clone(),
             /*parent_trace*/ None,
-            /*supports_openai_form_elicitation*/ false,
+            ClientMcpExtensions::default(),
         )
         .await
         .expect("seed rollout path in store");
@@ -3312,7 +2009,7 @@ async fn rollout_path_resume_and_fork_read_history_through_thread_store() {
             rollout_path.clone(),
             auth_manager,
             /*parent_trace*/ None,
-            /*supports_openai_form_elicitation*/ false,
+            ClientMcpExtensions::default(),
         )
         .await
         .expect("resume from rollout path");
@@ -3343,6 +2040,135 @@ async fn rollout_path_resume_and_fork_read_history_through_thread_store() {
         .shutdown_and_wait()
         .await
         .expect("shutdown forked thread");
+}
+
+#[tokio::test]
+async fn metadata_update_without_result_reads_only_when_the_caller_needs_the_thread() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    config.experimental_thread_store = ThreadStoreConfig::InMemory {
+        id: format!("metadata-update-none-{}", uuid::Uuid::new_v4()),
+    };
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+
+    let auth_manager =
+        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+    let thread_store = thread_store_from_config(&config, /*state_db*/ None);
+    let in_memory_store = thread_store
+        .as_any()
+        .downcast_ref::<InMemoryThreadStore>()
+        .expect("configured in-memory store");
+    let manager = ThreadManager::new(
+        &config,
+        auth_manager.clone(),
+        build_models_manager(&config, auth_manager),
+        crate::CodexAppsToolsCache::default(),
+        SessionSource::Exec,
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        empty_extension_registry(),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
+        /*analytics_events_client*/ None,
+        thread_store.clone(),
+        /*agent_graph_store*/ None,
+        TEST_INSTALLATION_ID.to_string(),
+        /*attestation_provider*/ None,
+        /*external_time_provider*/ None,
+    );
+    let started = manager
+        .start_thread(StartThreadOptions::new(config))
+        .await
+        .expect("start thread");
+    started
+        .thread
+        .flush_rollout()
+        .await
+        .expect("flush initial metadata");
+    manager
+        .update_thread_metadata(
+            started.thread_id,
+            ThreadMetadataPatch {
+                name: Some(Some("initial name".to_string())),
+                ..Default::default()
+            },
+            /*include_archived*/ false,
+        )
+        .await
+        .expect("flush pending live metadata before measuring calls");
+    in_memory_store.omit_metadata_update_result_for_testing();
+
+    let before_loaded_update = in_memory_store.calls().await;
+    let loaded = manager
+        .update_thread_metadata(
+            started.thread_id,
+            ThreadMetadataPatch {
+                name: Some(Some("loaded name".to_string())),
+                ..Default::default()
+            },
+            /*include_archived*/ false,
+        )
+        .await
+        .expect("update loaded thread metadata");
+    assert_eq!(loaded.name.as_deref(), Some("loaded name"));
+    let after_loaded_update = in_memory_store.calls().await;
+    assert_eq!(
+        after_loaded_update.update_thread_metadata,
+        before_loaded_update.update_thread_metadata + 1
+    );
+    assert_eq!(
+        after_loaded_update.read_thread,
+        before_loaded_update.read_thread + 1
+    );
+
+    started
+        .thread
+        .append_rollout_items(&[RolloutItem::EventMsg(EventMsg::UserMessage(
+            UserMessageEvent {
+                message: "completion-only metadata".to_string(),
+                ..Default::default()
+            },
+        ))])
+        .await
+        .expect("append item with derived metadata");
+    let after_completion_only_update = in_memory_store.calls().await;
+    assert_eq!(
+        after_completion_only_update.update_thread_metadata,
+        after_loaded_update.update_thread_metadata + 1
+    );
+    assert_eq!(
+        after_completion_only_update.read_thread,
+        after_loaded_update.read_thread
+    );
+
+    started
+        .thread
+        .shutdown_and_wait()
+        .await
+        .expect("shutdown loaded thread");
+    let _ = manager.remove_thread(&started.thread_id).await;
+    let before_cold_update = in_memory_store.calls().await;
+    let cold = manager
+        .update_thread_metadata(
+            started.thread_id,
+            ThreadMetadataPatch {
+                name: Some(Some("cold name".to_string())),
+                ..Default::default()
+            },
+            /*include_archived*/ false,
+        )
+        .await
+        .expect("update cold thread metadata");
+    assert_eq!(cold.name.as_deref(), Some("cold name"));
+    let after_cold_update = in_memory_store.calls().await;
+    assert_eq!(
+        after_cold_update.update_thread_metadata,
+        before_cold_update.update_thread_metadata + 1
+    );
+    assert_eq!(
+        after_cold_update.read_thread,
+        before_cold_update.read_thread + 1
+    );
 }
 
 #[tokio::test]
@@ -3445,7 +2271,7 @@ async fn injected_models_manager_controls_refresh_policy() {
 #[test]
 fn interrupted_fork_snapshot_appends_interrupt_boundary() {
     let committed_history =
-        InitialHistory::Forked(vec![RolloutItem::ResponseItem(user_msg("hello"))]);
+        InitialHistory::Forked(vec![RolloutItem::ResponseItem(user_msg("hello").into())]);
 
     assert_eq!(
         serde_json::to_value(
@@ -3459,8 +2285,8 @@ fn interrupted_fork_snapshot_appends_interrupt_boundary() {
         )
         .expect("serialize interrupted fork history"),
         serde_json::to_value(vec![
-            RolloutItem::ResponseItem(user_msg("hello")),
-            RolloutItem::ResponseItem(contextual_user_interrupted_marker()),
+            RolloutItem::ResponseItem(user_msg("hello").into()),
+            RolloutItem::ResponseItem(contextual_user_interrupted_marker().into()),
             RolloutItem::EventMsg(EventMsg::TurnAborted(TurnAbortedEvent {
                 turn_id: None,
                 started_at: None,
@@ -3483,7 +2309,7 @@ fn interrupted_fork_snapshot_appends_interrupt_boundary() {
         )
         .expect("serialize interrupted empty fork history"),
         serde_json::to_value(vec![
-            RolloutItem::ResponseItem(contextual_user_interrupted_marker()),
+            RolloutItem::ResponseItem(contextual_user_interrupted_marker().into()),
             RolloutItem::EventMsg(EventMsg::TurnAborted(TurnAbortedEvent {
                 turn_id: None,
                 started_at: None,
@@ -3499,7 +2325,7 @@ fn interrupted_fork_snapshot_appends_interrupt_boundary() {
 #[test]
 fn disabled_interrupted_fork_snapshot_appends_only_interrupt_event() {
     let committed_history =
-        InitialHistory::Forked(vec![RolloutItem::ResponseItem(user_msg("hello"))]);
+        InitialHistory::Forked(vec![RolloutItem::ResponseItem(user_msg("hello").into())]);
 
     assert_eq!(
         serde_json::to_value(
@@ -3513,7 +2339,7 @@ fn disabled_interrupted_fork_snapshot_appends_only_interrupt_event() {
         )
         .expect("serialize disabled interrupted fork history"),
         serde_json::to_value(vec![
-            RolloutItem::ResponseItem(user_msg("hello")),
+            RolloutItem::ResponseItem(user_msg("hello").into()),
             RolloutItem::EventMsg(EventMsg::TurnAborted(TurnAbortedEvent {
                 turn_id: None,
                 started_at: None,
@@ -3551,9 +2377,9 @@ fn disabled_interrupted_fork_snapshot_appends_only_interrupt_event() {
 #[test]
 fn interrupted_snapshot_is_not_mid_turn() {
     let interrupted_history = InitialHistory::Forked(vec![
-        RolloutItem::ResponseItem(user_msg("hello")),
-        RolloutItem::ResponseItem(assistant_msg("partial")),
-        RolloutItem::ResponseItem(contextual_user_interrupted_marker()),
+        RolloutItem::ResponseItem(user_msg("hello").into()),
+        RolloutItem::ResponseItem(assistant_msg("partial").into()),
+        RolloutItem::ResponseItem(contextual_user_interrupted_marker().into()),
         RolloutItem::EventMsg(EventMsg::TurnAborted(TurnAbortedEvent {
             turn_id: Some("turn-1".to_string()),
             started_at: None,
@@ -3576,19 +2402,27 @@ fn interrupted_snapshot_is_not_mid_turn() {
 
 #[test]
 fn multi_agent_v2_interrupted_marker_uses_developer_input_message() {
-    let marker = developer_interrupted_marker();
-
-    let ResponseItem::Message { role, content, .. } = marker else {
-        panic!("expected interrupted marker to be a message");
-    };
-    assert_eq!(role, "developer");
-    assert!(
-        matches!(
-            content.as_slice(),
-            [ContentItem::InputText { text }]
-                if text.contains(crate::context::TurnAborted::INTERRUPTED_DEVELOPER_GUIDANCE)
-        ),
-        "expected interrupted marker to use developer InputText content"
+    assert_eq!(
+        developer_interrupted_marker(),
+        ResponseItem::Message {
+            id: None,
+            role: "developer".to_string(),
+            content: vec![ContentItem::InputText {
+                text: format!(
+                    "<turn_aborted>\n{}\n</turn_aborted>",
+                    crate::context::TurnAborted::INTERRUPTED_DEVELOPER_GUIDANCE
+                ),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: Some(
+                InternalChatMessageMetadataPassthrough {
+                    content_item_kinds: Some(vec![ContentItemKind(
+                        "generic.turn_aborted".to_string()
+                    )]),
+                    ..Default::default()
+                }
+            ),
+        }
     );
 }
 
@@ -3607,6 +2441,8 @@ fn completed_legacy_event_history_is_not_mid_turn() {
             message: "done".to_string(),
             phase: None,
             memory_citation: None,
+            delivery: None,
+            questions: None,
         })),
     ]);
 
@@ -3624,7 +2460,7 @@ fn completed_legacy_event_history_is_not_mid_turn() {
 #[test]
 fn mixed_response_and_legacy_user_event_history_is_mid_turn() {
     let mixed_history = InitialHistory::Forked(vec![
-        RolloutItem::ResponseItem(user_msg("hello")),
+        RolloutItem::ResponseItem(user_msg("hello").into()),
         RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
             client_id: None,
             message: "hello".to_string(),
@@ -3678,12 +2514,12 @@ async fn interrupted_fork_snapshot_does_not_synthesize_turn_id_for_legacy_histor
         .resume_thread_with_history(
             config.clone(),
             InitialHistory::Forked(vec![
-                RolloutItem::ResponseItem(user_msg("hello")),
-                RolloutItem::ResponseItem(assistant_msg("partial")),
+                RolloutItem::ResponseItem(user_msg("hello").into()),
+                RolloutItem::ResponseItem(assistant_msg("partial").into()),
             ]),
             auth_manager,
             /*parent_trace*/ None,
-            /*supports_openai_form_elicitation*/ false,
+            ClientMcpExtensions::default(),
         )
         .await
         .expect("create source thread from completed history");
@@ -3723,7 +2559,7 @@ async fn interrupted_fork_snapshot_does_not_synthesize_turn_id_for_legacy_histor
         .filter(|item| !matches!(item, RolloutItem::SessionMeta(_)))
         .collect();
     let interrupted_marker_json = serde_json::to_value(RolloutItem::ResponseItem(
-        contextual_user_interrupted_marker(),
+        contextual_user_interrupted_marker().into(),
     ))
     .expect("serialize interrupted marker");
     let interrupted_abort_json = serde_json::to_value(RolloutItem::EventMsg(
@@ -3740,8 +2576,9 @@ async fn interrupted_fork_snapshot_does_not_synthesize_turn_id_for_legacy_histor
         rollout_items
             .iter()
             .filter(|item| {
-                serde_json::to_value(item).expect("serialize rollout item")
-                    == interrupted_marker_json
+                strip_response_item_ids_from_json(
+                    serde_json::to_value(item).expect("serialize rollout item"),
+                ) == interrupted_marker_json
             })
             .count(),
         1,
@@ -3797,12 +2634,12 @@ async fn interrupted_fork_snapshot_preserves_explicit_turn_id() {
                     model_context_window: None,
                     collaboration_mode_kind: Default::default(),
                 })),
-                RolloutItem::ResponseItem(user_msg("hello")),
-                RolloutItem::ResponseItem(assistant_msg("partial")),
+                RolloutItem::ResponseItem(user_msg("hello").into()),
+                RolloutItem::ResponseItem(assistant_msg("partial").into()),
             ]),
             auth_manager,
             /*parent_trace*/ None,
-            /*supports_openai_form_elicitation*/ false,
+            ClientMcpExtensions::default(),
         )
         .await
         .expect("create source thread from explicit partial history");
@@ -3893,12 +2730,12 @@ async fn interrupted_fork_snapshot_uses_persisted_mid_turn_history_without_live_
         .resume_thread_with_history(
             config.clone(),
             InitialHistory::Forked(vec![
-                RolloutItem::ResponseItem(user_msg("hello")),
-                RolloutItem::ResponseItem(assistant_msg("partial")),
+                RolloutItem::ResponseItem(user_msg("hello").into()),
+                RolloutItem::ResponseItem(assistant_msg("partial").into()),
             ]),
             auth_manager,
             /*parent_trace*/ None,
-            /*supports_openai_form_elicitation*/ false,
+            ClientMcpExtensions::default(),
         )
         .await
         .expect("create source thread from partial history");
@@ -3937,15 +2774,16 @@ async fn interrupted_fork_snapshot_uses_persisted_mid_turn_history_without_live_
         .filter(|item| !matches!(item, RolloutItem::SessionMeta(_)))
         .collect();
     let interrupted_marker_json = serde_json::to_value(RolloutItem::ResponseItem(
-        contextual_user_interrupted_marker(),
+        contextual_user_interrupted_marker().into(),
     ))
     .expect("serialize interrupted marker");
     assert_eq!(
         forked_rollout_items
             .iter()
             .filter(|item| {
-                serde_json::to_value(item).expect("serialize forked rollout item")
-                    == interrupted_marker_json
+                strip_response_item_ids_from_json(
+                    serde_json::to_value(item).expect("serialize forked rollout item"),
+                ) == interrupted_marker_json
             })
             .count(),
         1,
@@ -3979,8 +2817,9 @@ async fn interrupted_fork_snapshot_uses_persisted_mid_turn_history_without_live_
         reforked_rollout_items
             .iter()
             .filter(|item| {
-                serde_json::to_value(item).expect("serialize re-forked rollout item")
-                    == interrupted_marker_json
+                strip_response_item_ids_from_json(
+                    serde_json::to_value(item).expect("serialize re-forked rollout item"),
+                ) == interrupted_marker_json
             })
             .count(),
         1,

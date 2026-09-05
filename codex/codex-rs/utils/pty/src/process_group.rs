@@ -133,6 +133,95 @@ fn signal_process_group_id(pgid: libc::pid_t, signal: libc::c_int) -> io::Result
     Ok(true)
 }
 
+#[cfg(target_os = "macos")]
+fn signal_process_id(pid: libc::pid_t, signal: libc::c_int) -> io::Result<bool> {
+    if unsafe { libc::kill(pid, signal) } == -1 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(false);
+        }
+        return Err(error);
+    }
+
+    Ok(true)
+}
+
+#[cfg(target_os = "macos")]
+fn signal_process_group_with_member_fallback(
+    process_group_id: u32,
+    signal: libc::c_int,
+    signal_group: impl FnOnce(libc::pid_t, libc::c_int) -> io::Result<bool>,
+    mut signal_member: impl FnMut(libc::pid_t, libc::c_int) -> io::Result<bool>,
+) -> io::Result<bool> {
+    let process_group_id = libc::pid_t::try_from(process_group_id)
+        .ok()
+        .filter(|process_group_id| *process_group_id > 0)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid process group ID"))?;
+
+    match signal_group(process_group_id, signal) {
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
+        result => return result,
+    }
+
+    let mut process_ids: Vec<libc::pid_t> = vec![0; 16];
+    loop {
+        let buffer_size = libc::c_int::try_from(std::mem::size_of_val(process_ids.as_slice()))
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "process group is too large")
+            })?;
+        let count = unsafe {
+            libc::proc_listpgrppids(
+                process_group_id,
+                process_ids.as_mut_ptr().cast(),
+                buffer_size,
+            )
+        };
+        if count < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let count = count as usize;
+        if count < process_ids.len() {
+            process_ids.truncate(count);
+            break;
+        }
+        let capacity = process_ids.len().checked_mul(2).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "process group is too large")
+        })?;
+        process_ids.resize(capacity, 0);
+    }
+    process_ids.sort_unstable_by_key(|process_id| *process_id == process_group_id);
+
+    let mut signalled = false;
+    let mut first_error = None;
+    for process_id in process_ids {
+        if process_id <= 0 {
+            continue;
+        }
+        let current_group_id = unsafe { libc::getpgid(process_id) };
+        if current_group_id == -1 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) && first_error.is_none() {
+                first_error = Some(error);
+            }
+            continue;
+        }
+        if current_group_id != process_group_id {
+            continue;
+        }
+        match signal_member(process_id, signal) {
+            Ok(delivered) => signalled |= delivered,
+            Err(error) if first_error.is_none() => first_error = Some(error),
+            Err(_) => {}
+        }
+    }
+
+    if signalled {
+        Ok(true)
+    } else {
+        first_error.map_or(Ok(false), Err)
+    }
+}
+
 #[cfg(unix)]
 /// Send SIGTERM to a specific process group ID (best-effort).
 ///
@@ -140,6 +229,17 @@ fn signal_process_group_id(pgid: libc::pid_t, signal: libc::c_int) -> io::Result
 /// `Ok(false)` when the group no longer exists.
 pub fn terminate_process_group(process_group_id: u32) -> io::Result<bool> {
     signal_process_group_id(process_group_id as libc::pid_t, libc::SIGTERM)
+}
+
+#[cfg(target_os = "macos")]
+/// Retry a denied SIGTERM against the exact group's individual members.
+pub fn terminate_process_group_with_member_fallback(process_group_id: u32) -> io::Result<bool> {
+    signal_process_group_with_member_fallback(
+        process_group_id,
+        libc::SIGTERM,
+        signal_process_group_id,
+        signal_process_id,
+    )
 }
 
 #[cfg(not(unix))]
@@ -166,67 +266,22 @@ pub fn kill_process_group(process_group_id: u32) -> io::Result<()> {
     signal_process_group_id(process_group_id as libc::pid_t, libc::SIGKILL).map(|_| ())
 }
 
+#[cfg(target_os = "macos")]
+/// Retry a denied SIGKILL against the exact group's individual members.
+pub fn kill_process_group_with_member_fallback(process_group_id: u32) -> io::Result<()> {
+    signal_process_group_with_member_fallback(
+        process_group_id,
+        libc::SIGKILL,
+        signal_process_group_id,
+        signal_process_id,
+    )
+    .map(|_| ())
+}
+
 #[cfg(not(unix))]
 /// No-op on non-Unix platforms.
 pub fn kill_process_group(_process_group_id: u32) -> io::Result<()> {
     Ok(())
-}
-
-#[cfg(unix)]
-/// Return whether a process group still has any members.
-pub fn process_group_exists(process_group_id: u32) -> io::Result<bool> {
-    signal_process_group_id(process_group_id as libc::pid_t, 0)
-}
-
-#[cfg(not(unix))]
-/// Process-group confirmation is unavailable on non-Unix platforms.
-pub fn process_group_exists(_process_group_id: u32) -> io::Result<bool> {
-    Ok(false)
-}
-
-#[cfg(target_os = "linux")]
-/// Return whether every remaining member of a process group is a terminal zombie.
-///
-/// A zombie can keep `killpg(pgid, 0)` successful while being incapable of any
-/// further userspace execution. Treat other states as live so SIGKILL delivery is
-/// confirmed before callers publish workspace quiescence.
-pub fn process_group_is_quiescent(process_group_id: u32) -> io::Result<bool> {
-    for entry in std::fs::read_dir("/proc")? {
-        let entry = entry?;
-        if entry.file_name().to_string_lossy().parse::<u32>().is_err() {
-            continue;
-        }
-        let stat = match std::fs::read_to_string(entry.path().join("stat")) {
-            Ok(stat) => stat,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
-        };
-        let Some(after_command) = stat.rsplit_once(')').map(|(_, rest)| rest.trim()) else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid /proc stat",
-            ));
-        };
-        let fields = after_command.split_whitespace().collect::<Vec<_>>();
-        if fields.len() < 3 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid /proc stat",
-            ));
-        }
-        if fields[2].parse::<u32>().ok() == Some(process_group_id)
-            && !matches!(fields[0], "Z" | "X")
-        {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-#[cfg(not(target_os = "linux"))]
-/// Process-group quiescence confirmation is currently Linux-only.
-pub fn process_group_is_quiescent(_process_group_id: u32) -> io::Result<bool> {
-    Ok(false)
 }
 
 #[cfg(unix)]
@@ -244,3 +299,7 @@ pub fn kill_child_process_group(child: &mut Child) -> io::Result<()> {
 pub fn kill_child_process_group(_child: &mut Child) -> io::Result<()> {
     Ok(())
 }
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "process_group_tests.rs"]
+mod tests;

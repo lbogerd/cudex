@@ -4,6 +4,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
+use codex_network_proxy::NetworkPolicyDecider;
+use codex_sandboxing::SandboxType;
 use tokio::sync::broadcast;
 use tokio::sync::watch;
 
@@ -11,12 +13,29 @@ use crate::ExecServerError;
 use crate::ProcessId;
 use crate::protocol::ExecParams;
 use crate::protocol::ProcessOutputChunk;
+use crate::protocol::ProcessSandboxType;
 use crate::protocol::ProcessSignal;
 use crate::protocol::ReadResponse;
 use crate::protocol::WriteResponse;
 
 pub struct StartedExecProcess {
     pub process: Arc<dyn ExecProcess>,
+    /// `None` means the exec-server peer did not report its sandbox type.
+    pub sandbox_type: Option<SandboxType>,
+}
+
+pub(crate) fn sandbox_type_from_protocol(
+    sandbox_type: Option<ProcessSandboxType>,
+) -> Option<SandboxType> {
+    match sandbox_type {
+        None => None,
+        Some(ProcessSandboxType::None) => Some(SandboxType::None),
+        Some(ProcessSandboxType::MacosSeatbelt) => Some(SandboxType::MacosSeatbelt),
+        Some(ProcessSandboxType::LinuxSeccomp) => Some(SandboxType::LinuxSeccomp),
+        Some(ProcessSandboxType::WindowsRestrictedToken) => {
+            Some(SandboxType::WindowsRestrictedToken)
+        }
+    }
 }
 
 /// Pushed process events for consumers that want to follow process output as it
@@ -146,34 +165,6 @@ pub struct ExecProcessEventReceiver {
 }
 
 impl ExecProcessEventReceiver {
-    /// Creates a standalone event channel for executor implementations that do not use the
-    /// built-in retained event log (for example, lightweight embedders and test backends).
-    pub fn channel(
-        capacity: usize,
-    ) -> (
-        broadcast::Sender<ExecProcessEvent>,
-        ExecProcessEventReceiver,
-    ) {
-        let (live_tx, live_rx) = broadcast::channel(capacity.max(1));
-        (
-            live_tx.clone(),
-            Self {
-                replay: VecDeque::new(),
-                live_rx,
-                _keepalive: Some(live_tx),
-            },
-        )
-    }
-
-    /// Subscribes to a standalone channel created by [`Self::channel`].
-    pub fn subscribe(sender: &broadcast::Sender<ExecProcessEvent>) -> Self {
-        Self {
-            replay: VecDeque::new(),
-            live_rx: sender.subscribe(),
-            _keepalive: Some(sender.clone()),
-        }
-    }
-
     /// Returns a receiver that remains open without yielding events.
     pub fn empty() -> Self {
         let (live_tx, live_rx) = broadcast::channel(1);
@@ -209,14 +200,6 @@ pub trait ExecProcess: Send + Sync {
 
     fn subscribe_wake(&self) -> watch::Receiver<u64>;
 
-    /// Counts successful transport recoveries that proved and resumed this exact
-    /// retained process. Local and non-recoverable backends keep the default closed
-    /// receiver at zero.
-    fn subscribe_recoveries(&self) -> watch::Receiver<u64> {
-        let (_tx, rx) = watch::channel(0);
-        rx
-    }
-
     fn subscribe_events(&self) -> ExecProcessEventReceiver;
 
     fn read(
@@ -238,6 +221,30 @@ pub type ExecProcessFuture<'a, T> =
 
 pub trait ExecBackend: Send + Sync {
     fn start(&self, params: ExecParams) -> ExecBackendFuture<'_>;
+
+    /// Captures a local shell snapshot without starting the requested command.
+    /// Failures must remain retryable by real commands. Remote backends do not
+    /// support this operation; callers should leave them on the lazy path.
+    fn prewarm_shell_snapshot(&self, _params: ExecParams) -> ExecProcessFuture<'_, ()> {
+        Box::pin(async {
+            Err(ExecServerError::Protocol(
+                "exec backend does not support shell snapshot prewarming".to_string(),
+            ))
+        })
+    }
+
+    /// Starts a process with an authoritative controller-side policy decider.
+    fn start_with_network_policy_decider(
+        &self,
+        _params: ExecParams,
+        _decider: Arc<dyn NetworkPolicyDecider>,
+    ) -> ExecBackendFuture<'_> {
+        Box::pin(async {
+            Err(ExecServerError::Protocol(
+                "exec backend does not support remote network policy decisions".to_string(),
+            ))
+        })
+    }
 }
 
 pub type ExecBackendFuture<'a> =

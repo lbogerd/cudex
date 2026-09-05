@@ -1,8 +1,10 @@
 use crate::ClientNotification;
 use crate::ClientRequest;
+use crate::JsonSchema;
 use crate::ServerNotification;
 use crate::ServerNotificationEnvelope;
 use crate::ServerRequest;
+use crate::TS;
 use crate::experimental_api::experimental_fields;
 use crate::export_client_notification_schemas;
 use crate::export_client_param_schemas;
@@ -18,13 +20,10 @@ use crate::protocol::common::EXPERIMENTAL_CLIENT_METHODS;
 use crate::protocol::common::EXPERIMENTAL_SERVER_METHOD_PARAM_TYPES;
 use crate::protocol::common::EXPERIMENTAL_SERVER_METHOD_RESPONSE_TYPES;
 use crate::protocol::common::EXPERIMENTAL_SERVER_METHODS;
-use crate::protocol::common::EXPERIMENTAL_SERVER_NOTIFICATION_METHODS;
-use crate::protocol::common::EXPERIMENTAL_SERVER_NOTIFICATION_PAYLOAD_TYPES;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
-use codex_protocol::protocol::RolloutLine;
-use schemars::JsonSchema;
+use codex_history::RolloutLine;
 use schemars::schema_for;
 use serde::Serialize;
 use serde_json::Map;
@@ -40,18 +39,22 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
-use ts_rs::TS;
 
 pub(crate) const GENERATED_TS_HEADER: &str = "// GENERATED CODE! DO NOT MODIFY BY HAND!\n\n";
 const IGNORED_DEFINITIONS: &[&str] = &["Option<()>"];
 const JSON_V1_ALLOWLIST: &[&str] = &["InitializeParams", "InitializeResponse"];
 const EXPERIMENTAL_CLIENT_METHOD_DEPENDENCY_TYPES: &[&str] = &[
+    "AwsCredentialType",
+    "BedrockAwsProfile",
+    "BedrockEnvironmentCredential",
     "EnvironmentShellInfo",
     "EnvironmentStatusKind",
-    "PathUri",
     "RemoteControlClient",
     "RemoteControlClientsListOrder",
     "ThreadBackgroundTerminal",
+    "ThreadSearchOccurrence",
+    "ThreadSearchTextRange",
+    "TurnSettingsUpdateStatus",
 ];
 const SPECIAL_DEFINITIONS: &[&str] = &[
     "ClientNotification",
@@ -88,11 +91,6 @@ impl GeneratedSchema {
 }
 
 type JsonSchemaEmitter = fn(&Path) -> Result<GeneratedSchema>;
-pub fn generate_types(out_dir: &Path, prettier: Option<&Path>) -> Result<()> {
-    generate_ts(out_dir, prettier)?;
-    generate_json(out_dir)?;
-    Ok(())
-}
 
 #[derive(Clone, Copy, Debug)]
 pub struct GenerateTsOptions {
@@ -111,10 +109,6 @@ impl Default for GenerateTsOptions {
             experimental_api: false,
         }
     }
-}
-
-pub fn generate_ts(out_dir: &Path, prettier: Option<&Path>) -> Result<()> {
-    generate_ts_with_options(out_dir, prettier, GenerateTsOptions::default())
 }
 
 pub fn generate_ts_with_options(
@@ -264,16 +258,6 @@ fn filter_experimental_ts(out_dir: &Path) -> Result<()> {
     // post-processing because they encode method/field information locally.
     filter_request_ts(out_dir, "ClientRequest.ts", EXPERIMENTAL_CLIENT_METHODS)?;
     filter_request_ts(out_dir, "ServerRequest.ts", EXPERIMENTAL_SERVER_METHODS)?;
-    filter_request_ts(
-        out_dir,
-        "ServerNotification.ts",
-        EXPERIMENTAL_SERVER_NOTIFICATION_METHODS,
-    )?;
-    filter_request_ts(
-        out_dir,
-        "ServerNotificationEnvelope.ts",
-        EXPERIMENTAL_SERVER_NOTIFICATION_METHODS,
-    )?;
     filter_experimental_type_fields_ts(out_dir, &registered_fields)?;
     remove_generated_type_files(out_dir, &experimental_method_types, "ts")?;
     Ok(())
@@ -285,14 +269,6 @@ pub(crate) fn filter_experimental_ts_tree(tree: &mut BTreeMap<PathBuf, String>) 
     for (file_name, experimental_methods) in [
         ("ClientRequest.ts", EXPERIMENTAL_CLIENT_METHODS),
         ("ServerRequest.ts", EXPERIMENTAL_SERVER_METHODS),
-        (
-            "ServerNotification.ts",
-            EXPERIMENTAL_SERVER_NOTIFICATION_METHODS,
-        ),
-        (
-            "ServerNotificationEnvelope.ts",
-            EXPERIMENTAL_SERVER_NOTIFICATION_METHODS,
-        ),
     ] {
         if let Some(content) = tree.get_mut(Path::new(file_name)) {
             *content = filter_request_ts_contents(std::mem::take(content), experimental_methods);
@@ -348,48 +324,20 @@ fn filter_request_ts_contents(mut content: String, experimental_methods: &[&str]
         .copied()
         .filter(|method| !method.is_empty())
         .collect();
-    let new_body = filter_method_union(&body, &experimental_methods);
+    let arms = split_top_level(&body, '|');
+    let filtered_arms: Vec<String> = arms
+        .into_iter()
+        .filter(|arm| {
+            extract_method_from_arm(arm)
+                .is_none_or(|method| !experimental_methods.contains(method.as_str()))
+        })
+        .collect();
+    let new_body = filtered_arms.join(" | ");
     content = format!("{prefix}{new_body}{suffix}");
     let import_usage_scope = split_type_alias(&content)
         .map(|(_, filtered_body, _)| filtered_body)
         .unwrap_or_else(|| new_body.clone());
     prune_unused_type_imports(content, &import_usage_scope)
-}
-
-fn filter_method_union(body: &str, experimental_methods: &HashSet<&str>) -> String {
-    let leading_len = body.len() - body.trim_start().len();
-    let trailing_start = body.trim_end().len();
-    let trimmed = &body[leading_len..trailing_start];
-
-    let arms = split_top_level(trimmed, '|');
-    if arms.len() > 1 {
-        let filtered_arms: Vec<String> = arms
-            .into_iter()
-            .filter(|arm| {
-                extract_method_from_arm(arm)
-                    .is_none_or(|method| !experimental_methods.contains(method.as_str()))
-            })
-            .collect();
-        return filtered_arms.join(" | ");
-    }
-
-    let Some(intersection_index) = trimmed.find("& (") else {
-        return body.to_string();
-    };
-    let union_start = leading_len + intersection_index + "& (".len();
-    let Some(union_end) = body[..trailing_start].rfind(')') else {
-        return body.to_string();
-    };
-    if union_end <= union_start {
-        return body.to_string();
-    }
-    let filtered_union = filter_method_union(&body[union_start..union_end], experimental_methods);
-    format!(
-        "{}{}{}",
-        &body[..union_start],
-        filtered_union,
-        &body[union_end..]
-    )
 }
 
 /// Removes experimental properties from generated TypeScript type files.
@@ -465,7 +413,6 @@ fn filter_experimental_schema(bundle: &mut Value) -> Result<()> {
     filter_experimental_fields_in_definitions(bundle, &registered_fields);
     prune_experimental_methods(bundle, EXPERIMENTAL_CLIENT_METHODS);
     prune_experimental_methods(bundle, EXPERIMENTAL_SERVER_METHODS);
-    prune_experimental_methods(bundle, EXPERIMENTAL_SERVER_NOTIFICATION_METHODS);
     remove_experimental_method_type_definitions(bundle);
     Ok(())
 }
@@ -624,10 +571,6 @@ fn experimental_method_types() -> HashSet<String> {
     collect_experimental_type_names(EXPERIMENTAL_CLIENT_METHOD_DEPENDENCY_TYPES, &mut type_names);
     collect_experimental_type_names(EXPERIMENTAL_SERVER_METHOD_PARAM_TYPES, &mut type_names);
     collect_experimental_type_names(EXPERIMENTAL_SERVER_METHOD_RESPONSE_TYPES, &mut type_names);
-    collect_experimental_type_names(
-        EXPERIMENTAL_SERVER_NOTIFICATION_PAYLOAD_TYPES,
-        &mut type_names,
-    );
     type_names
 }
 
@@ -2206,6 +2149,17 @@ mod tests {
             client_request_ts.contains("MockExperimentalMethodParams"),
             false
         );
+        const LEGACY_ACCOUNT_USAGE_REQUEST: &str = concat!(
+            "{ \"method\": \"account/usage/read\", id: RequestId, ",
+            "params?: GetAccountTokenUsageParams | undefined, }"
+        );
+        assert!(client_request_ts.contains(LEGACY_ACCOUNT_USAGE_REQUEST));
+        let account_usage_response_ts = std::str::from_utf8(
+            fixture_tree
+                .get(Path::new("v2/GetAccountTokenUsageResponse.ts"))
+                .ok_or_else(|| anyhow::anyhow!("missing account usage response fixture"))?,
+        )?;
+        assert!(account_usage_response_ts.contains("threadUsage?: ThreadUsage | null"));
         let server_request_ts = std::str::from_utf8(
             fixture_tree
                 .get(Path::new("ServerRequest.ts"))
@@ -2224,7 +2178,6 @@ mod tests {
                 .get(Path::new("v2/ThreadStartParams.ts"))
                 .ok_or_else(|| anyhow::anyhow!("missing v2/ThreadStartParams.ts fixture"))?,
         )?;
-        assert_eq!(thread_start_ts.contains("agentType"), false);
         assert_eq!(thread_start_ts.contains("mockExperimentalField"), false);
         assert_eq!(
             fixture_tree.contains_key(Path::new("v2/MockExperimentalMethodParams.ts")),
@@ -2279,7 +2232,12 @@ mod tests {
                 });
 
             let contents = std::str::from_utf8(contents)?;
-            if contents.contains("| undefined") {
+            // The stable usage RPC originally required `params: undefined`. Keep that exact
+            // legacy value accepted while extending the same method with optional thread params.
+            let legacy_account_usage_undefined = path == Path::new("ClientRequest.ts")
+                && contents.matches("| undefined").count() == 1
+                && contents.contains(LEGACY_ACCOUNT_USAGE_REQUEST);
+            if contents.contains("| undefined") && !legacy_account_usage_undefined {
                 undefined_offenders.push(path.clone());
             }
 
@@ -2391,9 +2349,14 @@ mod tests {
 
                 // If the last non-whitespace before ':' is '?', then this is an
                 // optional field with a nullable type (i.e., "?: T | null").
-                // These are only allowed in *Params types.
+                // These are only allowed in *Params types, except the additive stable usage
+                // response field, which older servers omit and newer servers return as null.
+                let legacy_account_usage_response = path
+                    == Path::new("v2/GetAccountTokenUsageResponse.ts")
+                    && field_prefix.trim() == "threadUsage?";
                 if field_prefix.chars().rev().find(|c| !c.is_whitespace()) == Some('?')
                     && !allow_optional_nullable
+                    && !legacy_account_usage_response
                 {
                     let line_number =
                         contents[..abs_idx].chars().filter(|c| *c == '\n').count() + 1;

@@ -1,224 +1,111 @@
-use std::fs::File;
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
-const HOSTED_LOCK_PATH: &str = "/run/cudex/code-mode.lock";
-const HOSTED_IDENTITY_PATH: &str = "/run/cudex/code-mode.identity";
+use anyhow::Context;
+use clap::Parser;
+use codex_otel::OtelExporter;
+use codex_otel::OtelHttpProtocol;
+use codex_otel::OtelProvider;
+use codex_otel::OtelSettings;
+use codex_otel_trace_websocket::TraceWebSocket;
+use tracing_subscriber::Layer;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
-struct HostedSingleton {
-    _lock: File,
-    identity_path: PathBuf,
-}
+const OTEL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 5);
 
-impl HostedSingleton {
-    fn acquire(identity: &str) -> anyhow::Result<Self> {
-        Self::acquire_at(
-            identity,
-            Path::new(HOSTED_LOCK_PATH),
-            Path::new(HOSTED_IDENTITY_PATH),
-        )
-    }
+#[derive(Debug, Parser)]
+struct Cli {
+    /// Transport endpoint: `stdio`, `stdio://`, or `grpc://IP:PORT`.
+    #[arg(
+        long,
+        value_name = "URL",
+        default_value = codex_code_mode_host::DEFAULT_LISTEN_URL
+    )]
+    listen: String,
 
-    fn acquire_at(identity: &str, lock_path: &Path, identity_path: &Path) -> anyhow::Result<Self> {
-        if identity.is_empty() || identity.len() > 4096 || identity.contains('\n') {
-            anyhow::bail!("hosted runtime identity is invalid");
-        }
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .mode(0o600)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-            .open(lock_path)?;
-        // SAFETY: flock only observes the valid descriptor owned by `lock`.
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            anyhow::bail!("another hosted code-mode runtime owns this sandbox");
-        }
-        let mut identity_file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o600)
-            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-            .open(identity_path)?;
-        writeln!(identity_file, "pid={}", std::process::id())?;
-        writeln!(identity_file, "identity={identity}")?;
-        identity_file.sync_all()?;
-        Ok(Self {
-            _lock: lock,
-            identity_path: identity_path.to_path_buf(),
-        })
-    }
-}
+    /// Optional WebSocket endpoint that streams only raw OTLP trace batches.
+    #[arg(long, value_name = "URL")]
+    otel_trace_listen: Option<String>,
 
-impl Drop for HostedSingleton {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.identity_path);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::fs;
-    use std::os::unix::fs::symlink;
-
-    use pretty_assertions::assert_eq;
-    use tempfile::TempDir;
-
-    use super::HostedSingleton;
-
-    struct SingletonPaths {
-        _directory: TempDir,
-        lock: std::path::PathBuf,
-        identity: std::path::PathBuf,
-    }
-
-    impl SingletonPaths {
-        fn new() -> Self {
-            let directory = tempfile::tempdir().expect("create singleton test directory");
-            Self {
-                lock: directory.path().join("code-mode.lock"),
-                identity: directory.path().join("code-mode.identity"),
-                _directory: directory,
-            }
-        }
-
-        fn acquire(&self, identity: &str) -> anyhow::Result<HostedSingleton> {
-            HostedSingleton::acquire_at(identity, &self.lock, &self.identity)
-        }
-    }
-
-    #[test]
-    fn singleton_writes_identity_and_removes_it_on_clean_exit() {
-        let paths = SingletonPaths::new();
-        let singleton = paths.acquire("runtime-1").expect("acquire singleton");
-
-        assert_eq!(
-            fs::read_to_string(&paths.identity).expect("read identity file"),
-            format!("pid={}\nidentity=runtime-1\n", std::process::id())
-        );
-
-        drop(singleton);
-        assert!(!paths.identity.exists());
-    }
-
-    #[test]
-    fn singleton_collision_refuses_without_disturbing_the_owner() {
-        let paths = SingletonPaths::new();
-        let owner = paths.acquire("runtime-owner").expect("acquire owner");
-
-        let error = paths
-            .acquire("runtime-collider")
-            .err()
-            .expect("second runtime must be refused");
-        assert_eq!(
-            error.to_string(),
-            "another hosted code-mode runtime owns this sandbox"
-        );
-        assert_eq!(
-            fs::read_to_string(&paths.identity).expect("owner identity remains"),
-            format!("pid={}\nidentity=runtime-owner\n", std::process::id())
-        );
-
-        drop(owner);
-    }
-
-    #[test]
-    fn singleton_lock_is_released_when_the_owner_is_dropped() {
-        let paths = SingletonPaths::new();
-        let owner = paths.acquire("runtime-1").expect("acquire first owner");
-        drop(owner);
-
-        let replacement = paths
-            .acquire("runtime-2")
-            .expect("kernel releases the lock with its file descriptor");
-        assert_eq!(
-            fs::read_to_string(&paths.identity).expect("replacement identity"),
-            format!("pid={}\nidentity=runtime-2\n", std::process::id())
-        );
-        drop(replacement);
-    }
-
-    #[test]
-    fn invalid_identity_is_rejected_before_creating_runtime_files() {
-        for invalid in ["", "line\nbreak"] {
-            let paths = SingletonPaths::new();
-            let error = paths
-                .acquire(invalid)
-                .err()
-                .expect("invalid identity must fail");
-            assert_eq!(error.to_string(), "hosted runtime identity is invalid");
-            assert!(!paths.lock.exists());
-            assert!(!paths.identity.exists());
-        }
-
-        let paths = SingletonPaths::new();
-        let oversized = "x".repeat(4097);
-        let error = paths
-            .acquire(&oversized)
-            .err()
-            .expect("oversized identity must fail");
-        assert_eq!(error.to_string(), "hosted runtime identity is invalid");
-        assert!(!paths.lock.exists());
-        assert!(!paths.identity.exists());
-    }
-
-    #[test]
-    fn singleton_refuses_symlinked_runtime_files() {
-        let paths = SingletonPaths::new();
-        let target = paths
-            .identity
-            .parent()
-            .expect("identity parent")
-            .join("target");
-        fs::write(&target, "do-not-overwrite").expect("write target");
-        symlink(&target, &paths.identity).expect("create identity symlink");
-
-        let _error = paths
-            .acquire("runtime-1")
-            .err()
-            .expect("symlinked identity must fail");
-        assert_eq!(
-            fs::read_to_string(target).expect("read target"),
-            "do-not-overwrite"
-        );
-    }
-}
-
-fn usage() {
-    println!("Usage: codex-code-mode-host [--hosted-singleton --identity ID]");
+    /// Optional OTLP/HTTP JSON trace exporter endpoint, analogous to
+    /// `otel.trace_exporter` in app-server configuration.
+    #[arg(long, value_name = "URL", conflicts_with = "otel_trace_listen")]
+    otel_trace_exporter: Option<String>,
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
-    let mut args = std::env::args().skip(1);
-    let mut hosted_singleton = false;
-    let mut identity = None;
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--help" | "-h" => {
-                usage();
-                return Ok(());
-            }
-            "--hosted-singleton" => hosted_singleton = true,
-            "--identity" => identity = args.next(),
-            _ => anyhow::bail!("unknown argument: {arg}"),
-        }
-    }
-    let _singleton = if hosted_singleton {
-        Some(HostedSingleton::acquire(identity.as_deref().ok_or_else(
-            || anyhow::anyhow!("--identity is required in hosted singleton mode"),
-        )?)?)
+    let cli = Cli::parse();
+    let mut trace_transport = if let Some(trace_listen) = cli.otel_trace_listen.as_deref() {
+        Some(TraceWebSocket::start(trace_listen).await?)
     } else {
-        if identity.is_some() {
-            anyhow::bail!("--identity requires --hosted-singleton");
-        }
         None
     };
-    codex_code_mode_host::run_stdio().await
+    let trace_exporter_endpoint = trace_transport
+        .as_ref()
+        .map(TraceWebSocket::exporter_endpoint)
+        .or(cli.otel_trace_exporter.as_deref());
+    let otel = trace_exporter_endpoint
+        .map(build_trace_provider)
+        .transpose()?;
+    let otel_layer = otel.as_ref().and_then(OtelProvider::tracing_layer);
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_ansi(false)
+                .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+        )
+        .with(otel_layer)
+        .init();
+    if let Some(trace_transport) = trace_transport.as_ref() {
+        let listen_addr = trace_transport.listen_addr();
+        tracing::info!("codex-code-mode-host OTEL trace websocket listening on ws://{listen_addr}");
+    }
+    tracing::info_span!(
+        "code_mode_host.startup",
+        otel.name = "code_mode_host.startup"
+    )
+    .in_scope(|| {});
+
+    let main_transport = codex_code_mode_host::run_main(&cli.listen);
+    let result = match trace_transport.as_mut() {
+        Some(trace_transport) => tokio::select! {
+            result = main_transport => result,
+            result = trace_transport.wait_for_failure() => result,
+        },
+        None => main_transport.await,
+    };
+    if let Some(otel) = otel
+        && let Err(error) = otel.shutdown_with_timeout(OTEL_SHUTDOWN_TIMEOUT).await
+    {
+        tracing::warn!(%error, "failed to finish code-mode host telemetry shutdown");
+    }
+    drop(trace_transport);
+    result
+}
+
+fn build_trace_provider(endpoint: &str) -> anyhow::Result<OtelProvider> {
+    OtelProvider::try_new(&OtelSettings {
+        environment: "code-mode-host".to_string(),
+        service_name: "codex-code-mode-host".to_string(),
+        service_version: env!("CARGO_PKG_VERSION").to_string(),
+        codex_home: PathBuf::from("/tmp"),
+        exporter: OtelExporter::None,
+        trace_exporter: OtelExporter::OtlpHttp {
+            endpoint: endpoint.to_string(),
+            headers: HashMap::new(),
+            protocol: OtelHttpProtocol::Json,
+            tls: None,
+        },
+        metrics_exporter: OtelExporter::None,
+        runtime_metrics: false,
+        span_attributes: BTreeMap::new(),
+        tracestate: BTreeMap::new(),
+    })
+    .map_err(|error| anyhow::anyhow!("failed to build code-mode host OTEL provider: {error}"))?
+    .context("code-mode host OTEL trace provider was unexpectedly disabled")
 }

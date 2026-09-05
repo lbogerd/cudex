@@ -1,6 +1,8 @@
 use super::*;
 use codex_apply_patch::MaybeApplyPatchVerified;
 use codex_exec_server::LOCAL_FS;
+use codex_protocol::permissions::FileSystemAccessMode;
+use codex_protocol::permissions::FileSystemSandboxEntry;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::protocol::FileChange;
 use core_test_support::PathBufExt;
@@ -45,6 +47,24 @@ async fn invocation_for_payload(payload: ToolPayload) -> ToolInvocation {
 }
 
 #[tokio::test]
+async fn file_update_mode_follows_preserve_line_endings_feature() {
+    let (_, mut turn) = make_session_and_context().await;
+    assert_eq!(
+        apply_patch_file_update_mode(&turn),
+        codex_apply_patch::ApplyPatchFileUpdateMode::NormalizeToLf
+    );
+
+    Arc::make_mut(&mut turn.config)
+        .features
+        .enable(codex_features::Feature::ApplyPatchPreserveLineEndings)
+        .expect("feature should be enabled");
+    assert_eq!(
+        apply_patch_file_update_mode(&turn),
+        codex_apply_patch::ApplyPatchFileUpdateMode::PreserveLineEndings
+    );
+}
+
+#[tokio::test]
 async fn pre_tool_use_payload_uses_freeform_patch_input() {
     let patch = sample_patch();
     let payload = ToolPayload::Custom {
@@ -81,59 +101,6 @@ async fn post_tool_use_payload_uses_patch_input_and_tool_output() {
             tool_response: json!("Success. Updated files."),
         })
     );
-}
-
-#[tokio::test]
-async fn hosted_permission_denials_during_verification_use_the_stable_diagnostic() {
-    let (_, mut turn) = make_session_and_context().await;
-    turn.hosted_tool_authorization =
-        Some(crate::hosted_agent_runtime::HostedToolAuthorization::new(
-            "hosted-environment".to_string(),
-            codex_hosted_agent::AgentToolPolicy::default(),
-        ));
-    let error = codex_apply_patch::ApplyPatchError::from(std::io::Error::new(
-        std::io::ErrorKind::PermissionDenied,
-        "service-specific denial details",
-    ));
-
-    assert_eq!(
-        apply_patch_verification_error(&turn, error),
-        FunctionCallError::RespondToModel(
-            crate::hosted_agent_runtime::HOSTED_EXTERNAL_SANDBOX_DENIAL_MESSAGE.to_string()
-        )
-    );
-}
-
-#[tokio::test]
-async fn non_hosted_permission_denials_keep_the_existing_verification_context() {
-    let (_, turn) = make_session_and_context().await;
-    let error = codex_apply_patch::ApplyPatchError::from(std::io::Error::new(
-        std::io::ErrorKind::PermissionDenied,
-        "filesystem denial details",
-    ));
-
-    assert_eq!(
-        apply_patch_verification_error(&turn, error),
-        FunctionCallError::RespondToModel(
-            "apply_patch verification failed: I/O error: filesystem denial details".to_string()
-        )
-    );
-}
-
-#[tokio::test]
-async fn hosted_runtime_denials_are_identified_for_final_normalization() {
-    let (_, mut turn) = make_session_and_context().await;
-    turn.hosted_tool_authorization =
-        Some(crate::hosted_agent_runtime::HostedToolAuthorization::new(
-            "hosted-environment".to_string(),
-            codex_hosted_agent::AgentToolPolicy::default(),
-        ));
-    let out = Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied {
-        output: Box::default(),
-        network_policy_decision: None,
-    })));
-
-    assert!(is_hosted_apply_patch_denial(&turn, &out));
 }
 
 #[test]
@@ -336,8 +303,7 @@ fn write_permissions_for_paths_keep_dirs_outside_workspace_root() {
     );
 
     let permissions = write_permissions_for_paths(&[file_path], &sandbox_policy, &cwd_abs);
-    let expected_outside =
-        dunce::simplified(&outside.canonicalize().expect("canonicalize outside dir")).abs();
+    let expected_outside = outside.abs();
 
     assert_eq!(
         permissions
@@ -346,4 +312,36 @@ fn write_permissions_for_paths_keep_dirs_outside_workspace_root() {
             .and_then(|roots| roots.write),
         Some(vec![expected_outside])
     );
+}
+
+#[test]
+fn write_permissions_for_paths_do_not_widen_workspace_root_target() {
+    let tmp = TempDir::new().expect("tmp");
+    let cwd = tmp.path().join("workspace").abs();
+    std::fs::create_dir_all(&cwd).expect("create workspace");
+    let sandbox_policy = FileSystemSandboxPolicy::workspace_write(
+        &[],
+        /*exclude_tmpdir_env_var*/ true,
+        /*exclude_slash_tmp*/ true,
+    );
+
+    let permissions =
+        write_permissions_for_paths(std::slice::from_ref(&cwd), &sandbox_policy, &cwd);
+
+    assert_eq!(permissions, None);
+}
+
+#[test]
+fn write_permissions_for_paths_do_not_regrant_an_already_writable_parent() {
+    let tmp = TempDir::new().expect("tmp");
+    let cwd = tmp.path().abs();
+    let file_path = cwd.join("protected.txt");
+    let sandbox_policy = FileSystemSandboxPolicy::restricted(vec![
+        FileSystemSandboxEntry::new(cwd.clone().into(), FileSystemAccessMode::Write),
+        FileSystemSandboxEntry::new(file_path.clone().into(), FileSystemAccessMode::Read),
+    ]);
+
+    let permissions = write_permissions_for_paths(&[file_path], &sandbox_policy, &cwd);
+
+    assert_eq!(permissions, None);
 }

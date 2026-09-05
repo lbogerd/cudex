@@ -1,5 +1,4 @@
 use crate::function_tool::FunctionCallError;
-use crate::hosted_agent_runtime::HOSTED_EXTERNAL_SANDBOX_DENIAL_MESSAGE;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
@@ -8,10 +7,11 @@ use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::PostToolUsePayload;
 use crate::tools::registry::PreToolUsePayload;
 use crate::tools::registry::ToolExecutor;
+use crate::tools::sandboxing::ToolError;
+use crate::unified_exec::UnifiedExecContext;
 use crate::unified_exec::UnifiedExecError;
+use crate::unified_exec::WriteStdinInteractionEvent;
 use crate::unified_exec::WriteStdinRequest;
-use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::TerminalInteractionEvent;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 use serde::Deserialize;
@@ -46,7 +46,10 @@ impl ToolExecutor<ToolInvocation> for WriteStdinHandler {
         true
     }
 
-    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+    fn handle<'a>(&'a self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'a>
+    where
+        ToolInvocation: 'a,
+    {
         Box::pin(self.handle_call(invocation))
     }
 }
@@ -59,6 +62,9 @@ impl WriteStdinHandler {
         let ToolInvocation {
             session,
             turn,
+            step_context,
+            cancellation_token,
+            call_id,
             payload,
             ..
         } = invocation;
@@ -73,49 +79,40 @@ impl WriteStdinHandler {
         };
 
         let args: WriteStdinArgs = parse_arguments(&arguments)?;
+        let context =
+            UnifiedExecContext::new(session.clone(), step_context, cancellation_token, call_id);
         let response = session
             .services
             .unified_exec_manager
-            .write_stdin(WriteStdinRequest {
-                process_id: args.session_id,
-                input: &args.chars,
-                yield_time_ms: args.yield_time_ms,
-                max_output_tokens: args.max_output_tokens,
-                truncation_policy: turn.model_info.truncation_policy.into(),
-            })
+            .write_stdin(
+                &context,
+                WriteStdinRequest {
+                    process_id: args.session_id,
+                    input: &args.chars,
+                    yield_time_ms: args.yield_time_ms,
+                    max_output_tokens: args.max_output_tokens,
+                    truncation_policy: turn.model_info().truncation_policy.into(),
+                    interaction_event: Some(WriteStdinInteractionEvent {
+                        session: &session,
+                        turn: &turn,
+                    }),
+                },
+            )
             .await
-            .map_err(|err| map_write_stdin_error(turn.as_ref(), err))?;
-
-        // Empty stdin is a background poll, so emit it only while there is
-        // still a live process for the UI to wait on. Non-empty stdin is a real
-        // terminal interaction and should remain visible even if it completes
-        // the process before the response returns.
-        if !args.chars.is_empty() || response.process_id.is_some() {
-            let process_id = response.process_id.unwrap_or(args.session_id);
-            let interaction = TerminalInteractionEvent {
-                call_id: response.event_call_id.clone(),
-                process_id: process_id.to_string(),
-                stdin: args.chars.clone(),
-            };
-            session
-                .send_event(turn.as_ref(), EventMsg::TerminalInteraction(interaction))
-                .await;
-        }
+            .map_err(|err| {
+                let message = match err {
+                    UnifiedExecError::StdinApproval(ToolError::Rejected(reason)) => {
+                        format!("write_stdin rejected: {reason}")
+                    }
+                    UnifiedExecError::StdinApproval(ToolError::Codex(err)) => {
+                        format!("write_stdin approval failed: {err}")
+                    }
+                    err => format!("write_stdin failed: {err}"),
+                };
+                FunctionCallError::RespondToModel(message)
+            })?;
 
         Ok(boxed_tool_output(response))
-    }
-}
-
-pub(super) fn map_write_stdin_error(
-    turn: &crate::session::turn_context::TurnContext,
-    err: UnifiedExecError,
-) -> FunctionCallError {
-    if turn.hosted_tool_authorization.is_some()
-        && matches!(err, UnifiedExecError::SandboxDenied { .. })
-    {
-        FunctionCallError::RespondToModel(HOSTED_EXTERNAL_SANDBOX_DENIAL_MESSAGE.to_string())
-    } else {
-        FunctionCallError::RespondToModel(format!("write_stdin failed: {err}"))
     }
 }
 

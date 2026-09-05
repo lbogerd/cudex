@@ -51,11 +51,15 @@ pub(super) fn server_notification_thread_target(
         ServerNotification::ThreadStatusChanged(notification) => {
             Some(notification.thread_id.as_str())
         }
+        ServerNotification::ThreadReverted(notification) => Some(notification.thread_id.as_str()),
         ServerNotification::ThreadArchived(notification) => Some(notification.thread_id.as_str()),
         ServerNotification::ThreadDeleted(notification) => Some(notification.thread_id.as_str()),
         ServerNotification::ThreadUnarchived(notification) => Some(notification.thread_id.as_str()),
         ServerNotification::ThreadClosed(notification) => Some(notification.thread_id.as_str()),
         ServerNotification::ThreadNameUpdated(notification) => {
+            Some(notification.thread_id.as_str())
+        }
+        ServerNotification::ThreadProjectUpdated(notification) => {
             Some(notification.thread_id.as_str())
         }
         ServerNotification::ThreadTokenUsageUpdated(notification) => {
@@ -67,10 +71,10 @@ pub(super) fn server_notification_thread_target(
         ServerNotification::ThreadGoalCleared(notification) => {
             Some(notification.thread_id.as_str())
         }
-        ServerNotification::ThreadSettingsUpdated(notification) => {
+        ServerNotification::ThreadQueueChanged(notification) => {
             Some(notification.thread_id.as_str())
         }
-        ServerNotification::AgentPatchAvailable(notification) => {
+        ServerNotification::ThreadSettingsUpdated(notification) => {
             Some(notification.thread_id.as_str())
         }
         ServerNotification::TurnStarted(notification) => Some(notification.thread_id.as_str()),
@@ -84,6 +88,9 @@ pub(super) fn server_notification_thread_target(
             Some(notification.thread_id.as_str())
         }
         ServerNotification::ItemGuardianApprovalReviewCompleted(notification) => {
+            Some(notification.thread_id.as_str())
+        }
+        ServerNotification::StrictReviewRequired(notification) => {
             Some(notification.thread_id.as_str())
         }
         ServerNotification::ItemCompleted(notification) => Some(notification.thread_id.as_str()),
@@ -141,6 +148,15 @@ pub(super) fn server_notification_thread_target(
         ServerNotification::ThreadRealtimeItemAdded(notification) => {
             Some(notification.thread_id.as_str())
         }
+        ServerNotification::ThreadRealtimeItemStarted(notification) => {
+            Some(notification.thread_id.as_str())
+        }
+        ServerNotification::ThreadRealtimeItemTranscriptDelta(notification) => {
+            Some(notification.thread_id.as_str())
+        }
+        ServerNotification::ThreadRealtimeItemCompleted(notification) => {
+            Some(notification.thread_id.as_str())
+        }
         ServerNotification::ThreadRealtimeTranscriptDelta(notification) => {
             Some(notification.thread_id.as_str())
         }
@@ -159,6 +175,10 @@ pub(super) fn server_notification_thread_target(
         ServerNotification::ThreadRealtimeClosed(notification) => {
             Some(notification.thread_id.as_str())
         }
+        ServerNotification::AuthRecoveryStarted(notification)
+        | ServerNotification::AuthRecoveryCompleted(notification) => {
+            Some(notification.thread_id.as_str())
+        }
         ServerNotification::Warning(notification) => notification.thread_id.as_deref(),
         ServerNotification::GuardianWarning(notification) => Some(notification.thread_id.as_str()),
         ServerNotification::McpServerStatusUpdated(notification) => {
@@ -167,7 +187,8 @@ pub(super) fn server_notification_thread_target(
                 None => return ServerNotificationThreadTarget::AppScoped,
             }
         }
-        ServerNotification::SkillsChanged(_)
+        ServerNotification::ProjectChanged(_)
+        | ServerNotification::SkillsChanged(_)
         | ServerNotification::McpServerOauthLoginCompleted(_)
         | ServerNotification::AccountUpdated(_)
         | ServerNotification::AccountRateLimitsUpdated(_)
@@ -184,6 +205,7 @@ pub(super) fn server_notification_thread_target(
         | ServerNotification::CommandExecOutputDelta(_)
         | ServerNotification::ProcessOutputDelta(_)
         | ServerNotification::ProcessExited(_)
+        | ServerNotification::McpServerEventStream(_)
         | ServerNotification::FsChanged(_)
         | ServerNotification::WindowsWorldWritableWarning(_)
         | ServerNotification::WindowsSandboxSetupCompleted(_)
@@ -205,8 +227,6 @@ mod tests {
     use super::server_notification_thread_target;
     use crate::test_support::PathBufExt;
     use crate::test_support::test_path_buf;
-    use codex_app_server_protocol::AgentPatchArtifactMetadata;
-    use codex_app_server_protocol::AgentPatchAvailableNotification;
     use codex_app_server_protocol::GuardianWarningNotification;
     use codex_app_server_protocol::McpServerStartupState;
     use codex_app_server_protocol::McpServerStatusUpdatedNotification;
@@ -326,27 +346,6 @@ mod tests {
             ServerNotification::ThreadSettingsUpdated(ThreadSettingsUpdatedNotification {
                 thread_id: thread_id.to_string(),
                 thread_settings: test_thread_settings(),
-            });
-
-        let target = server_notification_thread_target(&notification);
-
-        assert_eq!(target, ServerNotificationThreadTarget::Thread(thread_id));
-    }
-
-    #[test]
-    fn agent_patch_available_notifications_route_to_owner_threads() {
-        let thread_id = ThreadId::new();
-        let notification =
-            ServerNotification::AgentPatchAvailable(AgentPatchAvailableNotification {
-                thread_id: thread_id.to_string(),
-                artifact: AgentPatchArtifactMetadata {
-                    artifact_id: "artifact-1".to_string(),
-                    agent_id: ThreadId::new().to_string(),
-                    base_snapshot_id: "snapshot-1".to_string(),
-                    checksum: "sha256:abc".to_string(),
-                    changed_files: 1,
-                    size_bytes: 10,
-                },
             });
 
         let target = server_notification_thread_target(&notification);
