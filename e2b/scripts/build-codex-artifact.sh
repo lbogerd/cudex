@@ -37,7 +37,7 @@ fi
 echo "Building codex and codex-code-mode-host (${profile}, ${target}) from ${revision}"
 v8_env_file=$(mktemp /tmp/cudex-v8-env.XXXXXX)
 trap 'rm -f "${v8_env_file}"' EXIT
-PYTHONPATH="${codex_dir}/scripts" python3 -c '
+CODEX_REPO_ROOT="${codex_dir}" PYTHONPATH="${codex_dir}/scripts" python3 -c '
 import sys
 from codex_package.targets import TARGET_SPECS
 from codex_package.v8 import resolve_codex_v8_cargo_env
