@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict'
-import { chmod, mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PassThrough } from 'node:stream'
 import test from 'node:test'
-import { collectAppServerNotification, initializeAndReadAccount, PocAppServerClient, startPocAppServer,
+import { assertHostedModelCompatibility, collectAppServerNotification, initializeAndReadAccount, PocAppServerClient, startPocAppServer,
   type PocAppServerEvidence } from '../src/poc-app-server-client.js'
 import { pocRunPaths } from '../src/poc-config.js'
 
@@ -24,6 +24,25 @@ function harness() {
   })
   return { requests, responses, client, read }
 }
+
+test('model preflight accepts stable omitted tool mode and rejects unknown modes', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'cudex-model-catalog-'))
+  try {
+    for (const mode of [undefined, null, 'code_mode_only', 'future_mode', 7]) {
+      await writeFile(join(home, 'models_cache.json'), JSON.stringify({ models: [{ slug: 'test-model', tool_mode: mode }] }))
+      const rpc = harness()
+      const result = assertHostedModelCompatibility(rpc, home)
+      const request = await rpc.read()
+      assert.equal(request.method, 'model/list')
+      rpc.responses.write(`${JSON.stringify({ id: request.id, result: {
+        data: [{ id: 'test-model', model: 'test-model', isDefault: true }], nextCursor: null,
+      } })}\n`)
+      if (mode === 'future_mode' || mode === 7) await assert.rejects(result, /unknown hosted tool mode/)
+      else assert.equal(await result, 'test-model')
+      rpc.responses.end()
+    }
+  } finally { await rm(home, { recursive: true, force: true }) }
+})
 
 test('JSON-RPC client handles interleaved responses and notifications', async () => {
   const { client, responses, read } = harness()

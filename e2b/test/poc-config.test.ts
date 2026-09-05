@@ -138,7 +138,7 @@ test('provenance and generated configuration contain exact hosted roles and expl
     expiresAt: '2026-07-19T12:00:00.000Z', manifestChecksum: `sha256:${'c'.repeat(64)}`, sizeBytes: 10 }
   const generated = await generateCodexConfiguration(paths, env, source, provenance)
   const config = await readFile(generated.configPath, 'utf8')
-  for (const expected of ['hosted_agents = true', '[features.multi_agent_v2]', 'enabled = true',
+  for (const expected of ['hosted_agents = true', 'code_mode = true', 'unified_exec = true', '[features.multi_agent_v2]', 'enabled = true',
     'default_agent_type = "root"', 'sandbox_template = "poc-root-v1"', 'sandbox_template = "poc-child-v1"',
     source.sourceSnapshotId, source.checksum, 'model = "gpt-test"']) assert.ok(config.includes(expected))
   assert.ok(config.includes('tool_namespace = "collaboration"'))

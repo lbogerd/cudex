@@ -233,7 +233,7 @@ function catalogEntries(value: unknown, result: Array<Record<string, unknown>>):
 }
 
 export async function assertHostedModelCompatibility(
-  process: PocAppServerProcess, codexHome: string, configuredModel?: string,
+  process: Pick<PocAppServerProcess, 'client'>, codexHome: string, configuredModel?: string,
 ): Promise<string> {
   const models: Array<Record<string, unknown>> = []
   let cursor: string | undefined
@@ -270,7 +270,9 @@ export async function assertHostedModelCompatibility(
   catalogEntries(cached, entries)
   const capability = entries.find(entry => entry.slug === model)
   if (!capability) throw new Error('selected model capability is unavailable')
-  if (capability.tool_mode !== null && capability.tool_mode !== 'code_mode_only') {
+  // Stable Codex omits None rather than serializing it as null. Our generated
+  // config explicitly enables code mode for models without a forced tool mode.
+  if (capability.tool_mode !== undefined && capability.tool_mode !== null && capability.tool_mode !== 'code_mode_only') {
     const mode = typeof capability.tool_mode === 'string' ? capability.tool_mode : typeof capability.tool_mode
     throw new Error(`selected model has an unknown hosted tool mode: ${model} (${mode})`)
   }

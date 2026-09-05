@@ -197,6 +197,8 @@ export async function generateCodexConfiguration(
 
 [features]
 hosted_agents = true
+code_mode = true
+unified_exec = true
 
 [features.multi_agent_v2]
 enabled = true
