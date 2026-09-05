@@ -117,7 +117,8 @@ async function setup(release: string, paths: CudexPaths): Promise<void> {
     if (!metadata?.isFile() || metadata.isSymbolicLink()) throw new Error('provider CA certificate is missing or unsafe')
   }
   const config = createPilotConfig({ releaseId: installed.manifest.releaseId, releaseDirectory: installed.directory,
-    apiUrl, domain, ...(providerCaCertificate ? { providerCaCertificate } : {}) })
+    apiUrl, domain, validateApiKey: environment.CUDEX_VALIDATE_API_KEY,
+    ...(providerCaCertificate ? { providerCaCertificate } : {}) })
   await saveCudexSetup(paths, config, validateCudexCredentials({ version: 1, e2bApiKey: apiKey }))
   console.log(JSON.stringify({ configured: true, releaseId: installed.manifest.releaseId,
     templateId: installed.manifest.template.templateId, authentication: await discoverCodexAuth(paths) ? 'existing' : 'login-required' }))

@@ -92,8 +92,13 @@ export function validateCudexConfig(value: unknown): CudexConfig {
   exactKeys(record, ['version', 'releaseId', 'releaseDirectory', 'apiUrl', 'domain', 'validateApiKey',
     'controlPort', 'postgresPort', 'garagePort', ...(optionalCa ? ['providerCaCertificate'] : [])], 'Cudex configuration')
   if (record.version !== 1) throw new Error('Cudex configuration version is unsupported')
-  const apiUrlText = safeString(record.apiUrl, 'API URL', /^https:\/\/[^\s]+$/u)
-  const apiUrl = new URL(apiUrlText)
+  const apiUrlText = safeString(record.apiUrl, 'API URL', /^https?:\/\/[^\s\\]+$/u)
+  // Check the original authority: URL parsing normalizes alternate IPv4 spellings
+  // such as 127.1 or 2130706433 into 127.0.0.1, which are not our literal allowlist.
+  const literalLoopback = /^http:\/\/(?:127\.0\.0\.1|\[::1\])(?::[0-9]+)?(?:\/|$)/u.test(apiUrlText)
+  let apiUrl: URL
+  try { apiUrl = new URL(apiUrlText) } catch { throw new Error('Cudex configuration has invalid API URL') }
+  if (apiUrl.protocol !== 'https:' && !literalLoopback) throw new Error('Cudex configuration has invalid API URL')
   if (apiUrl.username || apiUrl.password || apiUrl.search || apiUrl.hash) throw new Error('Cudex configuration has invalid API URL')
   const ports = {
     controlPort: port(record.controlPort, 'control port'), postgresPort: port(record.postgresPort, 'PostgreSQL port'),

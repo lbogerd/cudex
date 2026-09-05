@@ -36,3 +36,16 @@ test('configuration rejects unknown fields, unsafe URLs, ports, and credential s
   assert.throws(() => createPilotConfig({ ...base, controlPort: 15432, postgresPort: 15432 }), /distinct/)
   assert.throws(() => createPilotConfig({ ...base, domain: 'bad domain' }), /sandbox domain/)
 })
+
+test('HTTP API URLs allow only exact loopback literals, with HTTPS required elsewhere', () => {
+  const base = { releaseId: 'pilot', releaseDirectory: '/tmp/release' }
+  for (const apiUrl of ['http://127.0.0.1:8000', 'http://[::1]:8000/api', 'https://cube.invalid']) {
+    assert.equal(createPilotConfig({ ...base, apiUrl }).apiUrl, apiUrl)
+  }
+  for (const apiUrl of ['http://localhost:8000', 'http://127.1', 'http://2130706433',
+    'http://0x7f000001', 'http://127.0.0.2', 'http://[0:0:0:0:0:0:0:1]', 'http://[::ffff:127.0.0.1]',
+    'http://127.0.0.1.example', 'http://127.0.0.1@remote.invalid', 'http://user@127.0.0.1',
+    'http://127.0.0.1/?token=secret', 'http://[::1]/#fragment', 'http://127.0.0.1\\@remote.invalid']) {
+    assert.throws(() => createPilotConfig({ ...base, apiUrl }), /API URL/, apiUrl)
+  }
+})

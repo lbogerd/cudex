@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import test from 'node:test'
 import { copyDiscoveredCodexAuth, discoverCodexAuth, parseCudexArguments } from '../src/cudex-cli.js'
 import { resolveCudexPaths } from '../src/cudex-config.js'
+import { loadCudexEnv } from '../src/config/cudex-env.js'
 
 test('CLI parses only the supported pilot surface', () => {
   assert.deepEqual(parseCudexArguments([], '/project'), { command: 'session', directory: '/project' })
@@ -15,6 +16,15 @@ test('CLI parses only the supported pilot surface', () => {
   assert.throws(() => parseCudexArguments(['--full-auto']), /unsupported/)
   assert.throws(() => parseCudexArguments(['one', 'two']), /one prompt/)
   assert.throws(() => parseCudexArguments(['setup']), /usage/)
+})
+
+test('setup API-key validation is an explicit opt-out boolean, enabled by default', () => {
+  assert.equal(loadCudexEnv({}).CUDEX_VALIDATE_API_KEY, true)
+  assert.equal(loadCudexEnv({ CUDEX_VALIDATE_API_KEY: 'true' }).CUDEX_VALIDATE_API_KEY, true)
+  assert.equal(loadCudexEnv({ CUDEX_VALIDATE_API_KEY: 'false' }).CUDEX_VALIDATE_API_KEY, false)
+  for (const value of ['0', '1', 'FALSE', '', ' false ']) {
+    assert.throws(() => loadCudexEnv({ CUDEX_VALIDATE_API_KEY: value }), /Invalid environment/)
+  }
 })
 
 test('auth discovery prefers existing Codex auth and runtime copying preserves bytes with mode policy', async () => {

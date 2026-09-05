@@ -43,6 +43,26 @@ The artifact script resolves upstream's checksummed V8 artifacts using `CODEX_RE
 
 ## Build and publish a development template
 
+### Install the local CLI
+
+On this machine, start CubeSandbox using the commands below, then run:
+
+```sh
+cd /home/xub/src/cudex
+bash e2b/scripts/setup-local.sh
+cudex -C /absolute/path/to/project
+```
+
+Setup requires a clean source checkout, Node 22+, npm, Git, Docker/Compose, and a completed clean musl release build. It selects the newest build whose Codex source matches the checkout (or accepts `--build-id <id>`), publishes its template if metadata is absent, packages a checksummed release, installs the runner into `~/.local/bin`, configures it, and runs `cudex doctor --verify-template`. It does not rebuild Rust automatically or launch an agent session. The installed runner is independent of later checkout changes.
+
+Connection settings come from private `e2b/poc/.env` (mode 600), overridden by `CUDEX_API_URL`, `CUDEX_API_KEY`, `CUDEX_DOMAIN`, `CUDEX_VALIDATE_API_KEY`, and `CUDEX_PROVIDER_CA_CERTIFICATE`. The dotenv file is parsed as data, never sourced as shell code, and is not copied into the installation. The existing file-backed Codex login is reused; if absent, run `cudex login` and then `cudex doctor --verify-template`. The setup script reports a missing PATH entry; add `~/.local/bin` to your shell PATH if necessary.
+
+The API can use plain HTTP only on literal `127.0.0.1` or `[::1]`; remote endpoints still require HTTPS. This machine uses `http://127.0.0.1:3000` and `CUDEX_VALIDATE_API_KEY=false`, inherited from its development configuration. The latter controls SDK key-format validation, not server authentication. Keep API credentials private. Setup does not alter database engine versions, tainer routes, or shell startup files.
+
+Use `cudex status` to inspect a run and `cudex cleanup` to recover an interrupted run. The interactive POC described below is a separate fixture-based test, not the normal CLI.
+
+### Build artifacts manually
+
 From `e2b/`, on Linux/x86-64 with the pinned Rust toolchain, musl target/tools, Docker, `jq`, and CubeSandbox CLI installed:
 
 ```sh
