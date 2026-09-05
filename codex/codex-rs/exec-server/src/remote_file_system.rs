@@ -417,6 +417,10 @@ fn remote_sandbox_context(
 
 fn map_remote_error(error: ExecServerError) -> io::Error {
     match error {
+        ExecServerError::Server {
+            code: codex_exec_server_protocol::FILE_SYSTEM_PERMISSION_DENIED_ERROR_CODE,
+            message,
+        } => io::Error::new(io::ErrorKind::PermissionDenied, message),
         ExecServerError::Server { code, message } if code == NOT_FOUND_ERROR_CODE => {
             io::Error::new(io::ErrorKind::NotFound, message)
         }

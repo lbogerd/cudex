@@ -77,6 +77,31 @@ impl NoiseRendezvousConnectProvider for PrefetchedConnectProvider {
 }
 
 impl LazyRemoteExecServerClient {
+    /// Tombstones the lazy handle as well as its current session. Unlike refresh,
+    /// no later lookup or reconnect may make this environment usable again.
+    pub(crate) async fn retire_environment(&self) {
+        let previous = {
+            let reconnect = self
+                .reconnect
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let current = self
+                .current_client
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.removed.cancel();
+            self.startup.cancelled.cancel();
+            if let Some(attempt) = reconnect.as_ref() {
+                attempt.cancelled.cancel();
+            }
+            self.environment_connection_state_tx
+                .send_replace(EnvironmentConnectionState::Disconnected);
+            current.clone()
+        };
+        if let Some(previous) = previous {
+            previous.inner.retire().await;
+        }
+    }
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "serialize explicit refreshes, not ordinary connection or recovery attempts"
@@ -210,6 +235,7 @@ impl LazyRemoteExecServerClient {
                 })?;
             let client = tokio::select! {
                 biased;
+                _ = self.removed.cancelled() => return Err(Arc::new(ExecServerError::Disconnected("environment was removed".to_string()))),
                 _ = attempt.cancelled.cancelled() => return Err(Arc::new(ExecServerError::Disconnected("connection attempt was superseded".to_string()))),
                 result = ExecServerClient::connect_for_transport(transport.clone(), self.http_client_factory.clone()) => result.map_err(Arc::new)?,
             };
@@ -220,7 +246,7 @@ impl LazyRemoteExecServerClient {
                     .current_client
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if !attempt.cancelled.is_cancelled() {
+                if !attempt.cancelled.is_cancelled() && !self.removed.is_cancelled() {
                     client.attach_environment_connection_state(
                         self.environment_connection_state_tx.clone(),
                     );

@@ -97,7 +97,7 @@ struct RetainedOutputChunk {
 }
 
 struct RunningProcess {
-    session: ExecCommandSession,
+    session: Arc<ExecCommandSession>,
     tty: bool,
     pipe_stdin: bool,
     accepted_stdin_write_ids: Arc<Mutex<AcceptedStdinWriteIds>>,
@@ -110,6 +110,7 @@ struct RunningProcess {
     output_notify: Arc<Notify>,
     open_streams: usize,
     closed: bool,
+    quiesced: bool,
     metrics: Option<ProcessMetricGuard>,
     termination_requested: bool,
     sandbox: SandboxType,
@@ -437,7 +438,7 @@ impl LocalProcess {
             process_map.insert(
                 process_id.clone(),
                 ProcessEntry::Running(Box::new(RunningProcess {
-                    session: spawned.session,
+                    session: Arc::new(spawned.session),
                     tty: params.tty,
                     pipe_stdin: params.pipe_stdin,
                     accepted_stdin_write_ids: Arc::new(
@@ -452,6 +453,7 @@ impl LocalProcess {
                     output_notify: Arc::clone(&output_notify),
                     open_streams: 2,
                     closed: false,
+                    quiesced: false,
                     metrics: Some(metrics),
                     termination_requested: false,
                     sandbox: prepared.sandbox,
@@ -557,6 +559,7 @@ impl LocalProcess {
                         exited: process.exit_code.is_some(),
                         exit_code: process.exit_code,
                         closed: process.closed,
+                        quiesced: process.quiesced,
                         failure: None,
                         sandbox_denied: process.sandbox_denied,
                     },
@@ -684,12 +687,12 @@ impl LocalProcess {
                     if let Some(network_policy_shutdown) = &process.network_policy_shutdown {
                         network_policy_shutdown.cancel();
                     }
-                    if process.exit_code.is_some() {
-                        return Ok(TerminateResponse { running: false });
-                    }
+                    // The parent may have exited while descendants still own its
+                    // output pipes. Teardown must kill that group too.
+                    let running = process.exit_code.is_none();
                     process.termination_requested = true;
                     process.session.terminate();
-                    true
+                    running
                 }
                 Some(ProcessEntry::Starting(_)) => {
                     process_map.remove(&params.process_id);
@@ -1127,25 +1130,46 @@ async fn maybe_emit_closed(process_id: ProcessId, inner: Arc<Inner>) {
     }
 
     output_notify.notify_waiters();
-    let cleanup_process_id = process_id.clone();
-    let cleanup_inner = Arc::clone(&inner);
-    tokio::spawn(async move {
-        tokio::time::sleep(EXITED_PROCESS_RETENTION).await;
-        let mut processes = cleanup_inner.processes.lock().await;
-        match processes.entry(cleanup_process_id) {
-            Entry::Occupied(entry) => {
-                if matches!(entry.get(), ProcessEntry::Running(process) if process.closed) {
-                    entry.remove();
-                }
-            }
-            Entry::Vacant(_) => {}
-        }
-    });
-
     if let Some(notifications) = notification_sender(&inner) {
         let _ = notifications
             .notify(EXEC_CLOSED_METHOD, &notification)
             .await;
+    }
+    let session = {
+        let processes = inner.processes.lock().await;
+        let Some(ProcessEntry::Running(process)) = processes.get(&process_id) else {
+            return;
+        };
+        Arc::clone(&process.session)
+    };
+    if session.terminate_confirmed().await.unwrap_or(false) {
+        {
+            let mut processes = inner.processes.lock().await;
+            let Some(ProcessEntry::Running(process)) = processes.get_mut(&process_id) else {
+                return;
+            };
+            process.quiesced = true;
+            process.output_notify.notify_waiters();
+        }
+        if let Some(notifications) = notification_sender(&inner) {
+            let _ = notifications
+                .notify(
+                    crate::protocol::EXEC_QUIESCED_METHOD,
+                    &crate::protocol::ExecQuiescedNotification {
+                        process_id: process_id.clone(),
+                    },
+                )
+                .await;
+        }
+        tokio::spawn(async move {
+            tokio::time::sleep(EXITED_PROCESS_RETENTION).await;
+            let mut processes = inner.processes.lock().await;
+            if let Entry::Occupied(entry) = processes.entry(process_id)
+                && matches!(entry.get(), ProcessEntry::Running(process) if process.quiesced)
+            {
+                entry.remove();
+            }
+        });
     }
 }
 
@@ -1588,6 +1612,7 @@ mod tests {
                 exited: true,
                 exit_code: Some(0),
                 closed: false,
+                quiesced: false,
                 failure: None,
                 sandbox_denied: false,
             }
@@ -1710,6 +1735,7 @@ mod tests {
                 exited: false,
                 exit_code: None,
                 closed: false,
+                quiesced: false,
                 failure: None,
                 sandbox_denied: false,
             }
@@ -1856,7 +1882,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn closed_process_is_evicted_after_retention() {
+    async fn unconfirmed_process_is_retained_after_output_closes() {
         let backend = LocalProcess::default();
         let mut process = spawn_test_process(&backend, "proc-closed-eviction").await;
         let process_id = process.process_id.clone();
@@ -1873,19 +1899,16 @@ mod tests {
         .expect("process should close");
         assert!(closed_response.closed);
 
-        timeout(Duration::from_secs(1), async {
-            loop {
-                {
-                    let processes = backend.inner.processes.lock().await;
-                    if !processes.contains_key(&process_id) {
-                        break;
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("closed process should be evicted");
+        tokio::time::sleep(EXITED_PROCESS_RETENTION * 2).await;
+        assert!(
+            backend
+                .inner
+                .processes
+                .lock()
+                .await
+                .contains_key(&process_id)
+        );
+        assert!(!closed_response.quiesced);
         backend.shutdown().await;
     }
 
@@ -1922,7 +1945,7 @@ mod tests {
         let previous = processes.insert(
             process_id.clone(),
             ProcessEntry::Running(Box::new(RunningProcess {
-                session: dummy_session(),
+                session: Arc::new(dummy_session()),
                 tty: false,
                 pipe_stdin: false,
                 accepted_stdin_write_ids: Arc::new(Mutex::new(AcceptedStdinWriteIds::default())),
@@ -1935,6 +1958,7 @@ mod tests {
                 output_notify: Arc::clone(&output_notify),
                 open_streams: 2,
                 closed: false,
+                quiesced: false,
                 metrics: Some(backend.inner.telemetry.process_started(&process_id)),
                 termination_requested: false,
                 sandbox: SandboxType::None,

@@ -354,6 +354,7 @@ type ConnectionResult = Result<ExecServerClient, Arc<ExecServerError>>;
 
 #[derive(Clone)]
 pub(crate) struct LazyRemoteExecServerClient {
+    removed: CancellationToken,
     transport_params: Option<ExecServerTransportParams>,
     http_client_factory: HttpClientFactory,
     recovery_policy: RecoveryPolicy,
@@ -373,6 +374,7 @@ impl LazyRemoteExecServerClient {
     ) -> Self {
         Self {
             transport_params: Some(transport_params),
+            removed: CancellationToken::new(),
             http_client_factory,
             recovery_policy: RecoveryPolicy::Wait,
             startup: Arc::new(ConnectionAttempt::default()),
@@ -416,6 +418,11 @@ impl LazyRemoteExecServerClient {
     }
 
     pub(crate) fn readiness_result(&self) -> Option<Result<(), ExecServerError>> {
+        if self.removed.is_cancelled() {
+            return Some(Err(ExecServerError::Disconnected(
+                "environment was removed".to_string(),
+            )));
+        }
         if let Some(client) = self.cached_client() {
             return client.readiness_result();
         }
@@ -457,10 +464,20 @@ impl LazyRemoteExecServerClient {
     }
 
     pub(crate) async fn wait_until_ready(&self) -> Result<(), ExecServerError> {
+        if self.removed.is_cancelled() {
+            return Err(ExecServerError::Disconnected(
+                "environment was removed".to_string(),
+            ));
+        }
         self.initial_client().await.map(drop)
     }
 
     pub(crate) async fn get(&self) -> Result<ExecServerClient, ExecServerError> {
+        if self.removed.is_cancelled() {
+            return Err(ExecServerError::Disconnected(
+                "environment was removed".to_string(),
+            ));
+        }
         if matches!(self.recovery_policy, RecoveryPolicy::FailFast) {
             let client = match self.cached_client() {
                 Some(client) => client,
@@ -1337,6 +1354,7 @@ impl SessionState {
             exited: true,
             exit_code: None,
             closed: true,
+            quiesced: false,
             failure: Some(message),
             sandbox_denied: false,
         }
@@ -2590,6 +2608,7 @@ mod tests {
                         exited: false,
                         exit_code: None,
                         closed: false,
+                        quiesced: false,
                         failure: None,
                         sandbox_denied: false,
                     })

@@ -48,6 +48,7 @@ use tracing::instrument::WithSubscriber;
 
 #[path = "environment/accepted.rs"]
 mod accepted;
+mod owned;
 
 pub const CODEX_EXEC_SERVER_URL_ENV_VAR: &str = "CODEX_EXEC_SERVER_URL";
 pub const CODEX_EXEC_SERVER_NOISE_REGISTRY_URL_ENV_VAR: &str =
@@ -88,6 +89,8 @@ pub struct EnvironmentManager {
     local_environment: Option<Arc<Environment>>,
     local_runtime_paths: Option<ExecServerRuntimePaths>,
     http_client_factory: HttpClientFactory,
+    /// IDs whose lifecycle belongs to a hosted lease, not static configuration.
+    owned_environment_ids: RwLock<HashSet<String>>,
 }
 
 /// Information supplied by the environment owner when an environment is ready.
@@ -102,6 +105,10 @@ pub const MAX_SELECTED_CAPABILITY_ROOTS: usize = 256;
 
 pub const LOCAL_ENVIRONMENT_ID: &str = "local";
 pub const REMOTE_ENVIRONMENT_ID: &str = "remote";
+
+#[cfg(test)]
+#[path = "environment_owned_tests.rs"]
+mod owned_tests;
 
 /// Non-mutating connection status observed by an environment owner.
 ///
@@ -132,6 +139,7 @@ impl EnvironmentManager {
     pub fn default_for_tests() -> Self {
         Self {
             default_environment: Some(LOCAL_ENVIRONMENT_ID.to_string()),
+            owned_environment_ids: RwLock::new(HashSet::new()),
             environments: RwLock::new(HashMap::from([(
                 LOCAL_ENVIRONMENT_ID.to_string(),
                 Arc::new(Environment::default_for_tests()),
@@ -147,6 +155,7 @@ impl EnvironmentManager {
     pub fn without_environments(http_client_factory: HttpClientFactory) -> Self {
         Self {
             default_environment: None,
+            owned_environment_ids: RwLock::new(HashSet::new()),
             environments: RwLock::new(HashMap::new()),
             local_environment: None,
             local_runtime_paths: None,
@@ -228,6 +237,7 @@ impl EnvironmentManager {
         let connect_provider = config.into_connect_provider(http_client_factory.clone())?;
         let manager = Self {
             default_environment: Some(REMOTE_ENVIRONMENT_ID.to_string()),
+            owned_environment_ids: RwLock::new(HashSet::new()),
             environments: RwLock::new(HashMap::new()),
             local_environment: None,
             local_runtime_paths,
@@ -337,6 +347,7 @@ impl EnvironmentManager {
         }
         Ok(Self {
             default_environment,
+            owned_environment_ids: RwLock::new(HashSet::new()),
             environments: RwLock::new(environment_map),
             local_environment,
             local_runtime_paths,
@@ -532,6 +543,16 @@ impl EnvironmentManager {
                 .environments
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if self
+                .owned_environment_ids
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&environment_id)
+            {
+                return Err(ExecServerError::Protocol(format!(
+                    "environment `{environment_id}` is lease-owned and cannot be replaced"
+                )));
+            }
             environments.insert(environment_id, Arc::clone(&environment))
         };
         drop(replaced);

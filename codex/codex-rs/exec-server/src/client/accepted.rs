@@ -240,6 +240,7 @@ impl LazyRemoteExecServerClient {
             watch::channel(EnvironmentConnectionState::Connected).0;
         client.attach_environment_connection_state(environment_connection_state_tx.clone());
         Self {
+            removed: tokio_util::sync::CancellationToken::new(),
             transport_params: None,
             http_client_factory,
             recovery_policy: super::RecoveryPolicy::Wait,

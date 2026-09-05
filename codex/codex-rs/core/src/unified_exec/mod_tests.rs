@@ -233,6 +233,7 @@ struct BlockingTerminateExecProcess {
 impl BlockingTerminateExecProcess {
     async fn read(&self) -> Result<ReadResponse, codex_exec_server::ExecServerError> {
         Ok(ReadResponse {
+            quiesced: false,
             chunks: Vec::new(),
             next_seq: 1,
             exited: false,

@@ -35,6 +35,14 @@ use crate::connection::JsonRpcTransport;
 use crate::rpc_server_requests::RpcServerRequestSender;
 
 pub(crate) const SESSION_ALREADY_ATTACHED_ERROR_CODE: i64 = -32010;
+
+pub(crate) fn file_system_permission_denied(message: String) -> JSONRPCErrorError {
+    JSONRPCErrorError {
+        code: codex_exec_server_protocol::FILE_SYSTEM_PERMISSION_DENIED_ERROR_CODE,
+        message,
+        data: None,
+    }
+}
 const MAX_IN_FLIGHT_REGULAR_CALLS: usize = 1024;
 const RESERVED_CLEANUP_CALLS: usize = 1;
 const RESERVED_OUTBOUND_CONTROL_MESSAGES: usize = 16;

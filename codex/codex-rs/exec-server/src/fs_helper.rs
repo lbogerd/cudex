@@ -389,9 +389,10 @@ pub(crate) async fn run_direct_request(
 pub(crate) fn map_fs_error(err: io::Error) -> JSONRPCErrorError {
     match err.kind() {
         io::ErrorKind::NotFound => not_found(err.to_string()),
-        io::ErrorKind::InvalidInput | io::ErrorKind::PermissionDenied => {
-            invalid_request(err.to_string())
+        io::ErrorKind::PermissionDenied => {
+            crate::rpc::file_system_permission_denied(err.to_string())
         }
+        io::ErrorKind::InvalidInput => invalid_request(err.to_string()),
         _ => internal_error(err.to_string()),
     }
 }

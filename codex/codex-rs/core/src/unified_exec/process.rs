@@ -503,6 +503,7 @@ impl UnifiedExecProcess {
                         }
                     };
                     let ExecReadResponse {
+                        quiesced: _,
                         chunks,
                         next_seq,
                         exited,

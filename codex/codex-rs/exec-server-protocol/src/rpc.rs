@@ -19,6 +19,8 @@ use serde_json::Number;
 use serde_json::Value;
 
 pub const JSONRPC_VERSION: &str = "2.0";
+/// Preserve filesystem authorization failures across the execution transport.
+pub const FILE_SYSTEM_PERMISSION_DENIED_ERROR_CODE: i64 = -32011;
 
 // A maximum-size fs/walk response has at most 50,000 entries and needs roughly
 // 150,000 JSON values. Keep ample headroom for legitimate protocol messages

@@ -660,3 +660,11 @@ async fn write_jsonrpc_websocket(
         .await
         .expect("json-rpc websocket frame should write");
 }
+#[test]
+fn remote_permission_denial_keeps_its_error_kind() {
+    let error = super::map_remote_error(crate::ExecServerError::Server {
+        code: codex_exec_server_protocol::FILE_SYSTEM_PERMISSION_DENIED_ERROR_CODE,
+        message: "access denied".into(),
+    });
+    pretty_assertions::assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+}

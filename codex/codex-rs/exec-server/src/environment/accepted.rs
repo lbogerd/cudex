@@ -32,6 +32,7 @@ impl EnvironmentManager {
             client, /*local_runtime_paths*/ None,
         ));
         Ok(Self {
+            owned_environment_ids: std::sync::RwLock::new(std::collections::HashSet::new()),
             default_environment: Some(environment_id.clone()),
             environments: RwLock::new(HashMap::from([(environment_id, environment)])),
             local_environment: None,

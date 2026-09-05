@@ -293,6 +293,7 @@ async fn accepted_websocket_reconnect_recovers_running_process_and_output() -> R
                 exited: false,
                 exit_code: None,
                 closed: false,
+                quiesced: false,
                 failure: None,
                 sandbox_denied: false,
             })?,
@@ -326,6 +327,7 @@ async fn accepted_websocket_reconnect_recovers_running_process_and_output() -> R
         exited: false,
         exit_code: None,
         closed: false,
+        quiesced: false,
         failure: None,
         sandbox_denied: false,
     };

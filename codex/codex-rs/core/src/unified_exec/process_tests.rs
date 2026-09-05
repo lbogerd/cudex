@@ -32,6 +32,7 @@ impl MockExecProcess {
             .await
             .pop_front()
             .unwrap_or(ReadResponse {
+                quiesced: false,
                 chunks: Vec::new(),
                 next_seq: 1,
                 exited: false,

@@ -96,6 +96,7 @@ impl SessionState {
             exited,
             exit_code,
             closed,
+            quiesced: _,
             failure,
             sandbox_denied,
         } = response;

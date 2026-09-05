@@ -69,6 +69,56 @@ struct ProcessContext {
     _server: Option<ExecServerHarness>,
 }
 
+#[cfg(target_os = "linux")]
+enum QuiescenceTermination {
+    Automatic,
+    Explicit,
+}
+
+#[cfg(target_os = "linux")]
+#[test_case("sleep 60 >/dev/null 2>&1 & exit 0", QuiescenceTermination::Automatic; "closed_output")]
+#[test_case("sleep 60 & exit 0", QuiescenceTermination::Explicit; "inherited_output")]
+#[tokio::test]
+async fn output_closure_confirms_background_process_group_quiescence(
+    script: &str,
+    termination: QuiescenceTermination,
+) -> Result<()> {
+    let context = create_process_context(/*use_remote*/ false).await?;
+    let started = context
+        .backend
+        .start(ExecParams {
+            process_id: ProcessId::new("hosted-quiescence-test"),
+            argv: vec!["/bin/sh".into(), "-c".into(), script.into()],
+            cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
+            env_policy: None,
+            shell_snapshot: None,
+            env: HashMap::new(),
+            tty: false,
+            pipe_stdin: false,
+            arg0: None,
+            sandbox: None,
+            enforce_managed_network: false,
+            managed_network: None,
+            network_proxy: None,
+        })
+        .await?;
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let response = started.process.read(None, Some(1024), Some(100)).await?;
+            if response.quiesced {
+                assert!(response.closed && response.exited);
+                return Ok::<(), anyhow::Error>(());
+            }
+            if response.exited && matches!(termination, QuiescenceTermination::Explicit) {
+                started.process.terminate().await?;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
+    Ok(())
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum ProcessEventSnapshot {
     Output {
