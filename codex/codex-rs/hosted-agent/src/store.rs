@@ -8,6 +8,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use codex_protocol::ThreadId;
+use codex_utils_path_uri::PathUri;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -25,12 +26,23 @@ pub(crate) enum CompletionMode {
     Finalize,
 }
 
+/// Immutable workspace identity for the current lease, excluding connection secrets.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct BindingIdentity {
+    pub cwd: PathUri,
+    pub workspace_roots: Vec<PathUri>,
+    pub base_snapshot_id: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct Journal {
     pub version: u32,
     pub request: AgentProvisionRequest,
     pub record: Option<HostedAgentRuntimeRecord>,
+    #[serde(default)]
+    pub binding_identity: Option<BindingIdentity>,
     pub sequence: u64,
     pub pending: Option<String>,
     pub finalization: Option<String>,
@@ -48,6 +60,22 @@ pub(crate) struct Store {
 
 pub(crate) fn failure(message: &str) -> HostedAgentError {
     HostedAgentError::new(HostedAgentErrorCategory::Unavailable, message)
+}
+
+/// Detect durable hosted ownership without opening a service or creating state.
+/// Tombstones still count: disabling hosted configuration must not bypass its
+/// cleanup/identity checks. Malformed or unsafe state fails closed.
+pub fn has_hosted_thread(state_dir: &Path, id: ThreadId) -> Result<bool> {
+    let root = state_dir.join("hosted-runtime-v1");
+    match fs::symlink_metadata(&root) {
+        Ok(meta) if !meta.is_dir() || meta.file_type().is_symlink() => {
+            return Err(failure("unsafe hosted state directory"));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err(failure("cannot inspect hosted state directory")),
+    }
+    Ok(Store { root }.read(id)?.is_some())
 }
 
 /// Refuse legacy hosted SQLite state before upstream opens its colliding migrations.

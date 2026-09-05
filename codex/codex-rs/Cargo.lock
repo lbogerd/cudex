@@ -3493,6 +3493,7 @@ name = "codex-hosted-agent"
 version = "0.153.4"
 dependencies = [
  "codex-exec-server",
+ "codex-http-client",
  "codex-protocol",
  "codex-utils-path-uri",
  "pretty_assertions",

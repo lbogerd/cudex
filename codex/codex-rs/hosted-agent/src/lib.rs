@@ -10,6 +10,7 @@ mod types;
 pub use runtime::HostedRuntimeManager;
 pub use runtime::PrepareRequest;
 pub use runtime::RuntimeBinding;
+pub use store::has_hosted_thread;
 pub use store::reject_legacy_state;
 
 pub use fake::FakeHostedAgentService;

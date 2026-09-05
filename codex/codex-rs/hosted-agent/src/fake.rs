@@ -93,6 +93,12 @@ struct FileChange {
 }
 
 impl FakeHostedAgentService {
+    #[cfg(test)]
+    pub(crate) fn replace_binding(&self, binding: ProvisionedAgent) {
+        let lease_id = binding.lease_id.clone();
+        self.lock().leases.get_mut(&lease_id).expect("lease").provisioned = binding;
+    }
+
     /// Overrides the environment ID returned by the next new provision request.
     pub fn set_next_environment_id(&self, environment_id: impl Into<String>) {
         self.lock().next_environment_id = Some(environment_id.into());

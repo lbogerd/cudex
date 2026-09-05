@@ -203,9 +203,11 @@ impl<S: HostedAgentService> HostedRuntimeManager<S> {
                     || journal.request.owner_agent_id != request.owner_agent_id
                     || journal.request.agent_type != request.agent_type
                     || journal.request.sandbox_template != request.sandbox_template
+                    || (request.owner_agent_id.is_none()
+                        && journal.request.source != request.source)
                 {
                     return Err(failure(
-                        "hosted resume identity does not match its durable owner or role",
+                        "hosted resume identity does not match its durable owner, role, or source",
                     ));
                 }
                 journal
@@ -233,6 +235,7 @@ impl<S: HostedAgentService> HostedRuntimeManager<S> {
                         idempotency_key: format!("cudex-provision-{id}"),
                     },
                     record: None,
+                    binding_identity: None,
                     sequence: 0,
                     pending: None,
                     finalization: None,
@@ -303,9 +306,15 @@ impl<S: HostedAgentService> HostedRuntimeManager<S> {
                 {
                     Ok(value) => {
                         let record = live_record(&journal)?;
+                        let identity = journal.binding_identity.as_ref().ok_or_else(|| {
+                            failure("hosted journal has no immutable binding identity; explicit migration is required")
+                        })?;
                         if value.lease_id != record.lease_id
                             || value.environment_id != record.environment_id
                             || value.connection_generation < record.connection_generation
+                            || value.cwd != identity.cwd
+                            || value.workspace_roots != identity.workspace_roots
+                            || value.base_snapshot_id != identity.base_snapshot_id
                         {
                             return Err(failure(
                                 "hosted reconnect changed durable environment identity",
@@ -344,6 +353,11 @@ impl<S: HostedAgentService> HostedRuntimeManager<S> {
                 "hosting service reused another agent's environment",
             ));
         }
+        journal.binding_identity = Some(crate::store::BindingIdentity {
+            cwd: provisioned.cwd.clone(),
+            workspace_roots: provisioned.workspace_roots.clone(),
+            base_snapshot_id: provisioned.base_snapshot_id.clone(),
+        });
         journal.record = Some(HostedAgentRuntimeRecord {
             owner_agent_id: journal.request.owner_agent_id,
             agent_type: journal.request.agent_type.clone(),
