@@ -15,9 +15,15 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 const OTEL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(/*secs*/ 5);
+mod hosted_singleton;
 
 #[derive(Debug, Parser)]
 struct Cli {
+    /// Allow only one code-mode host in this CubeSandbox instance.
+    #[arg(long, requires = "identity")]
+    hosted_singleton: bool,
+    #[arg(long, requires = "hosted_singleton")]
+    identity: Option<String>,
     /// Transport endpoint: `stdio`, `stdio://`, or `grpc://IP:PORT`.
     #[arg(
         long,
@@ -39,6 +45,11 @@ struct Cli {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let _hosted_singleton = cli
+        .identity
+        .as_deref()
+        .map(hosted_singleton::acquire)
+        .transpose()?;
     let mut trace_transport = if let Some(trace_listen) = cli.otel_trace_listen.as_deref() {
         Some(TraceWebSocket::start(trace_listen).await?)
     } else {

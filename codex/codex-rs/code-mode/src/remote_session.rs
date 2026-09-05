@@ -29,6 +29,9 @@ use self::connection::SessionCleanup;
 use crate::NoopCodeModeSessionDelegate;
 
 mod connection;
+mod hosted;
+pub use hosted::HostedCodeModeRuntimeIdentity;
+pub use hosted::HostedEnvironmentCodeModeSessionProvider;
 
 pub(crate) type ShutdownResultReceiver = watch::Receiver<Option<Result<(), String>>>;
 
@@ -121,6 +124,7 @@ async fn create_host_session(
 }
 
 struct OwnedCodeModeHost {
+    hosted: bool,
     host_program: PathBuf,
     connection: StdMutex<Option<Arc<Connection>>>,
     connect_permit: Semaphore,
@@ -132,6 +136,7 @@ struct OwnedCodeModeHost {
 impl OwnedCodeModeHost {
     fn new(host_program: PathBuf) -> Self {
         Self {
+            hosted: false,
             host_program,
             connection: StdMutex::new(None),
             connect_permit: Semaphore::new(/*permits*/ 1),
@@ -144,6 +149,13 @@ impl OwnedCodeModeHost {
     async fn connection(&self) -> Result<Arc<Connection>, ConnectionError> {
         if let Some(connection) = self.live_connection() {
             return Ok(connection);
+        }
+
+        if self.hosted {
+            return Err(ConnectionError::Other(
+                "hosted code-mode process was lost; volatile JavaScript state cannot be recovered"
+                    .into(),
+            ));
         }
 
         let observed_generation = self.connection_generation.load(Ordering::Acquire);

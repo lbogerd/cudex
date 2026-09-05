@@ -1,12 +1,12 @@
 use codex_code_mode_protocol::host::FramedReader;
-use tokio::process::ChildStdout;
+use tokio::io::AsyncRead;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::driver::DriverEvent;
 
 pub(super) async fn drive_reader(
-    mut reader: FramedReader<ChildStdout>,
+    mut reader: FramedReader<Box<dyn AsyncRead + Unpin + Send>>,
     events: mpsc::Sender<DriverEvent>,
     cancellation: CancellationToken,
 ) -> Result<(), String> {

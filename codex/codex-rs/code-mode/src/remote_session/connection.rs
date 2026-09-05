@@ -30,10 +30,10 @@ use codex_code_mode_protocol::host::SESSION_RESOURCE_LIMITS_CAPABILITY;
 use codex_code_mode_protocol::host::SupportedProtocolVersions;
 use codex_protocol::shell_environment::scrub_non_inheritable_env_vars;
 use tokio::io::AsyncBufReadExt;
+use tokio::io::AsyncRead;
+use tokio::io::AsyncWrite;
 use tokio::io::BufReader;
 use tokio::process::Child;
-use tokio::process::ChildStdin;
-use tokio::process::ChildStdout;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -52,6 +52,7 @@ use self::reader::drive_reader;
 
 mod driver;
 mod reader;
+mod remote_io;
 
 const IPC_CHANNEL_CAPACITY: usize = 128;
 const LOCAL_HOST_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -117,7 +118,7 @@ struct CallerCancellation {
 }
 
 struct ConnectionSupervisor {
-    child: Child,
+    child: HostProcess,
     event_tx: mpsc::Sender<DriverEvent>,
     cancellation: CancellationToken,
     alive: Arc<AtomicBool>,
@@ -125,6 +126,51 @@ struct ConnectionSupervisor {
     driver_task: JoinHandle<()>,
     reader_task: JoinHandle<Result<(), String>>,
     writer_task: JoinHandle<Result<(), String>>,
+}
+
+enum HostProcess {
+    Local(Child),
+    Remote(Arc<dyn codex_exec_server::ExecProcess>),
+}
+
+impl Drop for HostProcess {
+    fn drop(&mut self) {
+        if let Self::Remote(process) = self
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            let process = Arc::clone(process);
+            runtime.spawn(async move {
+                let _ = process.terminate().await;
+            });
+        }
+    }
+}
+
+impl HostProcess {
+    async fn wait(&mut self) -> Result<String, String> {
+        match self {
+            Self::Local(child) => child
+                .wait()
+                .await
+                .map(|status| status.to_string())
+                .map_err(|error| error.to_string()),
+            Self::Remote(process) => {
+                let mut events = process.subscribe_events();
+                loop {
+                    match events.recv().await.map_err(|error| error.to_string())? {
+                        codex_exec_server::ExecProcessEvent::Exited { exit_code, .. } => {
+                            return Ok(exit_code.to_string());
+                        }
+                        codex_exec_server::ExecProcessEvent::Closed { .. } => {
+                            return Ok("closed".into());
+                        }
+                        codex_exec_server::ExecProcessEvent::Failed(error) => return Err(error),
+                        codex_exec_server::ExecProcessEvent::Output(_) => {}
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl CallerCancellation {
@@ -193,13 +239,18 @@ impl Connection {
             .take()
             .ok_or_else(|| ConnectionError::Other("spawned code-mode host has no stdout".into()))?;
 
-        Self::establish(FramedReader::new(stdout), FramedWriter::new(stdin), child).await
+        Self::establish(
+            FramedReader::new(Box::new(stdout) as Box<dyn AsyncRead + Unpin + Send>),
+            FramedWriter::new(Box::new(stdin) as Box<dyn AsyncWrite + Unpin + Send>),
+            HostProcess::Local(child),
+        )
+        .await
     }
 
     async fn establish(
-        mut reader: FramedReader<ChildStdout>,
-        mut writer: FramedWriter<ChildStdin>,
-        mut child: Child,
+        mut reader: FramedReader<Box<dyn AsyncRead + Unpin + Send>>,
+        mut writer: FramedWriter<Box<dyn AsyncWrite + Unpin + Send>>,
+        mut child: HostProcess,
     ) -> Result<Self, ConnectionError> {
         let handshake = async {
             let session_limits_capability = Capability::new(SESSION_RESOURCE_LIMITS_CAPABILITY)
@@ -483,7 +534,7 @@ impl Connection {
 }
 
 async fn drive_writer(
-    mut writer: FramedWriter<ChildStdin>,
+    mut writer: FramedWriter<Box<dyn AsyncWrite + Unpin + Send>>,
     mut outgoing: mpsc::Receiver<EncodedFrame>,
     cancellation: CancellationToken,
 ) -> Result<(), String> {
@@ -580,7 +631,14 @@ fn failure_message(failure: &std::sync::Mutex<Option<String>>) -> String {
         .unwrap_or_else(|| "code-mode host connection closed".to_string())
 }
 
-async fn kill_and_reap(child: &mut Child) {
-    let _ = child.start_kill();
-    let _ = child.wait().await;
+async fn kill_and_reap(child: &mut HostProcess) {
+    match child {
+        HostProcess::Local(child) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
+        HostProcess::Remote(process) => {
+            let _ = process.terminate().await;
+        }
+    }
 }
