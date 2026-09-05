@@ -49,6 +49,11 @@ pub(crate) fn exit_code_from_status(status: ExitStatus) -> i32 {
 }
 
 pub(crate) trait ChildTerminator: Send + Sync {
+    /// The group owned by this handle, if the backend can prove its identity.
+    fn process_group_id(&self) -> Option<u32> {
+        None
+    }
+
     fn signal(&mut self, signal: ProcessSignal) -> io::Result<()>;
 
     fn kill(&mut self) -> io::Result<()>;
@@ -109,6 +114,7 @@ type ResizeFn = Box<dyn FnMut(TerminalSize) -> anyhow::Result<()> + Send>;
 
 /// Handle for driving an interactive process (PTY or pipe).
 pub struct ProcessHandle {
+    process_group_id: Option<u32>,
     writer_tx: StdMutex<Option<mpsc::Sender<Vec<u8>>>>,
     killer: StdMutex<Option<Box<dyn ChildTerminator>>>,
     reader_handle: StdMutex<Option<JoinHandle<()>>>,
@@ -145,7 +151,9 @@ impl ProcessHandle {
         pty_handles: Option<PtyHandles>,
         resizer: Option<ResizeFn>,
     ) -> Self {
+        let process_group_id = killer.process_group_id();
         Self {
+            process_group_id,
             writer_tx: StdMutex::new(Some(writer_tx)),
             killer: StdMutex::new(Some(killer)),
             reader_handle: StdMutex::new(Some(reader_handle)),
@@ -223,6 +231,27 @@ impl ProcessHandle {
             && let Some(mut killer) = killer_opt.take()
         {
             let _ = killer.kill();
+        }
+    }
+
+    /// Stop the owned group and confirm that no member can continue execution.
+    ///
+    /// Child exit and closed output streams are not snapshot barriers. Unsupported
+    /// backends and expired confirmation deadlines return false, never success.
+    pub async fn terminate_confirmed(&self) -> io::Result<bool> {
+        self.request_terminate();
+        let Some(group) = self.process_group_id else {
+            return Ok(false);
+        };
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if crate::process_group::process_group_is_quiescent(group)? {
+                return Ok(true);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(false);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
     }
 

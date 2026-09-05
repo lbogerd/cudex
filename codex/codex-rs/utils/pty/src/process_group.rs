@@ -19,6 +19,55 @@ use std::io;
 
 use tokio::process::Child;
 
+/// Confirm absence of live userspace members after an owned group is killed.
+/// Zombies cannot mutate a workspace but can keep killpg(group, 0) successful.
+/// Errors (including inaccessible procfs entries) are deliberately fail-closed.
+#[cfg(target_os = "linux")]
+pub fn process_group_is_quiescent(process_group_id: u32) -> io::Result<bool> {
+    let group = libc::pid_t::try_from(process_group_id)
+        .ok()
+        .filter(|id| *id > 0)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid process group"))?;
+    if !signal_process_group_id(group, 0)? {
+        return Ok(true);
+    }
+    let mut found_member = false;
+    for entry in std::fs::read_dir("/proc")? {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy().parse::<u32>().is_err() {
+            continue;
+        }
+        let stat = match std::fs::read_to_string(entry.path().join("stat")) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid process stat");
+        let (_, fields) = stat.rsplit_once(')').ok_or_else(invalid)?;
+        let mut fields = fields.split_whitespace();
+        let state = fields.next().ok_or_else(invalid)?;
+        let member_group = fields
+            .nth(1)
+            .ok_or_else(invalid)?
+            .parse::<u32>()
+            .map_err(|_| invalid())?;
+        if member_group == process_group_id {
+            found_member = true;
+            if !matches!(state, "Z" | "X") {
+                return Ok(false);
+            }
+        }
+    }
+    // A group that exists but has no visible members may be hidden by procfs.
+    Ok(found_member || !signal_process_group_id(group, 0)?)
+}
+
+/// Confirmation is unavailable on this platform; callers must retain their fence.
+#[cfg(not(target_os = "linux"))]
+pub fn process_group_is_quiescent(_process_group_id: u32) -> io::Result<bool> {
+    Ok(false)
+}
+
 #[cfg(target_os = "linux")]
 /// Ensure the child receives SIGTERM when the original parent dies.
 ///

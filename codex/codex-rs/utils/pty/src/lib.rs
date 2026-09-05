@@ -2,6 +2,9 @@ pub mod pipe;
 mod process;
 pub mod process_group;
 pub mod pty;
+#[cfg(all(test, target_os = "linux"))]
+#[path = "quiescence_tests.rs"]
+mod quiescence_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(unix)]
