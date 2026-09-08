@@ -79,6 +79,49 @@ test('cleanup evaluation requires terminal database state and an empty exact pro
   }).noLiveTickets, false)
 })
 
+test('aborted cleanup accepts zero leases without weakening functional proof', () => {
+  const database: PocDatabaseInspection = { leases: [], operations: [], snapshots: [], artifacts: [],
+    patchApplications: [], allocations: [], liveTicketCount: 0, unfinishedInteractionCount: 0, interactions: [] }
+  assert.ok(Object.values(evaluatePocCleanupInspection(database,
+    { managedSandboxIds: [], knownProviderSnapshotIds: [] })).every(Boolean))
+  const functional = evaluatePocFunctionalInspection(database, undefined).assertions
+  assert.equal(functional.rootLeaseExists, false)
+  assert.equal(functional.childLeaseExists, false)
+  assert.equal(functional.rootCodeModeRuntimeReady, false)
+  assert.equal(functional.childCodeModeRuntimeReady, false)
+})
+
+test('aborted cleanup accepts a released root without a child or a started runtime', () => {
+  const database: PocDatabaseInspection = { leases: [{ leaseId: 'root', environmentId: 'environment', agentId: 'agent',
+    ownerAgentId: null, ownerLeaseId: null, providerSandboxId: 'sandbox', baseSnapshotId: 'base',
+    latestSnapshotId: 'base', state: 'released' }], operations: [], snapshots: [], artifacts: [],
+    patchApplications: [], allocations: [], liveTicketCount: 0, unfinishedInteractionCount: 0, interactions: [] }
+  for (const interactions of [[], [{ leaseId: 'root', connectionGeneration: 1,
+    processId: 'hosted-code-mode-root', state: 'finished' }]]) {
+    assert.ok(Object.values(evaluatePocCleanupInspection({ ...database, interactions },
+      { managedSandboxIds: [], knownProviderSnapshotIds: [] })).every(Boolean))
+  }
+})
+
+test('cleanup rejects every unfinished observed runtime, including later leases and unknown roles', () => {
+  const leases = ['root', 'restored-root', 'child', 'second-child'].map((leaseId, index) => ({ leaseId,
+    environmentId: `env-${index}`, agentId: `agent-${index}`, ownerAgentId: index < 2 ? null : 'agent-0',
+    ownerLeaseId: index < 2 ? null : 'root', providerSandboxId: null,
+    baseSnapshotId: 'base', latestSnapshotId: 'base', state: 'released' }))
+  for (const leaseId of [...leases.map(lease => lease.leaseId), 'unknown']) {
+    const database: PocDatabaseInspection = { leases, operations: [], snapshots: [], artifacts: [],
+      patchApplications: [], allocations: [], liveTicketCount: 0, unfinishedInteractionCount: 0,
+      interactions: [{ leaseId, connectionGeneration: 1, processId: 'hosted-code-mode-observed', state: 'active' }] }
+    const cleanup = evaluatePocCleanupInspection(database, { managedSandboxIds: [], knownProviderSnapshotIds: [] })
+    assert.equal(cleanup.noUnfinishedInteractions, false, leaseId)
+    if (leaseId !== 'unknown') {
+      assert.equal(cleanup[leaseId.includes('child') ? 'childCodeModeRuntimeQuiesced' : 'rootCodeModeRuntimeQuiesced'],
+        false, leaseId)
+    }
+    assert.ok(!Object.values(cleanup).every(Boolean), leaseId)
+  }
+})
+
 test('provider inspection and cleanup use only the exact run ownership scope and known IDs', async () => {
   const calls: unknown[] = []
   const provider = {

@@ -170,22 +170,24 @@ export interface PocProviderInspection {
 export function evaluatePocCleanupInspection(
   database: PocDatabaseInspection, provider: PocProviderInspection,
 ): Record<string, boolean> {
-  const rootLease = database.leases.find(lease => lease.ownerLeaseId === null)
-  const childLease = database.leases.find(lease => lease.ownerLeaseId !== null)
+  const rootLeaseIds = new Set(database.leases.filter(lease => lease.ownerLeaseId === null).map(lease => lease.leaseId))
+  const childLeaseIds = new Set(database.leases.filter(lease => lease.ownerLeaseId !== null).map(lease => lease.leaseId))
   const codeModeProcesses = database.interactions.filter(interaction =>
     interaction.processId?.startsWith('hosted-code-mode-'))
-  const quiesced = (leaseId: string | undefined) => Boolean(leaseId)
-    && codeModeProcesses.some(item => item.leaseId === leaseId)
-    && codeModeProcesses.filter(item => item.leaseId === leaseId).every(item => item.state === 'finished')
+  // Cleanup proves that observed work has stopped, not that a functional run
+  // reached both roles. Startup can abort before either runtime ever exists.
+  const quiesced = (leaseIds: Set<string>) => codeModeProcesses
+    .filter(item => leaseIds.has(item.leaseId)).every(item => item.state === 'finished')
   return {
     allLeasesReleased: database.leases.every(lease => lease.state === 'released'),
     noInProgressOperations: database.operations.every(operation => operation.state !== 'in_progress'),
     noPendingAllocations: database.allocations.every(allocation => allocation.state !== 'allocated'
       && allocation.state !== 'reclaim_pending'),
     noLiveTickets: database.liveTicketCount === 0,
-    noUnfinishedInteractions: database.unfinishedInteractionCount === 0,
-    rootCodeModeRuntimeQuiesced: quiesced(rootLease?.leaseId),
-    childCodeModeRuntimeQuiesced: quiesced(childLease?.leaseId),
+    noUnfinishedInteractions: database.unfinishedInteractionCount === 0
+      && database.interactions.every(item => item.state === 'finished'),
+    rootCodeModeRuntimeQuiesced: quiesced(rootLeaseIds),
+    childCodeModeRuntimeQuiesced: quiesced(childLeaseIds),
     noManagedProviderSandboxes: provider.managedSandboxIds.length === 0,
     noKnownProviderSnapshots: provider.knownProviderSnapshotIds.length === 0,
   }
